@@ -359,7 +359,7 @@ let
     ];
     nativeBuildInputs = [ pkgs.makeWrapper ];
     postBuild = ''
-      for program in brood brood-client brood-remote brood-sessiond brood-runner-exec brood-runner-nix-develop; do
+      for program in brood brood-client brood-computer-use-mcp brood-remote brood-sessiond brood-runner-exec brood-runner-nix-develop; do
         wrapProgram "$out/bin/$program" \
           --prefix PATH : "${appToolPath}" \
           --prefix LD_LIBRARY_PATH : "${nativeLibraryPath}" \

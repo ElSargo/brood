@@ -8,9 +8,10 @@ use std::{
 
 use brood_computer_use::{
     AUTOMATION_VIEWPORT_HEIGHT, AUTOMATION_VIEWPORT_WIDTH, ActionStatus, ComputerAction,
-    ComputerActionBatch, ComputerActionResult, ComputerObservation, ComputerRect,
-    ComputerUseFailure, ComputerWindow, MAX_OBSERVATION_PNG_BYTES, MAX_QUEUED_OBSERVATIONS,
-    MIN_CAPTURE_INTERVAL_MS, PointerButton, SettleEvidence, TaskId,
+    ComputerActionBatch, ComputerActionResult, ComputerObservation, ComputerObservationSummary,
+    ComputerRect, ComputerUseFailure, ComputerUseObserverCommand, ComputerUseObserverUpdate,
+    ComputerWindow, MAX_OBSERVATION_PNG_BYTES, MAX_QUEUED_OBSERVATIONS, MIN_CAPTURE_INTERVAL_MS,
+    PointerButton, SettleEvidence, TaskId,
 };
 use image::{ColorType, ImageEncoder, codecs::png::PngEncoder};
 use smithay::{
@@ -49,6 +50,7 @@ struct PendingBatch {
     results: Vec<ComputerActionResult>,
     active_action: Option<ActiveAction>,
     response: BatchResponse,
+    adapter_call_id: Option<String>,
 }
 
 enum ActiveAction {
@@ -87,6 +89,10 @@ pub struct AutomationRuntime {
     next_execution_id: u64,
     next_frame_sequence: u64,
     next_observation_sequence: u64,
+    next_approval_sequence: u64,
+    observer_recipient: Option<String>,
+    observer_event_cursor: u64,
+    observer_observation_sequence: u64,
     pub capture_attempts: u64,
     pub capture_failures: u64,
     pub captures_dropped_cadence: u64,
@@ -210,6 +216,31 @@ impl AutomationRuntime {
         self.observations.len()
     }
 
+    pub(crate) fn observations_after(
+        &self,
+        task: &TaskId,
+        sequence: u64,
+    ) -> Vec<ComputerObservation> {
+        self.observations
+            .iter()
+            .filter(|observation| observation.task == *task && observation.sequence > sequence)
+            .cloned()
+            .collect()
+    }
+
+    fn next_approval_id(&mut self) -> String {
+        self.next_approval_sequence = self.next_approval_sequence.saturating_add(1).max(1);
+        format!("approval-{}", self.next_approval_sequence)
+    }
+
+    fn observation_summaries_after(&self, sequence: u64) -> Vec<ComputerObservationSummary> {
+        self.observations
+            .iter()
+            .filter(|observation| observation.sequence > sequence)
+            .map(ComputerObservationSummary::from)
+            .collect()
+    }
+
     pub(crate) const fn pending_batch(&self) -> bool {
         self.pending_batch.is_some()
     }
@@ -223,6 +254,107 @@ impl AutomationRuntime {
     }
 }
 
+pub fn handle_observer_command(
+    state: &mut Brood,
+    sender: String,
+    body: &[u8],
+) -> Result<(), String> {
+    let command = serde_json::from_slice::<ComputerUseObserverCommand>(body)
+        .map_err(|error| format!("decode computer-use observer command: {error}"))?;
+    match command {
+        ComputerUseObserverCommand::Subscribe {
+            after_event_cursor,
+            after_observation_sequence,
+        } => {
+            state.computer_use_automation.observer_recipient = Some(sender);
+            state.computer_use_automation.observer_event_cursor = after_event_cursor;
+            state.computer_use_automation.observer_observation_sequence =
+                after_observation_sequence;
+        }
+        ComputerUseObserverCommand::Pause { task } => {
+            cancel_pending_batch(state, &task, "computer-use task paused by observer");
+            let now_ms = monotonic_ms(state);
+            state
+                .computer_use
+                .pause(&task, now_ms)
+                .map_err(|error| error.to_string())?;
+        }
+        ComputerUseObserverCommand::Resume {
+            task,
+            lease_duration_ms,
+        } => {
+            let now_ms = monotonic_ms(state);
+            state
+                .computer_use
+                .resume(&task, now_ms)
+                .map_err(|error| error.to_string())?;
+            let lease = state
+                .computer_use
+                .acquire_lease(&task, now_ms, lease_duration_ms)
+                .map_err(|error| error.to_string())?;
+            if let Some(pane) = lease.windows.iter().next().copied() {
+                activate_window(state, lease.session, pane)?;
+            }
+        }
+        ComputerUseObserverCommand::Stop { task } => {
+            cancel_pending_batch(state, &task, "computer-use task stopped by observer");
+            let now_ms = monotonic_ms(state);
+            state
+                .computer_use
+                .stop(&task, now_ms)
+                .map_err(|error| error.to_string())?;
+        }
+        ComputerUseObserverCommand::DecideApproval { decision } => {
+            state
+                .computer_use
+                .decide_approval(&decision)
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    publish_observer_update(state)
+}
+
+pub fn publish_observer_update(state: &mut Brood) -> Result<(), String> {
+    let Some(recipient) = state.computer_use_automation.observer_recipient.clone() else {
+        return Ok(());
+    };
+    let after_event_cursor = state.computer_use_automation.observer_event_cursor;
+    let after_observation_sequence = state.computer_use_automation.observer_observation_sequence;
+    let observations = state
+        .computer_use_automation
+        .observation_summaries_after(after_observation_sequence);
+    let update = ComputerUseObserverUpdate {
+        protocol_version: brood_computer_use::COMPUTER_USE_PROTOCOL_VERSION,
+        event_cursor: state.computer_use.latest_event_cursor(),
+        tasks: state.computer_use.tasks(),
+        lease: state.computer_use.lease().cloned(),
+        approvals: state.computer_use.pending_approvals(None),
+        events: state.computer_use.events_after(
+            after_event_cursor,
+            None,
+            brood_computer_use::MAX_EVENT_PAGE,
+        ),
+        observations,
+    };
+    let encoded = serde_json::to_vec(&update).map_err(|error| error.to_string())?;
+    if state
+        .send_computer_use_observer_message(&recipient, &encoded)
+        .is_err()
+    {
+        state.computer_use_automation.observer_recipient = None;
+        return Ok(());
+    }
+    state.computer_use_automation.observer_event_cursor = update.event_cursor;
+    if let Some(sequence) = update
+        .observations
+        .last()
+        .map(|observation| observation.sequence)
+    {
+        state.computer_use_automation.observer_observation_sequence = sequence;
+    }
+    Ok(())
+}
+
 pub fn activate_window(state: &mut Brood, session: u64, pane: u64) -> Result<(), String> {
     let exists = state
         .presentation_window_summaries()
@@ -232,6 +364,7 @@ pub fn activate_window(state: &mut Brood, session: u64, pane: u64) -> Result<(),
         return Err("computer-use target window is outside the live session".to_string());
     }
     state.computer_use_automation.select_window(session, pane);
+    configure_automation_target(state, pane);
     match capture_viewport(state, session, Some(pane)) {
         Ok(snapshot) => state.computer_use_automation.store_capture(snapshot),
         Err(error) => state.computer_use_automation.record_failure(&error),
@@ -246,21 +379,48 @@ pub fn capture_current(state: &mut Brood) -> Result<(), String> {
     state.refresh_window_state();
     let session = state.active_surface_session().raw();
     let selected = state.computer_use_automation.selected_pane(state, session);
+    if let Some(pane) = selected {
+        configure_automation_target(state, pane);
+    }
     let snapshot = capture_viewport(state, session, selected).map_err(|error| error.to_string())?;
     state.computer_use_automation.store_capture(snapshot);
     Ok(())
 }
 
-pub fn begin_action_batch(state: &mut Brood, batch: ComputerActionBatch, response: BatchResponse) {
+pub fn begin_adapter_action_batch(
+    state: &mut Brood,
+    batch: ComputerActionBatch,
+    adapter_call_id: Option<String>,
+    response: BatchResponse,
+) {
     let prepared = (|| -> Result<(u64, u64), String> {
         if state.computer_use_automation.pending_batch.is_some() {
             return Err("another computer-use batch is executing".to_string());
         }
         let now_ms = monotonic_ms(state);
-        state
-            .computer_use
-            .validate_batch(&batch, now_ms)
-            .map_err(|error| error.to_string())?;
+        if let Err(error) = state.computer_use.validate_batch(&batch, now_ms) {
+            if error == brood_computer_use::ComputerUseError::ApprovalRequired
+                && let Some(kind) = state.computer_use.required_approval_kind(&batch, now_ms)
+            {
+                let id = state.computer_use_automation.next_approval_id();
+                let request = brood_computer_use::ComputerApprovalRequest {
+                    id: id.clone(),
+                    task: batch.task.clone(),
+                    sequence: batch.expected_sequence,
+                    kind,
+                    prompt: format!("allow {kind:?} input for task {}", batch.task.0),
+                    created_at_ms: now_ms,
+                    expires_at_ms: now_ms.saturating_add(30_000),
+                };
+                state
+                    .computer_use
+                    .request_approval(request)
+                    .map_err(|request_error| request_error.to_string())?;
+                drop(publish_observer_update(state));
+                return Err(format!("approval is required: {id}"));
+            }
+            return Err(error.to_string());
+        }
         let target_pane = batch
             .target_window
             .or_else(|| {
@@ -313,6 +473,7 @@ pub fn begin_action_batch(state: &mut Brood, batch: ComputerActionBatch, respons
         results: Vec::new(),
         active_action: None,
         response,
+        adapter_call_id,
     });
     tracing::info!(
         task = %audit_task,
@@ -836,6 +997,7 @@ fn finish_settled_batch(state: &mut Brood, quiet: Duration, timed_out: bool) {
     };
     cleanup_held_input(state);
     let payload = serde_json::json!({
+        "call_id": pending.adapter_call_id,
         "sequence": pending.sequence,
         "results": pending.results,
         "observation": snapshot,
@@ -848,6 +1010,7 @@ fn finish_settled_batch(state: &mut Brood, quiet: Duration, timed_out: bool) {
         quiet_ms = quiet.as_millis(),
         "computer-use batch completed"
     );
+    drop(publish_observer_update(state));
     let encoded = serde_json::to_string(&payload).map_err(|error| error.to_string());
     drop(pending.response.send(encoded));
 }
@@ -871,6 +1034,7 @@ fn finish_failed_batch(
     });
     cleanup_held_input(state);
     let payload = serde_json::json!({
+        "call_id": pending.adapter_call_id,
         "sequence": pending.sequence,
         "results": pending.results,
         "error": detail,
@@ -883,6 +1047,7 @@ fn finish_failed_batch(
         detail,
         "computer-use batch failed"
     );
+    drop(publish_observer_update(state));
     drop(pending.response.send(Ok(payload.to_string())));
 }
 
@@ -925,6 +1090,7 @@ pub fn cancel_pending_batch(state: &mut Brood, task: &TaskId, detail: &str) -> b
     });
     cleanup_held_input(state);
     let payload = serde_json::json!({
+        "call_id": pending.adapter_call_id,
         "sequence": pending.sequence,
         "results": pending.results,
         "error": detail,
@@ -935,6 +1101,7 @@ pub fn cancel_pending_batch(state: &mut Brood, task: &TaskId, detail: &str) -> b
         detail,
         "computer-use batch cancelled"
     );
+    drop(publish_observer_update(state));
     drop(pending.response.send(Ok(payload.to_string())));
     true
 }
@@ -964,6 +1131,9 @@ pub fn capture_after_commit(state: &mut Brood) {
     }
     let session = state.active_surface_session().raw();
     let selected = state.computer_use_automation.selected_pane(state, session);
+    if let Some(pane) = selected {
+        configure_automation_target(state, pane);
+    }
     match capture_viewport(state, session, selected) {
         Ok(snapshot) => {
             state.computer_use_automation.store_capture(snapshot);
@@ -982,6 +1152,14 @@ pub fn capture_after_commit(state: &mut Brood) {
         }
         Err(error) => state.computer_use_automation.record_failure(&error),
     }
+}
+
+fn configure_automation_target(state: &mut Brood, pane: u64) {
+    state.configure_automation_pane_size(
+        pane,
+        i32::try_from(AUTOMATION_VIEWPORT_WIDTH).unwrap_or(i32::MAX),
+        i32::try_from(AUTOMATION_VIEWPORT_HEIGHT).unwrap_or(i32::MAX),
+    );
 }
 
 fn schedule_automation_frame_callback(state: &mut Brood, pane: Option<u64>) {

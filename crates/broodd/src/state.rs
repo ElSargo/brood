@@ -1137,6 +1137,19 @@ impl Brood {
         Ok(())
     }
 
+    pub(crate) fn send_computer_use_observer_message(
+        &mut self,
+        recipient: &str,
+        body: &[u8],
+    ) -> Result<()> {
+        self.send_presentation_actor_message(
+            BackendActorRealm::Daemon,
+            "computer-use",
+            recipient,
+            body,
+        )
+    }
+
     fn flush_presentation_actor_messages(&mut self) {
         let Some(fast_path) = self.dmabuf.fast_path.as_mut() else {
             return;
@@ -3240,6 +3253,29 @@ impl Brood {
             .insert(pane, requested);
         self.configure_presentation_client_toplevel_size(pane, &surface, toplevel, requested);
         true
+    }
+
+    pub(crate) fn configure_automation_pane_size(
+        &mut self,
+        pane: u64,
+        width: i32,
+        height: i32,
+    ) -> bool {
+        let Some(surface) = self.content_surface_for_pane(pane) else {
+            return false;
+        };
+        let Some(window) = self.window_for_any_toplevel_surface(&surface) else {
+            return false;
+        };
+        let Some(toplevel) = window.toplevel() else {
+            return false;
+        };
+        self.configure_presentation_client_toplevel_size(
+            pane,
+            &surface,
+            toplevel,
+            (width.max(1), height.max(1)),
+        )
     }
 
     pub fn restart_ordinary_presentation_client_pane_size(

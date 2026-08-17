@@ -290,8 +290,7 @@ if ctl computer-use batch "$CROSS_SESSION_BATCH" >"$OUT/cross-session.out" 2>"$O
   echo "ERR cross-session batch was accepted" >&2
   exit 1
 fi
-OUT_OF_BOUNDS_X=$((ACTION_WIDTH + 1))
-((OUT_OF_BOUNDS_X < 1440))
+OUT_OF_BOUNDS_X="$ACTION_WIDTH"
 OUT_OF_BOUNDS_BATCH="$(jq -nc --argjson generation "$LEASE_GENERATION" --argjson pane "$ACTION_PANE" --argjson x "$OUT_OF_BOUNDS_X" '{protocol_version:1,task:"phase2-proof",lease_generation:$generation,expected_sequence:2,target_session:1,target_window:$pane,approval_proof:null,actions:[{type:"click",x:$x,y:10,button:"left"}]}')"
 if ctl computer-use batch "$OUT_OF_BOUNDS_BATCH" >"$OUT/out-of-bounds.out" 2>"$OUT/out-of-bounds.err"; then
   echo "ERR out-of-bounds batch was accepted" >&2
@@ -477,6 +476,249 @@ jq -e '
   and .computer_use_held_keys == 0
 ' <<<"$STATUS" >/dev/null
 
+if [[ "${BROOD_COMPUTER_USE_SPEEDCRUNCH:-0}" == "1" ]]; then
+  for pid in "$CLIENT_PID" "$SWAY_PID" "$APP_PID"; do
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid"
+      wait "$pid" 2>/dev/null || true
+    fi
+  done
+  CLIENT_PID=""
+  SWAY_PID=""
+  APP_PID=""
+  command -v speedcrunch >/dev/null 2>&1 || {
+    echo "ERR speedcrunch is required for the requested workload" >&2
+    exit 2
+  }
+  MCP_BIN="$(dirname "$BROOD_BIN")/brood-computer-use-mcp"
+  [[ -x "$MCP_BIN" ]] || {
+    echo "ERR brood-computer-use-mcp is required beside $BROOD_BIN" >&2
+    exit 2
+  }
+  mkdir -p "$OUT/speedcrunch-home/.config" "$OUT/speedcrunch-home/.local/share"
+  env HOME="$OUT/speedcrunch-home" \
+    XDG_CONFIG_HOME="$OUT/speedcrunch-home/.config" \
+    XDG_DATA_HOME="$OUT/speedcrunch-home/.local/share" \
+    XDG_RUNTIME_DIR="$RUNTIME_DIR" WAYLAND_DISPLAY="$WAYLAND_DISPLAY" \
+    QT_QPA_PLATFORM=wayland speedcrunch >"$OUT/speedcrunch.log" 2>&1 &
+  APP_PID=$!
+  for _ in $(seq 1 300); do
+    ctl debug dump "$OUT/speedcrunch-ready" surfaces >/dev/null 2>&1 || true
+    SPEEDCRUNCH_PANE="$(jq -r '.windows[] | select(((.application_id | ascii_downcase) | contains("speedcrunch")) and .content_width > 0 and .content_height > 0) | .pane' "$OUT/speedcrunch-ready/automation.json" 2>/dev/null || true)"
+    [[ -n "$SPEEDCRUNCH_PANE" ]] && break
+    sleep 0.05
+  done
+  [[ -n "$SPEEDCRUNCH_PANE" ]]
+  sleep 0.2
+  ctl debug dump "$OUT/speedcrunch-ready" surfaces >/dev/null
+  SPEEDCRUNCH_START="$(jq -nc \
+    --argjson pane "$SPEEDCRUNCH_PANE" \
+    '{protocol_version:1,task:"speedcrunch-proof",principal:"codex-direct-adapter",scope:{session:1,windows:[$pane]},policy:{human_input:"pause",require_approval:["keyboard"]},limits:{max_actions_per_batch:64,max_script_wall_ms:30000,max_script_cpu_ms:5000,max_script_memory_bytes:67108864,max_output_bytes:1048576,max_display_images:16,max_queued_host_calls:64},lease_duration_ms:30000,active_window:$pane}')"
+  SPEEDCRUNCH_LEASE="$(ctl computer-use start-request "$SPEEDCRUNCH_START")"
+  SPEEDCRUNCH_GENERATION="$(jq -r .generation <<<"$SPEEDCRUNCH_LEASE")"
+  ctl computer-use observe speedcrunch-proof 0 0 >"$OUT/speedcrunch-observer-initial.json"
+  jq -e '.task.state == "running" and .lease.generation != null' \
+    "$OUT/speedcrunch-observer-initial.json" >/dev/null
+  ctl computer-use pause speedcrunch-proof >/dev/null
+  ctl computer-use observe speedcrunch-proof 0 0 >"$OUT/speedcrunch-observer-paused.json"
+  jq -e '.task.state == "paused" and .lease == null' \
+    "$OUT/speedcrunch-observer-paused.json" >/dev/null
+  SPEEDCRUNCH_LEASE="$(ctl computer-use resume speedcrunch-proof 30000)"
+  SPEEDCRUNCH_GENERATION="$(jq -r .generation <<<"$SPEEDCRUNCH_LEASE")"
+  ctl computer-use observe speedcrunch-proof 0 0 >"$OUT/speedcrunch-observer-resumed.json"
+  jq -e --argjson generation "$SPEEDCRUNCH_GENERATION" \
+    '.task.state == "running" and .lease.generation == $generation' \
+    "$OUT/speedcrunch-observer-resumed.json" >/dev/null
+
+  codex_call() {
+    local call_id="$1"
+    local batch="$2"
+    local output="$3"
+    local call
+    call="$(jq -c --arg call_id "$call_id" '. + {call_id:$call_id}' <<<"$batch")"
+    ctl computer-use call "$call" >"$output"
+    jq -e --arg call_id "$call_id" '.call_id == $call_id' "$output" >/dev/null
+  }
+  SPEEDCRUNCH_MENU_BATCH="$(jq -nc \
+    --argjson generation "$SPEEDCRUNCH_GENERATION" \
+    --argjson pane "$SPEEDCRUNCH_PANE" \
+    '{protocol_version:1,task:"speedcrunch-proof",lease_generation:$generation,expected_sequence:1,target_session:1,target_window:$pane,approval_proof:null,actions:[{type:"click",x:160,y:15,button:"left"},{type:"wait",duration_ms:150},{type:"screenshot"}]}')"
+  codex_call speedcrunch-menu-settings "$SPEEDCRUNCH_MENU_BATCH" \
+    "$OUT/speedcrunch-settings-menu.json"
+  python3 -c \
+    'import json, pathlib, sys; pathlib.Path(sys.argv[2]).write_bytes(bytes(json.load(open(sys.argv[1]))["observation"]["png"]))' \
+    "$OUT/speedcrunch-settings-menu.json" "$OUT/speedcrunch-settings-menu.png"
+  SPEEDCRUNCH_DISPLAY_BATCH="$(jq -nc \
+    --argjson generation "$SPEEDCRUNCH_GENERATION" \
+    --argjson pane "$SPEEDCRUNCH_PANE" \
+    '{protocol_version:1,task:"speedcrunch-proof",lease_generation:$generation,expected_sequence:2,target_session:1,target_window:$pane,approval_proof:null,actions:[{type:"click",x:210,y:127,button:"left"},{type:"wait",duration_ms:150},{type:"screenshot"}]}')"
+  codex_call speedcrunch-menu-display "$SPEEDCRUNCH_DISPLAY_BATCH" \
+    "$OUT/speedcrunch-display-menu.json"
+  python3 -c \
+    'import json, pathlib, sys; pathlib.Path(sys.argv[2]).write_bytes(bytes(json.load(open(sys.argv[1]))["observation"]["png"]))' \
+    "$OUT/speedcrunch-display-menu.json" "$OUT/speedcrunch-display-menu.png"
+  SPEEDCRUNCH_COLOR_BATCH="$(jq -nc \
+    --argjson generation "$SPEEDCRUNCH_GENERATION" \
+    --argjson pane "$SPEEDCRUNCH_PANE" \
+    '{protocol_version:1,task:"speedcrunch-proof",lease_generation:$generation,expected_sequence:3,target_session:1,target_window:$pane,approval_proof:null,actions:[{type:"click",x:310,y:127,button:"left"},{type:"wait",duration_ms:150},{type:"screenshot"}]}')"
+  codex_call speedcrunch-menu-color "$SPEEDCRUNCH_COLOR_BATCH" \
+    "$OUT/speedcrunch-color-menu.json"
+  python3 -c \
+    'import json, pathlib, sys; pathlib.Path(sys.argv[2]).write_bytes(bytes(json.load(open(sys.argv[1]))["observation"]["png"]))' \
+    "$OUT/speedcrunch-color-menu.json" "$OUT/speedcrunch-color-menu.png"
+  SPEEDCRUNCH_CONFIGURE_BATCH="$(jq -nc \
+    --argjson generation "$SPEEDCRUNCH_GENERATION" \
+    --argjson pane "$SPEEDCRUNCH_PANE" \
+    '{protocol_version:1,task:"speedcrunch-proof",lease_generation:$generation,expected_sequence:4,target_session:1,target_window:$pane,approval_proof:null,actions:[{type:"click",x:450,y:202,button:"left"},{type:"wait",duration_ms:250},{type:"screenshot"}]}')"
+  codex_call speedcrunch-menu-configure "$SPEEDCRUNCH_CONFIGURE_BATCH" \
+    "$OUT/speedcrunch-configured.json"
+  python3 -c \
+    'import json, pathlib, sys; pathlib.Path(sys.argv[2]).write_bytes(bytes(json.load(open(sys.argv[1]))["observation"]["png"]))' \
+    "$OUT/speedcrunch-configured.json" "$OUT/speedcrunch-configured.png"
+  [[ "$(sha256sum "$OUT/speedcrunch-ready/automation.png" | cut -d' ' -f1)" != \
+     "$(sha256sum "$OUT/speedcrunch-configured.png" | cut -d' ' -f1)" ]]
+  [[ "$(magick "$OUT/speedcrunch-configured.png" -format '%[pixel:p{720,450}]' info:)" == \
+     "srgba(253,246,227,1)" ]]
+
+  speedcrunch_calculation() {
+    local sequence="$1"
+    local name="$2"
+    local expression="$3"
+    local first=false
+    if [[ "$sequence" == "5" ]]; then
+      first=true
+    fi
+    local batch call approval_id
+    batch="$(jq -nc \
+      --argjson generation "$SPEEDCRUNCH_GENERATION" \
+      --argjson pane "$SPEEDCRUNCH_PANE" \
+      --argjson sequence "$sequence" \
+      --argjson first "$first" \
+      --arg expression "$expression" \
+      '{protocol_version:1,task:"speedcrunch-proof",lease_generation:$generation,expected_sequence:$sequence,target_session:1,target_window:$pane,approval_proof:null,actions:((if $first then [{type:"click",x:240,y:880,button:"left"}] else [] end) + [{type:"keypress",keys:["CTRL","A"]},{type:"type",text:$expression},{type:"wait",duration_ms:250},{type:"screenshot"}])}')"
+    call="$(jq -c --arg call_id "speedcrunch-$name" '. + {call_id:$call_id}' <<<"$batch")"
+    if ctl computer-use call "$call" >"$OUT/speedcrunch-$name-unapproved.out" \
+      2>"$OUT/speedcrunch-$name-unapproved.err"; then
+      echo "ERR keyboard call was accepted without approval" >&2
+      exit 1
+    fi
+    ctl computer-use observe speedcrunch-proof 0 0 \
+      >"$OUT/speedcrunch-$name-approval.json"
+    approval_id="$(jq -r '.approvals[] | select(.kind == "keyboard") | .id' \
+      "$OUT/speedcrunch-$name-approval.json")"
+    [[ -n "$approval_id" ]]
+    jq -e '.task.state == "waiting_approval"' \
+      "$OUT/speedcrunch-$name-approval.json" >/dev/null
+    ctl computer-use approve "$approval_id" approve nested-operator >/dev/null
+    call="$(jq -c --arg proof "$approval_id" '.approval_proof = $proof' <<<"$call")"
+    ctl computer-use call "$call" >"$OUT/speedcrunch-$name.json"
+    python3 -c \
+      'import json, pathlib, sys; pathlib.Path(sys.argv[2]).write_bytes(bytes(json.load(open(sys.argv[1]))["observation"]["png"]))' \
+      "$OUT/speedcrunch-$name.json" "$OUT/speedcrunch-$name.png"
+    jq -e --argjson sequence "$sequence" --arg name "$name" '
+      .sequence == $sequence
+      and .call_id == ("speedcrunch-" + $name)
+      and all(.results[]; .status == "completed")
+      and .observation.settle.settled
+    ' "$OUT/speedcrunch-$name.json" >/dev/null
+  }
+  speedcrunch_calculation 5 power-and-product "sqrt(2)^10 + 17*23"
+  speedcrunch_calculation 6 trigonometry "sin(pi/6) + cos(pi/3)"
+  speedcrunch_calculation 7 integer-arithmetic "(12345*6789)-987654"
+  ctl computer-use observe speedcrunch-proof 0 0 \
+    >"$OUT/speedcrunch-observer-detached-final.json"
+  jq -e '
+    .task.state == "running"
+    and .task.next_sequence == 8
+    and .lease.generation != null
+    and (.events | map(.event.type) | index("batch_committed")) != null
+    and (.observations | length) == 2
+  ' "$OUT/speedcrunch-observer-detached-final.json" >/dev/null
+  jq -n \
+    --argjson pane "$SPEEDCRUNCH_PANE" \
+    --argjson generation "$SPEEDCRUNCH_GENERATION" \
+    --slurpfile power "$OUT/speedcrunch-power-and-product.json" \
+    --slurpfile trig "$OUT/speedcrunch-trigonometry.json" \
+    --slurpfile integer "$OUT/speedcrunch-integer-arithmetic.json" \
+    '{pane:$pane,lease_generation:$generation,viewport:{width:1440,height:900},configuration:{menu:"Settings > Display > Color Scheme",value:"Solarized Light",background_rgba:[253,246,227,255]},calculations:[{expression:"sqrt(2)^10 + 17*23",expected:"423",sequence:$power[0].sequence,frame_sequence:$power[0].observation.settle.frame_sequence},{expression:"sin(pi/6) + cos(pi/3)",expected:"1",sequence:$trig[0].sequence,frame_sequence:$trig[0].observation.settle.frame_sequence},{expression:"(12345*6789)-987654",expected:"82822551",sequence:$integer[0].sequence,frame_sequence:$integer[0].observation.settle.frame_sequence}]}' \
+    >"$OUT/speedcrunch-metrics.json"
+
+  PRESENT_DISPLAY=""
+  env XDG_RUNTIME_DIR="$PRESENT_RUNTIME_DIR" \
+    WLR_BACKENDS=headless WLR_HEADLESS_OUTPUTS=1 WLR_LIBINPUT_NO_DEVICES=1 \
+    sway --unsupported-gpu --config "$OUT/sway.conf" \
+    >"$OUT/replacement-sway.log" 2>&1 &
+  SWAY_PID=$!
+  for _ in $(seq 1 300); do
+    PRESENT_DISPLAY="$(find "$PRESENT_RUNTIME_DIR" -maxdepth 1 -type s -name 'wayland-*' -printf '%f\n' | head -1)"
+    [[ -n "$PRESENT_DISPLAY" ]] && break
+    kill -0 "$SWAY_PID" 2>/dev/null || exit 1
+    sleep 0.05
+  done
+  [[ -n "$PRESENT_DISPLAY" ]]
+  env -u brood_session \
+    XDG_RUNTIME_DIR="$PRESENT_RUNTIME_DIR" WAYLAND_DISPLAY="$PRESENT_DISPLAY" \
+    BROOD_FRAME_TRANSPORT=shared-memory WGPU_BACKEND=vulkan \
+    RUST_LOG="${RUST_LOG:-brood_client=info,wgpu_core=warn,wgpu_hal=warn}" \
+    "$CLIENT_BIN" --config "$CLIENT_CONFIG" "${CLIENT_INIT_ARGS[@]}" \
+    --dbus-destination "$DESTINATION" --dbus-address "$DBUS_SESSION_BUS_ADDRESS" \
+    >"$OUT/replacement-presentation-client.log" 2>&1 &
+  CLIENT_PID=$!
+  for _ in $(seq 1 600); do
+    STATUS="$(ctl status-json)"
+    [[ "$(jq -r .presentation <<<"$STATUS")" == "Attached" ]] && break
+    kill -0 "$CLIENT_PID" 2>/dev/null || exit 1
+    sleep 0.05
+  done
+  [[ "$(jq -r .presentation <<<"$STATUS")" == "Attached" ]]
+  for _ in $(seq 1 300); do
+    rg -q 'computer-use observer update .*observations=2 .*"id":"speedcrunch-proof".*"next_sequence":8.*"state":"running"' \
+      "$OUT/replacement-presentation-client.log" 2>/dev/null && break
+    kill -0 "$CLIENT_PID" 2>/dev/null || exit 1
+    sleep 0.05
+  done
+  rg -q 'computer-use observer update .*observations=2 .*"id":"speedcrunch-proof".*"next_sequence":8.*"state":"running"' \
+    "$OUT/replacement-presentation-client.log"
+  INITIAL_EVENT_CURSOR="$(jq -r .event_cursor "$OUT/speedcrunch-observer-initial.json")"
+  ctl computer-use observe speedcrunch-proof "$INITIAL_EVENT_CURSOR" 0 \
+    >"$OUT/speedcrunch-observer-replacement.json"
+  jq -e '
+    .task.state == "paused"
+    and .task.next_sequence == 8
+    and .lease == null
+    and (.events | length) >= 10
+    and (.events | map(.event.type) | index("approval_requested")) != null
+    and (.events | map(.event.type) | index("approval_decided")) != null
+    and (.events | map(.event.type) | index("lease_released")) != null
+    and (.observations | length) == 2
+  ' "$OUT/speedcrunch-observer-replacement.json" >/dev/null
+
+  MCP_LEASE="$(ctl computer-use resume speedcrunch-proof 30000)"
+  MCP_GENERATION="$(jq -r .generation <<<"$MCP_LEASE")"
+  MCP_ACTION_ARGUMENTS="$(jq -nc \
+    --argjson generation "$MCP_GENERATION" \
+    --argjson pane "$SPEEDCRUNCH_PANE" \
+    '{tool_call_id:"mcp-screenshot",arguments:{protocol_version:1,call_id:"mcp-screenshot",task:"speedcrunch-proof",lease_generation:$generation,expected_sequence:8,target_session:1,target_window:$pane,actions:[{type:"screenshot"}],approval_proof:null}}')"
+  {
+    jq -nc '{jsonrpc:"2.0",id:1,method:"initialize",params:{}}'
+    jq -nc '{jsonrpc:"2.0",id:2,method:"tools/list",params:{}}'
+    jq -nc --argjson arguments "$MCP_ACTION_ARGUMENTS" \
+      '{jsonrpc:"2.0",id:3,method:"tools/call",params:{name:"computer_action",arguments:$arguments}}'
+    jq -nc '{jsonrpc:"2.0",id:4,method:"tools/call",params:{name:"computer_observe",arguments:{task:"speedcrunch-proof",event_cursor:0,observation_sequence:0}}}'
+  } | env -u brood_session \
+    BROODD_DBUS_DESTINATION="$DESTINATION" BROODD_DBUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS" \
+    "$MCP_BIN" >"$OUT/speedcrunch-mcp.jsonl"
+  jq -s -e '
+    length == 4
+    and .[0].result.serverInfo.name == "brood-computer-use"
+    and (.[1].result.tools | map(.name) | index("computer_action")) != null
+    and (.[2].result.content[0].text | fromjson | .call_id) == "mcp-screenshot"
+    and (.[2].result.content[0].text | fromjson | .sequence) == 8
+    and (.[3].result.content[0].text | fromjson | .task.next_sequence) == 9
+  ' "$OUT/speedcrunch-mcp.jsonl" >/dev/null
+  ctl computer-use stop speedcrunch-proof >/dev/null
+fi
+
 jq -n \
   --argjson pane "$ACTION_PANE" \
   --argjson width "$ACTION_WIDTH" \
@@ -499,6 +741,17 @@ cat >"$OUT/proof.md" <<EOF
 - human takeover: human-takeover-response.json, human-task.json, human-status.json, and presentation-client.log
 - negative live-boundary proofs: stale-lease.err, cross-session.err, and out-of-bounds.err
 EOF
+
+if [[ "${BROOD_COMPUTER_USE_SPEEDCRUNCH:-0}" == "1" ]]; then
+  cat >>"$OUT/proof.md" <<EOF
+- SpeedCrunch menu configuration: Solarized Light selected through Settings > Display > Color Scheme; speedcrunch-settings-menu.png, speedcrunch-display-menu.png, speedcrunch-color-menu.png, and speedcrunch-configured.png
+- SpeedCrunch calculations: sqrt(2)^10 + 17*23 = 423, sin(pi/6) + cos(pi/3) = 1, and (12345*6789)-987654 = 82822551; corresponding speedcrunch-*.png files and speedcrunch-metrics.json
+- SpeedCrunch isolation: private HOME, XDG_CONFIG_HOME, and XDG_DATA_HOME under speedcrunch-home
+- Phase 3 adapter: Codex-shaped call IDs and action batches in speedcrunch-*.json; server approval checkpoints in speedcrunch-*-approval.json
+- Phase 3 observer continuity: speedcrunch-observer-initial.json, speedcrunch-observer-detached-final.json, speedcrunch-observer-replacement.json, and replacement-presentation-client.log prove the replacement client first received the running task and lease, then primary presentation input paused it without interleaving
+- Phase 3 MCP surface: speedcrunch-mcp.jsonl records initialization, tool discovery, a real screenshot action at sequence 8, and the resulting task sequence 9
+EOF
+fi
 
 echo "computer-use nested capture proof passed"
 echo "proof=$OUT/proof.md"

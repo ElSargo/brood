@@ -9,6 +9,7 @@ bytemuck.workspace = true
 clap.workspace = true
 cosmic-text = "0.19.0"
 brood-cli.workspace = true
+brood-computer-use.workspace = true
 brood-dmabuf = { path = "../../crates/brood-dmabuf" }
 brood-graphics.workspace = true
 brood-ipc.workspace = true

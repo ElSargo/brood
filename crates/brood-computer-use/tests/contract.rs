@@ -6,10 +6,11 @@
 use std::{collections::BTreeSet, fs, path::PathBuf};
 
 use brood_computer_use::{
-    ApprovalKind, ComputerActionBatch, ComputerApprovalDecision, ComputerApprovalRequest,
-    ComputerCancellation, ComputerScriptRequest, ComputerScriptResult, ComputerUseError,
-    ComputerUseLease, ComputerUseLimits, ComputerUsePolicy, ComputerUseScope,
-    ComputerUseSupervisor, ComputerUseTask, TaskId, TaskState,
+    ApprovalKind, CodexComputerCall, ComputerActionBatch, ComputerApprovalDecision,
+    ComputerApprovalRequest, ComputerCancellation, ComputerScriptRequest, ComputerScriptResult,
+    ComputerUseError, ComputerUseEventKind, ComputerUseLease, ComputerUseLimits, ComputerUsePolicy,
+    ComputerUseScope, ComputerUseSupervisor, ComputerUseTask, McpDirectActionCall, TaskId,
+    TaskState,
 };
 use serde::{Deserialize, Serialize};
 
@@ -196,5 +197,66 @@ fn approval_proof_is_scoped_expiring_and_single_use() {
     assert_eq!(
         supervisor.validate_batch(&batch, 1050),
         Err(ComputerUseError::ApprovalRequired)
+    );
+}
+
+#[test]
+fn observer_events_survive_disconnect_and_resume_from_cursor() {
+    let (mut supervisor, task, generation) = running_supervisor();
+    let first_page = supervisor.events_after(0, Some(&task), 64);
+    assert_eq!(first_page.len(), 2);
+    assert!(matches!(
+        first_page.first().map(|event| &event.event),
+        Some(ComputerUseEventKind::TaskCreated)
+    ));
+    assert!(matches!(
+        first_page.get(1).map(|event| &event.event),
+        Some(ComputerUseEventKind::LeaseAcquired {
+            generation: observed,
+            ..
+        }) if *observed == generation
+    ));
+    let disconnected_at = first_page.last().expect("event page").cursor;
+
+    supervisor.pause(&task, 1020).expect("pause task");
+    supervisor.resume(&task, 1030).expect("resume task");
+    let replacement_page = supervisor.events_after(disconnected_at, Some(&task), 64);
+    assert_eq!(replacement_page.len(), 3);
+    assert!(replacement_page.windows(2).all(|pair| {
+        pair.first()
+            .zip(pair.last())
+            .is_some_and(|(first, last)| first.cursor < last.cursor)
+    }));
+    assert!(matches!(
+        replacement_page.last().expect("replacement event").event,
+        ComputerUseEventKind::StateChanged {
+            state: TaskState::Ready
+        }
+    ));
+}
+
+#[test]
+fn codex_and_mcp_calls_translate_to_the_authoritative_batch() {
+    let batch: ComputerActionBatch =
+        serde_json::from_str(&fixture("direct-action-batch-v1.json")).expect("decode fixture");
+    let call = CodexComputerCall {
+        protocol_version: batch.protocol_version,
+        call_id: "call-17".to_string(),
+        task: batch.task.clone(),
+        lease_generation: batch.lease_generation,
+        expected_sequence: batch.expected_sequence,
+        target_session: batch.target_session,
+        target_window: batch.target_window,
+        actions: batch.actions.clone(),
+        approval_proof: batch.approval_proof.clone(),
+    };
+    assert_eq!(call.clone().into_batch(), batch);
+    assert_eq!(
+        McpDirectActionCall {
+            tool_call_id: "tool-17".to_string(),
+            arguments: call,
+        }
+        .into_batch(),
+        batch
     );
 }

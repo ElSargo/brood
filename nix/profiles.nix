@@ -123,6 +123,7 @@ let
     pkgs.mesa-demos
     pkgs.procps
     pkgs.sway
+    pkgs.speedcrunch
     pkgs.vulkan-tools
     pkgs.wayland-scanner
     pkgs.wayland-protocols

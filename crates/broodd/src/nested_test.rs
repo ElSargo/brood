@@ -9,6 +9,7 @@ pub fn run(args: TestArgs) -> Result<()> {
         .unwrap_or_else(|| TestCommand::Nested(NestedTestArgs::default()))
     {
         TestCommand::ComputerUse(args) => run_computer_use(args),
+        TestCommand::ComputerUseSpeedcrunch(args) => run_computer_use_speedcrunch(args),
         TestCommand::Nested(args) => run_nested(args),
         TestCommand::Editor(args) => run_editor(args),
         TestCommand::Resize(args) => run_resize(args),
@@ -16,11 +17,22 @@ pub fn run(args: TestArgs) -> Result<()> {
     }
 }
 
+fn run_computer_use_speedcrunch(args: NestedTestArgs) -> Result<()> {
+    run_computer_use_with(args, true)
+}
+
 fn run_computer_use(args: NestedTestArgs) -> Result<()> {
+    run_computer_use_with(args, false)
+}
+
+fn run_computer_use_with(args: NestedTestArgs, speedcrunch: bool) -> Result<()> {
     let root = find_checkout_root()?;
     let script = root.join("tools/test-computer-use-nested.sh");
     let mut command = Command::new("bash");
     command.arg(&script).current_dir(&root);
+    if speedcrunch {
+        command.env("BROOD_COMPUTER_USE_SPEEDCRUNCH", "1");
+    }
     if let Some(out_dir) = args.out_dir {
         command.env("BROOD_COMPUTER_USE_OUT", out_dir);
     }

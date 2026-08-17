@@ -2357,6 +2357,10 @@ fn execute_dbus_request(command: Vec<String>, json: bool, state: &mut Brood) -> 
     };
     let response = execute_tokens(&tokens, state)?;
 
+    if let Err(error) = crate::computer_use::publish_observer_update(state) {
+        warn!(%error, "publish computer-use observer update failed");
+    }
+
     if let Err(err) = state.display_handle.flush_clients() {
         warn!(?err, "flush clients after control command failed");
     }
@@ -2378,16 +2382,39 @@ fn execute_state_request(request: DbusStateRequest, state: &mut Brood) {
             json,
             response,
         } => {
-            let batch_json = (!json
-                && command.first().is_some_and(|token| token == "computer-use")
-                && command.get(1).is_some_and(|token| token == "batch"))
-            .then(|| command.get(2).cloned())
+            let adapter_request = (!json
+                && command.first().is_some_and(|token| token == "computer-use"))
+            .then(|| Some((command.get(1)?.as_str(), command.get(2)?.as_str())))
             .flatten();
-            if let Some(batch_json) = batch_json {
-                match serde_json::from_str::<brood_computer_use::ComputerActionBatch>(&batch_json) {
-                    Ok(batch) => {
-                        crate::computer_use::begin_action_batch(state, batch, response);
+            if let Some((kind, payload)) = adapter_request {
+                let parsed = match kind {
+                    "batch" => {
+                        serde_json::from_str::<brood_computer_use::ComputerActionBatch>(payload)
+                            .map(|batch| (batch, None))
                     }
+                    "call" => serde_json::from_str::<brood_computer_use::CodexComputerCall>(
+                        payload,
+                    )
+                    .map(|call| {
+                        let call_id = call.call_id.clone();
+                        (call.into_batch(), Some(call_id))
+                    }),
+                    "mcp-call" => {
+                        serde_json::from_str::<brood_computer_use::McpDirectActionCall>(payload)
+                            .map(|call| {
+                                let call_id = call.tool_call_id.clone();
+                                (call.into_batch(), Some(call_id))
+                            })
+                    }
+                    _ => {
+                        send_response(response, execute_dbus_request(command, json, state));
+                        return;
+                    }
+                };
+                match parsed {
+                    Ok((batch, call_id)) => crate::computer_use::begin_adapter_action_batch(
+                        state, batch, call_id, response,
+                    ),
                     Err(error) => send_response(response, Err(anyhow::anyhow!(error))),
                 }
             } else {
@@ -2918,7 +2945,13 @@ fn drain_fast_path_actor_messages(state: &mut Brood) {
     for (realm, decoded) in messages {
         match (realm, decoded) {
             (Ok(brood_protocol::BackendActorRealm::Daemon), Ok((sender, recipient, body))) => {
-                if let Err(error) = state.send_daemon_actor_message(&recipient, &sender, body) {
+                let result = if recipient == "computer-use" {
+                    crate::computer_use::handle_observer_command(state, sender, &body)
+                        .map_err(anyhow::Error::msg)
+                } else {
+                    state.send_daemon_actor_message(&recipient, &sender, body)
+                };
+                if let Err(error) = result {
                     warn!(
                         actor = %recipient,
                         error = %error,
@@ -3446,6 +3479,12 @@ fn execute_tokens(tokens: &[String], state: &mut Brood) -> Result<String> {
             format!("{}\n", status_json_string(state)?)
         }
         "computer-use" => match args {
+            [subcommand, request] if subcommand == "start-request" => {
+                let request =
+                    serde_json::from_str::<brood_computer_use::ComputerUseStartRequest>(request)
+                        .context("decode computer-use start request")?;
+                start_computer_use_request(state, request)?
+            }
             [subcommand, task, session, lease_ms] if subcommand == "start" => {
                 start_computer_use_task(state, task, session, None, lease_ms)?
             }
@@ -3463,6 +3502,99 @@ fn execute_tokens(tokens: &[String], state: &mut Brood) -> Result<String> {
                 state.computer_use.stop(&task, now_ms)?;
                 "OK computer-use stopped\n".to_string()
             }
+            [subcommand, task] if subcommand == "pause" => {
+                let task = brood_computer_use::TaskId(task.clone());
+                crate::computer_use::cancel_pending_batch(state, &task, "computer-use task paused");
+                let now_ms = u64::from(monotonic_time_msec(state));
+                state.computer_use.pause(&task, now_ms)?;
+                "OK computer-use paused\n".to_string()
+            }
+            [subcommand, task, lease_ms] if subcommand == "resume" => {
+                let task = brood_computer_use::TaskId(task.clone());
+                let lease_ms = parse_u64(lease_ms, "lease duration")?;
+                let now_ms = u64::from(monotonic_time_msec(state));
+                state.computer_use.resume(&task, now_ms)?;
+                let lease = state.computer_use.acquire_lease(&task, now_ms, lease_ms)?;
+                if let Some(pane) = lease.windows.iter().next().copied() {
+                    crate::computer_use::activate_window(state, lease.session, pane)
+                        .map_err(anyhow::Error::msg)?;
+                }
+                format!("{}\n", serde_json::to_string(&lease)?)
+            }
+            [subcommand, task, generation, lease_ms] if subcommand == "renew" => {
+                let task = brood_computer_use::TaskId(task.clone());
+                let generation = parse_u64(generation, "lease generation")?;
+                let lease_ms = parse_u64(lease_ms, "lease duration")?;
+                let now_ms = u64::from(monotonic_time_msec(state));
+                let lease = state
+                    .computer_use
+                    .renew_lease(&task, generation, now_ms, lease_ms)?;
+                format!("{}\n", serde_json::to_string(&lease)?)
+            }
+            [subcommand, request_id, approved, principal] if subcommand == "approve" => {
+                let approved = match approved.as_str() {
+                    "true" | "approve" => true,
+                    "false" | "deny" => false,
+                    _ => bail!("approval decision must be approve or deny"),
+                };
+                let now_ms = u64::from(monotonic_time_msec(state));
+                state.computer_use.decide_approval(
+                    &brood_computer_use::ComputerApprovalDecision {
+                        request_id: request_id.clone(),
+                        approved,
+                        principal: principal.clone(),
+                        decided_at_ms: now_ms,
+                    },
+                )?;
+                "OK computer-use approval decided\n".to_string()
+            }
+            [subcommand] if subcommand == "list" => {
+                format!("{}\n", serde_json::to_string(&state.computer_use.tasks())?)
+            }
+            [subcommand, task, cursor] if subcommand == "events" => {
+                let task = brood_computer_use::TaskId(task.clone());
+                let cursor = parse_u64(cursor, "event cursor")?;
+                format!(
+                    "{}\n",
+                    serde_json::to_string(&state.computer_use.events_after(
+                        cursor,
+                        Some(&task),
+                        brood_computer_use::MAX_EVENT_PAGE,
+                    ))?
+                )
+            }
+            [subcommand, task, event_cursor, observation_sequence] if subcommand == "observe" => {
+                let task_id = brood_computer_use::TaskId(task.clone());
+                let event_cursor = parse_u64(event_cursor, "event cursor")?;
+                let observation_sequence = parse_u64(observation_sequence, "observation sequence")?;
+                let task = state
+                    .computer_use
+                    .task(&task_id)
+                    .context("computer-use task was not found")?
+                    .clone();
+                let lease = state
+                    .computer_use
+                    .lease()
+                    .filter(|lease| lease.task == task_id)
+                    .cloned();
+                let snapshot = serde_json::json!({
+                    "protocol_version": brood_computer_use::COMPUTER_USE_PROTOCOL_VERSION,
+                    "task": task,
+                    "lease": lease,
+                    "event_cursor": state.computer_use.latest_event_cursor(),
+                    "events": state.computer_use.events_after(
+                        event_cursor,
+                        Some(&task_id),
+                        brood_computer_use::MAX_EVENT_PAGE,
+                    ),
+                    "approvals": state.computer_use.pending_approvals(Some(&task_id)),
+                    "observations": state.computer_use_automation.observations_after(
+                        &task_id,
+                        observation_sequence,
+                    ),
+                });
+                format!("{}\n", serde_json::to_string(&snapshot)?)
+            }
             [subcommand, task] if subcommand == "inspect" => {
                 let task = brood_computer_use::TaskId(task.clone());
                 let task = state
@@ -3471,12 +3603,10 @@ fn execute_tokens(tokens: &[String], state: &mut Brood) -> Result<String> {
                     .context("computer-use task was not found")?;
                 format!("{}\n", serde_json::to_string(task)?)
             }
-            [subcommand, _] if subcommand == "batch" => {
-                bail!("computer-use batch must be sent through the DBus control boundary")
+            [subcommand, _] if matches!(subcommand.as_str(), "batch" | "call" | "mcp-call") => {
+                bail!("computer-use action calls must be sent through the DBus control boundary")
             }
-            _ => bail!(
-                "usage: computer-use start <task> <session> [pane] <lease-ms>|batch <json>|inspect <task>|stop <task>"
-            ),
+            _ => bail!("unsupported computer-use command"),
         },
         "quit" if args.is_empty() => {
             let closed_browsers = state.browsers.close_all().len();
@@ -4336,6 +4466,43 @@ fn start_computer_use_task(
     let lease = state.computer_use.acquire_lease(&task, now_ms, lease_ms)?;
     if let Some(pane) = lease.windows.iter().next().copied() {
         crate::computer_use::activate_window(state, session, pane).map_err(anyhow::Error::msg)?;
+    }
+    Ok(format!("{}\n", serde_json::to_string(&lease)?))
+}
+
+fn start_computer_use_request(
+    state: &mut Brood,
+    request: brood_computer_use::ComputerUseStartRequest,
+) -> Result<String> {
+    ensure!(
+        request.protocol_version == brood_computer_use::COMPUTER_USE_PROTOCOL_VERSION,
+        "unsupported computer-use protocol version"
+    );
+    ensure!(
+        request
+            .active_window
+            .is_none_or(|pane| request.scope.permits_window(pane)),
+        "active window is outside the requested computer-use scope"
+    );
+    let now_ms = u64::from(monotonic_time_msec(state));
+    state.computer_use.create_task(
+        &request.task,
+        request.principal,
+        request.scope,
+        request.policy,
+        request.limits,
+        now_ms,
+    )?;
+    let lease =
+        state
+            .computer_use
+            .acquire_lease(&request.task, now_ms, request.lease_duration_ms)?;
+    if let Some(pane) = request
+        .active_window
+        .or_else(|| lease.windows.iter().next().copied())
+    {
+        crate::computer_use::activate_window(state, lease.session, pane)
+            .map_err(anyhow::Error::msg)?;
     }
     Ok(format!("{}\n", serde_json::to_string(&lease)?))
 }

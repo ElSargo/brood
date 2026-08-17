@@ -389,6 +389,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "brood-cli",
+ "brood-computer-use",
  "brood-dmabuf",
  "brood-graphics",
  "brood-ipc",

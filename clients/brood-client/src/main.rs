@@ -33,6 +33,7 @@ use brood_cli::{
         resolve_control_target, shared_memory_resource,
     },
 };
+use brood_computer_use::{ComputerUseObserverCommand, ComputerUseObserverUpdate};
 use brood_dmabuf::{SinglePlaneDmabuf, import_single_plane};
 use brood_layout::{
     ComposedDivider, ComposedInteractionZone, ComposedLayout, ComposedZoneId, CursorRole,
@@ -70,6 +71,9 @@ mod plugin_gpu;
 mod plugin_graphics;
 mod pointer_policy;
 mod remote;
+
+const COMPUTER_USE_OBSERVER_ACTOR: &str = "computer-use-observer";
+const COMPUTER_USE_SERVER_ACTOR: &str = "computer-use";
 
 #[cfg(test)]
 #[path = "../../../plugins/default-workspace/src/backend_layout.rs"]
@@ -930,6 +934,7 @@ fn main() -> Result<()> {
         .is_some(),
         ..Application::default()
     };
+    application.subscribe_computer_use_observer()?;
     application.publish_backend_sessions()?;
 
     let run_result = event_loop
@@ -3769,6 +3774,7 @@ struct Application {
     window_resize: Option<WindowResizeTransaction>,
     proof_managed_frame_gate_enabled: bool,
     proof_held_managed_frame: Option<(u64, ClientEvent)>,
+    computer_use_observer_updates: BTreeMap<BackendId, ComputerUseObserverUpdate>,
 }
 
 #[derive(Clone, Debug)]
@@ -3778,6 +3784,31 @@ struct LocalBackendTemplate {
 }
 
 impl Application {
+    fn subscribe_computer_use_observer(&mut self) -> Result<()> {
+        let body = serde_json::to_vec(&ComputerUseObserverCommand::Subscribe {
+            after_event_cursor: 0,
+            after_observation_sequence: 0,
+        })?;
+        let backends = self
+            .backend_registry
+            .connected_backend_ids()
+            .collect::<Vec<_>>();
+        let sender = self
+            .actor_message_sender
+            .as_mut()
+            .context("presentation actor-message lane is unavailable")?;
+        for backend in backends {
+            sender.send(&actor_runtime::BackendActorMessageRequest {
+                backend,
+                sender: COMPUTER_USE_OBSERVER_ACTOR.to_string(),
+                realm: BackendActorRealm::Daemon,
+                actor: COMPUTER_USE_SERVER_ACTOR.to_string(),
+                body: body.clone(),
+            })?;
+        }
+        Ok(())
+    }
+
     fn drop_frontend_wayland_state(&mut self) {
         drop_frontend_wayland_state(
             &mut self.wayland_drop,
@@ -9303,6 +9334,40 @@ impl ApplicationHandler<ClientEvent> for Application {
                 received_at,
             } => {
                 if !self.backend_registry.observe(backend, None) {
+                    return;
+                }
+                if sender == COMPUTER_USE_SERVER_ACTOR && recipient == COMPUTER_USE_OBSERVER_ACTOR {
+                    match serde_json::from_slice::<ComputerUseObserverUpdate>(&body) {
+                        Ok(update) => {
+                            let tasks = update
+                                .tasks
+                                .iter()
+                                .map(|task| {
+                                    serde_json::json!({
+                                        "id": task.id,
+                                        "state": task.state,
+                                        "next_sequence": task.next_sequence,
+                                    })
+                                })
+                                .collect::<Vec<_>>();
+                            eprintln!(
+                                "computer-use observer update backend={} event_cursor={} tasks={} approvals={} observations={} task_states={}",
+                                backend.0,
+                                update.event_cursor,
+                                update.tasks.len(),
+                                update.approvals.len(),
+                                update.observations.len(),
+                                serde_json::to_string(&tasks).unwrap_or_else(|_| "[]".to_string()),
+                            );
+                            self.computer_use_observer_updates.insert(backend, update);
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "dropped invalid computer-use observer update backend={} error={error}",
+                                backend.0,
+                            );
+                        }
+                    }
                     return;
                 }
                 if body.starts_with(b"BTRM")

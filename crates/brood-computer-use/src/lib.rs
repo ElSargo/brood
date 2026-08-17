@@ -4,7 +4,7 @@
 //! presentation-client dependency. `broodd` owns one [`ComputerUseSupervisor`]
 //! and adapters translate their wire shapes into these types.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -15,6 +15,8 @@ pub const AUTOMATION_VIEWPORT_HEIGHT: u32 = 900;
 pub const MAX_OBSERVATION_PNG_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_QUEUED_OBSERVATIONS: usize = 2;
 pub const MIN_CAPTURE_INTERVAL_MS: u64 = 50;
+pub const MAX_TASK_EVENTS: usize = 256;
+pub const MAX_EVENT_PAGE: usize = 64;
 
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
@@ -148,6 +150,18 @@ pub struct ComputerUseTask {
     pub next_sequence: u64,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ComputerUseStartRequest {
+    pub protocol_version: u32,
+    pub task: TaskId,
+    pub principal: String,
+    pub scope: ComputerUseScope,
+    pub policy: ComputerUsePolicy,
+    pub limits: ComputerUseLimits,
+    pub lease_duration_ms: u64,
+    pub active_window: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -390,6 +404,130 @@ pub struct ComputerCancellation {
     pub requested_at_ms: u64,
 }
 
+/// Cursor-addressable server state retained independently from observers.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ComputerUseEvent {
+    pub cursor: u64,
+    pub task: TaskId,
+    pub occurred_at_ms: u64,
+    pub event: ComputerUseEventKind,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ComputerUseObserverCommand {
+    Subscribe {
+        after_event_cursor: u64,
+        after_observation_sequence: u64,
+    },
+    Pause {
+        task: TaskId,
+    },
+    Resume {
+        task: TaskId,
+        lease_duration_ms: u64,
+    },
+    Stop {
+        task: TaskId,
+    },
+    DecideApproval {
+        decision: ComputerApprovalDecision,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ComputerObservationSummary {
+    pub task: TaskId,
+    pub sequence: u64,
+    pub captured_at_ms: u64,
+    pub active_window: Option<u64>,
+    pub png_bytes: usize,
+    pub settle: SettleEvidence,
+}
+
+impl From<&ComputerObservation> for ComputerObservationSummary {
+    fn from(observation: &ComputerObservation) -> Self {
+        Self {
+            task: observation.task.clone(),
+            sequence: observation.sequence,
+            captured_at_ms: observation.captured_at_ms,
+            active_window: observation.active_window,
+            png_bytes: observation.png.len(),
+            settle: observation.settle.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ComputerUseObserverUpdate {
+    pub protocol_version: u32,
+    pub event_cursor: u64,
+    pub tasks: Vec<ComputerUseTask>,
+    pub lease: Option<ComputerUseLease>,
+    pub approvals: Vec<ComputerApprovalRequest>,
+    pub events: Vec<ComputerUseEvent>,
+    pub observations: Vec<ComputerObservationSummary>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ComputerUseEventKind {
+    TaskCreated,
+    StateChanged { state: TaskState },
+    LeaseAcquired { generation: u64, expires_at_ms: u64 },
+    LeaseReleased { generation: u64, reason: String },
+    ApprovalRequested { request: ComputerApprovalRequest },
+    ApprovalDecided { decision: ComputerApprovalDecision },
+    BatchCommitted { sequence: u64 },
+}
+
+/// Familiar direct-computer request shape accepted by Codex-facing adapters.
+///
+/// Conversion is deliberately mechanical. The supervisor remains authoritative
+/// for all policy, lease, sequence, and scope validation.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct CodexComputerCall {
+    pub protocol_version: u32,
+    pub call_id: String,
+    pub task: TaskId,
+    pub lease_generation: u64,
+    pub expected_sequence: u64,
+    pub target_session: u64,
+    pub target_window: Option<u64>,
+    pub actions: Vec<ComputerAction>,
+    pub approval_proof: Option<String>,
+}
+
+impl CodexComputerCall {
+    #[must_use]
+    pub fn into_batch(self) -> ComputerActionBatch {
+        ComputerActionBatch {
+            protocol_version: self.protocol_version,
+            task: self.task,
+            lease_generation: self.lease_generation,
+            expected_sequence: self.expected_sequence,
+            target_session: self.target_session,
+            target_window: self.target_window,
+            actions: self.actions,
+            approval_proof: self.approval_proof,
+        }
+    }
+}
+
+/// Transport-neutral invocation used by an MCP server implementation.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct McpDirectActionCall {
+    pub tool_call_id: String,
+    pub arguments: CodexComputerCall,
+}
+
+impl McpDirectActionCall {
+    #[must_use]
+    pub fn into_batch(self) -> ComputerActionBatch {
+        self.arguments.into_batch()
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, Error, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ComputerUseError {
@@ -444,6 +582,8 @@ pub struct ComputerUseSupervisor {
     approval_requests: BTreeMap<String, ComputerApprovalRequest>,
     granted_approvals: BTreeMap<String, (TaskId, ApprovalKind, u64)>,
     next_lease_generation: u64,
+    events: VecDeque<ComputerUseEvent>,
+    next_event_cursor: u64,
 }
 
 impl ComputerUseSupervisor {
@@ -451,6 +591,7 @@ impl ComputerUseSupervisor {
     pub fn new() -> Self {
         Self {
             next_lease_generation: 1,
+            next_event_cursor: 1,
             ..Self::default()
         }
     }
@@ -481,6 +622,7 @@ impl ComputerUseSupervisor {
             updated_at_ms: now_ms,
         };
         self.tasks.insert(id.clone(), task);
+        self.push_event(id, now_ms, ComputerUseEventKind::TaskCreated);
         self.tasks.get(id).ok_or(ComputerUseError::TaskNotFound)
     }
 
@@ -497,6 +639,40 @@ impl ComputerUseSupervisor {
     #[must_use]
     pub fn task_count(&self) -> usize {
         self.tasks.len()
+    }
+
+    #[must_use]
+    pub fn tasks(&self) -> Vec<ComputerUseTask> {
+        self.tasks.values().cloned().collect()
+    }
+
+    #[must_use]
+    pub fn pending_approvals(&self, task: Option<&TaskId>) -> Vec<ComputerApprovalRequest> {
+        self.approval_requests
+            .values()
+            .filter(|request| task.is_none_or(|task| request.task == *task))
+            .cloned()
+            .collect()
+    }
+
+    #[must_use]
+    pub fn events_after(
+        &self,
+        cursor: u64,
+        task: Option<&TaskId>,
+        limit: usize,
+    ) -> Vec<ComputerUseEvent> {
+        self.events
+            .iter()
+            .filter(|event| event.cursor > cursor && task.is_none_or(|task| event.task == *task))
+            .take(limit.clamp(1, MAX_EVENT_PAGE))
+            .cloned()
+            .collect()
+    }
+
+    #[must_use]
+    pub fn latest_event_cursor(&self) -> u64 {
+        self.events.back().map_or(0, |event| event.cursor)
     }
 
     pub fn acquire_lease(
@@ -528,6 +704,14 @@ impl ComputerUseSupervisor {
         task.state = TaskState::Running;
         task.updated_at_ms = now_ms;
         self.lease = Some(lease.clone());
+        self.push_event(
+            id,
+            now_ms,
+            ComputerUseEventKind::LeaseAcquired {
+                generation: lease.generation,
+                expires_at_ms: lease.expires_at_ms,
+            },
+        );
         Ok(lease)
     }
 
@@ -549,7 +733,7 @@ impl ComputerUseSupervisor {
 
     pub fn pause(&mut self, id: &TaskId, now_ms: u64) -> Result<(), ComputerUseError> {
         self.transition(id, TaskState::Paused, now_ms)?;
-        self.revoke_lease_for(id);
+        self.revoke_lease_for(id, now_ms, "task paused");
         Ok(())
     }
 
@@ -563,6 +747,13 @@ impl ComputerUseSupervisor {
         }
         task.state = TaskState::Ready;
         task.updated_at_ms = now_ms;
+        self.push_event(
+            id,
+            now_ms,
+            ComputerUseEventKind::StateChanged {
+                state: TaskState::Ready,
+            },
+        );
         Ok(())
     }
 
@@ -576,7 +767,14 @@ impl ComputerUseSupervisor {
         }
         task.state = TaskState::Stopped;
         task.updated_at_ms = now_ms;
-        self.revoke_lease_for(id);
+        self.push_event(
+            id,
+            now_ms,
+            ComputerUseEventKind::StateChanged {
+                state: TaskState::Stopped,
+            },
+        );
+        self.revoke_lease_for(id, now_ms, "task stopped");
         Ok(())
     }
 
@@ -590,7 +788,14 @@ impl ComputerUseSupervisor {
         }
         task.state = TaskState::Failed;
         task.updated_at_ms = now_ms;
-        self.revoke_lease_for(id);
+        self.push_event(
+            id,
+            now_ms,
+            ComputerUseEventKind::StateChanged {
+                state: TaskState::Failed,
+            },
+        );
+        self.revoke_lease_for(id, now_ms, "task failed");
         Ok(())
     }
 
@@ -607,7 +812,13 @@ impl ComputerUseSupervisor {
         }
         task.state = TaskState::WaitingApproval;
         task.updated_at_ms = request.created_at_ms;
-        self.approval_requests.insert(request.id.clone(), request);
+        self.approval_requests
+            .insert(request.id.clone(), request.clone());
+        self.push_event(
+            &request.task.clone(),
+            request.created_at_ms,
+            ComputerUseEventKind::ApprovalRequested { request },
+        );
         Ok(())
     }
 
@@ -629,17 +840,35 @@ impl ComputerUseSupervisor {
         if task.state != TaskState::WaitingApproval {
             return Err(ComputerUseError::InvalidTransition);
         }
+        let mut released_lease = None;
         if decision.approved {
             self.granted_approvals.insert(
                 request.id,
-                (request.task, request.kind, request.expires_at_ms),
+                (request.task.clone(), request.kind, request.expires_at_ms),
             );
             task.state = TaskState::Running;
         } else {
             task.state = TaskState::Paused;
-            self.lease = None;
+            released_lease = self.lease.take();
         }
         task.updated_at_ms = decision.decided_at_ms;
+        if let Some(lease) = released_lease {
+            self.push_event(
+                &lease.task,
+                decision.decided_at_ms,
+                ComputerUseEventKind::LeaseReleased {
+                    generation: lease.generation,
+                    reason: "approval denied".to_string(),
+                },
+            );
+        }
+        self.push_event(
+            &request.task,
+            decision.decided_at_ms,
+            ComputerUseEventKind::ApprovalDecided {
+                decision: decision.clone(),
+            },
+        );
         Ok(())
     }
 
@@ -686,6 +915,26 @@ impl ComputerUseSupervisor {
         Ok(())
     }
 
+    #[must_use]
+    pub fn required_approval_kind(
+        &self,
+        batch: &ComputerActionBatch,
+        now_ms: u64,
+    ) -> Option<ApprovalKind> {
+        let task = self.tasks.get(&batch.task)?;
+        batch.actions.iter().find_map(|action| {
+            let kind = action.approval_kind()?;
+            (task.policy.require_approval.contains(&kind)
+                && !self.approval_valid(
+                    batch.approval_proof.as_deref(),
+                    &batch.task,
+                    Some(kind),
+                    now_ms,
+                ))
+            .then_some(kind)
+        })
+    }
+
     pub fn validate_live_lease(
         &mut self,
         task: &TaskId,
@@ -720,6 +969,11 @@ impl ComputerUseSupervisor {
         if let Some(proof) = &batch.approval_proof {
             self.granted_approvals.remove(proof);
         }
+        self.push_event(
+            &batch.task,
+            now_ms,
+            ComputerUseEventKind::BatchCommitted { sequence },
+        );
         Ok(sequence)
     }
 
@@ -760,7 +1014,8 @@ impl ComputerUseSupervisor {
     }
 
     pub fn handle_human_input(&mut self, now_ms: u64) -> Option<TaskId> {
-        let task_id = self.lease.as_ref()?.task.clone();
+        let lease = self.lease.take()?;
+        let task_id = lease.task.clone();
         let policy = self.tasks.get(&task_id)?.policy.human_input.clone();
         if let Some(task) = self.tasks.get_mut(&task_id) {
             task.state = match policy {
@@ -769,7 +1024,24 @@ impl ComputerUseSupervisor {
             };
             task.updated_at_ms = now_ms;
         }
-        self.lease = None;
+        self.push_event(
+            &task_id,
+            now_ms,
+            ComputerUseEventKind::LeaseReleased {
+                generation: lease.generation,
+                reason: "human primary input".to_string(),
+            },
+        );
+        self.push_event(
+            &task_id,
+            now_ms,
+            ComputerUseEventKind::StateChanged {
+                state: self
+                    .tasks
+                    .get(&task_id)
+                    .map_or(TaskState::Ready, |task| task.state),
+            },
+        );
         Some(task_id)
     }
 
@@ -801,6 +1073,7 @@ impl ComputerUseSupervisor {
         }
         task.state = to;
         task.updated_at_ms = now_ms;
+        self.push_event(id, now_ms, ComputerUseEventKind::StateChanged { state: to });
         Ok(())
     }
 
@@ -829,14 +1102,46 @@ impl ComputerUseSupervisor {
                 task.state = TaskState::Ready;
                 task.updated_at_ms = now_ms;
             }
-            self.lease = None;
+            if let Some(lease) = self.lease.take() {
+                self.push_event(
+                    &lease.task,
+                    now_ms,
+                    ComputerUseEventKind::LeaseReleased {
+                        generation: lease.generation,
+                        reason: "lease expired".to_string(),
+                    },
+                );
+            }
         }
     }
 
-    fn revoke_lease_for(&mut self, id: &TaskId) {
-        if self.lease.as_ref().is_some_and(|lease| lease.task == *id) {
-            self.lease = None;
+    fn revoke_lease_for(&mut self, id: &TaskId, now_ms: u64, reason: &str) {
+        if self.lease.as_ref().is_some_and(|lease| lease.task == *id)
+            && let Some(lease) = self.lease.take()
+        {
+            self.push_event(
+                id,
+                now_ms,
+                ComputerUseEventKind::LeaseReleased {
+                    generation: lease.generation,
+                    reason: reason.to_string(),
+                },
+            );
         }
+    }
+
+    fn push_event(&mut self, task: &TaskId, occurred_at_ms: u64, event: ComputerUseEventKind) {
+        let cursor = self.next_event_cursor.max(1);
+        self.next_event_cursor = cursor.saturating_add(1);
+        if self.events.len() == MAX_TASK_EVENTS {
+            self.events.pop_front();
+        }
+        self.events.push_back(ComputerUseEvent {
+            cursor,
+            task: task.clone(),
+            occurred_at_ms,
+            event,
+        });
     }
 
     fn approval_valid(

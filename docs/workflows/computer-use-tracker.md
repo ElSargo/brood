@@ -15,10 +15,10 @@ work only when there is code and proportionate verification evidence.
 - Worktree: `/home/sargo/projects/brood-computer-use`
 - Branch: `codex/computer-use-plan`
 - Baseline: `147c83eb54a740479b136395e4d88222f9e744a4`
-- Current milestone: Phase 3, server-side task loop and adapters
-- Implementation status: Phase 2 direct actions, interruption cleanup, causal
-  settling, and human takeover are implemented and proven with real nested GUI
-  workloads
+- Current milestone: Phase 4, persistent code execution
+- Implementation status: Phase 3 server orchestration, approval checkpoints,
+  Codex and MCP adapters, and replacement presentation observation are
+  implemented and proven with a real nested Qt workload
 
 Checklist meanings:
 
@@ -89,14 +89,14 @@ with application-visible results and screenshot evidence.
 
 ## Phase 3: Server-side task loop and adapters
 
-- [ ] Add the computer-use task supervisor to `brood-sessiond`.
-- [ ] Stream observations and status independently of clients.
-- [ ] Add server-owned approval checkpoints.
-- [ ] Add pause, resume, stop, and replacement-observer behavior.
-- [ ] Implement a Codex-shaped direct computer-call adapter.
-- [ ] Expose equivalent MCP direct-action tools.
-- [ ] Add client observer and approval protocol messages.
-- [ ] Prove operation across presentation-client disconnect and replacement.
+- [x] Add the computer-use task supervisor to `brood-sessiond`.
+- [x] Stream observations and status independently of clients.
+- [x] Add server-owned approval checkpoints.
+- [x] Add pause, resume, stop, and replacement-observer behavior.
+- [x] Implement a Codex-shaped direct computer-call adapter.
+- [x] Expose equivalent MCP direct-action tools.
+- [x] Add client observer and approval protocol messages.
+- [x] Prove operation across presentation-client disconnect and replacement.
 
 Phase gate: a model adapter completes a multi-step task with the presentation
 client disconnected, and a replacement client can observe its state.
@@ -176,11 +176,15 @@ design or test workload.
 | 2026-08-17 | 2 | working tree | Headless Sway presentation observer, first takeover attempts | `/tmp/brood-computer-use-phase2-complete-g` and `-i`; presentation transport attached, but the client exited because its required `session-switcher` actor was unavailable | Failed: the synthetic human click arrived only after the automation drag completed; the proof now launches the real presentation actor explicitly |
 | 2026-08-17 | 2 | working tree | GTK action fixture, detached capture, and attached presentation takeover | `/tmp/brood-computer-use-phase2-final/proof.md`; application state records 5 clicks, 1 double-click, 250.599 px drag, 1 scroll, `Agent42`, and 1 Ctrl+L; original 1440x900 observation PNG; stop and human cancellation results; expiry and target-loss failures; final held keys/buttons 0; attached observer input count 122 | Passed: every direct action has an application-visible result, stale/scope/bounds rejection remains enforced, held input is released on stop, expiry, target loss, and human takeover, and primary human input pauses without interleaving |
 | 2026-08-17 | 2 | working tree | Nix-assembled Brood package running the full GTK and takeover workload | `/tmp/brood-computer-use-phase2-packaged-final/proof.md`; package `/nix/store/1zc6qmxr6g7yzfsagrzpyqnd2lf1hlji-brood`; packaged `brood`, `brood-client`, configuration, and presentation actor | Passed: the phase gate also succeeds from the assembled package graph rather than only development binaries |
+| 2026-08-17 | 2 | `4f0abde` plus working tree | Clean-Nix SpeedCrunch menu proof, first named-command attempts | `/tmp/brood-computer-use-speedcrunch-final` through `-final3`; captures showed the initial click opening Help under compact Qt geometry, then the Color Scheme click selecting Standard | Failed: fixed coordinates were recalibrated from the captured 1440x900 menu hierarchy and the chosen scheme gained an exact rendered-color assertion |
+| 2026-08-17 | 2 | `4f0abde` plus working tree | Detached SpeedCrunch menu configuration and three calculations | `/tmp/brood-computer-use-speedcrunch-final4/proof.md`; pane 5, lease generation 7, 1440x900 server viewport; Solarized Light `#fdf6e3`; action sequences 5-7 and frame sequences 46-48 show `423`, `1`, and `82822551` | Passed: a real Qt application accepted server-side clicks, keyboard shortcuts, typing, waits, and screenshots with no presentation client connected |
+| 2026-08-17 | 3 | working tree | Detached SpeedCrunch through the Codex call envelope, DBus observer replacement | `/tmp/brood-computer-use-phase3-a/proof.md`; event cursor 44; action sequences 1-7; three approved keyboard checkpoints; observation sequences 7-8 | Partial pass: daemon-owned history, approvals, and replacement polling worked; the presentation observer still used only the diagnostic DBus surface |
+| 2026-08-17 | 3 | working tree | Replacement presentation actor observer, first attempts | `/tmp/brood-computer-use-phase3-b` and `-c`; typed client update arrived with the running task and two observations | Failed gate assertion: retained Phase 2 audit tasks invalidated a total-task-count assumption, then replacement primary input correctly paused the task before the diagnostic snapshot |
+| 2026-08-17 | 3 | working tree | Detached SpeedCrunch Codex loop, replacement presentation observer, and MCP screenshot | `/tmp/brood-computer-use-phase3-e/proof.md`; pause/resume lease generations 7-8; event cursor 48 before replacement; action sequences 1-7 and observations 7-8 detached; replacement client received running sequence 8, then human input paused it; MCP resumed and completed screenshot sequence 8, observation sequence 9, event cursor 53; assembled package `/nix/store/yzy53qh7gq8b4rvhynjm1nm5pg6qc2mb-brood` contains `brood-computer-use-mcp` | Passed: a real Qt task completed through the Codex adapter with no presentation client, server-owned approvals were decided without interleaving, replacement presentation received the preserved state, and the stdio MCP adapter executed the same authoritative action path; the same adapter binary is present in the assembled package |
 
 ## Immediate next actions
 
-1. Add the computer-use task supervisor boundary to `brood-sessiond`.
-2. Stream task state and observations independently of presentation clients.
-3. Add the Codex-shaped direct-action adapter and equivalent MCP tools.
-4. Prove a multi-step model-driven task across presentation disconnect and
-   replacement.
+1. Select and package the QuickJS-in-WASM runtime.
+2. Add one persistent isolate per computer-use task.
+3. Marshal typed host calls through the existing action executor.
+4. Prove persistence and every ambient-authority denial with a real workload.

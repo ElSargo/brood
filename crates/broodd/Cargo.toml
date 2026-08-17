@@ -19,6 +19,11 @@ path = "src/bin/brood-sessiond.rs"
 test = false
 
 [[bin]]
+name = "brood-computer-use-mcp"
+path = "src/bin/brood-computer-use-mcp.rs"
+test = false
+
+[[bin]]
 name = "brood-runner-nix-develop"
 path = "src/bin/brood-runner-nix-develop.rs"
 test = false

@@ -9,6 +9,7 @@ code-links:
   - crates/broodd/src/frame_export.rs
   - crates/broodd/src/input.rs
   - crates/broodd/src/control.rs
+  - crates/broodd/src/bin/brood-computer-use-mcp.rs
   - crates/broodd/src/debug_dump.rs
   - crates/brood-wasm/wit/brood-plugin.wit
   - plugins/coding-agent/src/lib.rs
@@ -195,6 +196,12 @@ enough that a trained model can use its familiar action and screenshot shapes.
 An MCP surface can expose the same direct-action and `exec_js` tools. DBus may
 support local diagnostics and observer UX, but should not become the remote
 streaming protocol.
+
+The direct-action MCP adapter uses standard JSON-RPC over stdio and forwards
+typed calls to the session daemon. It has no input, capture, lease, or approval
+authority of its own. Presentation observers use the bounded actor-message
+lane and cursor-addressed updates, so disconnecting one observer never removes
+task history or observations from the daemon.
 
 ## Implementation plan
 
