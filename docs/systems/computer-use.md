@@ -86,6 +86,15 @@ that invariant: the server still does not create a *human presentation target*,
 but it does create an isolated automation render target. The presentation
 protocol must not acquire automation-layout authority as a side effect.
 
+When automation is active, a presentation may replace its ordinary composed
+workspace with an aspect-fitted spectator image from the newest server
+observation. This is a read-only projection: it does not resize managed
+applications, select automation windows, change coordinates, or request a new
+capture cadence. State/history and the newest compressed frame travel as
+separate bounded observer updates when needed, and slow clients retain only the
+newest frame. Deliberate human primary input still follows the task's pause or
+revoke policy before ordinary interaction resumes.
+
 ## Automation viewport
 
 The first viewport profile is a fixed 1440 by 900 logical-pixel canvas. It

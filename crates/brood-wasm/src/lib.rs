@@ -11,6 +11,7 @@ pub mod api;
 mod api_link;
 pub mod completion_io;
 pub mod component_actor;
+pub mod computer_use_js;
 pub mod coordination;
 mod epoch_clock;
 mod filesystem_watch;
@@ -58,6 +59,10 @@ pub use component_actor::{
     ComponentActor, ComponentActorConfig, ComponentActorEvent, ComponentActorEventWaker,
     ComponentActorMailboxStats, ComponentAppEvent, ComponentChildEvent, PresentationScope,
     WorkerId,
+};
+pub use computer_use_js::{
+    ComputerUseJsConfig, ComputerUseJsExecution, ComputerUseJsIsolate, ComputerUseJsMetrics,
+    ComputerUseJsPlan,
 };
 pub use coordination::{
     ActorNotification, ActorWatchResult, CoordinationConfig, CoordinationHub, CoordinationStats,

@@ -29,7 +29,11 @@ else
   BROOD_BIN="$PACKAGE/bin/brood"
   CONFIG="$PACKAGE/brood.toml"
 fi
-CLIENT_BIN="$(dirname "$BROOD_BIN")/brood-client"
+if [[ -n "${BROOD_COMPUTER_USE_CLIENT_BIN:-}" ]]; then
+  CLIENT_BIN="$(readlink -f "$BROOD_COMPUTER_USE_CLIENT_BIN")"
+else
+  CLIENT_BIN="$(dirname "$BROOD_BIN")/brood-client"
+fi
 [[ -x "$CLIENT_BIN" ]] || {
   echo "ERR brood-client is required beside $BROOD_BIN for takeover proof" >&2
   exit 2
@@ -622,9 +626,12 @@ if [[ "${BROOD_COMPUTER_USE_SPEEDCRUNCH:-0}" == "1" ]]; then
       and .observation.settle.settled
     ' "$OUT/speedcrunch-$name.json" >/dev/null
   }
+  SPEEDCRUNCH_DIRECT_STARTED_NS="$(date +%s%N)"
   speedcrunch_calculation 5 power-and-product "sqrt(2)^10 + 17*23"
   speedcrunch_calculation 6 trigonometry "sin(pi/6) + cos(pi/3)"
   speedcrunch_calculation 7 integer-arithmetic "(12345*6789)-987654"
+  SPEEDCRUNCH_DIRECT_FINISHED_NS="$(date +%s%N)"
+  SPEEDCRUNCH_DIRECT_ROUND_TRIP_MS="$(((SPEEDCRUNCH_DIRECT_FINISHED_NS - SPEEDCRUNCH_DIRECT_STARTED_NS) / 1000000))"
   ctl computer-use observe speedcrunch-proof 0 0 \
     >"$OUT/speedcrunch-observer-detached-final.json"
   jq -e '
@@ -632,16 +639,186 @@ if [[ "${BROOD_COMPUTER_USE_SPEEDCRUNCH:-0}" == "1" ]]; then
     and .task.next_sequence == 8
     and .lease.generation != null
     and (.events | map(.event.type) | index("batch_committed")) != null
-    and (.observations | length) == 2
+    and ((.observations | length) >= 2)
+    and ((.observations | length) <= 8)
   ' "$OUT/speedcrunch-observer-detached-final.json" >/dev/null
   jq -n \
     --argjson pane "$SPEEDCRUNCH_PANE" \
     --argjson generation "$SPEEDCRUNCH_GENERATION" \
+    --argjson direct_round_trip_ms "$SPEEDCRUNCH_DIRECT_ROUND_TRIP_MS" \
     --slurpfile power "$OUT/speedcrunch-power-and-product.json" \
     --slurpfile trig "$OUT/speedcrunch-trigonometry.json" \
     --slurpfile integer "$OUT/speedcrunch-integer-arithmetic.json" \
-    '{pane:$pane,lease_generation:$generation,viewport:{width:1440,height:900},configuration:{menu:"Settings > Display > Color Scheme",value:"Solarized Light",background_rgba:[253,246,227,255]},calculations:[{expression:"sqrt(2)^10 + 17*23",expected:"423",sequence:$power[0].sequence,frame_sequence:$power[0].observation.settle.frame_sequence},{expression:"sin(pi/6) + cos(pi/3)",expected:"1",sequence:$trig[0].sequence,frame_sequence:$trig[0].observation.settle.frame_sequence},{expression:"(12345*6789)-987654",expected:"82822551",sequence:$integer[0].sequence,frame_sequence:$integer[0].observation.settle.frame_sequence}]}' \
+    '{pane:$pane,lease_generation:$generation,viewport:{width:1440,height:900},configuration:{menu:"Settings > Display > Color Scheme",value:"Solarized Light",background_rgba:[253,246,227,255]},direct_round_trip_ms:$direct_round_trip_ms,calculations:[{expression:"sqrt(2)^10 + 17*23",expected:"423",sequence:$power[0].sequence,frame_sequence:$power[0].observation.settle.frame_sequence},{expression:"sin(pi/6) + cos(pi/3)",expected:"1",sequence:$trig[0].sequence,frame_sequence:$trig[0].observation.settle.frame_sequence},{expression:"(12345*6789)-987654",expected:"82822551",sequence:$integer[0].sequence,frame_sequence:$integer[0].observation.settle.frame_sequence}]}' \
     >"$OUT/speedcrunch-metrics.json"
+
+  ctl computer-use pause speedcrunch-proof >/dev/null
+  SCRIPT_START="$(jq -nc \
+    --argjson pane "$SPEEDCRUNCH_PANE" \
+    '{protocol_version:1,task:"speedcrunch-script",principal:"quickjs-wasm",scope:{session:1,windows:[$pane]},policy:{human_input:"pause",require_approval:[]},limits:{max_actions_per_batch:64,max_script_wall_ms:30000,max_script_cpu_ms:5000,max_script_memory_bytes:67108864,max_output_bytes:1048576,max_display_images:16,max_queued_host_calls:64},lease_duration_ms:30000,active_window:$pane}')"
+  SCRIPT_LEASE="$(ctl computer-use start-request "$SCRIPT_START")"
+  SCRIPT_GENERATION="$(jq -r .generation <<<"$SCRIPT_LEASE")"
+  ctl debug dump "$OUT/speedcrunch-script-ready" surfaces >/dev/null
+  jq -e --argjson pane "$SPEEDCRUNCH_PANE" '
+    .windows[] | select(.pane == $pane and .content_width == 1440 and .content_height == 900)
+  ' "$OUT/speedcrunch-script-ready/automation.json" >/dev/null
+  SCRIPT_SOURCE='globalThis.scriptRuns = (globalThis.scriptRuns || 0) + 1; computer.perform([computer.click(240, 880), computer.keypress(["CTRL", "A"]), computer.type("sqrt(2)^10 + 17*23"), computer.wait(250), computer.keypress(["CTRL", "A"]), computer.type("sin(pi/6) + cos(pi/3)"), computer.wait(250), computer.keypress(["CTRL", "A"]), computer.type("(12345*6789)-987654"), computer.wait(250)]); display(computer.screenshot()); console.log("script run", scriptRuns); ({run: scriptRuns})'
+  SCRIPT_REQUEST="$(jq -nc \
+    --argjson generation "$SCRIPT_GENERATION" \
+    --arg source "$SCRIPT_SOURCE" \
+    '{protocol_version:1,task:"speedcrunch-script",lease_generation:$generation,expected_sequence:1,source:$source,approval_proof:null}')"
+  SCRIPT_STARTED_NS="$(date +%s%N)"
+  ctl computer-use exec-js "$SCRIPT_REQUEST" >"$OUT/speedcrunch-script-first.json"
+  SCRIPT_FINISHED_NS="$(date +%s%N)"
+  SCRIPT_ROUND_TRIP_MS="$(((SCRIPT_FINISHED_NS - SCRIPT_STARTED_NS) / 1000000))"
+  jq -e '
+    .task == "speedcrunch-script"
+    and .sequence == 1
+    and .console == ["script run 1"]
+    and .value_json == "{\"run\":1}"
+    and (.displayed_pngs | length) == 1
+    and .exception == null
+    and .metrics.host_calls == 3
+    and .metrics.peak_memory_bytes > 0
+  ' "$OUT/speedcrunch-script-first.json" >/dev/null
+  python3 -c \
+    'import json, pathlib, sys; pathlib.Path(sys.argv[2]).write_bytes(bytes(json.load(open(sys.argv[1]))["displayed_pngs"][0]))' \
+    "$OUT/speedcrunch-script-first.json" "$OUT/speedcrunch-script-display.png"
+  [[ "$(magick identify -format '%wx%h' "$OUT/speedcrunch-script-display.png")" == "1440x900" ]]
+
+  SCRIPT_SECOND_SOURCE='scriptRuns += 1; console.log("persisted run", scriptRuns); ({run: scriptRuns})'
+  SCRIPT_SECOND_REQUEST="$(jq -nc \
+    --argjson generation "$SCRIPT_GENERATION" \
+    --arg source "$SCRIPT_SECOND_SOURCE" \
+    '{protocol_version:1,task:"speedcrunch-script",lease_generation:$generation,expected_sequence:2,source:$source,approval_proof:null}')"
+  ctl computer-use exec-js "$SCRIPT_SECOND_REQUEST" >"$OUT/speedcrunch-script-second.json"
+  jq -e '
+    .sequence == 2
+    and .console == ["persisted run 2"]
+    and .value_json == "{\"run\":2}"
+    and .exception == null
+  ' "$OUT/speedcrunch-script-second.json" >/dev/null
+  SCRIPT_CAPABILITY_SOURCE='({filesystem:typeof require,network:typeof fetch,process:typeof process,dbus:typeof DBus,hostDesktop:typeof window,windows:computer.windows(),activeWindow:computer.activeWindow()})'
+  SCRIPT_CAPABILITY_REQUEST="$(jq -nc \
+    --argjson generation "$SCRIPT_GENERATION" \
+    --arg source "$SCRIPT_CAPABILITY_SOURCE" \
+    '{protocol_version:1,task:"speedcrunch-script",lease_generation:$generation,expected_sequence:3,source:$source,approval_proof:null}')"
+  ctl computer-use exec-js "$SCRIPT_CAPABILITY_REQUEST" >"$OUT/speedcrunch-script-capabilities.json"
+  jq -e --argjson pane "$SPEEDCRUNCH_PANE" '
+    .sequence == 3
+    and ((.value_json | fromjson) as $value
+      | $value.filesystem == "undefined"
+      and $value.network == "undefined"
+      and $value.process == "undefined"
+      and $value.dbus == "undefined"
+      and $value.hostDesktop == "undefined"
+      and ($value.windows | length) == 1
+      and $value.windows[0].pane == $pane
+      and $value.windows[0].session == 1
+      and $value.activeWindow.pane == $pane)
+    and .exception == null
+  ' "$OUT/speedcrunch-script-capabilities.json" >/dev/null
+
+  SCRIPT_ASK_SOURCE='globalThis.askRuns = (globalThis.askRuns || 0) + 1; askUser("Allow the verified SpeedCrunch script to continue?"); computer.perform([computer.wait(50)]); ({askRuns: askRuns})'
+  SCRIPT_ASK_REQUEST="$(jq -nc \
+    --argjson generation "$SCRIPT_GENERATION" \
+    --arg source "$SCRIPT_ASK_SOURCE" \
+    '{protocol_version:1,task:"speedcrunch-script",lease_generation:$generation,expected_sequence:4,source:$source,approval_proof:null}')"
+  if ctl computer-use exec-js "$SCRIPT_ASK_REQUEST" \
+    >"$OUT/speedcrunch-script-ask-pending.out" \
+    2>"$OUT/speedcrunch-script-ask-pending.err"; then
+    echo "ERR askUser script continued without approval" >&2
+    exit 1
+  fi
+  ctl computer-use observe speedcrunch-script 0 0 \
+    >"$OUT/speedcrunch-script-ask-observer.json"
+  SCRIPT_ASK_APPROVAL="$(jq -r '
+    .approvals[]
+    | select(.kind == "script" and .prompt == "Allow the verified SpeedCrunch script to continue?")
+    | .id
+  ' "$OUT/speedcrunch-script-ask-observer.json")"
+  [[ -n "$SCRIPT_ASK_APPROVAL" ]]
+  jq -e --arg id "$SCRIPT_ASK_APPROVAL" '
+    .task.state == "waiting_approval"
+    and any(.approvals[]; .id == $id and .sequence == 4 and .kind == "script")
+  ' "$OUT/speedcrunch-script-ask-observer.json" >/dev/null
+  ctl computer-use approve "$SCRIPT_ASK_APPROVAL" approve nested-operator >/dev/null
+  SCRIPT_ASK_APPROVED_REQUEST="$(jq -c --arg proof "$SCRIPT_ASK_APPROVAL" \
+    '.approval_proof = $proof' <<<"$SCRIPT_ASK_REQUEST")"
+  ctl computer-use exec-js "$SCRIPT_ASK_APPROVED_REQUEST" \
+    >"$OUT/speedcrunch-script-ask-approved.json"
+  jq -e '
+    .sequence == 4
+    and .value_json == "{\"askRuns\":1}"
+    and .exception == null
+  ' "$OUT/speedcrunch-script-ask-approved.json" >/dev/null
+  SCRIPT_ASK_VERIFY_SOURCE='({askRuns: askRuns})'
+  SCRIPT_ASK_VERIFY_REQUEST="$(jq -nc \
+    --argjson generation "$SCRIPT_GENERATION" \
+    --arg source "$SCRIPT_ASK_VERIFY_SOURCE" \
+    '{protocol_version:1,task:"speedcrunch-script",lease_generation:$generation,expected_sequence:5,source:$source,approval_proof:null}')"
+  ctl computer-use exec-js "$SCRIPT_ASK_VERIFY_REQUEST" \
+    >"$OUT/speedcrunch-script-ask-verify.json"
+  jq -e '.sequence == 5 and .value_json == "{\"askRuns\":1}"' \
+    "$OUT/speedcrunch-script-ask-verify.json" >/dev/null
+
+  SCRIPT_CANCEL_SOURCE='globalThis.cancelledRuns = (globalThis.cancelledRuns || 0) + 1; askUser("Cancel this queued script by denying its lease?"); ({cancelledRuns: cancelledRuns})'
+  SCRIPT_CANCEL_REQUEST="$(jq -nc \
+    --argjson generation "$SCRIPT_GENERATION" \
+    --arg source "$SCRIPT_CANCEL_SOURCE" \
+    '{protocol_version:1,task:"speedcrunch-script",lease_generation:$generation,expected_sequence:6,source:$source,approval_proof:null}')"
+  if ctl computer-use exec-js "$SCRIPT_CANCEL_REQUEST" \
+    >"$OUT/speedcrunch-script-cancel-pending.out" \
+    2>"$OUT/speedcrunch-script-cancel-pending.err"; then
+    echo "ERR cancellation checkpoint continued without approval" >&2
+    exit 1
+  fi
+  ctl status-json >"$OUT/speedcrunch-script-checkpoint-pending-status.json"
+  jq -e '.computer_use_script_checkpoints == 1' \
+    "$OUT/speedcrunch-script-checkpoint-pending-status.json" >/dev/null
+  ctl computer-use observe speedcrunch-script 0 0 \
+    >"$OUT/speedcrunch-script-cancel-observer.json"
+  SCRIPT_CANCEL_APPROVAL="$(jq -r '
+    .approvals[] | select(.prompt == "Cancel this queued script by denying its lease?") | .id
+  ' "$OUT/speedcrunch-script-cancel-observer.json")"
+  ctl computer-use approve "$SCRIPT_CANCEL_APPROVAL" deny nested-operator >/dev/null
+  ctl status-json >"$OUT/speedcrunch-script-checkpoint-denied-status.json"
+  jq -e '
+    .computer_use_script_checkpoints == 0
+    and .computer_use_lease_generation == null
+    and .computer_use_held_keys == 0
+    and .computer_use_held_buttons == 0
+  ' "$OUT/speedcrunch-script-checkpoint-denied-status.json" >/dev/null
+
+  SCRIPT_GENERATION="$(ctl computer-use resume speedcrunch-script 30000 | jq -r .generation)"
+  SCRIPT_STOP_SOURCE='globalThis.stopQueued = (globalThis.stopQueued || 0) + 1; askUser("Stop this queued script with its task?"); ({stopQueued: stopQueued})'
+  SCRIPT_STOP_REQUEST="$(jq -nc \
+    --argjson generation "$SCRIPT_GENERATION" \
+    --arg source "$SCRIPT_STOP_SOURCE" \
+    '{protocol_version:1,task:"speedcrunch-script",lease_generation:$generation,expected_sequence:6,source:$source,approval_proof:null}')"
+  if ctl computer-use exec-js "$SCRIPT_STOP_REQUEST" \
+    >"$OUT/speedcrunch-script-stop-pending.out" \
+    2>"$OUT/speedcrunch-script-stop-pending.err"; then
+    echo "ERR stop checkpoint continued without approval" >&2
+    exit 1
+  fi
+  ctl status-json >"$OUT/speedcrunch-script-before-stop-status.json"
+  jq -e '
+    .computer_use_script_isolates == 1
+    and .computer_use_script_checkpoints == 1
+  ' "$OUT/speedcrunch-script-before-stop-status.json" >/dev/null
+  ctl computer-use stop speedcrunch-script >/dev/null
+  ctl status-json >"$OUT/speedcrunch-script-after-stop-status.json"
+  jq -e '
+    .computer_use_script_isolates == 0
+    and .computer_use_script_checkpoints == 0
+    and .computer_use_held_keys == 0
+    and .computer_use_held_buttons == 0
+  ' \
+    "$OUT/speedcrunch-script-after-stop-status.json" >/dev/null
+
+  SPEEDCRUNCH_LEASE="$(ctl computer-use resume speedcrunch-proof 30000)"
+  SPEEDCRUNCH_GENERATION="$(jq -r .generation <<<"$SPEEDCRUNCH_LEASE")"
 
   PRESENT_DISPLAY=""
   env XDG_RUNTIME_DIR="$PRESENT_RUNTIME_DIR" \
@@ -672,25 +849,95 @@ if [[ "${BROOD_COMPUTER_USE_SPEEDCRUNCH:-0}" == "1" ]]; then
   done
   [[ "$(jq -r .presentation <<<"$STATUS")" == "Attached" ]]
   for _ in $(seq 1 300); do
-    rg -q 'computer-use observer update .*observations=2 .*"id":"speedcrunch-proof".*"next_sequence":8.*"state":"running"' \
+    rg -q 'computer-use observer update .*observations=[2-8] .*"id":"speedcrunch-proof".*"next_sequence":8.*"state":"running"' \
       "$OUT/replacement-presentation-client.log" 2>/dev/null && break
     kill -0 "$CLIENT_PID" 2>/dev/null || exit 1
     sleep 0.05
   done
-  rg -q 'computer-use observer update .*observations=2 .*"id":"speedcrunch-proof".*"next_sequence":8.*"state":"running"' \
+  rg -q 'computer-use observer update .*observations=[2-8] .*"id":"speedcrunch-proof".*"next_sequence":8.*"state":"running"' \
     "$OUT/replacement-presentation-client.log"
+  for _ in $(seq 1 300); do
+    rg -q 'computer-use spectator frame task=speedcrunch-proof .*size=1440x900' \
+      "$OUT/replacement-presentation-client.log" 2>/dev/null && break
+    kill -0 "$CLIENT_PID" 2>/dev/null || exit 1
+    sleep 0.05
+  done
+  rg -q 'computer-use spectator frame task=speedcrunch-proof .*size=1440x900' \
+    "$OUT/replacement-presentation-client.log"
+  INITIAL_SPECTATOR_OBSERVATION="$(
+    rg -o 'computer-use spectator frame task=speedcrunch-proof observation_sequence=[0-9]+' \
+      "$OUT/replacement-presentation-client.log" \
+      | head -1 | sed 's/.*=//'
+  )"
+  ATTACHED_TASK_STATE="$(ctl computer-use observe speedcrunch-proof 0 0)"
+  if [[ "$(jq -r .task.state <<<"$ATTACHED_TASK_STATE")" == "paused" ]]; then
+    SPEEDCRUNCH_LEASE="$(ctl computer-use resume speedcrunch-proof 30000)"
+    SPEEDCRUNCH_GENERATION="$(jq -r .generation <<<"$SPEEDCRUNCH_LEASE")"
+  fi
+  LIVE_SPECTATOR_BATCH="$(jq -nc \
+    --argjson generation "$SPEEDCRUNCH_GENERATION" \
+    --argjson pane "$SPEEDCRUNCH_PANE" \
+    '{protocol_version:1,task:"speedcrunch-proof",lease_generation:$generation,expected_sequence:8,target_session:1,target_window:$pane,approval_proof:null,actions:[{type:"click",x:360,y:880,button:"left"},{type:"wait",duration_ms:100},{type:"screenshot"}]}')"
+  LIVE_SPECTATOR_CALL="$(jq -c '. + {call_id:"attached-spectator-action"}' \
+    <<<"$LIVE_SPECTATOR_BATCH")"
+  ctl computer-use call "$LIVE_SPECTATOR_CALL" >"$OUT/automation-spectator-action.json"
+  jq -e '
+    .call_id == "attached-spectator-action"
+    and .sequence == 8
+    and .observation.viewport_width == 1440
+    and .observation.viewport_height == 900
+  ' "$OUT/automation-spectator-action.json" >/dev/null
+  for _ in $(seq 1 300); do
+    LATEST_SPECTATOR_OBSERVATION="$(
+      rg -o 'computer-use spectator frame task=speedcrunch-proof observation_sequence=[0-9]+' \
+        "$OUT/replacement-presentation-client.log" 2>/dev/null \
+        | tail -1 | sed 's/.*=//' || true
+    )"
+    if [[ -n "$LATEST_SPECTATOR_OBSERVATION" ]] \
+      && ((LATEST_SPECTATOR_OBSERVATION > INITIAL_SPECTATOR_OBSERVATION)); then
+      break
+    fi
+    sleep 0.05
+  done
+  ((LATEST_SPECTATOR_OBSERVATION > INITIAL_SPECTATOR_OBSERVATION))
+  for _ in $(seq 1 100); do
+    env XDG_RUNTIME_DIR="$PRESENT_RUNTIME_DIR" WAYLAND_DISPLAY="$PRESENT_DISPLAY" \
+      grim "$OUT/automation-spectator.png"
+    if [[ "$(magick "$OUT/automation-spectator.png" -format '%k' info:)" -gt 16 ]]; then
+      break
+    fi
+    sleep 0.05
+  done
+  test -s "$OUT/automation-spectator.png"
+  [[ "$(magick identify -format '%wx%h' "$OUT/automation-spectator.png")" == "800x600" ]]
+  [[ "$(magick "$OUT/automation-spectator.png" -format '%k' info:)" -gt 16 ]]
+  read -r SPECTATOR_TOP_RED SPECTATOR_BOTTOM_RED <<<"$(
+    magick "$OUT/automation-spectator.png" \
+      -format '%[fx:p{400,53}.r] %[fx:p{400,547}.r]' info:
+  )"
+  awk -v top="$SPECTATOR_TOP_RED" -v bottom="$SPECTATOR_BOTTOM_RED" \
+    'BEGIN { exit !(top < bottom) }'
+  ctl debug dump "$OUT/spectator-server-viewport" surfaces >/dev/null
+  jq -e --argjson pane "$SPEEDCRUNCH_PANE" '
+    .viewport_width == 1440
+    and .viewport_height == 900
+    and any(.windows[]; .pane == $pane and .content_width == 1440 and .content_height == 900)
+  ' "$OUT/spectator-server-viewport/automation.json" >/dev/null
+  env XDG_RUNTIME_DIR="$PRESENT_RUNTIME_DIR" WAYLAND_DISPLAY="$PRESENT_DISPLAY" \
+    "$OUT/virtual-pointer-click" 400 300 800 600
   INITIAL_EVENT_CURSOR="$(jq -r .event_cursor "$OUT/speedcrunch-observer-initial.json")"
   ctl computer-use observe speedcrunch-proof "$INITIAL_EVENT_CURSOR" 0 \
     >"$OUT/speedcrunch-observer-replacement.json"
   jq -e '
     .task.state == "paused"
-    and .task.next_sequence == 8
+    and .task.next_sequence == 9
     and .lease == null
     and (.events | length) >= 10
     and (.events | map(.event.type) | index("approval_requested")) != null
     and (.events | map(.event.type) | index("approval_decided")) != null
     and (.events | map(.event.type) | index("lease_released")) != null
-    and (.observations | length) == 2
+    and ((.observations | length) >= 2)
+    and ((.observations | length) <= 8)
   ' "$OUT/speedcrunch-observer-replacement.json" >/dev/null
 
   MCP_LEASE="$(ctl computer-use resume speedcrunch-proof 30000)"
@@ -698,7 +945,7 @@ if [[ "${BROOD_COMPUTER_USE_SPEEDCRUNCH:-0}" == "1" ]]; then
   MCP_ACTION_ARGUMENTS="$(jq -nc \
     --argjson generation "$MCP_GENERATION" \
     --argjson pane "$SPEEDCRUNCH_PANE" \
-    '{tool_call_id:"mcp-screenshot",arguments:{protocol_version:1,call_id:"mcp-screenshot",task:"speedcrunch-proof",lease_generation:$generation,expected_sequence:8,target_session:1,target_window:$pane,actions:[{type:"screenshot"}],approval_proof:null}}')"
+    '{tool_call_id:"mcp-screenshot",arguments:{protocol_version:1,call_id:"mcp-screenshot",task:"speedcrunch-proof",lease_generation:$generation,expected_sequence:9,target_session:1,target_window:$pane,actions:[{type:"screenshot"}],approval_proof:null}}')"
   {
     jq -nc '{jsonrpc:"2.0",id:1,method:"initialize",params:{}}'
     jq -nc '{jsonrpc:"2.0",id:2,method:"tools/list",params:{}}'
@@ -713,10 +960,95 @@ if [[ "${BROOD_COMPUTER_USE_SPEEDCRUNCH:-0}" == "1" ]]; then
     and .[0].result.serverInfo.name == "brood-computer-use"
     and (.[1].result.tools | map(.name) | index("computer_action")) != null
     and (.[2].result.content[0].text | fromjson | .call_id) == "mcp-screenshot"
-    and (.[2].result.content[0].text | fromjson | .sequence) == 8
-    and (.[3].result.content[0].text | fromjson | .task.next_sequence) == 9
+    and (.[2].result.content[0].text | fromjson | .sequence) == 9
+    and (.[3].result.content[0].text | fromjson | .task.next_sequence) == 10
   ' "$OUT/speedcrunch-mcp.jsonl" >/dev/null
   ctl computer-use stop speedcrunch-proof >/dev/null
+
+  for pid in "$CLIENT_PID" "$SWAY_PID"; do
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid"
+      wait "$pid" 2>/dev/null || true
+    fi
+  done
+  CLIENT_PID=""
+  SWAY_PID=""
+
+  script_limit_failure() {
+    local name="$1"
+    local wall_ms="$2"
+    local cpu_ms="$3"
+    local memory_bytes="$4"
+    local output_bytes="$5"
+    local display_images="$6"
+    local host_calls="$7"
+    local source="$8"
+    local pattern="$9"
+    local task="speedcrunch-limit-$name"
+    local start lease generation request started_ns finished_ns round_trip_ms
+    start="$(jq -nc \
+      --arg task "$task" \
+      --argjson pane "$SPEEDCRUNCH_PANE" \
+      --argjson wall_ms "$wall_ms" \
+      --argjson cpu_ms "$cpu_ms" \
+      --argjson memory_bytes "$memory_bytes" \
+      --argjson output_bytes "$output_bytes" \
+      --argjson display_images "$display_images" \
+      --argjson host_calls "$host_calls" \
+      '{protocol_version:1,task:$task,principal:"quickjs-limit-proof",scope:{session:1,windows:[$pane]},policy:{human_input:"pause",require_approval:[]},limits:{max_actions_per_batch:64,max_script_wall_ms:$wall_ms,max_script_cpu_ms:$cpu_ms,max_script_memory_bytes:$memory_bytes,max_output_bytes:$output_bytes,max_display_images:$display_images,max_queued_host_calls:$host_calls},lease_duration_ms:30000,active_window:$pane}')"
+    lease="$(ctl computer-use start-request "$start")"
+    generation="$(jq -r .generation <<<"$lease")"
+    request="$(jq -nc \
+      --arg task "$task" \
+      --argjson generation "$generation" \
+      --arg source "$source" \
+      '{protocol_version:1,task:$task,lease_generation:$generation,expected_sequence:1,source:$source,approval_proof:null}')"
+    started_ns="$(date +%s%N)"
+    if ctl computer-use exec-js "$request" \
+      >"$OUT/speedcrunch-limit-$name.out" 2>"$OUT/speedcrunch-limit-$name.err"; then
+      echo "ERR $name limit script was accepted" >&2
+      exit 1
+    fi
+    finished_ns="$(date +%s%N)"
+    round_trip_ms="$(((finished_ns - started_ns) / 1000000))"
+    rg -q "$pattern" "$OUT/speedcrunch-limit-$name.err"
+    ((round_trip_ms < 10000))
+    jq -n --arg limit "$name" --argjson round_trip_ms "$round_trip_ms" \
+      '{limit:$limit,result:"rejected",round_trip_ms:$round_trip_ms}' \
+      >"$OUT/speedcrunch-limit-$name.json"
+    ctl computer-use stop "$task" >/dev/null
+  }
+
+  script_limit_failure cpu 30000 500 67108864 1048576 16 64 \
+    'while (true) {}' 'execute QuickJS source: error while executing'
+  script_limit_failure wall 5 30000 67108864 1048576 16 64 \
+    'while (true) {}' 'execute QuickJS source: error while executing'
+  script_limit_failure memory 30000 5000 1048576 1048576 16 64 \
+    '1' '(memory|resource limit|instantiate QuickJS)'
+  script_limit_failure output 30000 5000 67108864 1024 16 64 \
+    'console.log("x".repeat(2048))' 'guest response exceeds 1024 byte limit'
+  script_limit_failure image 30000 5000 67108864 1048576 1 64 \
+    'display(computer.screenshot()); display(computer.screenshot())' \
+    'script displayed more than 1 images'
+  script_limit_failure host-call 30000 5000 67108864 1048576 16 1 \
+    'computer.screenshot(); computer.screenshot()' \
+    'script queued more than 1 host calls'
+
+  jq -n \
+    --argjson generation "$SCRIPT_GENERATION" \
+    --argjson round_trip_ms "$SCRIPT_ROUND_TRIP_MS" \
+    --slurpfile first "$OUT/speedcrunch-script-first.json" \
+    --slurpfile second "$OUT/speedcrunch-script-second.json" \
+    --slurpfile capabilities "$OUT/speedcrunch-script-capabilities.json" \
+    --slurpfile direct "$OUT/speedcrunch-metrics.json" \
+    --slurpfile cpu "$OUT/speedcrunch-limit-cpu.json" \
+    --slurpfile wall "$OUT/speedcrunch-limit-wall.json" \
+    --slurpfile memory "$OUT/speedcrunch-limit-memory.json" \
+    --slurpfile output "$OUT/speedcrunch-limit-output.json" \
+    --slurpfile image "$OUT/speedcrunch-limit-image.json" \
+    --slurpfile host_call "$OUT/speedcrunch-limit-host-call.json" \
+    '{lease_generation:$generation,presentation:"Detached",round_trip_ms:$round_trip_ms,direct_round_trip_ms:$direct[0].direct_round_trip_ms,first:$first[0].metrics,persistent_value:$second[0].value_json,script_context:(($capabilities[0].value_json|fromjson)|{windows,activeWindow}),denied_capabilities:(($capabilities[0].value_json|fromjson)|{filesystem,network,process,dbus,hostDesktop}),isolate_destroyed_on_stop:true,limits:[$cpu[0],$wall[0],$memory[0],$output[0],$image[0],$host_call[0]]}' \
+    >"$OUT/speedcrunch-script-metrics.json"
 fi
 
 jq -n \
@@ -749,7 +1081,12 @@ if [[ "${BROOD_COMPUTER_USE_SPEEDCRUNCH:-0}" == "1" ]]; then
 - SpeedCrunch isolation: private HOME, XDG_CONFIG_HOME, and XDG_DATA_HOME under speedcrunch-home
 - Phase 3 adapter: Codex-shaped call IDs and action batches in speedcrunch-*.json; server approval checkpoints in speedcrunch-*-approval.json
 - Phase 3 observer continuity: speedcrunch-observer-initial.json, speedcrunch-observer-detached-final.json, speedcrunch-observer-replacement.json, and replacement-presentation-client.log prove the replacement client first received the running task and lease, then primary presentation input paused it without interleaving
-- Phase 3 MCP surface: speedcrunch-mcp.jsonl records initialization, tool discovery, a real screenshot action at sequence 8, and the resulting task sequence 9
+- Phase 3 MCP surface: speedcrunch-mcp.jsonl records initialization, tool discovery, a real screenshot action at sequence 9, and the resulting task sequence 10
+- Phase 4 QuickJS/WASM: speedcrunch-script-first.json performs ten ordered SpeedCrunch actions and displays a 1440x900 screenshot while detached; speedcrunch-script-second.json proves persistent globals; speedcrunch-script-metrics.json records isolate and round-trip metrics
+- Phase 4 askUser: speedcrunch-script-ask-observer.json, speedcrunch-script-ask-approved.json, and speedcrunch-script-ask-verify.json prove an observer-visible approval checkpoint resumed without re-running script side effects
+- Phase 4 queued-call teardown: speedcrunch-script-checkpoint-denied-status.json and speedcrunch-script-after-stop-status.json prove denial/lease loss and task stop remove checkpoints with no held input
+- Automation spectator: automation-spectator.png is an upright 800x600 view of the server-owned 1440x900 frame; automation-spectator-action.json and replacement-presentation-client.log prove observation advancement while attached; spectator-server-viewport/automation.json proves presentation did not resize the automation target
+- Assembled package: ${PACKAGE:-development binaries}
 EOF
 fi
 

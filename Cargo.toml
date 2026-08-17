@@ -23,6 +23,7 @@ edition = "2024"
 
 [workspace.dependencies]
 anyhow = "1.0.102"
+base64 = "0.22.1"
 bytemuck = { version = "1.25.0", features = ["derive"] }
 calloop = "0.14.4"
 calloop-wayland-source = "0.4.1"

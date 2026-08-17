@@ -9,6 +9,9 @@ in
 
     LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath profiles.nativeLibs;
     RUST_SRC_PATH = "${profiles.rustToolchainWithTools}/lib/rustlib/src/rust/library";
+    RQUICKJS_SYS_NO_WASI_SDK = "1";
+    CC_wasm32_wasip1 = "${profiles.wasi32Cc}/bin/wasm32-unknown-wasi-cc";
+    AR_wasm32_wasip1 = "${profiles.wasi32Binutils}/bin/wasm32-unknown-wasi-ar";
 
     shellHook = ''
       export BROOD_DEV_SHELL=1
@@ -22,6 +25,9 @@ in
 
     LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath profiles.nativeLibs;
     RUST_SRC_PATH = "${profiles.rustToolchainWithTools}/lib/rustlib/src/rust/library";
+    RQUICKJS_SYS_NO_WASI_SDK = "1";
+    CC_wasm32_wasip1 = "${profiles.wasi32Cc}/bin/wasm32-unknown-wasi-cc";
+    AR_wasm32_wasip1 = "${profiles.wasi32Binutils}/bin/wasm32-unknown-wasi-ar";
 
     shellHook = ''
       export BROOD_DEV_SHELL=1

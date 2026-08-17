@@ -33,7 +33,10 @@ use brood_cli::{
         resolve_control_target, shared_memory_resource,
     },
 };
-use brood_computer_use::{ComputerUseObserverCommand, ComputerUseObserverUpdate};
+use brood_computer_use::{
+    AUTOMATION_VIEWPORT_HEIGHT, AUTOMATION_VIEWPORT_WIDTH, ComputerObservationFrame,
+    ComputerUseObserverCommand, ComputerUseObserverUpdate, MAX_OBSERVATION_PNG_BYTES, TaskState,
+};
 use brood_dmabuf::{SinglePlaneDmabuf, import_single_plane};
 use brood_layout::{
     ComposedDivider, ComposedInteractionZone, ComposedLayout, ComposedZoneId, CursorRole,
@@ -8789,6 +8792,13 @@ impl ApplicationHandler<ClientEvent> for Application {
                 }
                 renderer.window.request_redraw();
                 self.renderer = Some(renderer);
+                if let Err(error) = self.subscribe_computer_use_observer() {
+                    self.fail(
+                        event_loop,
+                        error.context("subscribe computer-use spectator after renderer startup"),
+                    );
+                    return;
+                }
                 if let (Some(runtime), Some(renderer)) =
                     (self.wasm_runtime.as_ref(), self.renderer.as_mut())
                 {
@@ -9339,6 +9349,25 @@ impl ApplicationHandler<ClientEvent> for Application {
                 if sender == COMPUTER_USE_SERVER_ACTOR && recipient == COMPUTER_USE_OBSERVER_ACTOR {
                     match serde_json::from_slice::<ComputerUseObserverUpdate>(&body) {
                         Ok(update) => {
+                            let spectator_active = update.tasks.iter().any(|task| {
+                                matches!(
+                                    task.state,
+                                    TaskState::Running
+                                        | TaskState::Paused
+                                        | TaskState::WaitingApproval
+                                )
+                            });
+                            if let Some(renderer) = self.renderer.as_mut()
+                                && let Err(error) = renderer.update_automation_spectator(
+                                    update.frame.as_ref(),
+                                    spectator_active,
+                                )
+                            {
+                                eprintln!(
+                                    "dropped computer-use spectator frame backend={} error={error:#}",
+                                    backend.0,
+                                );
+                            }
                             let tasks = update
                                 .tasks
                                 .iter()
@@ -10951,6 +10980,7 @@ struct Renderer {
     pending_managed_resource_releases: Vec<(BackendId, u64)>,
     sent_plugin_sizes: HashMap<u64, PluginPaneSize>,
     window_resize_in_progress: bool,
+    automation_spectator: Option<AutomationSpectatorFrame>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -11107,6 +11137,15 @@ struct ImportedFrame {
     bind_group: wgpu::BindGroup,
     source: ImportedFrameSource,
     extent: (u32, u32),
+}
+
+struct AutomationSpectatorFrame {
+    _texture: wgpu::Texture,
+    bind_group: wgpu::BindGroup,
+    extent: (u32, u32),
+    task: String,
+    observation_sequence: u64,
+    _frame_sequence: u64,
 }
 
 enum ImportedFrameSource {
@@ -13343,7 +13382,123 @@ impl Renderer {
             pending_managed_resource_releases: Vec::new(),
             sent_plugin_sizes: HashMap::new(),
             window_resize_in_progress: false,
+            automation_spectator: None,
         })
+    }
+
+    fn update_automation_spectator(
+        &mut self,
+        frame: Option<&ComputerObservationFrame>,
+        active: bool,
+    ) -> Result<()> {
+        if !active {
+            if self.automation_spectator.take().is_some() {
+                eprintln!("computer-use spectator stopped");
+                self.window.request_redraw();
+            }
+            return Ok(());
+        }
+        let Some(frame) = frame else {
+            return Ok(());
+        };
+        anyhow::ensure!(
+            frame.png.len() <= MAX_OBSERVATION_PNG_BYTES,
+            "computer-use observation exceeds the PNG byte limit"
+        );
+        anyhow::ensure!(
+            frame.viewport_width == AUTOMATION_VIEWPORT_WIDTH
+                && frame.viewport_height == AUTOMATION_VIEWPORT_HEIGHT,
+            "computer-use observation has an unexpected automation viewport"
+        );
+        if self.automation_spectator.as_ref().is_some_and(|current| {
+            current.task == frame.task.0 && current.observation_sequence >= frame.sequence
+        }) {
+            return Ok(());
+        }
+        let mut reader = image::ImageReader::new(Cursor::new(&frame.png))
+            .with_guessed_format()
+            .context("identify computer-use observation image")?;
+        let mut limits = image::Limits::default();
+        limits.max_image_width = Some(AUTOMATION_VIEWPORT_WIDTH);
+        limits.max_image_height = Some(AUTOMATION_VIEWPORT_HEIGHT);
+        limits.max_alloc = Some(
+            u64::from(AUTOMATION_VIEWPORT_WIDTH)
+                .saturating_mul(u64::from(AUTOMATION_VIEWPORT_HEIGHT))
+                .saturating_mul(4),
+        );
+        reader.limits(limits);
+        let mut rgba = reader
+            .decode()
+            .context("decode computer-use observation PNG")?
+            .into_rgba8();
+        anyhow::ensure!(
+            rgba.width() == frame.viewport_width && rgba.height() == frame.viewport_height,
+            "computer-use observation PNG dimensions do not match its metadata"
+        );
+        // The shared frame shader samples compositor textures in Wayland's
+        // bottom-left convention. PNG scanlines are top-first, so normalize
+        // this upload before using the common pipeline.
+        image::imageops::flip_vertical_in_place(&mut rgba);
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("computer-use spectator observation"),
+            size: wgpu::Extent3d {
+                width: rgba.width(),
+                height: rgba.height(),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[wgpu::TextureFormat::Rgba8UnormSrgb],
+        });
+        write_packed_image(
+            &texture,
+            &self.queue,
+            rgba.width(),
+            rgba.height(),
+            rgba.width().saturating_mul(4),
+            rgba.as_raw(),
+        )?;
+        let view = texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("computer-use spectator sRGB view"),
+            format: Some(wgpu::TextureFormat::Rgba8UnormSrgb),
+            ..Default::default()
+        });
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("computer-use spectator bind group"),
+            layout: &self.frame_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.frame_sampler),
+                },
+            ],
+        });
+        eprintln!(
+            "computer-use spectator frame task={} observation_sequence={} frame_sequence={} size={}x{} png_bytes={}",
+            frame.task.0,
+            frame.sequence,
+            frame.settle.frame_sequence,
+            rgba.width(),
+            rgba.height(),
+            frame.png.len(),
+        );
+        self.automation_spectator = Some(AutomationSpectatorFrame {
+            _texture: texture,
+            bind_group,
+            extent: (rgba.width(), rgba.height()),
+            task: frame.task.0.clone(),
+            observation_sequence: frame.sequence,
+            _frame_sequence: frame.settle.frame_sequence,
+        });
+        self.window.request_redraw();
+        Ok(())
     }
 
     fn logical_extent(&self) -> (f32, f32, f32) {
@@ -14959,40 +15114,94 @@ impl Renderer {
                 multiview_mask: None,
             });
             let extent = self.composition_extent();
-            for target in self.layout_paint_targets() {
-                let LayoutPaintTarget::Pane(pane) = target else {
-                    let LayoutPaintTarget::Divider(divider) = target else {
+            if let Some(spectator) = &self.automation_spectator {
+                let viewport =
+                    aspect_fit_viewport(spectator.extent, (self.config.width, self.config.height));
+                render_pass.set_viewport(
+                    viewport[0],
+                    viewport[1],
+                    viewport[2],
+                    viewport[3],
+                    0.0,
+                    1.0,
+                );
+                render_pass.set_pipeline(&self.frame_pipeline);
+                render_pass.set_bind_group(0, &spectator.bind_group, &[]);
+                render_pass.draw(0..3, 0..1);
+            } else {
+                for target in self.layout_paint_targets() {
+                    let LayoutPaintTarget::Pane(pane) = target else {
+                        let LayoutPaintTarget::Divider(divider) = target else {
+                            continue;
+                        };
+                        let line = snapped_divider_rect(divider, self.layout_extent());
+                        let Some(line) = clip_rect_to_extent(line, extent) else {
+                            continue;
+                        };
+                        let viewport =
+                            scaled_viewport(line, extent, (self.config.width, self.config.height));
+                        render_pass.set_viewport(
+                            viewport[0],
+                            viewport[1],
+                            viewport[2],
+                            viewport[3],
+                            0.0,
+                            1.0,
+                        );
+                        let pipeline = if self.captured_zone == Some(divider.zone) {
+                            &self.divider_active_pipeline
+                        } else if self.hovered_zone == Some(divider.zone) {
+                            &self.divider_hover_pipeline
+                        } else {
+                            &self.divider_pipeline
+                        };
+                        render_pass.set_pipeline(pipeline);
+                        render_pass.draw(0..3, 0..1);
                         continue;
                     };
-                    let line = snapped_divider_rect(divider, self.layout_extent());
-                    let Some(line) = clip_rect_to_extent(line, extent) else {
+                    if let Some(plugin) = self.plugin_panes.get(&pane) {
+                        let Some(rect) = clip_rect_to_extent(plugin.rect, extent) else {
+                            continue;
+                        };
+                        let viewport =
+                            scaled_viewport(rect, extent, (self.config.width, self.config.height));
+                        render_pass.set_viewport(
+                            viewport[0],
+                            viewport[1],
+                            viewport[2],
+                            viewport[3],
+                            0.0,
+                            1.0,
+                        );
+                        render_pass.set_pipeline(&self.frame_pipeline);
+                        render_pass.set_bind_group(0, plugin.scene.output_bind_group(), &[]);
+                        render_pass.draw(0..3, 0..1);
+                        continue;
+                    }
+
+                    let window = self
+                        .current_windows
+                        .iter()
+                        .find(|window| window.window_id == pane);
+                    let imported =
+                        window.and_then(|window| self.imported_frames.get(&window.resource_id));
+                    let rect = window
+                        .map(|window| window.rect)
+                        .or_else(|| {
+                            self.accepted_layout.pane_item(pane).map(|item| {
+                                let rect = item.pixel_rect(self.layout_extent());
+                                [rect.x, rect.y, rect.w, rect.h]
+                            })
+                        })
+                        .and_then(|rect| clip_rect_to_extent(rect, extent));
+                    let Some(rect) = rect else {
                         continue;
                     };
-                    let viewport =
-                        scaled_viewport(line, extent, (self.config.width, self.config.height));
-                    render_pass.set_viewport(
-                        viewport[0],
-                        viewport[1],
-                        viewport[2],
-                        viewport[3],
-                        0.0,
-                        1.0,
-                    );
-                    let pipeline = if self.captured_zone == Some(divider.zone) {
-                        &self.divider_active_pipeline
-                    } else if self.hovered_zone == Some(divider.zone) {
-                        &self.divider_hover_pipeline
-                    } else {
-                        &self.divider_pipeline
-                    };
-                    render_pass.set_pipeline(pipeline);
-                    render_pass.draw(0..3, 0..1);
-                    continue;
-                };
-                if let Some(plugin) = self.plugin_panes.get(&pane) {
-                    let Some(rect) = clip_rect_to_extent(plugin.rect, extent) else {
-                        continue;
-                    };
+                    let available = self
+                        .available_windows
+                        .iter()
+                        .any(|window| window.pane == pane);
+                    let frame_ready = imported.is_some();
                     let viewport =
                         scaled_viewport(rect, extent, (self.config.width, self.config.height));
                     render_pass.set_viewport(
@@ -15003,54 +15212,16 @@ impl Renderer {
                         0.0,
                         1.0,
                     );
-                    render_pass.set_pipeline(&self.frame_pipeline);
-                    render_pass.set_bind_group(0, plugin.scene.output_bind_group(), &[]);
+                    if let Some(imported) = imported {
+                        render_pass.set_pipeline(&self.frame_pipeline);
+                        render_pass.set_bind_group(0, &imported.bind_group, &[]);
+                    } else if managed_pane_uses_placeholder(available, frame_ready) {
+                        render_pass.set_pipeline(&self.placeholder_pipeline);
+                    } else {
+                        continue;
+                    }
                     render_pass.draw(0..3, 0..1);
-                    continue;
                 }
-
-                let window = self
-                    .current_windows
-                    .iter()
-                    .find(|window| window.window_id == pane);
-                let imported =
-                    window.and_then(|window| self.imported_frames.get(&window.resource_id));
-                let rect = window
-                    .map(|window| window.rect)
-                    .or_else(|| {
-                        self.accepted_layout.pane_item(pane).map(|item| {
-                            let rect = item.pixel_rect(self.layout_extent());
-                            [rect.x, rect.y, rect.w, rect.h]
-                        })
-                    })
-                    .and_then(|rect| clip_rect_to_extent(rect, extent));
-                let Some(rect) = rect else {
-                    continue;
-                };
-                let available = self
-                    .available_windows
-                    .iter()
-                    .any(|window| window.pane == pane);
-                let frame_ready = imported.is_some();
-                let viewport =
-                    scaled_viewport(rect, extent, (self.config.width, self.config.height));
-                render_pass.set_viewport(
-                    viewport[0],
-                    viewport[1],
-                    viewport[2],
-                    viewport[3],
-                    0.0,
-                    1.0,
-                );
-                if let Some(imported) = imported {
-                    render_pass.set_pipeline(&self.frame_pipeline);
-                    render_pass.set_bind_group(0, &imported.bind_group, &[]);
-                } else if managed_pane_uses_placeholder(available, frame_ready) {
-                    render_pass.set_pipeline(&self.placeholder_pipeline);
-                } else {
-                    continue;
-                }
-                render_pass.draw(0..3, 0..1);
             }
             drop(render_pass);
         }
@@ -15145,6 +15316,9 @@ impl Renderer {
     }
 
     fn pending_managed_resize_requests(&self) -> Vec<(u64, u32, u32, u32, u32, u32, Option<u64>)> {
+        if self.automation_spectator.is_some() {
+            return Vec::new();
+        }
         let scale = self.window.scale_factor().max(f64::EPSILON);
         let scale_120 = (scale * f64::from(brood_protocol::FRACTIONAL_SCALE_DENOMINATOR))
             .round()
@@ -15907,6 +16081,27 @@ fn scaled_viewport(
     ]
 }
 
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "WGPU viewports require f32 while image and surface extents are integer pixels"
+)]
+fn aspect_fit_viewport(source: (u32, u32), target: (u32, u32)) -> [f32; 4] {
+    let source_aspect = source.0 as f32 / source.1.max(1) as f32;
+    let target_aspect = target.0 as f32 / target.1.max(1) as f32;
+    if target_aspect > source_aspect {
+        let width = target.1 as f32 * source_aspect;
+        [(target.0 as f32 - width) / 2.0, 0.0, width, target.1 as f32]
+    } else {
+        let height = target.0 as f32 / source_aspect;
+        [
+            0.0,
+            (target.1 as f32 - height) / 2.0,
+            target.0 as f32,
+            height,
+        ]
+    }
+}
+
 #[derive(Clone, Copy)]
 struct RenderTimings {
     acquire_us: u128,
@@ -15944,6 +16139,18 @@ mod tests {
     use super::*;
     use brood_layout::LayoutItemId;
     use default_workspace_backend_layout::{PanePlacement, pane_placement};
+
+    #[test]
+    fn automation_spectator_preserves_source_aspect_ratio() {
+        assert_eq!(
+            aspect_fit_viewport((1440, 900), (1280, 720)),
+            [64.0, 0.0, 1152.0, 720.0]
+        );
+        assert_eq!(
+            aspect_fit_viewport((1440, 900), (1920, 1080)),
+            [96.0, 0.0, 1728.0, 1080.0]
+        );
+    }
 
     fn managed_route(view_pane: u64) -> ManagedPaneRoute {
         ManagedPaneRoute {

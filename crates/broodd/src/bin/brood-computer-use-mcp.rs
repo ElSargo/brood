@@ -102,6 +102,11 @@ fn call_tool(target: &brood_cli::control::ControlTarget, params: &Value) -> Resu
             "mcp-call".to_string(),
             serde_json::to_string(&arguments)?,
         ],
+        "computer_exec_js" => vec![
+            "computer-use".to_string(),
+            "exec-js".to_string(),
+            serde_json::to_string(&arguments)?,
+        ],
         "computer_observe" => vec![
             "computer-use".to_string(),
             "observe".to_string(),
@@ -152,6 +157,7 @@ fn tool_definitions() -> Value {
     json!([
         {"name":"computer_start","description":"Start a scoped server-side computer-use task","inputSchema":{"type":"object"}},
         {"name":"computer_action","description":"Execute a validated ordered direct-action call","inputSchema":{"type":"object","required":["tool_call_id","arguments"]}},
+        {"name":"computer_exec_js","description":"Evaluate JavaScript in the task's persistent capability-empty QuickJS/WASM isolate","inputSchema":{"type":"object","required":["protocol_version","task","lease_generation","expected_sequence","source"]}},
         {"name":"computer_observe","description":"Read cursored task events and observations","inputSchema":{"type":"object","required":["task","event_cursor","observation_sequence"]}},
         {"name":"computer_pause","description":"Pause a computer-use task","inputSchema":{"type":"object","required":["task"]}},
         {"name":"computer_resume","description":"Resume a task with a new daemon-wide lease","inputSchema":{"type":"object","required":["task","lease_duration_ms"]}},

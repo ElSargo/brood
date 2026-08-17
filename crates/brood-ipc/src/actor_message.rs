@@ -16,10 +16,13 @@ use thiserror::Error;
 use brood_protocol::BackendActorRealm;
 
 const MAGIC: u64 = 0x4d41_4e49_4143_544d;
-const ABI_VERSION: u32 = 2;
+const ABI_VERSION: u32 = 3;
 const CAPACITY: usize = 16;
 const CAPACITY_U32: u32 = 16;
-const RECORD_BYTES: usize = 16 * 1024;
+// Match the reliable actor-message capability advertised by the protocol.
+// Sixteen records keep the entire lane bounded to 1 MiB while allowing one
+// compact automation observation frame per record.
+const RECORD_BYTES: usize = 64 * 1024;
 const RECORD_HEADER_BYTES: usize = 40;
 /// Maximum combined UTF-8 sender, UTF-8 recipient, and mailbox body bytes.
 pub const ACTOR_MESSAGE_BODY_CAPACITY: usize = RECORD_BYTES - RECORD_HEADER_BYTES;

@@ -13,7 +13,7 @@ pub const COMPUTER_USE_PROTOCOL_VERSION: u32 = 1;
 pub const AUTOMATION_VIEWPORT_WIDTH: u32 = 1440;
 pub const AUTOMATION_VIEWPORT_HEIGHT: u32 = 900;
 pub const MAX_OBSERVATION_PNG_BYTES: usize = 8 * 1024 * 1024;
-pub const MAX_QUEUED_OBSERVATIONS: usize = 2;
+pub const MAX_QUEUED_OBSERVATIONS: usize = 8;
 pub const MIN_CAPTURE_INTERVAL_MS: u64 = 50;
 pub const MAX_TASK_EVENTS: usize = 256;
 pub const MAX_EVENT_PAGE: usize = 64;
@@ -445,6 +445,55 @@ pub struct ComputerObservationSummary {
     pub settle: SettleEvidence,
 }
 
+/// A full observation encoded compactly for the bounded presentation actor
+/// lane. The decoded `png` remains byte-for-byte identical to the server's
+/// authoritative observation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ComputerObservationFrame {
+    pub protocol_version: u32,
+    pub task: TaskId,
+    pub sequence: u64,
+    pub captured_at_ms: u64,
+    pub viewport_width: u32,
+    pub viewport_height: u32,
+    pub active_window: Option<u64>,
+    pub windows: Vec<ComputerWindow>,
+    #[serde(with = "base64_png")]
+    pub png: Vec<u8>,
+    pub settle: SettleEvidence,
+}
+
+impl From<&ComputerObservation> for ComputerObservationFrame {
+    fn from(observation: &ComputerObservation) -> Self {
+        Self {
+            protocol_version: observation.protocol_version,
+            task: observation.task.clone(),
+            sequence: observation.sequence,
+            captured_at_ms: observation.captured_at_ms,
+            viewport_width: observation.viewport_width,
+            viewport_height: observation.viewport_height,
+            active_window: observation.active_window,
+            windows: observation.windows.clone(),
+            png: observation.png.clone(),
+            settle: observation.settle.clone(),
+        }
+    }
+}
+
+mod base64_png {
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+    use serde::{Deserialize as _, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&BASE64.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        let encoded = String::deserialize(deserializer)?;
+        BASE64.decode(encoded).map_err(serde::de::Error::custom)
+    }
+}
+
 impl From<&ComputerObservation> for ComputerObservationSummary {
     fn from(observation: &ComputerObservation) -> Self {
         Self {
@@ -467,6 +516,11 @@ pub struct ComputerUseObserverUpdate {
     pub approvals: Vec<ComputerApprovalRequest>,
     pub events: Vec<ComputerUseEvent>,
     pub observations: Vec<ComputerObservationSummary>,
+    /// The newest observation after the subscriber cursor. This is deliberately
+    /// a single compressed frame so a slow presentation cannot build an
+    /// unbounded image queue or influence the automation viewport.
+    #[serde(default)]
+    pub frame: Option<ComputerObservationFrame>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -733,6 +787,7 @@ impl ComputerUseSupervisor {
 
     pub fn pause(&mut self, id: &TaskId, now_ms: u64) -> Result<(), ComputerUseError> {
         self.transition(id, TaskState::Paused, now_ms)?;
+        self.clear_approvals_for(id);
         self.revoke_lease_for(id, now_ms, "task paused");
         Ok(())
     }
@@ -774,6 +829,7 @@ impl ComputerUseSupervisor {
                 state: TaskState::Stopped,
             },
         );
+        self.clear_approvals_for(id);
         self.revoke_lease_for(id, now_ms, "task stopped");
         Ok(())
     }
@@ -795,6 +851,7 @@ impl ComputerUseSupervisor {
                 state: TaskState::Failed,
             },
         );
+        self.clear_approvals_for(id);
         self.revoke_lease_for(id, now_ms, "task failed");
         Ok(())
     }
@@ -1013,6 +1070,19 @@ impl ComputerUseSupervisor {
         Ok(())
     }
 
+    /// Checks an issued proof without consuming it. Consumption remains tied
+    /// to committing the action batch that follows the checkpoint.
+    #[must_use]
+    pub fn approval_proof_valid(
+        &self,
+        proof: Option<&str>,
+        task: &TaskId,
+        kind: ApprovalKind,
+        now_ms: u64,
+    ) -> bool {
+        self.approval_valid(proof, task, Some(kind), now_ms)
+    }
+
     pub fn handle_human_input(&mut self, now_ms: u64) -> Option<TaskId> {
         let lease = self.lease.take()?;
         let task_id = lease.task.clone();
@@ -1128,6 +1198,12 @@ impl ComputerUseSupervisor {
                 },
             );
         }
+    }
+
+    fn clear_approvals_for(&mut self, id: &TaskId) {
+        self.approval_requests
+            .retain(|_, request| request.task != *id);
+        self.granted_approvals.retain(|_, (task, _, _)| task != id);
     }
 
     fn push_event(&mut self, task: &TaskId, occurred_at_ms: u64, event: ComputerUseEventKind) {

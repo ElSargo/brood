@@ -2387,6 +2387,16 @@ fn execute_state_request(request: DbusStateRequest, state: &mut Brood) {
             .then(|| Some((command.get(1)?.as_str(), command.get(2)?.as_str())))
             .flatten();
             if let Some((kind, payload)) = adapter_request {
+                if kind == "exec-js" {
+                    match serde_json::from_str::<brood_computer_use::ComputerScriptRequest>(payload)
+                    {
+                        Ok(request) => {
+                            crate::computer_use::begin_computer_use_script(state, request, response)
+                        }
+                        Err(error) => send_response(response, Err(anyhow::anyhow!(error))),
+                    }
+                    return;
+                }
                 let parsed = match kind {
                     "batch" => {
                         serde_json::from_str::<brood_computer_use::ComputerActionBatch>(payload)
@@ -3160,6 +3170,30 @@ fn drain_fast_path_input(state: &mut Brood) {
                 scale_120,
                 resize_epoch,
             }) => {
+                if state
+                    .computer_use
+                    .lease()
+                    .is_some_and(|lease| lease.windows.contains(&pane))
+                {
+                    if let Some(epoch) = resize_epoch {
+                        crate::state::emit_managed_resize_status(
+                            &mut fast_path,
+                            brood_protocol::ManagedResizeStatus {
+                                pane,
+                                resize_epoch: epoch,
+                                result: brood_protocol::ManagedResizeStatusResult::Rejected {
+                                    reason: brood_protocol::ManagedResizeRejectionReason::SizeUnsatisfied,
+                                },
+                            },
+                        );
+                    }
+                    warn!(
+                        pane,
+                        ?resize_epoch,
+                        "rejected presentation resize for automation-owned pane"
+                    );
+                    continue;
+                }
                 let logical_size = (
                     i32::try_from(logical_width).map_or(i32::MAX, |value| value),
                     i32::try_from(logical_height).map_or(i32::MAX, |value| value),
@@ -3498,6 +3532,7 @@ fn execute_tokens(tokens: &[String], state: &mut Brood) -> Result<String> {
                     &task,
                     "computer-use task stopped",
                 );
+                crate::computer_use::drop_script_isolate(state, &task);
                 let now_ms = u64::from(monotonic_time_msec(state));
                 state.computer_use.stop(&task, now_ms)?;
                 "OK computer-use stopped\n".to_string()
@@ -3546,6 +3581,11 @@ fn execute_tokens(tokens: &[String], state: &mut Brood) -> Result<String> {
                         decided_at_ms: now_ms,
                     },
                 )?;
+                if !approved {
+                    state
+                        .computer_use_automation
+                        .cancel_script_checkpoint_by_approval(request_id);
+                }
                 "OK computer-use approval decided\n".to_string()
             }
             [subcommand] if subcommand == "list" => {
@@ -4052,6 +4092,8 @@ struct StatusSnapshot {
     browsers: usize,
     computer_use_tasks: usize,
     computer_use_lease_generation: Option<u64>,
+    computer_use_script_isolates: usize,
+    computer_use_script_checkpoints: usize,
     computer_use_capture_attempts: u64,
     computer_use_capture_failures: u64,
     computer_use_capture_cadence_drops: u64,
@@ -4236,6 +4278,10 @@ impl StatusSnapshot {
             browsers: state.browsers.len(),
             computer_use_tasks: state.computer_use.task_count(),
             computer_use_lease_generation: state.computer_use.lease().map(|lease| lease.generation),
+            computer_use_script_isolates: state.computer_use_automation.script_isolate_count(),
+            computer_use_script_checkpoints: state
+                .computer_use_automation
+                .script_checkpoint_count(),
             computer_use_capture_attempts: state.computer_use_automation.capture_attempts,
             computer_use_capture_failures: state.computer_use_automation.capture_failures,
             computer_use_capture_cadence_drops: state

@@ -2,17 +2,21 @@
 
 use std::{
     collections::{BTreeMap, VecDeque},
+    fs,
     io::Cursor,
+    path::PathBuf,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use brood_computer_use::{
     AUTOMATION_VIEWPORT_HEIGHT, AUTOMATION_VIEWPORT_WIDTH, ActionStatus, ComputerAction,
-    ComputerActionBatch, ComputerActionResult, ComputerObservation, ComputerObservationSummary,
-    ComputerRect, ComputerUseFailure, ComputerUseObserverCommand, ComputerUseObserverUpdate,
-    ComputerWindow, MAX_OBSERVATION_PNG_BYTES, MAX_QUEUED_OBSERVATIONS, MIN_CAPTURE_INTERVAL_MS,
-    PointerButton, SettleEvidence, TaskId,
+    ComputerActionBatch, ComputerActionResult, ComputerObservation, ComputerObservationFrame,
+    ComputerObservationSummary, ComputerRect, ComputerScriptMetrics, ComputerScriptRequest,
+    ComputerScriptResult, ComputerUseFailure, ComputerUseLimits, ComputerUseObserverCommand,
+    ComputerUseObserverUpdate, ComputerWindow, MAX_OBSERVATION_PNG_BYTES, MAX_QUEUED_OBSERVATIONS,
+    MIN_CAPTURE_INTERVAL_MS, PointerButton, SettleEvidence, TaskId,
 };
+use brood_wasm::{ComputerUseJsConfig, ComputerUseJsIsolate, ComputerUseJsMetrics};
 use image::{ColorType, ImageEncoder, codecs::png::PngEncoder};
 use smithay::{
     backend::{
@@ -51,6 +55,22 @@ struct PendingBatch {
     active_action: Option<ActiveAction>,
     response: BatchResponse,
     adapter_call_id: Option<String>,
+    script: Option<PendingScript>,
+}
+
+struct PendingScript {
+    console: Vec<String>,
+    value_json: Option<String>,
+    exception: Option<String>,
+    metrics: ComputerUseJsMetrics,
+    display_latest_observation: bool,
+}
+
+struct PendingScriptCheckpoint {
+    approval_id: String,
+    source: String,
+    batch: ComputerActionBatch,
+    script: PendingScript,
 }
 
 enum ActiveAction {
@@ -93,6 +113,8 @@ pub struct AutomationRuntime {
     observer_recipient: Option<String>,
     observer_event_cursor: u64,
     observer_observation_sequence: u64,
+    script_isolates: BTreeMap<TaskId, ComputerUseJsIsolate>,
+    script_checkpoints: BTreeMap<TaskId, PendingScriptCheckpoint>,
     pub capture_attempts: u64,
     pub capture_failures: u64,
     pub captures_dropped_cadence: u64,
@@ -110,6 +132,8 @@ impl std::fmt::Debug for AutomationRuntime {
             .field("pending_batch", &self.pending_batch.is_some())
             .field("held_keys", &self.held_keys)
             .field("held_buttons", &self.held_buttons)
+            .field("script_isolates", &self.script_isolates.len())
+            .field("script_checkpoints", &self.script_checkpoints.len())
             .finish_non_exhaustive()
     }
 }
@@ -216,6 +240,21 @@ impl AutomationRuntime {
         self.observations.len()
     }
 
+    pub(crate) fn script_isolate_count(&self) -> usize {
+        self.script_isolates.len()
+    }
+
+    pub(crate) fn script_checkpoint_count(&self) -> usize {
+        self.script_checkpoints.len()
+    }
+
+    pub(crate) fn cancel_script_checkpoint_by_approval(&mut self, approval_id: &str) -> bool {
+        let before = self.script_checkpoints.len();
+        self.script_checkpoints
+            .retain(|_, checkpoint| checkpoint.approval_id != approval_id);
+        self.script_checkpoints.len() != before
+    }
+
     pub(crate) fn observations_after(
         &self,
         task: &TaskId,
@@ -239,6 +278,20 @@ impl AutomationRuntime {
             .filter(|observation| observation.sequence > sequence)
             .map(ComputerObservationSummary::from)
             .collect()
+    }
+
+    fn latest_observation_after(
+        &self,
+        sequence: u64,
+        task: Option<&TaskId>,
+    ) -> Option<ComputerObservation> {
+        self.observations
+            .iter()
+            .rev()
+            .find(|observation| {
+                observation.sequence > sequence && task.is_none_or(|task| observation.task == *task)
+            })
+            .cloned()
     }
 
     pub(crate) const fn pending_batch(&self) -> bool {
@@ -298,6 +351,7 @@ pub fn handle_observer_command(
         }
         ComputerUseObserverCommand::Stop { task } => {
             cancel_pending_batch(state, &task, "computer-use task stopped by observer");
+            drop_script_isolate(state, &task);
             let now_ms = monotonic_ms(state);
             state
                 .computer_use
@@ -305,10 +359,17 @@ pub fn handle_observer_command(
                 .map_err(|error| error.to_string())?;
         }
         ComputerUseObserverCommand::DecideApproval { decision } => {
+            let denied_request = (!decision.approved).then(|| decision.request_id.clone());
             state
                 .computer_use
                 .decide_approval(&decision)
                 .map_err(|error| error.to_string())?;
+            if let Some(request_id) = denied_request {
+                state
+                    .computer_use_automation
+                    .script_checkpoints
+                    .retain(|_, checkpoint| checkpoint.approval_id != request_id);
+            }
         }
     }
     publish_observer_update(state)
@@ -323,6 +384,12 @@ pub fn publish_observer_update(state: &mut Brood) -> Result<(), String> {
     let observations = state
         .computer_use_automation
         .observation_summaries_after(after_observation_sequence);
+    let leased_task = state.computer_use.lease().map(|lease| lease.task.clone());
+    let frame = state
+        .computer_use_automation
+        .latest_observation_after(after_observation_sequence, leased_task.as_ref())
+        .as_ref()
+        .map(ComputerObservationFrame::from);
     let update = ComputerUseObserverUpdate {
         protocol_version: brood_computer_use::COMPUTER_USE_PROTOCOL_VERSION,
         event_cursor: state.computer_use.latest_event_cursor(),
@@ -335,22 +402,40 @@ pub fn publish_observer_update(state: &mut Brood) -> Result<(), String> {
             brood_computer_use::MAX_EVENT_PAGE,
         ),
         observations,
+        frame,
     };
+    const OBSERVER_BODY_TARGET_BYTES: usize = 60 * 1024;
     let encoded = serde_json::to_vec(&update).map_err(|error| error.to_string())?;
-    if state
-        .send_computer_use_observer_message(&recipient, &encoded)
-        .is_err()
-    {
-        state.computer_use_automation.observer_recipient = None;
-        return Ok(());
-    }
-    state.computer_use_automation.observer_event_cursor = update.event_cursor;
-    if let Some(sequence) = update
-        .observations
-        .last()
-        .map(|observation| observation.sequence)
-    {
-        state.computer_use_automation.observer_observation_sequence = sequence;
+    let updates = if encoded.len() > OBSERVER_BODY_TARGET_BYTES && update.frame.is_some() {
+        let mut metadata = update.clone();
+        metadata.observations.clear();
+        metadata.frame = None;
+        let mut image = update;
+        image.events.clear();
+        vec![metadata, image]
+    } else {
+        vec![update]
+    };
+    for update in updates {
+        let encoded = serde_json::to_vec(&update).map_err(|error| error.to_string())?;
+        if let Err(error) = state.send_computer_use_observer_message(&recipient, &encoded) {
+            tracing::warn!(
+                recipient,
+                encoded_bytes = encoded.len(),
+                %error,
+                "computer-use observer update could not be queued"
+            );
+            state.computer_use_automation.observer_recipient = None;
+            return Ok(());
+        }
+        state.computer_use_automation.observer_event_cursor = update.event_cursor;
+        if let Some(sequence) = update
+            .observations
+            .last()
+            .map(|observation| observation.sequence)
+        {
+            state.computer_use_automation.observer_observation_sequence = sequence;
+        }
     }
     Ok(())
 }
@@ -474,6 +559,7 @@ pub fn begin_adapter_action_batch(
         active_action: None,
         response,
         adapter_call_id,
+        script: None,
     });
     tracing::info!(
         task = %audit_task,
@@ -483,6 +569,370 @@ pub fn begin_adapter_action_batch(
         actions = action_count,
         "computer-use batch accepted"
     );
+    schedule_next_action(state, Duration::ZERO, execution_id);
+}
+
+pub fn begin_computer_use_script(
+    state: &mut Brood,
+    request: ComputerScriptRequest,
+    response: BatchResponse,
+) {
+    let now_ms = monotonic_ms(state);
+    if let Err(error) = state.computer_use.validate_script(&request, now_ms) {
+        if error == brood_computer_use::ComputerUseError::ApprovalRequired {
+            let id = state.computer_use_automation.next_approval_id();
+            let approval = brood_computer_use::ComputerApprovalRequest {
+                id: id.clone(),
+                task: request.task.clone(),
+                sequence: request.expected_sequence,
+                kind: brood_computer_use::ApprovalKind::Script,
+                prompt: format!("allow script execution for task {}", request.task.0),
+                created_at_ms: now_ms,
+                expires_at_ms: now_ms.saturating_add(30_000),
+            };
+            let result = state
+                .computer_use
+                .request_approval(approval)
+                .map_err(|approval_error| approval_error.to_string());
+            drop(publish_observer_update(state));
+            drop(response.send(match result {
+                Ok(()) => Err(format!("approval is required: {id}")),
+                Err(error) => Err(error),
+            }));
+            return;
+        }
+        drop(response.send(Err(error.to_string())));
+        return;
+    }
+    if state.computer_use_automation.pending_batch.is_some() {
+        drop(response.send(Err("another computer-use batch is executing".to_string())));
+        return;
+    }
+
+    if let Some(checkpoint) = state
+        .computer_use_automation
+        .script_checkpoints
+        .get(&request.task)
+    {
+        let matches = checkpoint.source == request.source
+            && checkpoint.batch.protocol_version == request.protocol_version
+            && checkpoint.batch.lease_generation == request.lease_generation
+            && checkpoint.batch.expected_sequence == request.expected_sequence;
+        if !matches {
+            drop(response.send(Err(
+                "script retry does not match the pending askUser checkpoint".to_string(),
+            )));
+            return;
+        }
+        if request.approval_proof.as_deref() != Some(checkpoint.approval_id.as_str())
+            || !state.computer_use.approval_proof_valid(
+                request.approval_proof.as_deref(),
+                &request.task,
+                brood_computer_use::ApprovalKind::Script,
+                now_ms,
+            )
+        {
+            drop(response.send(Err(format!(
+                "askUser approval is required: {}",
+                checkpoint.approval_id
+            ))));
+            return;
+        }
+        let Some(mut checkpoint) = state
+            .computer_use_automation
+            .script_checkpoints
+            .remove(&request.task)
+        else {
+            drop(response.send(Err("askUser checkpoint disappeared".to_string())));
+            return;
+        };
+        checkpoint.batch.approval_proof = request.approval_proof;
+        begin_script_action_batch(state, checkpoint.batch, checkpoint.script, response);
+        return;
+    }
+
+    let (limits, lease, windows, active_window) = match state.computer_use.task(&request.task) {
+        Some(task) => {
+            let Some(lease) = state
+                .computer_use
+                .lease()
+                .filter(|lease| lease.task == request.task)
+                .cloned()
+            else {
+                drop(response.send(Err("computer-use lease disappeared".to_string())));
+                return;
+            };
+            let mut windows = state
+                .computer_use_automation
+                .latest()
+                .map(|snapshot| {
+                    snapshot
+                        .windows
+                        .iter()
+                        .filter(|window| {
+                            window.session == lease.session && lease.windows.contains(&window.pane)
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            windows.sort_by_key(|window| window.pane);
+            let active_window = windows.iter().find(|window| window.active).cloned();
+            (task.limits, lease, windows, active_window)
+        }
+        None => {
+            drop(response.send(Err("computer-use task disappeared".to_string())));
+            return;
+        }
+    };
+
+    let execution = (|| -> Result<_, String> {
+        if !state
+            .computer_use_automation
+            .script_isolates
+            .contains_key(&request.task)
+        {
+            let path = computer_use_js_runtime_path();
+            let module = fs::read(&path).map_err(|error| {
+                format!("read computer-use JS runtime {}: {error}", path.display())
+            })?;
+            let isolate = ComputerUseJsIsolate::load(&module, script_runtime_config(limits))
+                .map_err(|error| error.to_string())?;
+            state
+                .computer_use_automation
+                .script_isolates
+                .insert(request.task.clone(), isolate);
+        }
+        let isolate = state
+            .computer_use_automation
+            .script_isolates
+            .get_mut(&request.task)
+            .ok_or_else(|| "computer-use JS isolate disappeared".to_string())?;
+        isolate
+            .set_computer_context(
+                &serde_json::to_value(&windows).map_err(|error| error.to_string())?,
+                &serde_json::to_value(&active_window).map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?;
+        isolate
+            .execute(&request.source)
+            .map_err(|error| error.to_string())
+    })();
+    let execution = match execution {
+        Ok(execution) => execution,
+        Err(error) => {
+            state
+                .computer_use_automation
+                .script_isolates
+                .remove(&request.task);
+            drop(response.send(Err(error)));
+            return;
+        }
+    };
+    let (actions, display_latest_observation, ask_user_prompt) =
+        match script_actions(&execution.plan.calls, limits) {
+            Ok(actions) => actions,
+            Err(error) => {
+                drop(response.send(Err(error)));
+                return;
+            }
+        };
+    let pending_script = PendingScript {
+        console: execution.plan.console,
+        value_json: execution.plan.value_json,
+        exception: execution.plan.exception,
+        metrics: execution.metrics,
+        display_latest_observation,
+    };
+
+    let batch = ComputerActionBatch {
+        protocol_version: request.protocol_version,
+        task: request.task.clone(),
+        lease_generation: request.lease_generation,
+        expected_sequence: request.expected_sequence,
+        target_session: lease.session,
+        target_window: lease.windows.iter().next().copied(),
+        actions: if actions.is_empty() {
+            vec![ComputerAction::Screenshot]
+        } else {
+            actions
+        },
+        approval_proof: request.approval_proof.clone(),
+    };
+    if let Some(prompt) = ask_user_prompt {
+        let id = state.computer_use_automation.next_approval_id();
+        let approval = brood_computer_use::ComputerApprovalRequest {
+            id: id.clone(),
+            task: batch.task.clone(),
+            sequence: batch.expected_sequence,
+            kind: brood_computer_use::ApprovalKind::Script,
+            prompt,
+            created_at_ms: now_ms,
+            expires_at_ms: now_ms.saturating_add(30_000),
+        };
+        if let Err(error) = state.computer_use.request_approval(approval) {
+            drop(response.send(Err(error.to_string())));
+            return;
+        }
+        state.computer_use_automation.script_checkpoints.insert(
+            batch.task.clone(),
+            PendingScriptCheckpoint {
+                approval_id: id.clone(),
+                source: request.source,
+                batch,
+                script: pending_script,
+            },
+        );
+        drop(publish_observer_update(state));
+        drop(response.send(Err(format!("approval is required: {id}"))));
+        return;
+    }
+    begin_script_action_batch(state, batch, pending_script, response);
+}
+
+fn script_runtime_config(limits: ComputerUseLimits) -> ComputerUseJsConfig {
+    let max_output_bytes = usize::try_from(limits.max_output_bytes).unwrap_or(usize::MAX);
+    let max_memory_bytes = usize::try_from(limits.max_script_memory_bytes).unwrap_or(usize::MAX);
+    ComputerUseJsConfig {
+        max_source_bytes: max_output_bytes,
+        max_response_bytes: max_output_bytes,
+        max_memory_bytes,
+        max_host_calls: usize::from(limits.max_queued_host_calls),
+        max_console_lines: max_output_bytes,
+        fuel_per_call: u64::from(limits.max_script_cpu_ms).saturating_mul(10_000),
+        wall_time: Duration::from_millis(u64::from(limits.max_script_wall_ms)),
+        ..ComputerUseJsConfig::default()
+    }
+}
+
+fn computer_use_js_runtime_path() -> PathBuf {
+    std::env::var_os("BROOD_COMPUTER_USE_JS_RUNTIME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(
+                "runtimes/computer-use-js/target/wasm32-wasip1/release/brood_computer_use_js_runtime.wasm",
+            )
+        })
+}
+
+fn script_actions(
+    calls: &[serde_json::Value],
+    limits: ComputerUseLimits,
+) -> Result<(Vec<ComputerAction>, bool, Option<String>), String> {
+    let mut actions = Vec::new();
+    let mut display_latest = false;
+    let mut display_images = 0_u16;
+    let mut ask_user_prompt = None;
+    for call in calls {
+        let kind = call
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "script host call has no kind".to_string())?;
+        match kind {
+            "perform" => {
+                let planned = call
+                    .get("actions")
+                    .and_then(serde_json::Value::as_array)
+                    .ok_or_else(|| "computer.perform requires an action array".to_string())?;
+                for planned_action in planned {
+                    let mut encoded = planned_action.clone();
+                    let object = encoded
+                        .as_object_mut()
+                        .ok_or_else(|| "computer.perform action must be an object".to_string())?;
+                    let kind = object
+                        .remove("kind")
+                        .ok_or_else(|| "computer.perform action has no kind".to_string())?;
+                    object.insert("type".to_string(), kind);
+                    actions.push(
+                        serde_json::from_value(encoded)
+                            .map_err(|error| format!("invalid script action: {error}"))?,
+                    );
+                }
+            }
+            "screenshot" => actions.push(ComputerAction::Screenshot),
+            "display" => {
+                display_images = display_images.saturating_add(1);
+                if display_images > limits.max_display_images {
+                    return Err(format!(
+                        "script displayed more than {} images",
+                        limits.max_display_images
+                    ));
+                }
+                display_latest = true;
+            }
+            "ask_user" => {
+                if ask_user_prompt.is_some() {
+                    return Err("a script may queue only one askUser checkpoint".to_string());
+                }
+                let prompt = call
+                    .get("prompt")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|prompt| !prompt.trim().is_empty())
+                    .ok_or_else(|| "askUser requires a non-empty prompt".to_string())?;
+                ask_user_prompt = Some(prompt.to_string());
+            }
+            other => return Err(format!("unknown script host call {other}")),
+        }
+    }
+    Ok((actions, display_latest, ask_user_prompt))
+}
+
+fn begin_script_action_batch(
+    state: &mut Brood,
+    batch: ComputerActionBatch,
+    script: PendingScript,
+    response: BatchResponse,
+) {
+    let prepared = (|| -> Result<(u64, u64), String> {
+        let now_ms = monotonic_ms(state);
+        state
+            .computer_use
+            .validate_batch(&batch, now_ms)
+            .map_err(|error| error.to_string())?;
+        let target_pane = batch
+            .target_window
+            .or_else(|| {
+                state
+                    .computer_use_automation
+                    .selected_pane(state, batch.target_session)
+            })
+            .ok_or_else(|| "computer-use target window is unavailable".to_string())?;
+        let window = state
+            .presentation_window_for_pane(target_pane)
+            .ok_or_else(|| "computer-use target window disappeared".to_string())?;
+        validate_live_coordinates(&batch, window.geometry().size.w, window.geometry().size.h)?;
+        let sequence = state
+            .computer_use
+            .commit_batch(&batch, now_ms)
+            .map_err(|error| error.to_string())?;
+        Ok((target_pane, sequence))
+    })();
+    let (target_pane, sequence) = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            drop(response.send(Err(error)));
+            return;
+        }
+    };
+    state.computer_use_automation.next_execution_id = state
+        .computer_use_automation
+        .next_execution_id
+        .saturating_add(1)
+        .max(1);
+    let execution_id = state.computer_use_automation.next_execution_id;
+    state.computer_use_automation.pending_batch = Some(PendingBatch {
+        execution_id,
+        batch,
+        sequence,
+        target_pane,
+        next_action: 0,
+        settle_started: None,
+        results: Vec::new(),
+        active_action: None,
+        response,
+        adapter_call_id: None,
+        script: Some(script),
+    });
     schedule_next_action(state, Duration::ZERO, execution_id);
 }
 
@@ -996,12 +1446,38 @@ fn finish_settled_batch(state: &mut Brood, quiet: Duration, timed_out: bool) {
         }
     };
     cleanup_held_input(state);
-    let payload = serde_json::json!({
-        "call_id": pending.adapter_call_id,
-        "sequence": pending.sequence,
-        "results": pending.results,
-        "observation": snapshot,
-    });
+    let payload = if let Some(script) = pending.script {
+        let displayed_pngs = if script.display_latest_observation {
+            snapshot
+                .as_ref()
+                .map(|observation| vec![observation.png.clone()])
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        serde_json::to_value(ComputerScriptResult {
+            task: pending.batch.task.clone(),
+            sequence: pending.sequence,
+            console: script.console,
+            displayed_pngs,
+            value_json: script.value_json,
+            exception: script.exception,
+            metrics: ComputerScriptMetrics {
+                wall_ms: script.metrics.wall_ms,
+                cpu_ms: u32::try_from(script.metrics.fuel_consumed / 10_000).unwrap_or(u32::MAX),
+                peak_memory_bytes: script.metrics.memory_bytes,
+                host_calls: script.metrics.host_calls,
+            },
+        })
+        .unwrap_or_else(|error| serde_json::json!({ "error": error.to_string() }))
+    } else {
+        serde_json::json!({
+            "call_id": pending.adapter_call_id,
+            "sequence": pending.sequence,
+            "results": pending.results,
+            "observation": snapshot,
+        })
+    };
     tracing::info!(
         task = %pending.batch.task.0,
         sequence = pending.sequence,
@@ -1067,17 +1543,36 @@ pub fn cleanup_held_input(state: &mut Brood) {
     }
 }
 
+pub fn drop_script_isolate(state: &mut Brood, task: &TaskId) -> bool {
+    let isolate = state
+        .computer_use_automation
+        .script_isolates
+        .remove(task)
+        .is_some();
+    let checkpoint = state
+        .computer_use_automation
+        .script_checkpoints
+        .remove(task)
+        .is_some();
+    isolate || checkpoint
+}
+
 pub fn cancel_pending_batch(state: &mut Brood, task: &TaskId, detail: &str) -> bool {
+    let checkpoint_cancelled = state
+        .computer_use_automation
+        .script_checkpoints
+        .remove(task)
+        .is_some();
     if state
         .computer_use_automation
         .pending_batch
         .as_ref()
         .is_none_or(|pending| pending.batch.task != *task)
     {
-        return false;
+        return checkpoint_cancelled;
     }
     let Some(mut pending) = state.computer_use_automation.pending_batch.take() else {
-        return false;
+        return checkpoint_cancelled;
     };
     pending.results.push(ComputerActionResult {
         task: pending.batch.task.clone(),

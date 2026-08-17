@@ -111,6 +111,8 @@ let
   ];
 
   wasmTools = [ pkgs.wasm-tools ];
+  wasi32Cc = pkgs.pkgsCross.wasi32.stdenv.cc;
+  wasi32Binutils = wasi32Cc.bintools;
 
   smokeTools = [
     pkgs.dbus
@@ -144,6 +146,8 @@ in
     sessionSwitcherPython
     smokeTools
     wasmTools
+    wasi32Binutils
+    wasi32Cc
     westonWithSimpleClients
     ;
 

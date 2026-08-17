@@ -15,10 +15,12 @@ work only when there is code and proportionate verification evidence.
 - Worktree: `/home/sargo/projects/brood-computer-use`
 - Branch: `codex/computer-use-plan`
 - Baseline: `147c83eb54a740479b136395e4d88222f9e744a4`
-- Current milestone: Phase 4, persistent code execution
-- Implementation status: Phase 3 server orchestration, approval checkpoints,
-  Codex and MCP adapters, and replacement presentation observation are
-  implemented and proven with a real nested Qt workload
+- Current milestone: Phase 5, semantic scripting
+- Implementation status: Phase 4 is complete. A packaged, capability-empty
+  QuickJS/WASM isolate executes persistent scripts through the authoritative
+  server action path, including observer-visible approval checkpoints and
+  bounded queued-call teardown. The presentation client can spectate changing
+  server observations without gaining automation-layout authority.
 
 Checklist meanings:
 
@@ -103,16 +105,24 @@ client disconnected, and a replacement client can observe its state.
 
 ## Phase 4: Persistent code execution
 
-- [ ] Select and package the QuickJS-in-WASM runtime.
-- [ ] Add one persistent isolate per computer-use task.
-- [ ] Expose `computer`, `display`, `console`, and `askUser` globals.
-- [ ] Marshal all host calls through typed task commands.
-- [ ] Preserve variables and helper functions across `exec_js` calls.
-- [ ] Return console output, images, values, exceptions, and metrics.
-- [ ] Enforce CPU, wall-time, memory, output, image, and host-call limits.
-- [ ] Deny ambient filesystem, network, process, DBus, and host-desktop access.
-- [ ] Cancel queued calls and destroy the isolate when its task ends.
-- [ ] Compare scripted and direct-action throughput on the same workload.
+- [x] Select and package the QuickJS-in-WASM runtime.
+- [x] Add one persistent isolate per computer-use task.
+- [x] Expose `computer`, `display`, `console`, and `askUser` globals.
+- [x] Marshal all host calls through typed task commands.
+- [x] Preserve variables and helper functions across `exec_js` calls.
+- [x] Return console output, images, values, exceptions, and metrics.
+- [x] Enforce CPU, wall-time, memory, output, image, and host-call limits.
+- [x] Deny ambient filesystem, network, process, DBus, and host-desktop access.
+- [x] Cancel queued calls and destroy the isolate when its task ends.
+- [x] Compare scripted and direct-action throughput on the same workload.
+
+`computer`, `display`, and `console` are live, including task-scoped metadata
+from `computer.windows()` and `computer.activeWindow()`. `askUser` creates a
+typed observer-visible approval checkpoint; an exact scoped proof resumes the
+already-evaluated plan without repeating guest side effects. Denial and task
+stop remove pending checkpoints, approvals, isolates, and held input. Every
+task limit configures the host isolate or typed-call plan and has a distinct
+nested rejection proof.
 
 Phase gate: a persistent script completes and verifies a long GUI sequence,
 while adversarial scripts demonstrate every denied capability and limit.
@@ -150,7 +160,7 @@ resource exhaustion, and remote authorization.
 | Item | Resolve by | Notes |
 | --- | --- | --- |
 | Automation window layout beyond one active window | Phase 1 | Keep coordinates deterministic; do not inherit client layout. |
-| QuickJS distribution and Wasmtime integration | Phase 4 | Prefer the existing capability-oriented WASM boundary. |
+| QuickJS distribution and Wasmtime integration | Resolved | Package `rquickjs`/QuickJS-NG as a `wasm32-wasip1` core module and instantiate it through Wasmtime with an empty WASI context and bounded typed host-call plans. |
 | AT-SPI bus ownership inside session environments | Phase 5 | Must not expose unrelated host or session applications. |
 | Chromium target-to-managed-window binding | Phase 5 | Identity must be proven, not inferred from titles. |
 | Human input pause versus immediate revoke defaults | Resolved | Default to pause; revoke remains an explicit task policy. Both revoke the daemon-wide lease before forwarding primary human input. |
@@ -181,10 +191,25 @@ design or test workload.
 | 2026-08-17 | 3 | working tree | Detached SpeedCrunch through the Codex call envelope, DBus observer replacement | `/tmp/brood-computer-use-phase3-a/proof.md`; event cursor 44; action sequences 1-7; three approved keyboard checkpoints; observation sequences 7-8 | Partial pass: daemon-owned history, approvals, and replacement polling worked; the presentation observer still used only the diagnostic DBus surface |
 | 2026-08-17 | 3 | working tree | Replacement presentation actor observer, first attempts | `/tmp/brood-computer-use-phase3-b` and `-c`; typed client update arrived with the running task and two observations | Failed gate assertion: retained Phase 2 audit tasks invalidated a total-task-count assumption, then replacement primary input correctly paused the task before the diagnostic snapshot |
 | 2026-08-17 | 3 | working tree | Detached SpeedCrunch Codex loop, replacement presentation observer, and MCP screenshot | `/tmp/brood-computer-use-phase3-e/proof.md`; pause/resume lease generations 7-8; event cursor 48 before replacement; action sequences 1-7 and observations 7-8 detached; replacement client received running sequence 8, then human input paused it; MCP resumed and completed screenshot sequence 8, observation sequence 9, event cursor 53; assembled package `/nix/store/yzy53qh7gq8b4rvhynjm1nm5pg6qc2mb-brood` contains `brood-computer-use-mcp` | Passed: a real Qt task completed through the Codex adapter with no presentation client, server-owned approvals were decided without interleaving, replacement presentation received the preserved state, and the stdio MCP adapter executed the same authoritative action path; the same adapter binary is present in the assembled package |
+| 2026-08-17 | 4 | `5269a4c` plus working tree | First packaged persistent-script placement attempts | `/tmp/brood-computer-use-phase4-a` through `-c`; presentation detach did not complete, then attached-client geometry changed SpeedCrunch to 400x600, then restoring 1440x900 exposed an old-buffer GL upload mismatch | Failed: script execution moved before presentation attachment so automation geometry remains server-owned and detached |
+| 2026-08-17 | 4 | `5269a4c` plus working tree | Detached persistent SpeedCrunch script, early gate attempts | `/tmp/brood-computer-use-phase4-d` and `-e`; script sequence 1 completed 11 actions and sequence 2 preserved the global, but retained observations displaced Phase 3 evidence and then exact queue-length assertions rejected the new bounded depth | Failed: raised the bounded observation queue to eight and changed the proof to assert the documented range rather than an exact incidental length |
+| 2026-08-17 | 4 | `5269a4c` plus working tree | Packaged detached persistent SpeedCrunch script | `/tmp/brood-computer-use-phase4-f2/proof.md`; packaged runtime and daemon; ten planned GUI actions plus screenshot; persistent value 2; displayed 1440x900 PNG | Partial pass: the long real GUI sequence and packaging passed before ambient-authority and runaway-script checks were added |
+| 2026-08-17 | 4 | `5269a4c` plus working tree | Live runaway script and capability denial, first attempt | `/tmp/brood-computer-use-phase4-g`; all three successful script sequences completed and the runaway trapped, but the assertion expected a fuel/epoch keyword absent from Wasmtime's propagated WASM backtrace | Failed proof assertion: require the execution trap plus a measured bounded return instead of backend-specific wording |
+| 2026-08-17 | 4 | `5269a4c` plus working tree | Full packaged retry after assertion fix | `/tmp/brood-computer-use-phase4-h`; SHM changed but the two early DMA-BUF captures happened to match | Failed before Phase 4: retained as cadence evidence; immediate retry used the same package and workload |
+| 2026-08-17 | 4 | `5269a4c` plus working tree | Detached persistent SpeedCrunch script with adversarial capability probes | `/tmp/brood-computer-use-phase4-j/proof.md`; package `/nix/store/672yi6f1q75sq4m4c1g3x45iady1nbw9-brood` contains `runtimes/computer-use-js.wasm`; script performed the three calculations and displayed a 1440x900 PNG; persistent value 2; filesystem, network, process, DBus, and host-desktop globals all `undefined`; runaway trapped in 45 ms; scripted round trip 1314 ms versus 2161 ms direct | Partial pass: packaged persistent execution, real GUI actions, persistence, ambient denial, CPU bounding, and throughput comparison pass; `askUser`, live window context, exhaustive limit attacks, and termination proof remain before the phase gate |
+| 2026-08-17 | 4 | `5269a4c` plus working tree | Live managed-window context, first packaged attempt | `/tmp/brood-computer-use-phase4-k`; script reached context setup after all direct SpeedCrunch actions | Failed: QuickJS-NG does not provide browser `structuredClone`; the JSON-only metadata boundary now uses an internal JSON clone |
+| 2026-08-17 | 4 | `5269a4c` plus working tree | Development-binary context and limit retries | `/tmp/brood-computer-use-phase4-l` through `-n`; task-scoped window context and all six limit attacks passed in `-m`; local presentation actor availability and immediate human input caused unrelated earlier/later failures | Failed full gate: retained the successful Phase 4 artifacts, then returned to the assembled package path |
+| 2026-08-17 | 4 | `5269a4c` plus working tree | Final-package retries with expanded limit tasks | `/tmp/brood-computer-use-phase4-o` through `-q`; first DMA-BUF samples matched in `-o`; placing six retained limit tasks before replacement observation caused presentation churn in `-p`; `-q` passed observer and MCP checks but waited on stale attached status after killing the replacement client | Failed proof ordering and stale-status assertions: moved limit attacks after replacement-client verification and require process termination rather than immediate diagnostic detachment |
+| 2026-08-17 | 4 | `5269a4c` plus working tree | Packaged persistent SpeedCrunch script, live context, every limit, and teardown | `/tmp/brood-computer-use-phase4-s/proof.md`; exact current-tree package `/nix/store/4krnxf3q8is7fd8j2h02d4vfv628sjpn-brood`; packaged runtime 1,221,568 bytes; script round trip 1296 ms versus 1948 ms direct; pane 5 `org.speedcrunch.` context at 1440x900; persistent value 2; one displayed 1440x900 PNG; isolate count 1 before stop and 0 after; CPU, wall, memory, output, image, and host-call attacks rejected in 146-172 ms; all ambient globals unavailable | Partial pass: the documented persistent-execution exit criterion and every resource-limit attack pass from the assembled package; only `askUser` checkpoint handling and concurrent queued-call cancellation remain unchecked Phase 4 items |
+| 2026-08-17 | 4 | `5269a4c` plus working tree | First spectator and checkpoint package attempts | `/tmp/brood-computer-use-phase4-t` and `-u`; the presentation requested 480x566 before it could spectate, and the combined JSON update exceeded the 16 KiB local actor record | Failed: retained as evidence for enforcing automation-owned resize rejection at the server boundary and splitting compact observer state from its newest frame |
+| 2026-08-17 | 4 | `5269a4c` plus working tree | Development spectator visual review | `/tmp/brood-computer-use-phase4-z/proof.md` passed its assertions, but `automation-spectator.png` was vertically inverted | Failed visual acceptance: added explicit scanline orientation normalization plus a top-versus-bottom raster assertion; the static harness result alone was insufficient |
+| 2026-08-17 | 4 | `5269a4c` plus working tree | Packaged persistent scripts, checkpoints, cancellation, and live spectator | `/tmp/brood-computer-use-phase4-ae/proof.md`; package `/nix/store/fc69m27nb0ynf4sx3vmrmyq6vczlpl3j-brood`; upright `automation-spectator.png` at 800x600; attached action sequence 8 advanced the observation while the server viewport remained 1440x900; MCP sequence 9 advanced the task to 10; `askUser` resumed with `askRuns=1`; denial and stop reduced checkpoint count from 1 to 0 with zero held keys/buttons | Passed: the presentation displays changing automation output without layout authority, and all remaining Phase 4 interactive-checkpoint and queued-call lifecycle items have packaged nested evidence |
 
 ## Immediate next actions
 
-1. Select and package the QuickJS-in-WASM runtime.
-2. Add one persistent isolate per computer-use task.
-3. Marshal typed host calls through the existing action executor.
-4. Prove persistence and every ambient-authority denial with a real workload.
+1. Begin Phase 5 by discovering AT-SPI providers for the authorized managed
+   SpeedCrunch window without exposing host accessibility state.
+2. Define revisioned semantic snapshots and stale-node rejection alongside the
+   existing visual observation sequence.
+3. Keep the spectator non-authoritative while adding explicit approval, pause,
+   stop, and takeover controls in the later product-UX phase.
