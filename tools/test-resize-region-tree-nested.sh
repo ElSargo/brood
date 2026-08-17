@@ -7,6 +7,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+. "$ROOT/tools/smoke-lib.sh"
 
 for tool in cargo cc grim jq magick pkg-config python3 rg swaymsg; do
   command -v "$tool" > /dev/null 2>&1 || {
@@ -50,19 +51,8 @@ cleanup() {
     && kill -0 "$POINTER_PID" 2> /dev/null; then
     printf 'quit\n' >&"$POINTER_WRITE_FD"
   fi
-  if [[ -n "$POINTER_PID" ]]; then
-    kill "$POINTER_PID" > /dev/null 2>&1 || true
-    wait "$POINTER_PID" > /dev/null 2>&1 || true
-  fi
-  if [[ -n "$CLIENT_PID" ]] && kill -0 "$CLIENT_PID" 2> /dev/null; then
-    kill "$CLIENT_PID" > /dev/null 2>&1 || true
-    for _ in $(seq 1 80); do
-      kill -0 "$CLIENT_PID" 2> /dev/null || break
-      sleep 0.025
-    done
-    kill -KILL "$CLIENT_PID" > /dev/null 2>&1 || true
-    wait "$CLIENT_PID" > /dev/null 2>&1 || true
-  fi
+  terminate_process_bounded "$POINTER_PID"
+  terminate_process_bounded "$CLIENT_PID" 80
   if ((result != 0)); then
     {
       echo "resize_region_tree_proof=failed"

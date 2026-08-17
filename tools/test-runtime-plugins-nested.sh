@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+. "$ROOT/tools/smoke-lib.sh"
 
 if [[ -z "${BROOD_RUNTIME_PLUGIN_PACKAGE:-}" ]]; then
   echo "ERR invoke this lane through 'brood test nested' with BROOD_RUNTIME_PLUGIN_ONLY=1" >&2
@@ -80,11 +81,8 @@ PEER_PID=""
 cleanup() {
   local result=$?
   set +e
-  [[ -n "$PEER_PID" ]] && kill "$PEER_PID" > /dev/null 2>&1
-  if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2> /dev/null; then
-    kill "$SERVER_PID" > /dev/null 2>&1
-    wait "$SERVER_PID" > /dev/null 2>&1
-  fi
+  terminate_process_bounded "$PEER_PID"
+  terminate_process_bounded "$SERVER_PID"
   if ((result != 0)); then
     echo "server_log=$SERVER_LOG" >&2
     tail -n 200 "$SERVER_LOG" >&2 || true

@@ -16,9 +16,8 @@ LOG="$TMPDIR/broodd.log"
 cleanup() {
   if [[ -n "${PID:-}" ]] && kill -0 "$PID" 2> /dev/null; then
     target/debug/brood ctl --dbus-name "$DBUS_NAME" quit > /dev/null 2>&1 || true
-    sleep 0.5
-    kill "$PID" > /dev/null 2>&1 || true
   fi
+  terminate_process_bounded "${PID:-}" 20 0.025
 }
 trap cleanup EXIT
 

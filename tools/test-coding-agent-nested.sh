@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+. "$ROOT/tools/smoke-lib.sh"
 SSH_TARGET="${BROOD_CODING_AGENT_SSH_TARGET:-}"
 REMOTE_IMAGE_MARKER="REMOTE_IMAGE_PROOF: red green"
 
@@ -38,12 +39,10 @@ DRAG_PID=""
 cleanup() {
   local result=$?
   set +e
-  for pid in "$DRAG_PID" "$CLIENT_PID" "$SERVER_PID" "$COMPOSITOR_PID"; do
-    if [[ -n "$pid" ]] && kill -0 "$pid" 2> /dev/null; then
-      kill "$pid" > /dev/null 2>&1
-      wait "$pid" > /dev/null 2>&1
-    fi
-  done
+  terminate_process_bounded "$DRAG_PID"
+  terminate_process_bounded "$CLIENT_PID"
+  terminate_process_bounded "$SERVER_PID"
+  terminate_process_bounded "$COMPOSITOR_PID"
   if ((result != 0)); then
     echo "client_log=$CLIENT_LOG" >&2
     tail -n 240 "$CLIENT_LOG" >&2

@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+. "$ROOT/tools/smoke-lib.sh"
 
 if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
   exec dbus-run-session -- "$0" "$@"
@@ -65,12 +66,9 @@ COMPOSITOR_PID=""
 cleanup() {
   local result=$?
   set +e
-  for pid in "$CLIENT_PID" "$SERVER_PID" "$COMPOSITOR_PID"; do
-    if [[ -n "$pid" ]] && kill -0 "$pid" 2> /dev/null; then
-      kill "$pid" > /dev/null 2>&1
-      wait "$pid" > /dev/null 2>&1
-    fi
-  done
+  terminate_process_bounded "$CLIENT_PID"
+  terminate_process_bounded "$SERVER_PID"
+  terminate_process_bounded "$COMPOSITOR_PID"
   rm -rf -- "$RUNTIME_DIR"
   if ((result != 0)); then
     echo "client_before_log=$CLIENT1_LOG" >&2

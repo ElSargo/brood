@@ -1,5 +1,41 @@
 #!/usr/bin/env bash
 
+# Stop a background process without allowing test cleanup to hang forever.
+# The PID is validated before it is passed to kill so cleanup callers can use
+# unset/empty process variables safely under `set -u`.
+terminate_process_bounded() {
+  local pid="${1:-}"
+  local attempts="${2:-40}"
+  local delay="${3:-0.025}"
+
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 0
+  kill -0 "$pid" 2> /dev/null || {
+    wait "$pid" > /dev/null 2>&1 || true
+    return 0
+  }
+
+  kill -TERM "$pid" > /dev/null 2>&1 || true
+  local attempt
+  for ((attempt = 0; attempt < attempts; attempt += 1)); do
+    kill -0 "$pid" 2> /dev/null || break
+    [[ "$(ps -o stat= -p "$pid" 2> /dev/null)" == Z* ]] && break
+    sleep "$delay"
+  done
+  if kill -0 "$pid" 2> /dev/null \
+    && [[ "$(ps -o stat= -p "$pid" 2> /dev/null)" != Z* ]]; then
+    kill -KILL "$pid" > /dev/null 2>&1 || true
+    for ((attempt = 0; attempt < attempts; attempt += 1)); do
+      kill -0 "$pid" 2> /dev/null || break
+      [[ "$(ps -o stat= -p "$pid" 2> /dev/null)" == Z* ]] && break
+      sleep "$delay"
+    done
+  fi
+  if ! kill -0 "$pid" 2> /dev/null \
+    || [[ "$(ps -o stat= -p "$pid" 2> /dev/null)" == Z* ]]; then
+    wait "$pid" > /dev/null 2>&1 || true
+  fi
+}
+
 describe_host_presentation_environment() {
   local wayland_socket=""
   local display_number=""

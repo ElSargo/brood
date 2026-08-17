@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+. "$ROOT/tools/smoke-lib.sh"
 
 if (($# == 0)); then
   echo "usage: test-ssh-multi-backend.sh USER@HOST [--connect-host HOST]" >&2
@@ -128,25 +129,12 @@ cleanup() {
   fi
   if [[ -n "$DEPLOY_PID" ]] && kill -0 "$DEPLOY_PID" 2>/dev/null; then
     stop_remote_fallback
-    kill "$DEPLOY_PID" >/dev/null 2>&1 || true
-    wait "$DEPLOY_PID" >/dev/null 2>&1 || true
   fi
-  if [[ -n "$COMPOSITOR_PID" ]] && kill -0 "$COMPOSITOR_PID" 2>/dev/null; then
-    kill "$COMPOSITOR_PID" >/dev/null 2>&1 || true
-    wait "$COMPOSITOR_PID" >/dev/null 2>&1 || true
-  fi
-  if [[ -n "$PROFILE_PERF_PID" ]] && kill -0 "$PROFILE_PERF_PID" 2>/dev/null; then
-    kill "$PROFILE_PERF_PID" >/dev/null 2>&1 || true
-    wait "$PROFILE_PERF_PID" >/dev/null 2>&1 || true
-  fi
-  if [[ -n "$PROFILE_RECORD_PID" ]] && kill -0 "$PROFILE_RECORD_PID" 2>/dev/null; then
-    kill "$PROFILE_RECORD_PID" >/dev/null 2>&1 || true
-    wait "$PROFILE_RECORD_PID" >/dev/null 2>&1 || true
-  fi
-  if [[ -n "$PROFILE_PING_PID" ]] && kill -0 "$PROFILE_PING_PID" 2>/dev/null; then
-    kill "$PROFILE_PING_PID" >/dev/null 2>&1 || true
-    wait "$PROFILE_PING_PID" >/dev/null 2>&1 || true
-  fi
+  terminate_process_bounded "$DEPLOY_PID"
+  terminate_process_bounded "$COMPOSITOR_PID"
+  terminate_process_bounded "$PROFILE_PERF_PID"
+  terminate_process_bounded "$PROFILE_RECORD_PID"
+  terminate_process_bounded "$PROFILE_PING_PID"
   if ((result != 0)); then
     echo "deploy_log=$DEPLOY_LOG" >&2
     tail -n 240 "$DEPLOY_LOG" >&2 || true

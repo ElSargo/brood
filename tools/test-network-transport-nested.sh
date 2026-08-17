@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+. "$ROOT/tools/smoke-lib.sh"
 
 if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
   exec dbus-run-session -- "$0" "$@"
@@ -60,11 +61,9 @@ cargo run --quiet -p brood-wasm --example componentize -- \
 cleanup() {
   local result=$?
 
-  for pid in "${PROBE_PID:-}" "${RELAY_PID:-}" "${SERVER_PID:-}"; do
-    if [[ -n "$pid" ]] && kill -0 "$pid" 2> /dev/null; then
-      kill "$pid" > /dev/null 2>&1 || true
-    fi
-  done
+  terminate_process_bounded "${PROBE_PID:-}"
+  terminate_process_bounded "${RELAY_PID:-}"
+  terminate_process_bounded "${SERVER_PID:-}"
 
   if ((result != 0)); then
     echo "probe_log=$PROBE_LOG" >&2

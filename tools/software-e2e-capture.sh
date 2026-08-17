@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+TOOL_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$TOOL_ROOT/tools/smoke-lib.sh"
+
 usage() {
   echo "usage: software-e2e-capture.sh --out-dir DIR [--brood-bin PATH] [--client-bin PATH]" >&2
 }
@@ -85,15 +88,10 @@ COMPOSITOR_PID=""
 cleanup() {
   local result=$?
   set +e
-  for pid in "$CLIENT_PID" "$SERVER_PID" "$COMPOSITOR_PID"; do
-    if [[ -n "$pid" ]] && kill -0 "$pid" 2> /dev/null; then
-      kill "$pid" > /dev/null 2>&1
-      wait "$pid" > /dev/null 2>&1
-    fi
-  done
-  if [[ -n "$DBUS_SESSION_BUS_PID" ]]; then
-    kill "$DBUS_SESSION_BUS_PID" > /dev/null 2>&1
-  fi
+  terminate_process_bounded "$CLIENT_PID"
+  terminate_process_bounded "$SERVER_PID"
+  terminate_process_bounded "$COMPOSITOR_PID"
+  terminate_process_bounded "$DBUS_SESSION_BUS_PID"
   if ((result != 0)); then
     tail -n 160 "$CLIENT_LOG" >&2
     tail -n 120 "$SERVER_LOG" >&2
