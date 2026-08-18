@@ -1378,7 +1378,8 @@ impl PresentationWasmRuntime {
             if let Err(error) = self.executor.block_on(actor.actor.shutdown())
                 && first_error.is_none()
             {
-                first_error = Some(error);
+                first_error =
+                    Some(error.context(format!("shut down presentation actor {actor_id:?}")));
             }
         }
 

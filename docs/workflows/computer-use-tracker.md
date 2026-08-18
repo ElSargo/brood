@@ -15,12 +15,14 @@ work only when there is code and proportionate verification evidence.
 - Worktree: `/home/sargo/projects/brood-computer-use`
 - Branch: `codex/computer-use-plan`
 - Baseline: `147c83eb54a740479b136395e4d88222f9e744a4`
-- Current milestone: Phase 5, semantic scripting
+- Current milestone: Built-in agent integration complete; Phase 5 semantic scripting next
 - Implementation status: Phase 4 is complete. A packaged, capability-empty
   QuickJS/WASM isolate executes persistent scripts through the authoritative
   server action path, including observer-visible approval checkpoints and
   bounded queued-call teardown. The presentation client can spectate changing
-  server observations without gaining automation-layout authority.
+  server observations without gaining automation-layout authority. Built-in
+  session agent turns now receive computer use automatically and have completed
+  a real, visually verified SpeedCrunch workload through that path.
 
 Checklist meanings:
 
@@ -127,6 +129,22 @@ nested rejection proof.
 Phase gate: a persistent script completes and verifies a long GUI sequence,
 while adversarial scripts demonstrate every denied capability and limit.
 
+## Built-in agent integration
+
+- [x] Configure every built-in Codex turn with the required computer-use MCP server.
+- [x] Bind the adapter to the pane's surface session and stable agent principal.
+- [x] Forward only the Brood control environment required by the MCP subprocess.
+- [x] Reject cross-session tasks and operations at the adapter and live server boundary.
+- [x] Return observation PNGs as MCP image content instead of JSON byte arrays.
+- [x] Stop adapter-owned tasks on orderly turn teardown and retain daemon lease expiry.
+- [x] Launch requested GUI applications through the bound session and wait for a managed window.
+- [x] Prove the real picker, agent pane, model, MCP, compositor input, and capture path.
+
+Integration gate: a user opens the built-in agent pane normally and asks it to
+operate an application in that session without manual MCP configuration. The
+model must inspect changing server screenshots, produce an application-visible
+result, stop its task, and release the daemon-wide lease.
+
 ## Phase 5: Semantic scripting
 
 - [ ] Discover and scope AT-SPI providers for managed native applications.
@@ -204,6 +222,13 @@ design or test workload.
 | 2026-08-17 | 4 | `5269a4c` plus working tree | First spectator and checkpoint package attempts | `/tmp/brood-computer-use-phase4-t` and `-u`; the presentation requested 480x566 before it could spectate, and the combined JSON update exceeded the 16 KiB local actor record | Failed: retained as evidence for enforcing automation-owned resize rejection at the server boundary and splitting compact observer state from its newest frame |
 | 2026-08-17 | 4 | `5269a4c` plus working tree | Development spectator visual review | `/tmp/brood-computer-use-phase4-z/proof.md` passed its assertions, but `automation-spectator.png` was vertically inverted | Failed visual acceptance: added explicit scanline orientation normalization plus a top-versus-bottom raster assertion; the static harness result alone was insufficient |
 | 2026-08-17 | 4 | `5269a4c` plus working tree | Packaged persistent scripts, checkpoints, cancellation, and live spectator | `/tmp/brood-computer-use-phase4-ae/proof.md`; package `/nix/store/fc69m27nb0ynf4sx3vmrmyq6vczlpl3j-brood`; upright `automation-spectator.png` at 800x600; attached action sequence 8 advanced the observation while the server viewport remained 1440x900; MCP sequence 9 advanced the task to 10; `askUser` resumed with `askRuns=1`; denial and stop reduced checkpoint count from 1 to 0 with zero held keys/buttons | Passed: the presentation displays changing automation output without layout authority, and all remaining Phase 4 interactive-checkpoint and queued-call lifecycle items have packaged nested evidence |
+| 2026-08-18 | Agent integration | `c6d17ba` plus working tree | First built-in pane attempts against SpeedCrunch | `/tmp/brood-computer-use-builtin-agent-a` through `-n`; missing terminal UI artifact, picker launch timing, a rejected debug-sender experiment, binary-log matching, and unforwarded MCP control environment were isolated in sequence | Failed gate attempts: the proof now installs the complete default workspace, uses the real Ctrl+Alt+A key policy after committed layout, treats logs as binary-safe, and forwards only the named Brood environment variables through Codex MCP configuration |
+| 2026-08-18 | Agent integration | `c6d17ba` plus working tree | Built-in Codex pane drives real SpeedCrunch | `/tmp/brood-computer-use-builtin-agent-t/proof.md`; task `coding-agent-1-computer-2677515-1`; session 1, pane 1, principal `coding-agent-1`; task next sequence 3; observation sequences 1-2; settle frames 93-94; settle input sequences 8-54; changing 1440x900 PNGs; visible bounds 480x686; final result `82822551`; lease released | Passed: the normal picker and agent pane required no user MCP setup; Codex used MCP image observations and server-side keyboard actions, visually verified the calculator result, stopped its scoped task, and left presentation geometry non-authoritative |
+| 2026-08-18 | Agent integration | `c6d17ba` plus working tree | Built-in Codex starts from an empty application session | Live task `coding-agent-1-computer-2777481-1`; session status had zero managed windows and zero hosted children; the task paused before its first action and later expired | Failed: the earlier gate pre-launched SpeedCrunch in its harness, while the real adapter had no session-scoped application-launch tool |
+| 2026-08-18 | Agent integration | `c6d17ba` plus working tree | Empty-session launch proof retries | `/tmp/brood-computer-use-builtin-agent-launch-a` through `-d`; the empty workspace had one initial layout commit, then picker-hide was rejected when agent-pane creation advanced inventory and the durable picker snapshot repeatedly reclaimed focus | Failed before the model turn: removed the pre-launch-dependent harness assumptions and preserved pending overlay state across stale-inventory rejection |
+| 2026-08-18 | Agent integration | `c6d17ba` plus working tree | Built-in Codex launches and drives SpeedCrunch from an empty session | `/tmp/brood-computer-use-builtin-agent-launch-e/proof.md`; daemon spawned `speedcrunch` as pane 1 in session 1; task `coding-agent-1-computer-2803055-1`; sequences 1-3; frames 24-26; final result `82822551`; stopped with lease released; assembled package `/nix/store/8bfjs9s8aq6gp5hmdj11yf4xwnrwvbfm-brood` exposes `computer_launch` | Passed: the model used the session-bound launch tool, waited for a managed window, targeted that pane, visually verified the calculation from changing 1440x900 observations, and completed without shell or host-desktop access |
+| 2026-08-18 | Agent integration | working tree | Live presentation shutdown after an empty-session start | Client teardown returned `stop presentation WASM runtime: session actor address is invalid` after the session and observer reached an otherwise idle state | Failed: a queued guest command could lose a validation race with explicit component shutdown and turn orderly presentation teardown into a process error |
+| 2026-08-18 | Agent integration | working tree | Built-in agent automation followed by compositor-driven presentation close | `/tmp/brood-computer-use-builtin-agent-shutdown-b/proof.md`; task `coding-agent-1-computer-2897948-1`; observations 1-2; frames 27-28; `presentation-close.json` reports success; client exited zero after reporting final graphics and input diagnostics; assembled package `/nix/store/r1d1c3994yfffx9y6z5ww22hfpc7h7v6-brood` | Passed: explicit component teardown suppresses only errors produced after shutdown was requested, while live dispatcher errors remain fatal; the real window-close path is clean |
 
 ## Immediate next actions
 

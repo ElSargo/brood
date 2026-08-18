@@ -212,6 +212,33 @@ authority of its own. Presentation observers use the bounded actor-message
 lane and cursor-addressed updates, so disconnecting one observer never removes
 task history or observations from the daemon.
 
+## Built-in agent integration
+
+Every Codex turn launched from a built-in, session-scoped coding-agent pane
+receives a required `brood_computer_use` stdio MCP server automatically. The
+pane supplies the current surface-session identity and stable agent identity;
+the adapter injects those values into task creation, forwards only the Brood
+control environment that Codex needs to reach that daemon, and rejects tasks
+or actions that attempt to cross the bound session. Users do not configure an
+MCP server or copy task, lease, or session identifiers into their prompt.
+
+The server's MCP initialization instructions explain the observe-act-observe
+workflow and lease sequencing. Observation PNGs are returned as MCP image
+content, with compact metadata as text, so the model can inspect the hosted
+application directly. A session-bound adapter can also request that the daemon
+launch a GUI application through the normal hosted-child path. The request has
+no shell interpretation, is bound to the pane's session, and does not succeed
+until the child creates a managed window; an early exit is returned as a tool
+error. This lets an agent start from an empty session without acquiring host
+desktop authority. The adapter owns only tasks created during that turn and
+stops them when its input closes; the daemon remains authoritative for leases,
+scope validation, approvals, human-input policy, and eventual expiry.
+
+The coding-agent UI is still a client-local presentation pane. It can display
+the conversation and spectate automation, but it is not part of the visual
+computer, cannot assign automation geometry, and never grants access to the
+host desktop or another Brood session.
+
 ## Implementation plan
 
 ### Phase 0: Freeze the contract

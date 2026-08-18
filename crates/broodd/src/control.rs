@@ -3588,6 +3588,37 @@ fn execute_tokens(tokens: &[String], state: &mut Brood) -> Result<String> {
                 }
                 "OK computer-use approval decided\n".to_string()
             }
+            [subcommand, task, request_id, approved, principal]
+                if subcommand == "approve-for-task" =>
+            {
+                let task = brood_computer_use::TaskId(task.clone());
+                let request = state
+                    .computer_use
+                    .pending_approvals(Some(&task))
+                    .into_iter()
+                    .find(|request| request.id == *request_id)
+                    .context("computer-use approval does not belong to the requested task")?;
+                let approved = match approved.as_str() {
+                    "true" | "approve" => true,
+                    "false" | "deny" => false,
+                    _ => bail!("approval decision must be approve or deny"),
+                };
+                let now_ms = u64::from(monotonic_time_msec(state));
+                state.computer_use.decide_approval(
+                    &brood_computer_use::ComputerApprovalDecision {
+                        request_id: request.id.clone(),
+                        approved,
+                        principal: principal.clone(),
+                        decided_at_ms: now_ms,
+                    },
+                )?;
+                if !approved {
+                    state
+                        .computer_use_automation
+                        .cancel_script_checkpoint_by_approval(&request.id);
+                }
+                "OK computer-use approval decided\n".to_string()
+            }
             [subcommand] if subcommand == "list" => {
                 format!("{}\n", serde_json::to_string(&state.computer_use.tasks())?)
             }

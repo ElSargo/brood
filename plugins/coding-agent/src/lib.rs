@@ -29,6 +29,7 @@ const MAX_IMAGES: usize = 4;
 const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_TOTAL_IMAGE_BYTES: usize = 12 * 1024 * 1024;
 const IMAGE_CHUNK_BYTES: usize = 20 * 1024;
+const COMPUTER_USE_DEVELOPER_INSTRUCTIONS: &str = "You are operating inside a Brood session. For any request to open, start, or launch a graphical application in the session, call brood_computer_use.computer_launch before doing anything else. Never launch a graphical application through a shell command: a shell process is not a Brood-managed application and cannot reliably connect to the session display. Do not claim that an application opened unless computer_launch returned visible=true. Use the brood_computer_use tools for subsequent interaction with session applications.";
 const PROMPT_HEIGHT: f32 = 60.0;
 const IMAGE_TRAY_HEIGHT: f32 = 112.0;
 const IMAGE_TRAY_GAP: f32 = 8.0;
@@ -90,6 +91,7 @@ struct TurnRequest {
     prompt: String,
     model: String,
     reasoning: String,
+    session_id: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -145,6 +147,7 @@ enum Subscriber {
 
 struct AgentState {
     id: String,
+    session_id: u64,
     model: String,
     reasoning: String,
     status: String,
@@ -161,9 +164,10 @@ struct AgentState {
 }
 
 impl AgentState {
-    fn new() -> Self {
+    fn new(session_id: u64) -> Self {
         Self {
             id: String::new(),
+            session_id,
             model: "default".to_string(),
             reasoning: "medium".to_string(),
             status: "idle".to_string(),
@@ -348,7 +352,9 @@ fn handle_lifecycle(event: LifecycleEvent) -> Vec<ActorCommand> {
         }
         LifecycleEvent::Start(context) if context.instance_id.contains(".coding-agent-") => {
             if let Ok(mut state) = STATE.lock() {
-                *state = RoleState::Agent(AgentState::new());
+                *state = RoleState::Agent(AgentState::new(
+                    context.session_id.unwrap_or_default(),
+                ));
             }
             vec![ActorCommand::LifecycleComplete(Ok(()))]
         }
@@ -487,7 +493,7 @@ fn handle_mailbox(sender: &str, body: &[u8]) -> Vec<ActorCommand> {
             }
         }
         RoleState::Unknown => {
-            let mut agent = AgentState::new();
+            let mut agent = AgentState::new(message.session_id);
             let commands = handle_agent_message(&mut agent, sender, message);
             *state = RoleState::Agent(agent);
             commands
@@ -638,6 +644,7 @@ fn handle_agent_message(
                 prompt: message.prompt,
                 model: agent.model.clone(),
                 reasoning: agent.reasoning.clone(),
+                session_id: agent.session_id,
             };
             let mut commands = agent_commands(
                 agent,
@@ -2119,6 +2126,7 @@ async fn run_codex_turn(
         "--config".to_string(),
         format!("model_reasoning_effort=\"{}\"", request.reasoning),
     ];
+    arguments.extend(computer_use_config_arguments(request));
     if request.model != "default" {
         arguments.push("--model".to_string());
         arguments.push(request.model.clone());
@@ -2178,6 +2186,28 @@ async fn run_codex_turn(
     let _ = host::child_drop(process.child).await;
     cleanup_temporary_images(&request.agent, &temporary_images).await;
     result
+}
+
+fn computer_use_config_arguments(request: &TurnRequest) -> Vec<String> {
+    [
+        format!(
+            "developer_instructions={}",
+            serde_json::to_string(COMPUTER_USE_DEVELOPER_INSTRUCTIONS)
+                .expect("static developer instructions must serialize")
+        ),
+        "mcp_servers.brood_computer_use.command=\"brood-computer-use-mcp\"".to_string(),
+        format!(
+            "mcp_servers.brood_computer_use.args=[\"--session\",\"{}\",\"--principal\",\"{}\"]",
+            request.session_id, request.agent
+        ),
+        "mcp_servers.brood_computer_use.env_vars=[\"BROODD_DBUS_DESTINATION\",\"BROODD_DBUS_ADDRESS\",\"BROOD_SURFACE_SESSION_ID\"]".to_string(),
+        "mcp_servers.brood_computer_use.required=true".to_string(),
+        "mcp_servers.brood_computer_use.default_tools_approval_mode=\"approve\"".to_string(),
+        "mcp_servers.brood_computer_use.tool_timeout_sec=120".to_string(),
+    ]
+    .into_iter()
+    .flat_map(|value| ["--config".to_string(), value])
+    .collect()
 }
 
 fn temporary_image_path(agent: &str, image: &ImageAttachment) -> String {
@@ -2305,7 +2335,9 @@ fn drain_stream_lines(
 }
 
 fn summarize_codex_line(line: &str, fallback_kind: &str) -> (&'static str, String) {
-    if line == "Reading additional input from stdin..." {
+    if line == "Reading additional input from stdin..."
+        || line.contains("failed to clean up stale arg0 temp dirs")
+    {
         return ("status", String::new());
     }
     let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
@@ -2370,6 +2402,14 @@ fn summarize_codex_line(line: &str, fallback_kind: &str) -> (&'static str, Strin
                     ),
                 ),
                 "file_change" => ("tool", "Applied file changes".to_string()),
+                "mcp_tool_call" => summarize_mcp_tool_call(item),
+                "error" => (
+                    "error",
+                    item.get("message")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("Codex item failed")
+                        .to_string(),
+                ),
                 _ => ("status", one_line(item_type, 3000)),
             }
         }
@@ -2382,6 +2422,66 @@ fn summarize_codex_line(line: &str, fallback_kind: &str) -> (&'static str, Strin
             one_line(line, 3000),
         ),
     }
+}
+
+fn summarize_mcp_tool_call(item: &serde_json::Value) -> (&'static str, String) {
+    let server = item
+        .get("server")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("mcp");
+    let tool = item
+        .get("tool")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("tool");
+    let label = if server == "brood_computer_use" {
+        tool.to_string()
+    } else {
+        format!("{server}.{tool}")
+    };
+    let status = item
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("in progress")
+        .replace('_', " ");
+
+    if let Some(error) = item.get("error").filter(|error| !error.is_null()) {
+        let detail = error
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string)
+            .unwrap_or_else(|| one_line(&error.to_string(), 1000));
+        return ("error", format!("{label} failed: {detail}"));
+    }
+
+    let result_text = item
+        .get("result")
+        .and_then(|result| result.get("content"))
+        .and_then(serde_json::Value::as_array)
+        .and_then(|content| {
+            content.iter().find_map(|entry| {
+                (entry.get("type").and_then(serde_json::Value::as_str) == Some("text"))
+                    .then(|| entry.get("text").and_then(serde_json::Value::as_str))
+                    .flatten()
+            })
+        });
+    if status == "failed" {
+        return (
+            "error",
+            format!(
+                "{label} failed{}",
+                result_text
+                    .map(|text| format!(": {}", one_line(text, 1000)))
+                    .unwrap_or_default()
+            ),
+        );
+    }
+    if let Some(result_text) = result_text {
+        return (
+            "tool",
+            format!("{label} {status}: {}", one_line(result_text, 1000)),
+        );
+    }
+    ("tool", format!("{label} {status}"))
 }
 
 fn publish_worker_log(agent: &str, kind: &str, text: &str) {
@@ -2463,6 +2563,88 @@ mod tests {
         assert_eq!(view.reasoning, "high");
     }
 
+    #[test]
+    fn codex_turn_gets_a_required_session_bound_computer_use_server() {
+        let arguments = computer_use_config_arguments(&TurnRequest {
+            agent: "coding-agent-7".to_string(),
+            prompt: "Use the calculator".to_string(),
+            model: "default".to_string(),
+            reasoning: "medium".to_string(),
+            session_id: 42,
+        });
+        assert!(arguments.chunks_exact(2).all(|pair| pair[0] == "--config"));
+        assert!(arguments.iter().any(|argument| {
+            argument.starts_with("developer_instructions=")
+                && argument
+                    .contains("call brood_computer_use.computer_launch before doing anything else")
+                && argument
+                    .contains("Never launch a graphical application through a shell command")
+        }));
+        assert!(arguments.iter().any(|argument| {
+            argument
+                == "mcp_servers.brood_computer_use.args=[\"--session\",\"42\",\"--principal\",\"coding-agent-7\"]"
+        }));
+        assert!(arguments.iter().any(|argument| {
+            argument
+                == "mcp_servers.brood_computer_use.env_vars=[\"BROODD_DBUS_DESTINATION\",\"BROODD_DBUS_ADDRESS\",\"BROOD_SURFACE_SESSION_ID\"]"
+        }));
+        assert!(
+            arguments
+                .iter()
+                .any(|argument| argument == "mcp_servers.brood_computer_use.required=true")
+        );
+    }
+
+    #[test]
+    fn codex_runtime_housekeeping_warning_is_not_shown_as_an_agent_error() {
+        assert_eq!(
+            summarize_codex_line(
+                "WARNING: failed to clean up stale arg0 temp dirs: Permission denied (os error 13)",
+                "error"
+            ),
+            ("status", String::new())
+        );
+    }
+
+    #[test]
+    fn codex_mcp_launch_events_show_the_tool_and_result() {
+        assert_eq!(
+            summarize_codex_line(
+                r#"{"type":"item.started","item":{"type":"mcp_tool_call","server":"brood_computer_use","tool":"computer_launch","status":"in_progress"}}"#,
+                "agent"
+            ),
+            (
+                "tool",
+                "computer_launch in progress".to_string()
+            )
+        );
+        assert_eq!(
+            summarize_codex_line(
+                r#"{"type":"item.completed","item":{"type":"mcp_tool_call","server":"brood_computer_use","tool":"computer_launch","status":"completed","result":{"content":[{"type":"text","text":"{\"pane\":3,\"visible\":true}"}]}}}"#,
+                "agent"
+            ),
+            (
+                "tool",
+                "computer_launch completed: {\"pane\":3,\"visible\":true}".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn codex_mcp_launch_failure_is_shown_as_an_error() {
+        assert_eq!(
+            summarize_codex_line(
+                r#"{"type":"item.completed","item":{"type":"mcp_tool_call","server":"brood_computer_use","tool":"computer_launch","status":"failed","error":{"message":"speedcrunch exited before creating a managed window"}}}"#,
+                "agent"
+            ),
+            (
+                "error",
+                "computer_launch failed: speedcrunch exited before creating a managed window"
+                    .to_string()
+            )
+        );
+    }
+
     fn png_bytes(size: usize) -> Vec<u8> {
         let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
         bytes.resize(size.max(bytes.len()), 0x5a);
@@ -2487,7 +2669,7 @@ mod tests {
     #[test]
     fn agent_reassembles_ordered_image_chunks() {
         let bytes = png_bytes(IMAGE_CHUNK_BYTES + 11);
-        let mut agent = AgentState::new();
+        let mut agent = AgentState::new(1);
         begin_agent_image(
             &mut agent,
             &WireMessage {
@@ -2517,7 +2699,7 @@ mod tests {
 
     #[test]
     fn agent_rejects_out_of_order_image_chunks() {
-        let mut agent = AgentState::new();
+        let mut agent = AgentState::new(1);
         begin_agent_image(
             &mut agent,
             &WireMessage {

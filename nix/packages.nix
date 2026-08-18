@@ -370,7 +370,7 @@ let
     postBuild = ''
       for program in brood brood-client brood-computer-use-mcp brood-remote brood-sessiond brood-runner-exec brood-runner-nix-develop; do
         wrapProgram "$out/bin/$program" \
-          --prefix PATH : "${appToolPath}" \
+          --prefix PATH : "$out/bin:${appToolPath}" \
           --prefix LD_LIBRARY_PATH : "${nativeLibraryPath}" \
           --prefix GI_TYPELIB_PATH : "${gtkTypelibPath}" \
           --prefix XDG_DATA_DIRS : "${gtkDataDirs}" \

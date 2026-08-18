@@ -10,11 +10,32 @@ pub fn run(args: TestArgs) -> Result<()> {
     {
         TestCommand::ComputerUse(args) => run_computer_use(args),
         TestCommand::ComputerUseSpeedcrunch(args) => run_computer_use_speedcrunch(args),
+        TestCommand::ComputerUseAgent(args) => run_computer_use_agent(args),
         TestCommand::Nested(args) => run_nested(args),
         TestCommand::Editor(args) => run_editor(args),
         TestCommand::Resize(args) => run_resize(args),
         TestCommand::Ssh(args) => run_ssh(args),
     }
+}
+
+fn run_computer_use_agent(args: NestedTestArgs) -> Result<()> {
+    let root = find_checkout_root()?;
+    let script = root.join("tools/test-coding-agent-nested.sh");
+    let mut command = Command::new("bash");
+    command
+        .arg(&script)
+        .current_dir(&root)
+        .env("BROOD_CODING_AGENT_COMPUTER_USE", "1");
+    if let Some(out_dir) = args.out_dir {
+        command.env("BROOD_CODING_AGENT_OUT", out_dir);
+    }
+    let status = command
+        .status()
+        .with_context(|| format!("run {}", script.display()))?;
+    if !status.success() {
+        bail!("built-in computer-use agent proof exited with {status}");
+    }
+    Ok(())
 }
 
 fn run_computer_use_speedcrunch(args: NestedTestArgs) -> Result<()> {

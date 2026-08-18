@@ -1853,6 +1853,21 @@ fn apply_layout_transaction_notification(
         }
         "rejected" | "aborted" => {
             let rejected = state.pending_shell_layouts.remove(&notification.request_id);
+            if notification.message_type.as_str() == "rejected"
+                && notification.reason.as_ref().map(|reason| reason.as_str())
+                    == Some("stale-inventory-revision")
+                && let Some(rejected) = rejected.as_ref()
+                && rejected.native_resize_revision.is_none()
+            {
+                // A pane was added while an ordinary shell transition was in
+                // flight. The host rejected only the stale inventory token;
+                // the user's requested picker/sidebar state is still valid.
+                // Preserve it so the already-queued fresh layout-state can
+                // republish against the new inventory instead of resurrecting
+                // the previous durable overlay and stealing focus.
+                restore_shell_layout_state(state, &rejected.state);
+                return Vec::new();
+            }
             restore_latest_submitted_or_durable_shell_layout(state);
             if let Some(rejected) = rejected
                 && let Some(native_resize_revision) = rejected.native_resize_revision
@@ -5376,6 +5391,57 @@ mod tests {
                 .map(|layout| layout.presented_layout_revision),
             Some(8)
         );
+    }
+
+    #[test]
+    fn stale_inventory_rejection_preserves_hidden_picker_and_requested_focus() {
+        let mut state = SwitcherState::new();
+        state.picker_pane = Some(2);
+        state.picker_visible = true;
+        state.durable_shell_layout = Some(shell_layout_state(&state, Some(2)));
+        state.layout = Some(LayoutContext {
+            revision: 6,
+            presented_layout_revision: 8,
+            lease: LayoutLeaseToken {
+                id: 1,
+                generation: 1,
+            },
+            waitable_panes: serde_json_core::heapless::Vec::new(),
+            presented_panes: serde_json_core::heapless::Vec::new(),
+            visible_panes: serde_json_core::heapless::Vec::new(),
+            focused_pane: Some(9),
+            size: LayoutStateSize {
+                w: 1280,
+                height: 720,
+            },
+            rest: true,
+        });
+        state.picker_visible = false;
+        state.pending_shell_layouts.insert(
+            4,
+            super::PendingShellLayout {
+                state: shell_layout_state(&state, Some(9)),
+                native_resize_revision: None,
+                native_retry_count: 0,
+            },
+        );
+
+        assert!(
+            apply_layout_transaction_notification(
+                &mut state,
+                &super::decode_layout_transaction_notification(
+                    br#"{"type":"rejected","request_id":4,"reason":"stale-inventory-revision"}"#,
+                )
+                .expect("stale inventory rejection"),
+            )
+            .is_empty()
+        );
+        assert!(!state.picker_visible);
+        assert_eq!(
+            state.layout.as_ref().and_then(|layout| layout.focused_pane),
+            Some(9)
+        );
+        assert!(state.pending_shell_layouts.is_empty());
     }
 
     #[test]

@@ -2474,7 +2474,7 @@ async fn run_component_actor(
     blocking_io.wait_idle().await;
     let explicitly_stopped = store.data().shutdown_requested.load(Ordering::Acquire);
     let result = match concurrent_result {
-        Ok(result) => result,
+        Ok(result) => component_loop_result(result, explicitly_stopped),
         Err(_error) if explicitly_stopped => Ok(()),
         Err(error) => {
             let message = format!("{error:#}");
@@ -2489,6 +2489,13 @@ async fn run_component_actor(
     result?;
     let _ = stopped_observer.try_send(ComponentActorEvent::Stopped);
     Ok(())
+}
+
+fn component_loop_result(result: Result<()>, explicitly_stopped: bool) -> Result<()> {
+    if explicitly_stopped && result.is_err() {
+        return Ok(());
+    }
+    result
 }
 
 async fn run_component_event_loop(
@@ -3607,6 +3614,20 @@ mod tests {
                 .is_err()
         );
         assert_eq!(wakes.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn explicit_shutdown_ignores_only_errors_that_race_actor_teardown() {
+        assert!(component_loop_result(Ok(()), false).is_ok());
+        assert!(
+            component_loop_result(Err(anyhow::anyhow!("invalid queued command")), true).is_ok()
+        );
+        assert_eq!(
+            component_loop_result(Err(anyhow::anyhow!("invalid live command")), false)
+                .unwrap_err()
+                .to_string(),
+            "invalid live command"
+        );
     }
 
     #[cfg(unix)]

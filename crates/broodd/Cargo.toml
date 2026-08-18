@@ -21,7 +21,6 @@ test = false
 [[bin]]
 name = "brood-computer-use-mcp"
 path = "src/bin/brood-computer-use-mcp.rs"
-test = false
 
 [[bin]]
 name = "brood-runner-nix-develop"
@@ -34,6 +33,7 @@ shm-fallback = []
 
 [dependencies]
 anyhow.workspace = true
+base64.workspace = true
 calloop.workspace = true
 calloop-wayland-source.workspace = true
 clap.workspace = true

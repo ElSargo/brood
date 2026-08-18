@@ -961,7 +961,11 @@ if [[ "${BROOD_COMPUTER_USE_SPEEDCRUNCH:-0}" == "1" ]]; then
     and (.[1].result.tools | map(.name) | index("computer_action")) != null
     and (.[2].result.content[0].text | fromjson | .call_id) == "mcp-screenshot"
     and (.[2].result.content[0].text | fromjson | .sequence) == 9
+    and .[2].result.content[1].type == "image"
+    and .[2].result.content[1].mimeType == "image/png"
+    and (.[2].result.content[1].data | length) > 1000
     and (.[3].result.content[0].text | fromjson | .task.next_sequence) == 10
+    and (.[3].result.content | map(.type) | index("image")) != null
   ' "$OUT/speedcrunch-mcp.jsonl" >/dev/null
   ctl computer-use stop speedcrunch-proof >/dev/null
 
