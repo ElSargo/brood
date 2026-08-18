@@ -13,14 +13,11 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value, json};
 use smithay::{
     backend::renderer::{buffer_dimensions, buffer_has_alpha, buffer_type},
-    reexports::wayland_server::{Resource, protocol::wl_shm},
-    wayland::{
-        compositor::{BufferAssignment, SurfaceAttributes, with_states},
-        shm::{BufferData, with_buffer_contents},
-    },
+    reexports::wayland_server::Resource,
+    wayland::compositor::{BufferAssignment, SurfaceAttributes, with_states},
 };
 
-use crate::{control, frame_export, state::Brood};
+use crate::{buffer_readback, control, frame_export, state::Brood};
 
 #[derive(Clone, Copy)]
 pub struct DumpOptions {
@@ -88,11 +85,38 @@ pub fn dump_bundle(state: &mut Brood, dir: &Path, options: DumpOptions) -> Resul
     }
 
     if options.include_surfaces {
+        crate::computer_use::capture_current(state)
+            .map_err(anyhow::Error::msg)
+            .context("refresh automation capture")?;
         let surfaces_dir = dir.join("surfaces");
         fs::create_dir_all(&surfaces_dir)
             .with_context(|| format!("create surfaces dir {}", surfaces_dir.display()))?;
         let surfaces = dump_surfaces(state, &surfaces_dir)?;
         manifest.insert("surfaces".to_string(), Value::Array(surfaces));
+        if let Some(snapshot) = state.computer_use_automation.latest() {
+            let png_path = dir.join("automation.png");
+            fs::write(&png_path, &snapshot.png)
+                .with_context(|| format!("write {}", png_path.display()))?;
+            let metadata_path = dir.join("automation.json");
+            fs::write(
+                &metadata_path,
+                serde_json::to_vec_pretty(&json!({
+                    "viewport_width": brood_computer_use::AUTOMATION_VIEWPORT_WIDTH,
+                    "viewport_height": brood_computer_use::AUTOMATION_VIEWPORT_HEIGHT,
+                    "captured_at_ms": snapshot.captured_at_ms,
+                    "frame_sequence": snapshot.frame_sequence,
+                    "active_window": snapshot.active_window,
+                    "windows": snapshot.windows,
+                    "png_bytes": snapshot.png.len(),
+                }))
+                .context("encode automation metadata")?,
+            )
+            .with_context(|| format!("write {}", metadata_path.display()))?;
+            manifest.insert(
+                "automation".to_string(),
+                json!({ "png": "automation.png", "metadata": "automation.json" }),
+            );
+        }
     }
 
     let manifest_path = dir.join("manifest.json");
@@ -211,12 +235,10 @@ fn save_surface_buffer_png(
     dir: &Path,
     surface_id: &str,
 ) -> Result<Option<PathBuf>> {
-    let capture = with_buffer_contents(buffer, capture_shm_buffer)
-        .map_err(|err| anyhow::anyhow!("read shm buffer: {err}"));
-    let capture = match capture {
+    let capture = match buffer_readback::read_shm_buffer(buffer) {
         Ok(Some(capture)) => capture,
         Ok(None) => return Ok(None),
-        Err(err) => return Err(err),
+        Err(err) => return Err(anyhow::anyhow!(err)),
     };
     let path = dir.join(format!("{surface_id}.png"));
     image::save_buffer(
@@ -228,106 +250,4 @@ fn save_surface_buffer_png(
     )
     .with_context(|| format!("write {}", path.display()))?;
     Ok(Some(path))
-}
-
-struct SurfaceCapture {
-    width: u32,
-    height: u32,
-    bytes: Vec<u8>,
-}
-
-/// A validated view of one packed, four-byte-per-pixel SHM image.
-///
-/// Construction proves that every visible row fits inside the Smithay-provided
-/// mapping. Consumers therefore operate on slices and complete pixels rather
-/// than repeating offset, stride, and raw-pointer arithmetic.
-struct ShmImageView<'a> {
-    bytes: &'a [u8],
-    width: usize,
-    height: usize,
-    stride: usize,
-}
-
-impl ShmImageView<'_> {
-    /// Wrap the mapping passed to Smithay's `with_buffer_contents` callback.
-    ///
-    /// # Safety
-    ///
-    /// `ptr` must remain readable for `len` bytes for `'a`. This is precisely
-    /// the callback contract of `with_buffer_contents`; the view never escapes
-    /// that callback because it is converted into an owned `SurfaceCapture`.
-    unsafe fn from_smithay_mapping(ptr: *const u8, len: usize, data: &BufferData) -> Option<Self> {
-        let width = usize::try_from(data.width).ok()?;
-        let height = usize::try_from(data.height).ok()?;
-        let stride = usize::try_from(data.stride).ok()?;
-        let offset = usize::try_from(data.offset).ok()?;
-        if width == 0 || height == 0 || stride == 0 {
-            return None;
-        }
-        let row_bytes = width.checked_mul(4)?;
-        if stride < row_bytes {
-            return None;
-        }
-        let span = if height == 0 {
-            0
-        } else {
-            stride
-                .checked_mul(height.checked_sub(1)?)?
-                .checked_add(row_bytes)?
-        };
-        let end = offset.checked_add(span)?;
-        let pointer_limit = usize::try_from(isize::MAX).ok()?;
-        if end > len || end > pointer_limit || span > pointer_limit || ptr.is_null() {
-            return None;
-        }
-
-        // SAFETY: The caller supplies Smithay's live SHM mapping. `offset` and
-        // `span` were checked above to lie within its `len` readable bytes.
-        let bytes = unsafe { std::slice::from_raw_parts(ptr.add(offset), span) };
-        Some(ShmImageView {
-            bytes,
-            width,
-            height,
-            stride,
-        })
-    }
-
-    fn rgba(self, format: wl_shm::Format) -> Option<Vec<u8>> {
-        let alpha = match format {
-            wl_shm::Format::Argb8888 => true,
-            wl_shm::Format::Xrgb8888 => false,
-            _ => return None,
-        };
-        let row_bytes = self.width.checked_mul(4)?;
-        let capacity = row_bytes.checked_mul(self.height)?;
-        let mut rgba = Vec::with_capacity(capacity);
-
-        for row in self.bytes.chunks(self.stride).take(self.height) {
-            let visible = row.get(..row_bytes)?;
-            for pixel in visible.chunks_exact(4) {
-                let [blue, green, red, source_alpha] = pixel else {
-                    return None;
-                };
-                rgba.extend_from_slice(&[
-                    *red,
-                    *green,
-                    *blue,
-                    if alpha { *source_alpha } else { 0xff },
-                ]);
-            }
-        }
-        (rgba.len() == capacity).then_some(rgba)
-    }
-}
-
-fn capture_shm_buffer(ptr: *const u8, len: usize, data: BufferData) -> Option<SurfaceCapture> {
-    // SAFETY: Smithay invokes this function only while `ptr..ptr+len` is a
-    // readable mapping and keeps the mapping alive for the callback duration.
-    let view = unsafe { ShmImageView::from_smithay_mapping(ptr, len, &data) }?;
-    let rgba = view.rgba(data.format)?;
-    Some(SurfaceCapture {
-        width: u32::try_from(data.width).ok()?,
-        height: u32::try_from(data.height).ok()?,
-        bytes: rgba,
-    })
 }

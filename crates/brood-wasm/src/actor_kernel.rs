@@ -101,10 +101,9 @@ mod tests {
 
     #[test]
     fn generation_identity_is_shared_by_all_frontends() {
-        let first = allocate_generation().expect("allocate first actor generation");
-        let second = allocate_generation().expect("allocate second actor generation");
-
-        assert_ne!(first, second);
-        assert_eq!(second, first + 1);
+        assert!(matches!(
+            (allocate_generation(), allocate_generation()),
+            (Ok(first), Ok(second)) if first != second && second == first + 1
+        ));
     }
 }

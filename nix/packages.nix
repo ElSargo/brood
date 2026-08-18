@@ -93,6 +93,7 @@ let
         "${src}/plugins/terminal-session/Cargo.lock"
         "${src}/plugins/terminal-ui/Cargo.lock"
         "${src}/plugins/workspace-file-log/Cargo.lock"
+        "${src}/runtimes/computer-use-js/Cargo.lock"
       ];
     };
 
@@ -215,6 +216,9 @@ let
       runHook preBuild
 
       export CARGO_NET_OFFLINE=true
+      export RQUICKJS_SYS_NO_WASI_SDK=1
+      export CC_wasm32_wasip1=${profiles.wasi32Cc}/bin/wasm32-unknown-wasi-cc
+      export AR_wasm32_wasip1=${profiles.wasi32Binutils}/bin/wasm32-unknown-wasi-ar
 
       jobs="''${NIX_BUILD_CORES:-1}"
       if [[ "$jobs" == "0" ]]; then
@@ -291,6 +295,7 @@ let
         {
           find examples -path '*/target/wasm32-*/release/*.wasm' ! -path '*/release/deps/*' -print
           find plugins -path '*/target/wasm32-*/release/*.wasm' ! -path '*/release/deps/*' -print
+          find runtimes -path '*/target/wasm32-*/release/*.wasm' ! -path '*/release/deps/*' -print
         } | sort
       )
 
@@ -324,6 +329,7 @@ let
 
     mkdir -p "$out/apps"
     cp -R ${src}/apps/. "$out/apps/"
+    chmod -R u+w "$out/apps"
     rm -rf "$out/apps/__pycache__"
 
     if [[ -d ${wasmModules}/examples ]]; then
@@ -340,6 +346,10 @@ let
       echo "ERR packaged WASM modules did not include a plugins directory" >&2
       exit 2
     fi
+
+    install -D \
+      ${wasmModules}/runtimes/computer-use-js/target/wasm32-wasip1/release/brood_computer_use_js_runtime.wasm \
+      "$out/runtimes/computer-use-js.wasm"
 
     # The editor runtime belongs to the local client package only. Keep it
     # outside wasmModules so consumers of a single backend component (notably
@@ -359,9 +369,9 @@ let
     ];
     nativeBuildInputs = [ pkgs.makeWrapper ];
     postBuild = ''
-      for program in brood brood-client brood-remote brood-sessiond brood-runner-exec brood-runner-nix-develop; do
+      for program in brood brood-client brood-computer-use-mcp brood-remote brood-sessiond brood-runner-exec brood-runner-nix-develop; do
         wrapProgram "$out/bin/$program" \
-          --prefix PATH : "${appToolPath}" \
+          --prefix PATH : "$out/bin:${appToolPath}" \
           --prefix LD_LIBRARY_PATH : "${nativeLibraryPath}" \
           --prefix GI_TYPELIB_PATH : "${gtkTypelibPath}" \
           --prefix XDG_DATA_DIRS : "${gtkDataDirs}" \
@@ -369,6 +379,7 @@ let
           --set BROOD_SSH_BACKEND_SYSTEM "${pkgs.stdenv.hostPlatform.system}" \
           --set BROOD_CONTAINER_BACKEND "${containerBackend}" \
           --set BROOD_CONTAINER_BACKEND_SYSTEM "${pkgs.stdenv.hostPlatform.system}" \
+          --set BROOD_COMPUTER_USE_JS_RUNTIME "$out/runtimes/computer-use-js.wasm" \
           --set BROOD_PODMAN_REAL "${pkgs.podman}/bin/podman" \
           --run 'export GSETTINGS_SCHEMA_DIR="''${GSETTINGS_SCHEMA_DIR:-${gsettingsSchemaDir}}"' \
           --run 'export BROOD_CONFIG="''${BROOD_CONFIG:-'"$out"'/brood.toml}"'

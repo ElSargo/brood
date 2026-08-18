@@ -15,7 +15,9 @@ code-links:
 
 Brood has two runtime roles: an authoritative session server and an
 independent presentation client. The server is coherent with zero connected
-clients and never creates a native or offscreen presentation target.
+clients and never creates a native or offscreen human presentation target. A
+server-owned computer-use automation renderer is a separate machine-observation
+surface and does not assume presentation layout authority.
 
 Exact commands and parser behavior remain defined in the CLI code; this page
 describes ownership and startup order.

@@ -1,4 +1,4 @@
-WASM_DIRS := $(sort $(patsubst %/Cargo.toml,%,$(wildcard examples/wasm-*/Cargo.toml plugins/*/Cargo.toml)))
+WASM_DIRS := $(sort $(patsubst %/Cargo.toml,%,$(wildcard examples/wasm-*/Cargo.toml plugins/*/Cargo.toml runtimes/*/Cargo.toml)))
 WASM_JOBS := $(addprefix build-wasm-,$(WASM_DIRS))
 
 .PHONY: all host wasm local-client-package $(WASM_JOBS)

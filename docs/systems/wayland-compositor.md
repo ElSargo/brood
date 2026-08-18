@@ -31,8 +31,9 @@ Surface and hosted-process cleanup is driven by their Wayland and child-exit
 events. The server does not poll managed-window lifecycle while idle; teardown
 repairs focus and inventory on the event that made them stale.
 
-It does not create a Winit window, render an offscreen presentation, compute
-pane placement, perform global viewport hit testing, or run a layout actor.
+It does not create a Winit window, render an offscreen human presentation,
+compute pane placement, perform global viewport hit testing, or run a layout
+actor.
 
 ## Surface Export
 

@@ -97,6 +97,9 @@ build_wasm_one() {
     examples/wasm-preview1-worker|plugins/workspace-file-log)
       wasm_target=wasm32-wasip1-threads
       ;;
+    runtimes/computer-use-js)
+      wasm_target=wasm32-wasip1
+      ;;
   esac
 
   echo "build=wasm module=$crate_dir target=$wasm_target status=checking"

@@ -2249,16 +2249,7 @@ impl ComponentActor {
         &self,
         event: PresentationEvent,
     ) -> std::result::Result<(), ComponentActorSendError<PresentationEvent>> {
-        try_send_typed(
-            &self.commands,
-            RuntimeCommand::Presentation(event),
-            |command| {
-                let RuntimeCommand::Presentation(event) = command else {
-                    unreachable!()
-                };
-                event
-            },
-        )
+        try_send_typed(&self.commands, event, RuntimeCommand::Presentation)
     }
 
     /// Deliver one typed session snapshot or command completion without
@@ -2267,12 +2258,7 @@ impl ComponentActor {
         &self,
         event: SessionEvent,
     ) -> std::result::Result<(), ComponentActorSendError<SessionEvent>> {
-        try_send_typed(&self.commands, RuntimeCommand::Session(event), |command| {
-            let RuntimeCommand::Session(event) = command else {
-                unreachable!()
-            };
-            event
-        })
+        try_send_typed(&self.commands, event, RuntimeCommand::Session)
     }
 
     /// Deliver lifecycle feedback for one child owned by a blessed init actor.
@@ -2280,12 +2266,7 @@ impl ComponentActor {
         &self,
         event: ComponentChildEvent,
     ) -> std::result::Result<(), ComponentActorSendError<ComponentChildEvent>> {
-        try_send_typed(&self.commands, RuntimeCommand::Child(event), |command| {
-            let RuntimeCommand::Child(event) = command else {
-                unreachable!()
-            };
-            event
-        })
+        try_send_typed(&self.commands, event, RuntimeCommand::Child)
     }
 
     /// Deliver app lifecycle feedback to a blessed session init actor.
@@ -2293,12 +2274,7 @@ impl ComponentActor {
         &self,
         event: ComponentAppEvent,
     ) -> std::result::Result<(), ComponentActorSendError<ComponentAppEvent>> {
-        try_send_typed(&self.commands, RuntimeCommand::App(event), |command| {
-            let RuntimeCommand::App(event) = command else {
-                unreachable!()
-            };
-            event
-        })
+        try_send_typed(&self.commands, event, RuntimeCommand::App)
     }
 
     /// Snapshot cumulative mailbox delivery counters.
@@ -2415,17 +2391,16 @@ fn increment_saturating(counter: &AtomicU64) {
 
 fn try_send_typed<T>(
     commands: &mpsc::Sender<RuntimeCommand>,
-    command: RuntimeCommand,
-    recover: impl FnOnce(RuntimeCommand) -> T,
+    event: T,
+    wrap: impl FnOnce(T) -> RuntimeCommand,
 ) -> std::result::Result<(), ComponentActorSendError<T>> {
-    match commands.try_send(command) {
-        Ok(()) => Ok(()),
-        Err(mpsc::error::TrySendError::Full(command)) => {
-            Err(ComponentActorSendError::Full(recover(command)))
+    match commands.try_reserve() {
+        Ok(permit) => {
+            permit.send(wrap(event));
+            Ok(())
         }
-        Err(mpsc::error::TrySendError::Closed(command)) => {
-            Err(ComponentActorSendError::Closed(recover(command)))
-        }
+        Err(mpsc::error::TrySendError::Full(())) => Err(ComponentActorSendError::Full(event)),
+        Err(mpsc::error::TrySendError::Closed(())) => Err(ComponentActorSendError::Closed(event)),
     }
 }
 
@@ -2578,7 +2553,7 @@ async fn run_component_actor(
     blocking_io.wait_idle().await;
     let explicitly_stopped = store.data().shutdown_requested.load(Ordering::Acquire);
     let result = match concurrent_result {
-        Ok(result) => result,
+        Ok(result) => component_loop_result(result, explicitly_stopped),
         Err(_error) if explicitly_stopped => Ok(()),
         Err(error) => {
             let message = format!("{error:#}");
@@ -2593,6 +2568,13 @@ async fn run_component_actor(
     result?;
     let _ = stopped_observer.try_send(ComponentActorEvent::Stopped);
     Ok(())
+}
+
+fn component_loop_result(result: Result<()>, explicitly_stopped: bool) -> Result<()> {
+    if explicitly_stopped && result.is_err() {
+        return Ok(());
+    }
+    result
 }
 
 async fn run_component_event_loop(
@@ -3707,9 +3689,11 @@ mod tests {
     fn one_pending_observer_record_does_not_starve_the_next_dispatch() {
         let (sender, _receiver) = mpsc::channel(8);
         let observer = ComponentActorEventObserver::new(sender, None);
-        observer
-            .try_send(ComponentActorEvent::DispatcherReturned)
-            .unwrap();
+        assert!(
+            observer
+                .try_send(ComponentActorEvent::DispatcherReturned)
+                .is_ok()
+        );
 
         assert!(component_dispatch_can_start(false, &observer));
         assert!(!component_dispatch_can_start(true, &observer));
@@ -3718,14 +3702,16 @@ mod tests {
     #[test]
     fn saturated_component_command_lane_returns_the_unadmitted_event() {
         let (sender, _receiver) = mpsc::channel(1);
-        sender
-            .try_send(RuntimeCommand::Presentation(
-                PresentationEvent::PaneFocused {
-                    pane: 1,
-                    focused: true,
-                },
-            ))
-            .unwrap();
+        assert!(
+            sender
+                .try_send(RuntimeCommand::Presentation(
+                    PresentationEvent::PaneFocused {
+                        pane: 1,
+                        focused: true,
+                    },
+                ))
+                .is_ok()
+        );
         let pending = PresentationEvent::Key {
             pane: 1,
             physical_key: 42,
@@ -3734,19 +3720,13 @@ mod tests {
             repeat: false,
             modifiers: 0,
         };
-        let error = try_send_typed(&sender, RuntimeCommand::Presentation(pending), |command| {
-            let RuntimeCommand::Presentation(event) = command else {
-                unreachable!()
-            };
-            event
-        })
-        .unwrap_err();
+        let error = try_send_typed(&sender, pending, RuntimeCommand::Presentation);
         assert!(matches!(
             error,
-            ComponentActorSendError::Full(PresentationEvent::Key {
+            Err(ComponentActorSendError::Full(PresentationEvent::Key {
                 physical_key: 42,
                 ..
-            })
+            }))
         ));
         assert_eq!(sender.capacity(), 0);
     }
@@ -3840,6 +3820,20 @@ mod tests {
 
     fn sender_capacity(observer: &ComponentActorEventObserver) -> usize {
         observer.sender.capacity()
+    }
+
+    #[test]
+    fn explicit_shutdown_ignores_only_errors_that_race_actor_teardown() {
+        assert!(component_loop_result(Ok(()), false).is_ok());
+        assert!(
+            component_loop_result(Err(anyhow::anyhow!("invalid queued command")), true).is_ok()
+        );
+        assert_eq!(
+            component_loop_result(Err(anyhow::anyhow!("invalid live command")), false)
+                .err()
+                .map(|error| error.to_string()),
+            Some("invalid live command".to_string())
+        );
     }
 
     #[cfg(unix)]

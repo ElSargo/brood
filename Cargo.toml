@@ -2,6 +2,7 @@
 members = [
     "clients/brood-client",
     "crates/brood-cli",
+    "crates/brood-computer-use",
     "crates/brood-dmabuf",
     "crates/brood-graphics",
     "crates/brood-ipc",
@@ -22,6 +23,7 @@ edition = "2024"
 
 [workspace.dependencies]
 anyhow = "1.0.102"
+base64 = "0.22.1"
 bytemuck = { version = "1.25.0", features = ["derive"] }
 calloop = "0.14.4"
 calloop-wayland-source = "0.4.1"
@@ -40,6 +42,7 @@ raw-window-handle = "0.6.2"
 rustls = { version = "0.23.40", default-features = false, features = ["ring", "std"] }
 rustix = { version = "1.1.4", features = ["pipe"] }
 brood-cli = { path = "crates/brood-cli" }
+brood-computer-use = { path = "crates/brood-computer-use" }
 brood-graphics = { path = "crates/brood-graphics" }
 brood-ipc = { path = "crates/brood-ipc" }
 brood-keybindings = { path = "crates/brood-keybindings" }

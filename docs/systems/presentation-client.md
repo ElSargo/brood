@@ -60,7 +60,9 @@ viewport hit-test result crosses the server boundary.
 ## Required Invariants
 
 - The server remains coherent with zero connected clients.
-- The server never creates a native or offscreen presentation target.
+- The server never creates a native or offscreen *human presentation target*.
+  A server-owned computer-use automation render target is permitted, but it
+  cannot accept presentation layout authority or include client-local panes.
 - Closing, crashing, or replacing a client does not terminate a session or its
   managed applications.
 - A session with no managed windows remains alive until it is explicitly

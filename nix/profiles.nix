@@ -74,15 +74,24 @@ let
     ]
   );
 
+  dbusSessionConfigForDev = pkgs.runCommand "brood-dbus-session.conf" { } ''
+    substitute ${pkgs.dbus}/share/dbus-1/session.conf "$out" \
+      --replace-fail \
+      '<include ignore_missing="yes">/etc/dbus-1/session.conf</include>' \
+      ""
+  '';
+
   # The container's /etc/dbus-1/session.conf is only a distro redirect stub,
   # while the Nix D-Bus daemon is not patched to follow that distro layout.
   # Keep ordinary `dbus-run-session` test invocations working by replacing its
-  # --session argument with the complete configuration in the Nix closure.
+  # --session argument with a standalone configuration in the Nix closure.
+  # Drop its legacy /etc include so complete NixOS-generated host
+  # configurations cannot add a second listening address.
   dbusDaemonForDev = pkgs.writeShellScriptBin "dbus-daemon" ''
     args=()
     for arg in "$@"; do
       if [[ "$arg" == --session ]]; then
-        args+=(--config-file=${pkgs.dbus}/share/dbus-1/session.conf)
+        args+=(--config-file=${dbusSessionConfigForDev})
       else
         args+=("$arg")
       fi
@@ -127,6 +136,8 @@ let
   ];
 
   wasmTools = [ pkgs.wasm-tools ];
+  wasi32Cc = pkgs.pkgsCross.wasi32.stdenv.cc;
+  wasi32Binutils = wasi32Cc.bintools;
 
   smokeTools = [
     dbusDaemonForDev
@@ -141,6 +152,7 @@ let
     pkgs.nix
     pkgs.procps
     pkgs.sway
+    pkgs.speedcrunch
     pkgs.vulkan-tools
     pkgs.wayland-scanner
     pkgs.wayland-protocols
@@ -161,6 +173,8 @@ in
     sessionSwitcherPython
     smokeTools
     wasmTools
+    wasi32Binutils
+    wasi32Cc
     westonWithSimpleClients
     ;
 

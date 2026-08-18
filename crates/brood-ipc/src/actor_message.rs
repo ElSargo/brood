@@ -16,10 +16,13 @@ use thiserror::Error;
 use brood_protocol::BackendActorRealm;
 
 const MAGIC: u64 = 0x4d41_4e49_4143_544d;
-const ABI_VERSION: u32 = 2;
+const ABI_VERSION: u32 = 3;
 const CAPACITY: usize = 16;
 const CAPACITY_U32: u32 = 16;
-const RECORD_BYTES: usize = 16 * 1024;
+// Match the reliable actor-message capability advertised by the protocol.
+// Sixteen records keep the entire lane bounded to 1 MiB while allowing one
+// compact automation observation frame per record.
+const RECORD_BYTES: usize = 64 * 1024;
 const RECORD_HEADER_BYTES: usize = 40;
 /// Maximum combined UTF-8 sender, UTF-8 recipient, and mailbox body bytes.
 pub const ACTOR_MESSAGE_BODY_CAPACITY: usize = RECORD_BYTES - RECORD_HEADER_BYTES;
@@ -44,6 +47,10 @@ const _: () = assert!(size_of::<ActorMessageRecord>() == RECORD_BYTES);
 
 impl ActorMessageRecord {
     /// Encode one actor message after validating the bounded wire payload.
+    #[allow(
+        clippy::large_stack_arrays,
+        reason = "the fixed-size shared-memory ABI record is immediately moved into a Box"
+    )]
     pub fn new(
         connection_generation: u64,
         sequence: u64,
@@ -199,6 +206,10 @@ struct Slot {
 }
 
 impl Slot {
+    #[allow(
+        clippy::large_stack_arrays,
+        reason = "the fixed-size record is part of the statically initialized shared-memory layout"
+    )]
     const fn new(sequence: u64) -> Self {
         Self {
             sequence: AtomicU64::new(sequence),

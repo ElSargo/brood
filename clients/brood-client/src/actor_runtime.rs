@@ -1795,7 +1795,7 @@ impl PresentationWasmRuntime {
             .collect::<Vec<_>>();
         for task in actor_shutdowns {
             let result = self.executor.block_on(task);
-            let (_actor_id, result) = match result {
+            let (actor_id, result) = match result {
                 Ok(result) => result,
                 Err(error) => {
                     if first_error.is_none() {
@@ -1809,7 +1809,9 @@ impl PresentationWasmRuntime {
             if let Err(error) = result
                 && first_error.is_none()
             {
-                first_error = Some(anyhow::anyhow!(error));
+                first_error = Some(anyhow::anyhow!(
+                    "shut down presentation actor {actor_id:?}: {error}"
+                ));
             }
         }
 

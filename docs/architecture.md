@@ -29,7 +29,9 @@ The user-facing binary. It parses commands, starts runtime sessions, starts nest
 
 The authoritative session server. It owns the nested Wayland compositor,
 hosted applications, session catalogue, durable actors, and control endpoint.
-It never creates a presentation window or computes viewport layout.
+It never creates a human presentation window or computes human viewport
+layout. The server may own a fixed computer-use automation projection that is
+independent from presentation layout.
 
 `brood-client`
 

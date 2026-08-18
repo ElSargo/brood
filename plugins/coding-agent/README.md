@@ -33,6 +33,16 @@ Every UI's top bar follows the complete session registry, including agents
 created from other UI panes. Closing a UI pane does not stop its session-side
 agents.
 
+Codex turns launched from this pane automatically receive the
+`brood_computer_use` MCP tools bound to the pane's Brood session and agent
+identity. No per-user MCP setup is required. Ask the agent normally, for
+example: `Use SpeedCrunch to calculate (12345*6789)-987654 and verify the
+result visually.` The agent can start a task, inspect screenshots, act through
+the compositor's normal input paths, and stop the task. If the application is
+not open, it can launch it through Brood's hosted-application path and wait for
+its managed window before starting automation. It cannot target the host
+desktop, another Brood session, or client-local plugin panes.
+
 Attachments are read by the presentation client and transferred as bounded,
 ordered actor messages. The backend never dereferences a client pathname, so
 the same interaction works when the selected session is remote. The agent

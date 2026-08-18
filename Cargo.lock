@@ -389,6 +389,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "brood-cli",
+ "brood-computer-use",
  "brood-dmabuf",
  "brood-graphics",
  "brood-ipc",
@@ -419,6 +420,16 @@ dependencies = [
  "wayland-protocols-wlr",
  "wgpu",
  "winit",
+]
+
+[[package]]
+name = "brood-computer-use"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -547,7 +558,9 @@ name = "broodd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "brood-cli",
+ "brood-computer-use",
  "brood-ipc",
  "brood-protocol",
  "brood-wasm",

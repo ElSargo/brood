@@ -47,6 +47,9 @@ This directory is organized as a wiki-style knowledge base. Pages are grouped by
   bridge.
 - [[systems/inbox-plugin]] defines the persistent client-global notification
   queue and click-to-source actor routing.
+- [[systems/computer-use]] defines server-side observation, direct actions,
+  persistent code execution, leases, and semantic automation for applications
+  hosted inside Brood sessions.
 
 ## Core Concepts
 
@@ -68,6 +71,8 @@ This directory is organized as a wiki-style knowledge base. Pages are grouped by
 - [[workflows/test-nested]]
 - [[workflows/develop-with-nix]]
 - [[workflows/build-wasm-examples]]
+- [[workflows/computer-use-tracker]] tracks implementation phases, gates,
+  decisions, open items, and verification evidence.
 
 ## Reference
 

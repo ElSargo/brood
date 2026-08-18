@@ -48,6 +48,12 @@ pub struct TestArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum TestCommand {
+    /// Prove server-only computer-use capture with SHM and DMA-BUF clients.
+    ComputerUse(NestedTestArgs),
+    /// Drive real calculations and menu configuration in `SpeedCrunch`.
+    ComputerUseSpeedcrunch(NestedTestArgs),
+    /// Drive `SpeedCrunch` through the built-in session-scoped Codex pane.
+    ComputerUseAgent(NestedTestArgs),
     /// Run the external-client nested terminal workload.
     Nested(NestedTestArgs),
     /// Run the external-client Neovim editor workload.

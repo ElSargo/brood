@@ -19,6 +19,7 @@ pub struct Transform {
 }
 
 impl Transform {
+    #[must_use]
     pub const fn new(offset_u: f64, offset_v: f64, size_u: f64, size_v: f64) -> Self {
         Self {
             offset: AxisValue {
@@ -43,6 +44,7 @@ pub enum ItemKind {
 }
 
 impl ItemKind {
+    #[must_use]
     pub const fn pane(self) -> u64 {
         match self {
             Self::Pane { pane } | Self::OverlayPane { pane } => pane,
@@ -93,15 +95,18 @@ impl ResolvedLayout {
         self.items.iter().map(|item| item.kind.pane())
     }
 
+    #[must_use]
     pub fn pane_extent(&self, pane: u64, axis: Axis, pixels: f64) -> f64 {
         self.items
             .iter()
             .find(|item| item.kind.pane() == pane)
-            .map(|item| match axis {
-                Axis::Horizontal => item.transform.size.u,
-                Axis::Vertical => item.transform.size.v,
-            } * pixels / 2.0)
-            .unwrap_or(0.0)
+            .map_or(0.0, |item| {
+                let fraction = match axis {
+                    Axis::Horizontal => item.transform.size.u,
+                    Axis::Vertical => item.transform.size.v,
+                };
+                fraction * pixels / 2.0
+            })
     }
 }
 
@@ -182,7 +187,7 @@ pub struct SubmitSynchronizedLayout<'a> {
 }
 
 #[derive(Serialize)]
-pub struct SubmitLayoutRegion<'a, E: Serialize> {
+pub struct SubmitLayoutRegion<'a, E> {
     #[serde(rename = "type")]
     pub message_type: &'static str,
     pub resize_epoch: E,

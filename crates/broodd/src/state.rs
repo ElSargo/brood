@@ -738,6 +738,8 @@ pub struct Brood {
 
     focus: FocusService,
     pub browsers: BrowserManager,
+    pub(crate) computer_use: brood_computer_use::ComputerUseSupervisor,
+    pub(crate) computer_use_automation: crate::computer_use::AutomationRuntime,
     pub stats: RuntimeStats,
     next_window_slot: usize,
     last_window_count: usize,
@@ -864,6 +866,8 @@ impl Brood {
             seat,
             focus: FocusService::default(),
             browsers: BrowserManager::default(),
+            computer_use: brood_computer_use::ComputerUseSupervisor::new(),
+            computer_use_automation: crate::computer_use::AutomationRuntime::default(),
             stats: RuntimeStats::default(),
             next_window_slot: 0,
             last_window_count: 0,
@@ -1131,6 +1135,19 @@ impl Brood {
             sender, actor, "queued session-to-presentation actor message"
         );
         Ok(())
+    }
+
+    pub(crate) fn send_computer_use_observer_message(
+        &mut self,
+        recipient: &str,
+        body: &[u8],
+    ) -> Result<()> {
+        self.send_presentation_actor_message(
+            BackendActorRealm::Daemon,
+            "computer-use",
+            recipient,
+            body,
+        )
     }
 
     fn flush_presentation_actor_messages(&mut self) {
@@ -3066,6 +3083,17 @@ impl Brood {
         toplevel_app_id(&surface)
     }
 
+    pub(crate) fn window_title(&self, window: &Window) -> Option<String> {
+        let surface = Self::window_toplevel_surface(window)?;
+        toplevel_title(&surface)
+    }
+
+    pub(crate) fn window_session_id(&self, window: &Window) -> Option<u64> {
+        let surface = Self::window_toplevel_surface(window)?;
+        self.session_for_toplevel_surface(&surface)
+            .map(SurfaceSessionId::raw)
+    }
+
     pub fn presentation_window_summaries(&self) -> Vec<PresentationWindowSummary> {
         let mut windows = self
             .space
@@ -3225,6 +3253,40 @@ impl Brood {
             .insert(pane, requested);
         self.configure_presentation_client_toplevel_size(pane, &surface, toplevel, requested);
         true
+    }
+
+    pub(crate) fn computer_use_owns_pane(&self, pane: u64) -> bool {
+        let Some(lease) = self.computer_use.lease() else {
+            return false;
+        };
+        self.presentation_window_summaries().iter().any(|window| {
+            window.pane == pane
+                && window.session == lease.session
+                && (lease.windows.is_empty() || lease.windows.contains(&pane))
+        })
+    }
+
+    pub(crate) fn configure_automation_pane_size(
+        &mut self,
+        pane: u64,
+        width: i32,
+        height: i32,
+    ) -> bool {
+        let Some(surface) = self.content_surface_for_pane(pane) else {
+            return false;
+        };
+        let Some(window) = self.window_for_any_toplevel_surface(&surface) else {
+            return false;
+        };
+        let Some(toplevel) = window.toplevel() else {
+            return false;
+        };
+        self.configure_presentation_client_toplevel_size(
+            pane,
+            &surface,
+            toplevel,
+            (width.max(1), height.max(1)),
+        )
     }
 
     pub fn restart_ordinary_presentation_client_pane_size(
@@ -3398,6 +3460,13 @@ impl Brood {
         let Some(pane) = self.pane_for_toplevel_surface(surface) else {
             return false;
         };
+        if self.computer_use_owns_pane(pane) {
+            info!(
+                pane,
+                "suppressed presentation pane-size renegotiation during computer use"
+            );
+            return false;
+        }
         let active_correlation = self
             .dmabuf
             .fast_path

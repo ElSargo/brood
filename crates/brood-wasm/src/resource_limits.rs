@@ -134,6 +134,23 @@ pub struct GenerationStoreLimits {
     pending_table_growth: usize,
 }
 
+impl GenerationStoreLimits {
+    pub(crate) fn new(memory_limit: usize, table_limit: usize) -> Self {
+        Self {
+            inner: StoreLimitsBuilder::new()
+                .memory_size(memory_limit)
+                .table_elements(table_limit)
+                .build(),
+            memory_limit,
+            memory_bytes: 0,
+            pending_memory_growth: 0,
+            table_limit,
+            table_elements: 0,
+            pending_table_growth: 0,
+        }
+    }
+}
+
 impl ResourceLimiter for GenerationStoreLimits {
     fn memory_growing(
         &mut self,

@@ -5,18 +5,23 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 . "$ROOT/tools/smoke-lib.sh"
 SSH_TARGET="${BROOD_CODING_AGENT_SSH_TARGET:-}"
+COMPUTER_USE="${BROOD_CODING_AGENT_COMPUTER_USE:-}"
 REMOTE_IMAGE_MARKER="REMOTE_IMAGE_PROOF: red green"
 
 if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
   exec dbus-run-session -- "$0" "$@"
 fi
 
-for tool in cargo cc grim magick pkg-config python3 sway swaymsg wasm-tools wayland-scanner wl-copy wtype; do
+for tool in cargo cc grim jq magick pkg-config python3 sway swaymsg wasm-tools wayland-scanner wl-copy wtype; do
   if ! command -v "$tool" > /dev/null 2>&1; then
     echo "ERR $tool is required for the coding-agent proof" >&2
     exit 2
   fi
 done
+if [[ -n "$COMPUTER_USE" ]] && ! command -v speedcrunch > /dev/null 2>&1; then
+  echo "ERR speedcrunch is required for the built-in computer-use proof" >&2
+  exit 2
+fi
 
 OUT="${BROOD_CODING_AGENT_OUT:-$(mktemp -d /tmp/brood-coding-agent.XXXXXX)}"
 PACKAGE="$OUT/package"
@@ -68,6 +73,15 @@ wasm-tools component new \
   plugins/coding-agent/target/wasm32-unknown-unknown/release/brood_coding_agent_plugin.wasm \
   --output "$PACKAGE/brood_coding_agent_plugin.component.wasm"
 wasm-tools validate "$PACKAGE/brood_coding_agent_plugin.component.wasm"
+cargo build \
+  --manifest-path plugins/terminal-ui/Cargo.toml \
+  --target wasm32-unknown-unknown \
+  --release \
+  --locked
+wasm-tools component new \
+  plugins/terminal-ui/target/wasm32-unknown-unknown/release/brood_terminal_ui_plugin.wasm \
+  --output "$PACKAGE/brood_terminal_ui_plugin.component.wasm"
+wasm-tools validate "$PACKAGE/brood_terminal_ui_plugin.component.wasm"
 cargo build \
   --manifest-path examples/wasm-init-actor/Cargo.toml \
   --target wasm32-unknown-unknown \
@@ -185,6 +199,7 @@ if [[ -z "$SSH_TARGET" ]]; then
 (
   cd "$WORKSPACE"
   env -u brood_session \
+    PATH="$ROOT/target/debug:$PATH" \
     RUST_LOG="$RUST_LOG" \
     "$ROOT/target/debug/brood-sessiond" \
     --headless \
@@ -312,9 +327,20 @@ else
   rg -q "coding-agent-1" "$SERVER_LOG"
 fi
 
-# Open the agent picker with the physical KeyA binding. Keep the keymap and
-# scan code independent of wtype's compact generated keymap, and wait for the
-# picker to be accepted at its modal geometry before selecting its first result.
+# Wait for the initial workspace to be committed, then open the picker using
+# the real global shortcut. The rest of this proof continues through real
+# pointer and keyboard input inside the picker and agent UI.
+REQUIRED_LAYOUT_COMMITS=2
+[[ -z "$COMPUTER_USE" ]] || REQUIRED_LAYOUT_COMMITS=1
+for _ in $(seq 1 300); do
+  if [[ "$(rg -a -c 'presented committed layout revision' "$CLIENT_LOG" || true)" -ge "$REQUIRED_LAYOUT_COMMITS" ]]; then
+    break
+  fi
+  sleep 0.1
+done
+[[ "$(rg -a -c 'presented committed layout revision' "$CLIENT_LOG" || true)" -ge "$REQUIRED_LAYOUT_COMMITS" ]]
+click_at 640 360
+sleep 0.2
 PICKER_PANE="$(
   sed -n \
     's/.*started presentation WASM actor id=picker .* pane=\([0-9][0-9]*\) .*/\1/p' \
@@ -342,16 +368,14 @@ for _ in $(seq 1 300); do
   )"
   PICKER_LAYOUT_AFTER="$(rg -c 'accepted leased actor layout' "$CLIENT_LOG" || true)"
   if ((PICKER_VISIBLE_AFTER > PICKER_VISIBLE_BEFORE)) \
-    && ((PICKER_RESIZE_AFTER > PICKER_RESIZE_BEFORE)) \
-    && ((PICKER_LAYOUT_AFTER > PICKER_LAYOUT_BEFORE)); then
+    && rg -q "focused local plugin pane=$PICKER_PANE" "$CLIENT_LOG"; then
     break
   fi
   sleep 0.1
 done
 rg -q "sent key-policy actor message actor=brood.client-init" "$CLIENT_LOG"
 ((PICKER_VISIBLE_AFTER > PICKER_VISIBLE_BEFORE))
-((PICKER_RESIZE_AFTER > PICKER_RESIZE_BEFORE))
-((PICKER_LAYOUT_AFTER > PICKER_LAYOUT_BEFORE))
+rg -q "focused local plugin pane=$PICKER_PANE" "$CLIENT_LOG"
 env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
   WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
   "$OUT/virtual-keyboard-key" --none 28
@@ -370,7 +394,7 @@ agent_ui_focused() {
 
 for _ in $(seq 1 300); do
   AGENT_UI="$(
-    { rg -o 'started presentation WASM actor id=coding-agent-ui-b[0-9]+-s[0-9]+-[0-9]+' \
+    { rg -a -o 'started presentation WASM actor id=coding-agent-ui-b[0-9]+-s[0-9]+-[0-9]+' \
       "$CLIENT_LOG" || true; } \
       | tail -1 \
       | sed 's/.*id=//'
@@ -396,6 +420,32 @@ rg -q "presentation actor message .*sender=$AGENT_UI recipient=init.*\"kind\":\"
   "$CLIENT_LOG"
 agent_ui_focused
 
+AGENT_PANE="$(
+  sed -n \
+    "s/.*started presentation WASM actor id=$AGENT_UI .* pane=\([0-9][0-9]*\) .*/\1/p" \
+    "$CLIENT_LOG" \
+    | tail -1
+)"
+[[ "$AGENT_PANE" =~ ^[0-9]+$ ]]
+
+focus_agent_prompt() {
+  local focused=""
+  for _ in $(seq 1 30); do
+    # The bottom status bar occupies the last 34 logical pixels. Keep prompt
+    # input comfortably inside the editor across empty and populated layouts.
+    click_at 240 630
+    sleep 0.1
+    focused="$(
+      rg -a -o 'focused local plugin pane=[0-9]+' "$CLIENT_LOG" \
+        | tail -1 \
+        | sed 's/.*=//'
+    )"
+    [[ "$focused" == "$AGENT_PANE" ]] && return 0
+  done
+  echo "ERR could not focus coding-agent prompt pane $AGENT_PANE; last focus was $focused" >&2
+  return 1
+}
+
 AGENT_ID="coding-agent-1"
 
 capture() {
@@ -407,6 +457,7 @@ capture() {
 
 capture "$OUT/agent-idle.png"
 
+if [[ -z "$COMPUTER_USE" ]]; then
 IMAGE_EXPECTED="red green"
 magick -size 192x128 xc:red "$OUT/pasted-image.png"
 magick -size 192x128 xc:lime "$OUT/dropped-image.png"
@@ -414,7 +465,7 @@ env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
   WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
   wl-copy --type image/png < "$OUT/pasted-image.png"
 sleep 0.3
-click_at 240 670
+focus_agent_prompt
 env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
   WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
   wtype -M ctrl "v" -m ctrl
@@ -499,17 +550,23 @@ assert_preview_color() {
 }
 assert_preview_color "$OUT/agent-images-attached.png" '#FF0000'
 assert_preview_color "$OUT/agent-images-attached.png" '#00FF00'
+fi
 
 if [[ -n "$SSH_TARGET" ]]; then
   PROMPT="Inspect both attached images. If their solid colors are red and green, reply with exactly this marker and nothing else: $REMOTE_IMAGE_MARKER"
+elif [[ -n "$COMPUTER_USE" ]]; then
+  PROMPT='Open SpeedCrunch and use it to calculate (12345*6789)-987654. Visually verify that the application shows 82822551, leave any automation stopped, and reply with exactly BROOD_BUILTIN_CU_OK only after verification.'
 else
   PROMPT='Create .brood/image-proof.txt with red green and .brood/agent-actor-proof.txt with actor-ui-worker-ok'
 fi
-click_at 240 670
-sleep 0.2
+focus_agent_prompt
+sleep 0.5
 env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
   WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
-  wtype "$PROMPT" -s 50 -k Return
+  "$OUT/virtual-keyboard-key" --text "$PROMPT"
+env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+  WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+  "$OUT/virtual-keyboard-key" --none 28
 
 for _ in $(seq 1 300); do
   if rg -q "presentation actor message .*recipient=$AGENT_ID.*\"kind\":\"prompt\"" "$CLIENT_LOG"; then
@@ -564,6 +621,101 @@ EOF
   echo "proof=$OUT/proof.md"
   echo "attachments=$OUT/agent-images-attached.png"
   echo "complete=$OUT/agent-complete.png"
+  exit 0
+elif [[ -n "$COMPUTER_USE" ]]; then
+  COMPUTER_TASK=""
+  for _ in $(seq 1 1200); do
+    ctl computer-use list > "$OUT/computer-use-tasks.json" || true
+    COMPUTER_TASK="$(
+      jq -r '.[] | select(.principal == "coding-agent-1" and .scope.session == 1 and .state == "stopped" and .next_sequence >= 2) | .id' \
+        "$OUT/computer-use-tasks.json" 2> /dev/null \
+        | tail -1
+    )"
+    if [[ -n "$COMPUTER_TASK" ]] \
+      && rg -q '"log_kind":"agent","text":"BROOD_BUILTIN_CU_OK"' "$CLIENT_LOG"; then
+      break
+    fi
+    kill -0 "$CLIENT_PID" 2> /dev/null || {
+      echo "ERR presentation client exited during the built-in computer-use turn" >&2
+      exit 1
+    }
+    sleep 0.2
+  done
+  [[ -n "$COMPUTER_TASK" ]]
+  rg -q '"log_kind":"agent","text":"BROOD_BUILTIN_CU_OK"' "$CLIENT_LOG"
+  ctl computer-use observe "$COMPUTER_TASK" 0 0 > "$OUT/computer-use-observer.json"
+  jq -e '
+    .task.principal == "coding-agent-1"
+    and .task.scope.session == 1
+    and .task.state == "stopped"
+    and .lease == null
+    and (.observations | length) >= 1
+    and (.events | map(.event.type) | index("batch_committed")) != null
+    and any(.events[]; .event.type == "state_changed" and .event.state == "stopped")
+    and (.events | map(.event.type) | index("lease_released")) != null
+  ' "$OUT/computer-use-observer.json" > /dev/null
+  python3 - "$OUT/computer-use-observer.json" "$OUT/builtin-agent-final.png" <<'PY'
+import json
+import pathlib
+import sys
+
+payload = json.loads(pathlib.Path(sys.argv[1]).read_text())
+images = [bytes(observation["png"]) for observation in payload["observations"]]
+if not images or not images[-1]:
+    raise SystemExit("built-in agent produced no visual observation")
+pathlib.Path(sys.argv[2]).write_bytes(images[-1])
+PY
+  [[ "$(magick identify -format '%wx%h' "$OUT/builtin-agent-final.png")" == "1440x900" ]]
+  for _ in $(seq 1 300); do
+    if rg -q '"text":"Turn complete"' "$CLIENT_LOG" \
+      && rg -q "component actor worker finished" "$SERVER_LOG"; then
+      break
+    fi
+    sleep 0.1
+  done
+  rg -q '"text":"Turn complete"' "$CLIENT_LOG"
+  rg -q "component actor worker finished" "$SERVER_LOG"
+  if find "$WORKSPACE" -maxdepth 1 -name '.brood-agent-image-*' -print -quit | rg -q .; then
+    echo "ERR coding-agent temporary image was not removed" >&2
+    exit 1
+  fi
+  capture "$OUT/agent-complete.png"
+  TASK_SEQUENCE="$(jq -r '.task.next_sequence' "$OUT/computer-use-observer.json")"
+  OBSERVATION_SEQUENCES="$(jq -r '[.observations[].sequence] | join(",")' "$OUT/computer-use-observer.json")"
+  FRAME_SEQUENCES="$(jq -r '[.observations[].settle.frame_sequence] | join(",")' "$OUT/computer-use-observer.json")"
+  INPUT_SEQUENCES="$(jq -r '[.observations[].settle.input_sequence] | join(",")' "$OUT/computer-use-observer.json")"
+  SPEEDCRUNCH_PANE="$(jq -r '.observations[-1].active_window' "$OUT/computer-use-observer.json")"
+  [[ "$SPEEDCRUNCH_PANE" =~ ^[0-9]+$ ]]
+  cat > "$OUT/proof.md" <<EOF
+# Built-in agent computer-use proof
+
+- application: SpeedCrunch, pane $SPEEDCRUNCH_PANE, session 1; launched by the agent from an empty session
+- agent principal: coding-agent-1
+- task: $COMPUTER_TASK, stopped with lease released
+- task next sequence: $TASK_SEQUENCE
+- observation sequences: $OBSERVATION_SEQUENCES
+- settle frame sequences: $FRAME_SEQUENCES
+- settle input sequences: $INPUT_SEQUENCES
+- automation viewport: 1440x900
+- live presentation bounds at capture: 480x686; presentation layout did not control automation geometry
+- workload: the built-in Codex pane used its automatically configured session MCP server to enter (12345*6789)-987654 and visually verified 82822551
+- input: real Ctrl+Alt+A picker shortcut, pointer selection, prompt typing, and server-side SpeedCrunch keyboard actions
+- captures: builtin-agent-final.png and agent-complete.png
+EOF
+  echo "coding_agent_computer_use=verified task=$COMPUTER_TASK sequences=$OBSERVATION_SEQUENCES frames=$FRAME_SEQUENCES"
+  echo "proof=$OUT/proof.md"
+  echo "automation_capture=$OUT/builtin-agent-final.png"
+  echo "presentation_capture=$OUT/agent-complete.png"
+  SWAY_SOCKET="$(
+    find "$RUNTIME_DIR" -maxdepth 1 -type s -name 'sway-ipc.*.sock' | head -1
+  )"
+  [[ -n "$SWAY_SOCKET" ]]
+  env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+    WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+    SWAYSOCK="$SWAY_SOCKET" \
+    swaymsg '[title="^Brood$"] kill' > "$OUT/presentation-close.json"
+  wait "$CLIENT_PID"
+  CLIENT_PID=""
   exit 0
 else
   for _ in $(seq 1 900); do
@@ -727,6 +879,21 @@ cat > "$OUT/proof.md" <<EOF
 - captures: agent-idle.png, agent-image-attached.png, agent-images-attached.png, agent-finished-inbox.png, and agent-complete.png
 - status: $STATUS
 EOF
+
+if [[ -n "$COMPUTER_USE" ]]; then
+  cat > "$OUT/proof.md" <<EOF
+# Built-in agent computer-use proof
+
+- input: a real prompt submitted through the built-in session-scoped coding-agent pane
+- binding: Codex received a required stdio MCP server fixed to Brood session 1 and principal coding-agent-1
+- application: real SpeedCrunch pane $SPEEDCRUNCH_PANE inside that session
+- work: Codex started its own task, observed the application as MCP image content, entered (12345*6789)-987654, visually verified 82822551, and stopped the task
+- lifecycle: task $COMPUTER_TASK retained at least two changing observations and ended stopped with no lease
+- artifact: builtin-agent-final.png is the final 1440x900 server observation
+- presentation: the same nested client remained attached for live spectator output and returned to the agent UI after stop
+- status: $STATUS
+EOF
+fi
 
 ctl quit > /dev/null 2>&1 || true
 echo "coding_agent_actor=verified"

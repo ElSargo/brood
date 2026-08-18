@@ -105,7 +105,7 @@ impl CompositorHandler for Brood {
                 });
                 let maybe_dmabuf = new_buffer.and_then(|buffer| get_dmabuf(buffer).cloned().ok());
                 let new_buffer_size = new_buffer
-                    .and_then(|buffer| buffer_dimensions(buffer))
+                    .and_then(buffer_dimensions)
                     .map(|size| transform.transform_size(size))
                     .map(|size| (size.w, size.h));
                 (maybe_dmabuf, new_buffer_size)
@@ -225,6 +225,7 @@ impl CompositorHandler for Brood {
         handle_xdg_commit(self, surface);
         self.capture_managed_resize_commit(surface);
         crate::frame_export::request_redraw(self);
+        crate::computer_use::capture_after_commit(self);
     }
 }
 
