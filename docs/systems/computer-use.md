@@ -78,7 +78,20 @@ action types. No adapter is authoritative for action semantics.
 The automation viewport is not a human presentation surface. It is a fixed,
 server-owned projection used only for machine observation, coordinate mapping,
 and deterministic input. The presentation client continues to own human
-layout, final composition, and platform-native interaction.
+layout, final composition, and platform-native interaction. Managed-window
+size authority changes with the live computer-use lease:
+
+- without a lease, the presentation client sends the logical size selected by
+  its human layout;
+- with a lease, the server publishes `server_preferred` size authority and its
+  preferred logical size in the managed-window catalogue;
+- on human takeover, lease revocation restores presentation authority and the
+  client applies its current layout once.
+
+Catalogue authority, not screenshot arrival, controls this transition. The
+client scales server-sized managed frames or the newest spectator observation
+to its own presentation rectangle. Passive capture and debug dumps never
+configure an application's size.
 
 The existing presentation design says the server never creates a native or
 offscreen presentation target. Implementing computer use requires narrowing
@@ -93,7 +106,8 @@ applications, select automation windows, change coordinates, or request a new
 capture cadence. State/history and the newest compressed frame travel as
 separate bounded observer updates when needed, and slow clients retain only the
 newest frame. Deliberate human primary input still follows the task's pause or
-revoke policy before ordinary interaction resumes.
+revoke policy before ordinary interaction resumes. A paused task has no size
+authority unless it reacquires a lease.
 
 ## Automation viewport
 

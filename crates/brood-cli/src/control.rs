@@ -107,6 +107,7 @@ pub struct PresentationWindowSummary {
     pub pane: u64,
     pub session: u64,
     pub app_id: String,
+    pub size_authority: brood_protocol::ManagedWindowSizeAuthority,
 }
 
 #[derive(Clone, Debug)]
@@ -335,6 +336,7 @@ pub fn list_presentation_windows(target: &ControlTarget) -> Result<Vec<Presentat
                     pane,
                     session,
                     app_id,
+                    size_authority: brood_protocol::ManagedWindowSizeAuthority::Presentation,
                 })
                 .collect()
         })

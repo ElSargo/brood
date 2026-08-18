@@ -464,9 +464,6 @@ pub fn capture_current(state: &mut Brood) -> Result<(), String> {
     state.refresh_window_state();
     let session = state.active_surface_session().raw();
     let selected = state.computer_use_automation.selected_pane(state, session);
-    if let Some(pane) = selected {
-        configure_automation_target(state, pane);
-    }
     let snapshot = capture_viewport(state, session, selected).map_err(|error| error.to_string())?;
     state.computer_use_automation.store_capture(snapshot);
     Ok(())
@@ -1596,7 +1593,6 @@ pub fn cancel_pending_batch(state: &mut Brood, task: &TaskId, detail: &str) -> b
         detail,
         "computer-use batch cancelled"
     );
-    drop(publish_observer_update(state));
     drop(pending.response.send(Ok(payload.to_string())));
     true
 }
@@ -1626,9 +1622,6 @@ pub fn capture_after_commit(state: &mut Brood) {
     }
     let session = state.active_surface_session().raw();
     let selected = state.computer_use_automation.selected_pane(state, session);
-    if let Some(pane) = selected {
-        configure_automation_target(state, pane);
-    }
     match capture_viewport(state, session, selected) {
         Ok(snapshot) => {
             state.computer_use_automation.store_capture(snapshot);

@@ -2,7 +2,7 @@
 status: target
 type: workflow
 authority: implementation
-last-reviewed: 2026-08-17
+last-reviewed: 2026-08-18
 ---
 
 # Computer Use Implementation Tracker
@@ -40,6 +40,7 @@ Checklist meanings:
 | Closely model Codex direct computer actions and persistent code execution | Accepted |
 | Use a fixed 1440 by 900 server automation viewport initially | Accepted |
 | Keep the human presentation client an observer, approval, and takeover surface | Accepted |
+| Let the client size managed windows normally; publish and respect server-preferred size only for a live automation lease | Accepted |
 | Exclude client-local plugin panes from initial pixel control | Accepted |
 | Start with one daemon-wide lease because the compositor seat is shared | Accepted |
 | Isolate generated code with explicit capabilities and hard resource limits | Accepted |
@@ -66,6 +67,7 @@ specified, and no external adapter owns domain semantics.
 - [x] Separate reusable buffer import/readback from debug capture.
 - [x] Support DMA-BUF and SHM source buffers.
 - [x] Add the fixed automation viewport and deterministic layout.
+- [x] Publish server-preferred window size authority without coupling it to observation delivery.
 - [x] Add active-window selection by stable identity.
 - [x] Encode original PNG observations with complete metadata.
 - [x] Add monotonic observation and frame sequence markers.
@@ -85,6 +87,7 @@ screenshots and metadata from the server alone.
 - [x] Track and clean up held keys, modifiers, and buttons.
 - [x] Implement causal settle detection and bounded timeouts.
 - [x] Add pause, cancellation, and human-input takeover policy.
+- [x] Restore client layout authority and issue one current-layout resize on takeover.
 - [x] Publish auditable action and result events.
 - [x] Prove stale-lease, cross-session, and out-of-bounds rejection.
 
@@ -229,6 +232,7 @@ design or test workload.
 | 2026-08-18 | Agent integration | `c6d17ba` plus working tree | Built-in Codex launches and drives SpeedCrunch from an empty session | `/tmp/brood-computer-use-builtin-agent-launch-e/proof.md`; daemon spawned `speedcrunch` as pane 1 in session 1; task `coding-agent-1-computer-2803055-1`; sequences 1-3; frames 24-26; final result `82822551`; stopped with lease released; assembled package `/nix/store/8bfjs9s8aq6gp5hmdj11yf4xwnrwvbfm-brood` exposes `computer_launch` | Passed: the model used the session-bound launch tool, waited for a managed window, targeted that pane, visually verified the calculation from changing 1440x900 observations, and completed without shell or host-desktop access |
 | 2026-08-18 | Agent integration | working tree | Live presentation shutdown after an empty-session start | Client teardown returned `stop presentation WASM runtime: session actor address is invalid` after the session and observer reached an otherwise idle state | Failed: a queued guest command could lose a validation race with explicit component shutdown and turn orderly presentation teardown into a process error |
 | 2026-08-18 | Agent integration | working tree | Built-in agent automation followed by compositor-driven presentation close | `/tmp/brood-computer-use-builtin-agent-shutdown-b/proof.md`; task `coding-agent-1-computer-2897948-1`; observations 1-2; frames 27-28; `presentation-close.json` reports success; client exited zero after reporting final graphics and input diagnostics; assembled package `/nix/store/r1d1c3994yfffx9y6z5ww22hfpc7h7v6-brood` | Passed: explicit component teardown suppresses only errors produced after shutdown was requested, while live dispatcher errors remain fatal; the real window-close path is clean |
+| 2026-08-18 | Resize authority | working tree | Server-preferred automation size and human takeover | `/tmp/brood-computer-use-size-authority-verified-20260818/proof.md`; changing SHM and DMA-BUF captures; real client log has one normal resize before automation, no additional resize during the held automation drag, a paused observer update at event cursor 29, then a new current-layout resize; `human-status.json` retains an attached presentation with no lease | Passed: a live lease makes the server authoritative independently of screenshot delivery, synchronized presentation resize degrades to scaling without configuring the managed app, and primary human input restores client sizing after the fast-path input drain completes |
 
 ## Immediate next actions
 

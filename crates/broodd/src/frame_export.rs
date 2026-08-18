@@ -95,6 +95,7 @@ struct CatalogWindow {
     pane: u64,
     session: u64,
     app_id: String,
+    size_authority: brood_protocol::ManagedWindowSizeAuthority,
 }
 
 #[derive(Debug)]
@@ -284,6 +285,14 @@ pub fn publish_catalog_snapshot(state: &mut Brood) -> std::result::Result<(), Fr
                 pane: window.pane,
                 session: window.session,
                 app_id: window.app_id,
+                size_authority: if state.computer_use_owns_pane(window.pane) {
+                    brood_protocol::ManagedWindowSizeAuthority::ServerPreferred {
+                        logical_width: brood_computer_use::AUTOMATION_VIEWPORT_WIDTH,
+                        logical_height: brood_computer_use::AUTOMATION_VIEWPORT_HEIGHT,
+                    }
+                } else {
+                    brood_protocol::ManagedWindowSizeAuthority::Presentation
+                },
             })
             .collect(),
     };

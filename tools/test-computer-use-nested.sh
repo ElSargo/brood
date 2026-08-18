@@ -456,12 +456,21 @@ HUMAN_GENERATION="$(jq -r .generation <<<"$HUMAN_LEASE")"
 ctl computer-use batch "$(drag_batch human-takeover "$HUMAN_GENERATION")" \
   >"$OUT/human-takeover-response.json" &
 BATCH_PID=$!
-for _ in $(seq 1 100); do
+for _ in $(seq 1 1000); do
   STATUS="$(ctl status-json)"
   [[ "$(jq -r .computer_use_held_buttons <<<"$STATUS")" == "1" ]] && break
   sleep 0.01
 done
 [[ "$(jq -r .computer_use_held_buttons <<<"$STATUS")" == "1" ]]
+AUTOMATION_RESIZES="$({
+  rg -c 'requested managed window resize ' \
+    "$OUT/presentation-client.log" || true
+} | tail -1)"
+sleep 0.1
+[[ "$({
+  rg -c 'requested managed window resize ' \
+    "$OUT/presentation-client.log" || true
+} | tail -1)" == "$AUTOMATION_RESIZES" ]]
 env XDG_RUNTIME_DIR="$PRESENT_RUNTIME_DIR" WAYLAND_DISPLAY="$PRESENT_DISPLAY" \
   "$OUT/virtual-pointer-click" 400 300 800 600
 wait "$BATCH_PID"
@@ -470,6 +479,16 @@ jq -e '.results[-1].status == "cancelled" and .results[-1].failure == "cancelled
   "$OUT/human-takeover-response.json" >/dev/null
 ctl computer-use inspect human-takeover >"$OUT/human-task.json"
 jq -e '.state == "paused"' "$OUT/human-task.json" >/dev/null
+for _ in $(seq 1 300); do
+  TAKEOVER_RESIZES="$({
+    rg -c 'requested managed window resize ' \
+      "$OUT/presentation-client.log" || true
+  } | tail -1)"
+  ((TAKEOVER_RESIZES > AUTOMATION_RESIZES)) && break
+  kill -0 "$CLIENT_PID" 2>/dev/null || exit 1
+  sleep 0.05
+done
+((TAKEOVER_RESIZES > AUTOMATION_RESIZES))
 STATUS="$(ctl status-json)"
 printf '%s\n' "$STATUS" >"$OUT/human-status.json"
 jq -e '

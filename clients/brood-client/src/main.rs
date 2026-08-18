@@ -35,7 +35,7 @@ use brood_cli::{
 };
 use brood_computer_use::{
     AUTOMATION_VIEWPORT_HEIGHT, AUTOMATION_VIEWPORT_WIDTH, ComputerObservationFrame,
-    ComputerUseObserverCommand, ComputerUseObserverUpdate, MAX_OBSERVATION_PNG_BYTES, TaskState,
+    ComputerUseObserverCommand, ComputerUseObserverUpdate, MAX_OBSERVATION_PNG_BYTES,
 };
 use brood_dmabuf::{SinglePlaneDmabuf, import_single_plane};
 use brood_layout::{
@@ -45,7 +45,7 @@ use brood_layout::{
 };
 use brood_protocol::{
     ArtifactManifest, ArtifactRealm, BackendActorRealm, BackendId, ClientLifecycle, ClientMessage,
-    FrameTransportKind, InputEvent, PanePosition,
+    FrameTransportKind, InputEvent, ManagedWindowSizeAuthority, PanePosition,
     backend_catalogue::{
         BACKEND_CATALOGUE_ACTOR_ID, BACKEND_CATALOGUE_CLIENT_SENDER, BackendCatalogueEntry,
         BackendCatalogueMessage, BackendSessionEntry,
@@ -1509,6 +1509,8 @@ struct CatalogWireWindow {
     pane: u64,
     session: u64,
     app_id: String,
+    #[serde(default)]
+    size_authority: ManagedWindowSizeAuthority,
 }
 
 struct PendingCatalog {
@@ -1637,6 +1639,7 @@ fn spawn_catalog_updates(
                                     pane: window.pane,
                                     session: window.session,
                                     app_id: window.app_id,
+                                    size_authority: window.size_authority,
                                 })
                                 .collect::<Vec<_>>();
                             eprintln!(
@@ -3812,6 +3815,65 @@ impl Application {
         Ok(())
     }
 
+    fn sync_computer_use_presentation(&mut self) -> Result<()> {
+        let Some(renderer) = self.renderer.as_ref() else {
+            return Ok(());
+        };
+        let active_backend = renderer.active_backend;
+        let mut owned_panes = renderer
+            .available_windows
+            .iter()
+            .filter_map(|window| {
+                (!self
+                    .computer_use_observer_updates
+                    .contains_key(&window.backend)
+                    && matches!(
+                        window.size_authority,
+                        ManagedWindowSizeAuthority::ServerPreferred { .. }
+                    ))
+                .then_some(window.pane)
+            })
+            .collect::<BTreeSet<_>>();
+        let mut active_updates = Vec::new();
+        for (backend, update) in &self.computer_use_observer_updates {
+            let Some(lease) = update.lease.as_ref() else {
+                continue;
+            };
+            for window in &renderer.available_windows {
+                if window.backend != *backend || window.session != lease.session {
+                    continue;
+                }
+                let Some(qualified) = self.backend_registry.backend_pane(window.pane) else {
+                    continue;
+                };
+                if qualified.backend == *backend
+                    && (lease.windows.is_empty() || lease.windows.contains(&qualified.pane))
+                {
+                    owned_panes.insert(window.pane);
+                }
+            }
+            active_updates.push((*backend, update, lease));
+        }
+        let selected = active_updates
+            .iter()
+            .find(|(backend, _, _)| Some(*backend) == active_backend)
+            .or_else(|| active_updates.first());
+        let active_task = selected.map(|(_, _, lease)| lease.task.0.as_str());
+        let frame = selected.and_then(|(_, update, lease)| {
+            update
+                .frame
+                .as_ref()
+                .filter(|frame| frame.task == lease.task)
+        });
+        let renderer = self
+            .renderer
+            .as_mut()
+            .context("renderer disappeared while applying computer-use authority")?;
+        renderer.update_automation_spectator(frame, active_task, owned_panes)?;
+        flush_renderer_managed_resize_requests(self.input_sender.as_mut(), renderer);
+        Ok(())
+    }
+
     fn drop_frontend_wayland_state(&mut self) {
         drop_frontend_wayland_state(
             &mut self.wayland_drop,
@@ -3883,6 +3945,7 @@ impl Application {
         self.pending_frames.remove(&backend);
         self.pending_backend_snapshots.remove(&backend);
         self.last_presented_sequences.remove(&backend);
+        self.computer_use_observer_updates.remove(&backend);
         if let Some(sender) = self.input_sender.as_mut() {
             sender.set_pane_routes(self.backend_registry.all_view_routes());
         }
@@ -3891,6 +3954,7 @@ impl Application {
             .as_mut()
             .and_then(|renderer| renderer.disconnect_backend(backend))
             .or(focus_change);
+        self.sync_computer_use_presentation()?;
         if let Some(position) = self
             .remote_connections
             .iter()
@@ -8813,6 +8877,13 @@ impl ApplicationHandler<ClientEvent> for Application {
                             renderer.select_backend_snapshot(backend, active_session, windows);
                     }
                 }
+                if let Err(error) = self.sync_computer_use_presentation() {
+                    self.fail(
+                        event_loop,
+                        error.context("restore computer-use presentation authority"),
+                    );
+                    return;
+                }
                 if let (Some(sender), Some(renderer)) =
                     (self.input_sender.as_mut(), self.renderer.as_ref())
                 {
@@ -9223,6 +9294,13 @@ impl ApplicationHandler<ClientEvent> for Application {
                         .insert(backend, (active_session, windows));
                     None
                 };
+                if let Err(error) = self.sync_computer_use_presentation() {
+                    self.fail(
+                        event_loop,
+                        error.context("refresh computer-use presentation authority"),
+                    );
+                    return;
+                }
                 let synchronized_inventory_changed = self
                     .active_synchronized_resize
                     .as_ref()
@@ -9349,25 +9427,6 @@ impl ApplicationHandler<ClientEvent> for Application {
                 if sender == COMPUTER_USE_SERVER_ACTOR && recipient == COMPUTER_USE_OBSERVER_ACTOR {
                     match serde_json::from_slice::<ComputerUseObserverUpdate>(&body) {
                         Ok(update) => {
-                            let spectator_active = update.tasks.iter().any(|task| {
-                                matches!(
-                                    task.state,
-                                    TaskState::Running
-                                        | TaskState::Paused
-                                        | TaskState::WaitingApproval
-                                )
-                            });
-                            if let Some(renderer) = self.renderer.as_mut()
-                                && let Err(error) = renderer.update_automation_spectator(
-                                    update.frame.as_ref(),
-                                    spectator_active,
-                                )
-                            {
-                                eprintln!(
-                                    "dropped computer-use spectator frame backend={} error={error:#}",
-                                    backend.0,
-                                );
-                            }
                             let tasks = update
                                 .tasks
                                 .iter()
@@ -9389,6 +9448,12 @@ impl ApplicationHandler<ClientEvent> for Application {
                                 serde_json::to_string(&tasks).unwrap_or_else(|_| "[]".to_string()),
                             );
                             self.computer_use_observer_updates.insert(backend, update);
+                            if let Err(error) = self.sync_computer_use_presentation() {
+                                eprintln!(
+                                    "dropped computer-use presentation update backend={} error={error:#}",
+                                    backend.0,
+                                );
+                            }
                         }
                         Err(error) => {
                             eprintln!(
@@ -10980,6 +11045,7 @@ struct Renderer {
     pending_managed_resource_releases: Vec<(BackendId, u64)>,
     sent_plugin_sizes: HashMap<u64, PluginPaneSize>,
     window_resize_in_progress: bool,
+    automation_owned_panes: BTreeSet<u64>,
     automation_spectator: Option<AutomationSpectatorFrame>,
 }
 
@@ -11067,6 +11133,7 @@ struct AvailableWindow {
     pane: u64,
     session: u64,
     app_id: String,
+    size_authority: ManagedWindowSizeAuthority,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
@@ -13382,6 +13449,7 @@ impl Renderer {
             pending_managed_resource_releases: Vec::new(),
             sent_plugin_sizes: HashMap::new(),
             window_resize_in_progress: false,
+            automation_owned_panes: BTreeSet::new(),
             automation_spectator: None,
         })
     }
@@ -13389,18 +13457,37 @@ impl Renderer {
     fn update_automation_spectator(
         &mut self,
         frame: Option<&ComputerObservationFrame>,
-        active: bool,
+        active_task: Option<&str>,
+        owned_panes: BTreeSet<u64>,
     ) -> Result<()> {
-        if !active {
+        apply_automation_size_authority(
+            &mut self.automation_owned_panes,
+            owned_panes,
+            &mut self.sent_managed_sizes,
+            &mut self.pending_ordinary_managed_recovery,
+        );
+        let Some(active_task) = active_task else {
             if self.automation_spectator.take().is_some() {
                 eprintln!("computer-use spectator stopped");
                 self.window.request_redraw();
             }
             return Ok(());
+        };
+        if self
+            .automation_spectator
+            .as_ref()
+            .is_some_and(|current| current.task != active_task)
+        {
+            self.automation_spectator = None;
+            self.window.request_redraw();
         }
         let Some(frame) = frame else {
             return Ok(());
         };
+        anyhow::ensure!(
+            frame.task.0 == active_task,
+            "computer-use observation belongs to a task without presentation authority"
+        );
         anyhow::ensure!(
             frame.png.len() <= MAX_OBSERVATION_PNG_BYTES,
             "computer-use observation exceeds the PNG byte limit"
@@ -13526,6 +13613,7 @@ impl Renderer {
                     window.pane,
                     window.session,
                     window.app_id.clone(),
+                    window.size_authority,
                 )
             })
             .collect::<Vec<_>>();
@@ -13537,6 +13625,7 @@ impl Renderer {
                 pane: window.pane,
                 session: window.session,
                 app_id: window.app_id,
+                size_authority: window.size_authority,
             })
             .collect::<Vec<_>>();
         available_windows.sort_by_key(|window| window.pane);
@@ -13548,6 +13637,7 @@ impl Renderer {
                     window.pane,
                     window.session,
                     window.app_id.clone(),
+                    window.size_authority,
                 )
             })
             .collect::<Vec<_>>();
@@ -15277,6 +15367,10 @@ impl Renderer {
         epoch: u64,
         wait: bool,
     ) -> Result<()> {
+        anyhow::ensure!(
+            !self.automation_owned_panes.contains(&route.view_pane),
+            "server owns the managed pane size during computer use"
+        );
         let item = self
             .accepted_layout
             .pane_item(route.view_pane)
@@ -15316,9 +15410,6 @@ impl Renderer {
     }
 
     fn pending_managed_resize_requests(&self) -> Vec<(u64, u32, u32, u32, u32, u32, Option<u64>)> {
-        if self.automation_spectator.is_some() {
-            return Vec::new();
-        }
         let scale = self.window.scale_factor().max(f64::EPSILON);
         let scale_120 = (scale * f64::from(brood_protocol::FRACTIONAL_SCALE_DENOMINATOR))
             .round()
@@ -15328,10 +15419,13 @@ impl Renderer {
             .expectations
             .values()
             .filter_map(|expectation| {
-                matches!(
-                    expectation.state,
-                    ManagedResizeExpectationState::PendingSend
-                )
+                (!self
+                    .automation_owned_panes
+                    .contains(&expectation.route.view_pane)
+                    && matches!(
+                        expectation.state,
+                        ManagedResizeExpectationState::PendingSend
+                    ))
                 .then_some((
                     expectation.route.view_pane,
                     expectation.logical_size.0,
@@ -15346,6 +15440,7 @@ impl Renderer {
         requests.extend(
             self.pending_ordinary_managed_recovery
                 .iter()
+                .filter(|pane| !self.automation_owned_panes.contains(pane))
                 .filter_map(|pane| {
                     let window = self
                         .current_windows
@@ -15370,10 +15465,11 @@ impl Renderer {
                 self.current_windows
                     .iter()
                     .filter(|window| {
-                        !self
-                            .managed_resizes
-                            .expectations
-                            .contains_key(&window.window_id)
+                        !self.automation_owned_panes.contains(&window.window_id)
+                            && !self
+                                .managed_resizes
+                                .expectations
+                                .contains_key(&window.window_id)
                             && !self
                                 .pending_ordinary_managed_recovery
                                 .contains(&window.window_id)
@@ -15934,6 +16030,18 @@ fn schedule_ordinary_managed_recovery(
     pending.insert(pane);
 }
 
+fn apply_automation_size_authority(
+    current: &mut BTreeSet<u64>,
+    next: BTreeSet<u64>,
+    sent_sizes: &mut HashMap<u64, (u32, u32)>,
+    pending_recovery: &mut BTreeSet<u64>,
+) {
+    for pane in current.difference(&next).copied().collect::<Vec<_>>() {
+        schedule_ordinary_managed_recovery(sent_sizes, pending_recovery, pane);
+    }
+    *current = next;
+}
+
 fn aborted_plugin_refresh_plan(
     was_pre_promotion: bool,
     active_panes: Vec<u64>,
@@ -16150,6 +16258,26 @@ mod tests {
             aspect_fit_viewport((1440, 900), (1920, 1080)),
             [96.0, 0.0, 1728.0, 1080.0]
         );
+    }
+
+    #[test]
+    fn takeover_releases_server_size_and_reissues_the_human_layout() {
+        let mut authority = BTreeSet::from([7, 8]);
+        let mut sent = HashMap::from([(7, (1440, 900)), (8, (1440, 900)), (9, (640, 480))]);
+        let mut pending = BTreeSet::new();
+
+        apply_automation_size_authority(
+            &mut authority,
+            BTreeSet::from([8]),
+            &mut sent,
+            &mut pending,
+        );
+
+        assert_eq!(authority, BTreeSet::from([8]));
+        assert!(!sent.contains_key(&7));
+        assert_eq!(sent.get(&8), Some(&(1440, 900)));
+        assert_eq!(sent.get(&9), Some(&(640, 480)));
+        assert_eq!(pending, BTreeSet::from([7]));
     }
 
     fn managed_route(view_pane: u64) -> ManagedPaneRoute {
@@ -19254,6 +19382,7 @@ mod tests {
             pane,
             session,
             app_id: format!("app-{pane}"),
+            size_authority: ManagedWindowSizeAuthority::Presentation,
         }
     }
 
@@ -19349,6 +19478,7 @@ mod tests {
             pane: 10,
             session: 4,
             app_id: "managed".to_string(),
+            size_authority: ManagedWindowSizeAuthority::Presentation,
         }];
         let plugin_realms = BTreeMap::from([
             (20, Some((BackendId(2), 7))),

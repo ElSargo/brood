@@ -3010,6 +3010,7 @@ fn drain_fast_path_input(state: &mut Brood) {
     state.dmabuf.fast_path_input_draining = true;
     let mut request_redraw = false;
     let mut disconnected = false;
+    let mut publish_computer_use_update = false;
     loop {
         let message = {
             let Some(record) = fast_path.input.try_recv() else {
@@ -3039,6 +3040,7 @@ fn drain_fast_path_input(state: &mut Brood) {
                     &task,
                     "automation paused by human primary input",
                 );
+                publish_computer_use_update = true;
             }
         }
         match message {
@@ -3170,11 +3172,7 @@ fn drain_fast_path_input(state: &mut Brood) {
                 scale_120,
                 resize_epoch,
             }) => {
-                if state
-                    .computer_use
-                    .lease()
-                    .is_some_and(|lease| lease.windows.contains(&pane))
-                {
+                if state.computer_use_owns_pane(pane) {
                     if let Some(epoch) = resize_epoch {
                         crate::state::emit_managed_resize_status(
                             &mut fast_path,
@@ -3252,6 +3250,11 @@ fn drain_fast_path_input(state: &mut Brood) {
     } else {
         state.dmabuf.fast_path = Some(fast_path);
         state.dmabuf.fast_path_input_draining = false;
+    }
+    if publish_computer_use_update
+        && let Err(error) = crate::computer_use::publish_observer_update(state)
+    {
+        warn!(%error, "publish computer-use takeover update failed");
     }
     if request_redraw || disconnected {
         crate::frame_export::request_redraw(state);

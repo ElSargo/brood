@@ -347,6 +347,22 @@ pub struct CatalogWindow {
     pub pane: u64,
     pub session: u64,
     pub app_id: String,
+    #[serde(default)]
+    pub size_authority: ManagedWindowSizeAuthority,
+}
+
+/// Which endpoint chooses a managed application's configured logical size.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "owner", rename_all = "snake_case")]
+pub enum ManagedWindowSizeAuthority {
+    /// The presentation client chooses a size from its human layout.
+    #[default]
+    Presentation,
+    /// The session server chooses a stable size and presentations scale it.
+    ServerPreferred {
+        logical_width: u32,
+        logical_height: u32,
+    },
 }
 
 /// Pointer position in pane-local logical coordinates.
@@ -767,8 +783,9 @@ mod tests {
         ARTIFACT_ABI_VERSION, ArtifactKind, ArtifactManifest, ArtifactMessage, ArtifactRealm,
         ArtifactValidationError, CarrierKind, EndpointCapabilities, FrameTransportKind, InputEvent,
         MAX_ARTIFACT_CHUNK_BYTES, ManagedResizeRejectionReason, ManagedResizeStatus,
-        ManagedResizeStatusResult, NegotiationError, PRESENTATION_PROTOCOL_VERSION, ServerMessage,
-        TransportProfile, WindowFrame, negotiate_profile,
+        ManagedResizeStatusResult, ManagedWindowSizeAuthority, NegotiationError,
+        PRESENTATION_PROTOCOL_VERSION, ServerMessage, TransportProfile, WindowFrame,
+        negotiate_profile,
     };
 
     #[test]
@@ -817,6 +834,30 @@ mod tests {
         assert_eq!(
             negotiate_profile(&client, &server),
             Err(NegotiationError::ProtocolVersion)
+        );
+    }
+
+    #[test]
+    fn catalog_size_authority_defaults_to_presentation_and_carries_server_preference() {
+        let legacy = br#"{"pane":7,"session":1,"app_id":"org.example.App"}"#;
+        let decoded = serde_json::from_slice::<super::CatalogWindow>(legacy);
+        assert!(decoded.is_ok());
+        assert_eq!(
+            decoded.ok().map(|window| window.size_authority),
+            Some(ManagedWindowSizeAuthority::Presentation)
+        );
+
+        let authority = ManagedWindowSizeAuthority::ServerPreferred {
+            logical_width: 1440,
+            logical_height: 900,
+        };
+        let encoded = serde_json::to_vec(&authority);
+        assert!(encoded.is_ok());
+        assert_eq!(
+            encoded
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok()),
+            Some(authority)
         );
     }
 

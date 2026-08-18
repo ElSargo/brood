@@ -3255,6 +3255,17 @@ impl Brood {
         true
     }
 
+    pub(crate) fn computer_use_owns_pane(&self, pane: u64) -> bool {
+        let Some(lease) = self.computer_use.lease() else {
+            return false;
+        };
+        self.presentation_window_summaries().iter().any(|window| {
+            window.pane == pane
+                && window.session == lease.session
+                && (lease.windows.is_empty() || lease.windows.contains(&pane))
+        })
+    }
+
     pub(crate) fn configure_automation_pane_size(
         &mut self,
         pane: u64,
@@ -3449,6 +3460,13 @@ impl Brood {
         let Some(pane) = self.pane_for_toplevel_surface(surface) else {
             return false;
         };
+        if self.computer_use_owns_pane(pane) {
+            info!(
+                pane,
+                "suppressed presentation pane-size renegotiation during computer use"
+            );
+            return false;
+        }
         let active_correlation = self
             .dmabuf
             .fast_path
