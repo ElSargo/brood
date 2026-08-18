@@ -7,6 +7,7 @@ set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+. "$ROOT/tools/smoke-lib.sh"
 
 for tool in cargo cc dbus-run-session grim jq magick mkfifo pkg-config python3 readlink rg sha256sum swaymsg wayland-scanner; do
   command -v "$tool" > /dev/null 2>&1 || {
@@ -71,12 +72,9 @@ cleanup() {
   if [[ -n "$POINTER_WRITE_FD" && -n "$POINTER_PID" ]] && kill -0 "$POINTER_PID" 2>/dev/null; then
     printf 'cancel\n' >&"$POINTER_WRITE_FD"
   fi
-  for pid in "$POINTER_PID" "$CLIENT_PID" "$SERVER_PID"; do
-    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-      kill "$pid" 2>/dev/null || true
-      wait "$pid" 2>/dev/null || true
-    fi
-  done
+  terminate_process_bounded "$POINTER_PID"
+  terminate_process_bounded "$CLIENT_PID"
+  terminate_process_bounded "$SERVER_PID"
   if [[ -n "$ORIGINAL_SCALE" ]]; then
     wayland_env swaymsg output "$OUTPUT_NAME" scale "$ORIGINAL_SCALE" >/dev/null 2>&1 || true
   fi

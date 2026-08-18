@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, VecDeque},
     sync::Mutex,
 };
 
@@ -12,7 +12,7 @@ use brood_plugin_sdk::{
         ChildEvent, Command as ActorCommand, Event, Guest, LifecycleEvent, PresentationEvent,
         WorkerEvent, WorkerRequest,
     },
-    graphics::{drop_resources, layout_ui_text, submit_packet_for_resize},
+    graphics::{TextLayoutCache, drop_resources},
     input::BUTTON_PRIMARY as LEFT_BUTTON,
 };
 use serde::{Deserialize, Serialize};
@@ -119,14 +119,6 @@ struct LogLine {
     text: String,
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct TextLayoutKey {
-    text: String,
-    size: u32,
-    width: u32,
-    color: [u32; 4],
-}
-
 struct RootState {
     client: bool,
     backend_id: u64,
@@ -225,9 +217,7 @@ struct UiState {
     next_image: u64,
     suppressed_text: Option<String>,
     paste_key_pressed: bool,
-    text_resources: BTreeMap<TextLayoutKey, u64>,
-    frame_text_resources: BTreeSet<TextLayoutKey>,
-    created_text_resources: Vec<TextLayoutKey>,
+    text_cache: Option<TextLayoutCache>,
     draw_error: Option<String>,
     updates_since_draw: usize,
     error: String,
@@ -258,9 +248,7 @@ impl UiState {
             next_image: 1,
             suppressed_text: None,
             paste_key_pressed: false,
-            text_resources: BTreeMap::new(),
-            frame_text_resources: BTreeSet::new(),
-            created_text_resources: Vec::new(),
+            text_cache: None,
             draw_error: None,
             updates_since_draw: 0,
             error: String::new(),
@@ -380,13 +368,7 @@ fn set_root_state(client: bool, backend_id: u64, session_id: u64) {
 }
 
 fn start_ui_command(id: &str, backend_id: u64, session_id: u64) -> ActorCommand {
-    start_session_actor(
-        id,
-        COMPONENT_FILE,
-        Vec::new(),
-        backend_id,
-        session_id,
-    )
+    start_session_actor(id, COMPONENT_FILE, Vec::new(), backend_id, session_id)
 }
 
 fn start_agent_command(id: &str) -> ActorCommand {
@@ -1686,54 +1668,41 @@ fn redraw_ui_for_resize(ui: &mut UiState, resize_epoch: Option<u64>) {
     if ui.pane == 0 {
         return;
     }
-    ui.frame_text_resources.clear();
-    ui.created_text_resources.clear();
+    let mut text_cache = ui
+        .text_cache
+        .take()
+        .unwrap_or_else(|| TextLayoutCache::new(ui.pane));
+    text_cache.set_pane(ui.pane);
+    text_cache.begin_frame();
     ui.draw_error = None;
     let mut packet = Packet::new();
     packet.push(Command::FillRect {
         rect: Rect::new(0.0, 0.0, ui.width, ui.height),
         color: BG,
     });
-    draw_agent_tabs(ui, &mut packet);
-    draw_toolbar(ui, &mut packet);
-    draw_transcript(ui, &mut packet);
-    draw_prompt(ui, &mut packet);
-    let submitted = ui.draw_error.take().map_or_else(
-        || {
-            submit_packet_for_resize(ui.pane, resize_epoch, &packet).map(|_| ())
-        },
-        Err,
-    );
+    draw_agent_tabs(ui, &mut text_cache, &mut packet);
+    draw_toolbar(ui, &mut text_cache, &mut packet);
+    draw_transcript(ui, &mut text_cache, &mut packet);
+    draw_prompt(ui, &mut text_cache, &mut packet);
+    let submitted = if let Some(error) = ui.draw_error.take() {
+        text_cache.abort_frame();
+        Err(error)
+    } else {
+        text_cache.submit(resize_epoch, &packet).map(|_| ())
+    };
     match submitted {
         Ok(()) => {
             drop_resources(ui.pane, ui.retired_image_previews.drain(..));
-            let stale = ui
-                .text_resources
-                .keys()
-                .filter(|key| !ui.frame_text_resources.contains(*key))
-                .cloned()
-                .collect::<Vec<_>>();
-            for key in stale {
-                if let Some(resource) = ui.text_resources.remove(&key) {
-                    drop_resources(ui.pane, [resource]);
-                }
-            }
-            ui.created_text_resources.clear();
             ui.error.clear();
         }
         Err(error) => {
-            for key in std::mem::take(&mut ui.created_text_resources) {
-                if let Some(resource) = ui.text_resources.remove(&key) {
-                    drop_resources(ui.pane, [resource]);
-                }
-            }
             ui.error = error;
         }
     }
-    ui.frame_text_resources.clear();
+    ui.text_cache = Some(text_cache);
 }
 
-fn draw_agent_tabs(ui: &mut UiState, packet: &mut Packet) {
+fn draw_agent_tabs(ui: &mut UiState, text_cache: &mut TextLayoutCache, packet: &mut Packet) {
     packet.push(Command::FillRect {
         rect: Rect::new(0.0, 0.0, ui.width, 44.0),
         color: PANEL,
@@ -1759,6 +1728,7 @@ fn draw_agent_tabs(ui: &mut UiState, packet: &mut Packet) {
         });
         draw_text(
             ui,
+            text_cache,
             packet,
             agent,
             rect.x + 7.0,
@@ -1770,7 +1740,7 @@ fn draw_agent_tabs(ui: &mut UiState, packet: &mut Packet) {
     }
 }
 
-fn draw_toolbar(ui: &mut UiState, packet: &mut Packet) {
+fn draw_toolbar(ui: &mut UiState, text_cache: &mut TextLayoutCache, packet: &mut Packet) {
     let (status, model, reasoning) = ui
         .selected_agent()
         .and_then(|agent| ui.views.get(agent))
@@ -1797,6 +1767,7 @@ fn draw_toolbar(ui: &mut UiState, packet: &mut Packet) {
     let (model_rect, reasoning_rect) = toolbar_control_rects(ui.width);
     draw_text(
         ui,
+        text_cache,
         packet,
         &format!("status  {status}"),
         16.0,
@@ -1807,6 +1778,7 @@ fn draw_toolbar(ui: &mut UiState, packet: &mut Packet) {
     );
     draw_toolbar_button(
         ui,
+        text_cache,
         packet,
         UiTarget::Model,
         model_rect,
@@ -1815,6 +1787,7 @@ fn draw_toolbar(ui: &mut UiState, packet: &mut Packet) {
     );
     draw_toolbar_button(
         ui,
+        text_cache,
         packet,
         UiTarget::Reasoning,
         reasoning_rect,
@@ -1825,6 +1798,7 @@ fn draw_toolbar(ui: &mut UiState, packet: &mut Packet) {
 
 fn draw_toolbar_button(
     ui: &mut UiState,
+    text_cache: &mut TextLayoutCache,
     packet: &mut Packet,
     target: UiTarget,
     rect: Rect,
@@ -1846,6 +1820,7 @@ fn draw_toolbar_button(
     });
     draw_text(
         ui,
+        text_cache,
         packet,
         label,
         rect.x + 9.0,
@@ -1860,7 +1835,7 @@ fn draw_toolbar_button(
     );
 }
 
-fn draw_transcript(ui: &mut UiState, packet: &mut Packet) {
+fn draw_transcript(ui: &mut UiState, text_cache: &mut TextLayoutCache, packet: &mut Packet) {
     let lines = ui
         .selected_agent()
         .and_then(|agent| ui.views.get(agent))
@@ -1896,6 +1871,7 @@ fn draw_transcript(ui: &mut UiState, packet: &mut Packet) {
         let text = format!("{prefix}{}", one_line(&line.text, body_characters));
         draw_text(
             ui,
+            text_cache,
             packet,
             &text,
             18.0,
@@ -1908,10 +1884,15 @@ fn draw_transcript(ui: &mut UiState, packet: &mut Packet) {
     }
 }
 
-fn draw_prompt(ui: &mut UiState, packet: &mut Packet) {
+fn draw_prompt(ui: &mut UiState, text_cache: &mut TextLayoutCache, packet: &mut Packet) {
     let y = ui.height - PROMPT_HEIGHT - 18.0;
     if !ui.images.is_empty() {
-        draw_image_tray(ui, packet, y - IMAGE_TRAY_GAP - IMAGE_TRAY_HEIGHT);
+        draw_image_tray(
+            ui,
+            text_cache,
+            packet,
+            y - IMAGE_TRAY_GAP - IMAGE_TRAY_HEIGHT,
+        );
     }
     packet.push(Command::FillRoundedRect {
         rect: Rect::new(12.0, y, ui.width - 24.0, PROMPT_HEIGHT),
@@ -1920,6 +1901,7 @@ fn draw_prompt(ui: &mut UiState, packet: &mut Packet) {
     });
     draw_text(
         ui,
+        text_cache,
         packet,
         &format!("> {}", one_line(&ui.prompt, 150)),
         24.0,
@@ -1947,6 +1929,7 @@ fn draw_prompt(ui: &mut UiState, packet: &mut Packet) {
     });
     draw_text(
         ui,
+        text_cache,
         packet,
         if send_enabled { "Send" } else { "Enter" },
         ui.width - 88.0,
@@ -1963,6 +1946,7 @@ fn draw_prompt(ui: &mut UiState, packet: &mut Packet) {
         };
         draw_text(
             ui,
+            text_cache,
             packet,
             &one_line(&ui.error, 120),
             18.0,
@@ -1974,7 +1958,12 @@ fn draw_prompt(ui: &mut UiState, packet: &mut Packet) {
     }
 }
 
-fn draw_image_tray(ui: &mut UiState, packet: &mut Packet, y: f32) {
+fn draw_image_tray(
+    ui: &mut UiState,
+    text_cache: &mut TextLayoutCache,
+    packet: &mut Packet,
+    y: f32,
+) {
     packet.push(Command::FillRoundedRect {
         rect: Rect::new(12.0, y, ui.width - 24.0, IMAGE_TRAY_HEIGHT),
         radius: 8.0,
@@ -2025,6 +2014,7 @@ fn draw_image_tray(ui: &mut UiState, packet: &mut Packet, y: f32) {
         }
         draw_text(
             ui,
+            text_cache,
             packet,
             &one_line(&name, 24),
             card.x + 6.0,
@@ -2039,6 +2029,7 @@ fn draw_image_tray(ui: &mut UiState, packet: &mut Packet, y: f32) {
 #[allow(clippy::too_many_arguments)]
 fn draw_text(
     ui: &mut UiState,
+    text_cache: &mut TextLayoutCache,
     packet: &mut Packet,
     text: &str,
     x: f32,
@@ -2048,32 +2039,13 @@ fn draw_text(
     color: Color,
 ) {
     let width = width.max(1.0);
-    let key = TextLayoutKey {
-        text: text.to_string(),
-        size: size.to_bits(),
-        width: width.to_bits(),
-        color: [
-            color.r.to_bits(),
-            color.g.to_bits(),
-            color.b.to_bits(),
-            color.a.to_bits(),
-        ],
-    };
-    ui.frame_text_resources.insert(key.clone());
-    let handle = if let Some(handle) = ui.text_resources.get(&key) {
-        *handle
-    } else {
-        let layout = match layout_ui_text(ui.pane, text, size, width, size * 1.35, color) {
-            Ok(layout) => layout,
-            Err(error) => {
-                ui.draw_error
-                    .get_or_insert_with(|| format!("layout text: {error}"));
-                return;
-            }
-        };
-        ui.text_resources.insert(key.clone(), layout.handle);
-        ui.created_text_resources.push(key);
-        layout.handle
+    let handle = match text_cache.layout_text(text, size, width, size * 1.35, color) {
+        Ok(layout) => layout.handle,
+        Err(error) => {
+            ui.draw_error
+                .get_or_insert_with(|| format!("layout text: {error}"));
+            return;
+        }
     };
     packet.push(Command::DrawTextLayout {
         layout: handle,
@@ -2437,7 +2409,9 @@ mod tests {
         assert_eq!(ui.session_id, 9);
         assert_eq!(ui.selected_agent(), Some("coding-agent-1"));
         assert_eq!(
-            ui.views.get("coding-agent-1").map(|view| view.status.as_str()),
+            ui.views
+                .get("coding-agent-1")
+                .map(|view| view.status.as_str()),
             Some("connecting")
         );
 

@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+. "$ROOT/tools/smoke-lib.sh"
 
 DURATION_SECONDS="${BROOD_PROBE_DURATION_SECONDS:-10}"
 SAMPLE_INTERVAL_SECONDS="${BROOD_PROBE_SAMPLE_INTERVAL_SECONDS:-0.05}"
@@ -115,9 +116,8 @@ chmod +x "$WRAPPER"
 cleanup() {
   if [[ -n "${PID:-}" ]] && kill -0 "$PID" 2> /dev/null; then
     target/debug/brood ctl --dbus-name "$DBUS_DESTINATION" quit > /dev/null 2>&1 || true
-    sleep 0.2
-    kill "$PID" > /dev/null 2>&1 || true
   fi
+  terminate_process_bounded "${PID:-}" 8 0.025
 }
 trap cleanup EXIT
 

@@ -194,6 +194,23 @@ pub enum PresentationScope {
     Session { backend_id: u64, session_id: u64 },
 }
 
+#[derive(Debug)]
+pub enum ComponentActorSendError<T> {
+    Full(T),
+    Closed(T),
+}
+
+impl<T> std::fmt::Display for ComponentActorSendError<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Full(_) => "component actor command queue is full",
+            Self::Closed(_) => "component actor command queue is closed",
+        })
+    }
+}
+
+impl<T: std::fmt::Debug> std::error::Error for ComponentActorSendError<T> {}
+
 impl PresentationScope {
     #[must_use]
     pub const fn session(self) -> Option<(u64, u64)> {
@@ -237,27 +254,61 @@ impl std::fmt::Debug for ComponentActorEventWaker {
 
 #[derive(Clone)]
 struct ComponentActorEventObserver {
+    // Observer events are control and terminal records. Once admitted they
+    // must remain observable even when the host is temporarily descheduled.
     sender: mpsc::Sender<ComponentActorEvent>,
     waker: Option<ComponentActorEventWaker>,
+    dispatcher_returned_pending: Arc<AtomicBool>,
 }
 
 impl ComponentActorEventObserver {
-    const fn new(
+    const TERMINAL_RESERVE: usize = 2;
+
+    fn new(
         sender: mpsc::Sender<ComponentActorEvent>,
         waker: Option<ComponentActorEventWaker>,
     ) -> Self {
-        Self { sender, waker }
+        Self {
+            sender,
+            waker,
+            dispatcher_returned_pending: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     fn try_send(
         &self,
         event: ComponentActorEvent,
     ) -> std::result::Result<(), mpsc::error::TrySendError<ComponentActorEvent>> {
-        self.sender.try_send(event)?;
+        let terminal = matches!(
+            event,
+            ComponentActorEvent::DispatcherFailed { .. } | ComponentActorEvent::Stopped
+        );
+        if !terminal && self.sender.capacity() <= Self::TERMINAL_RESERVE {
+            return Err(mpsc::error::TrySendError::Full(event));
+        }
+        let dispatcher_returned = matches!(event, ComponentActorEvent::DispatcherReturned);
+        if dispatcher_returned
+            && self
+                .dispatcher_returned_pending
+                .swap(true, Ordering::AcqRel)
+        {
+            return Ok(());
+        }
+        if let Err(error) = self.sender.try_send(event) {
+            if dispatcher_returned {
+                self.dispatcher_returned_pending
+                    .store(false, Ordering::Release);
+            }
+            return Err(error);
+        }
         if let Some(waker) = self.waker.as_ref() {
             waker.wake();
         }
         Ok(())
+    }
+
+    fn has_ordinary_capacity(&self, required: usize) -> bool {
+        self.sender.capacity() >= required.saturating_add(Self::TERMINAL_RESERVE)
     }
 }
 
@@ -1951,6 +2002,7 @@ pub struct ComponentActor {
     shutdown_requested: Arc<AtomicBool>,
     limits: WasmResourceLimits,
     observer_result_bytes: Arc<Mutex<HashMap<WorkerId, GenerationBytePermit>>>,
+    dispatcher_returned_pending: Arc<AtomicBool>,
 }
 
 impl ComponentActor {
@@ -2044,8 +2096,13 @@ impl ComponentActor {
         let mailbox_capacity = config.mailbox_backlog;
         let observer_result_bytes = Arc::new(Mutex::new(HashMap::new()));
         let shutdown_requested = Arc::new(AtomicBool::new(false));
-        let (event_tx, event_rx) = mpsc::channel(config.command_capacity);
+        // One dispatcher result can yield at most `command_capacity` host
+        // records. Keep a second batch plus two reserved terminal slots so
+        // DispatcherFailed/Stopped remain observable under saturation.
+        let event_capacity = config.command_capacity.saturating_mul(2).saturating_add(2);
+        let (event_tx, event_rx) = mpsc::channel(event_capacity);
         let event_observer = ComponentActorEventObserver::new(event_tx, config.event_waker.clone());
+        let dispatcher_returned_pending = Arc::clone(&event_observer.dispatcher_returned_pending);
         let mut store = Store::new(
             &engine,
             ActorStore {
@@ -2129,6 +2186,7 @@ impl ComponentActor {
             shutdown_requested,
             limits,
             observer_result_bytes,
+            dispatcher_returned_pending,
         })
     }
 
@@ -2187,34 +2245,60 @@ impl ComponentActor {
     }
 
     /// Deliver one typed pane lifecycle or input event without blocking.
-    pub fn try_send_presentation_event(&self, event: PresentationEvent) -> Result<()> {
-        self.commands
-            .try_send(RuntimeCommand::Presentation(event))
-            .map_err(|error| {
-                anyhow::anyhow!("component actor rejected presentation event: {error}")
-            })
+    pub fn try_send_presentation_event(
+        &self,
+        event: PresentationEvent,
+    ) -> std::result::Result<(), ComponentActorSendError<PresentationEvent>> {
+        try_send_typed(
+            &self.commands,
+            RuntimeCommand::Presentation(event),
+            |command| {
+                let RuntimeCommand::Presentation(event) = command else {
+                    unreachable!()
+                };
+                event
+            },
+        )
     }
 
     /// Deliver one typed session snapshot or command completion without
     /// blocking the presentation event loop.
-    pub fn try_send_session_event(&self, event: SessionEvent) -> Result<()> {
-        self.commands
-            .try_send(RuntimeCommand::Session(event))
-            .map_err(|error| anyhow::anyhow!("component actor rejected session event: {error}"))
+    pub fn try_send_session_event(
+        &self,
+        event: SessionEvent,
+    ) -> std::result::Result<(), ComponentActorSendError<SessionEvent>> {
+        try_send_typed(&self.commands, RuntimeCommand::Session(event), |command| {
+            let RuntimeCommand::Session(event) = command else {
+                unreachable!()
+            };
+            event
+        })
     }
 
     /// Deliver lifecycle feedback for one child owned by a blessed init actor.
-    pub fn try_send_child_event(&self, event: ComponentChildEvent) -> Result<()> {
-        self.commands
-            .try_send(RuntimeCommand::Child(event))
-            .map_err(|error| anyhow::anyhow!("component init actor rejected child event: {error}"))
+    pub fn try_send_child_event(
+        &self,
+        event: ComponentChildEvent,
+    ) -> std::result::Result<(), ComponentActorSendError<ComponentChildEvent>> {
+        try_send_typed(&self.commands, RuntimeCommand::Child(event), |command| {
+            let RuntimeCommand::Child(event) = command else {
+                unreachable!()
+            };
+            event
+        })
     }
 
     /// Deliver app lifecycle feedback to a blessed session init actor.
-    pub fn try_send_app_event(&self, event: ComponentAppEvent) -> Result<()> {
-        self.commands
-            .try_send(RuntimeCommand::App(event))
-            .map_err(|error| anyhow::anyhow!("component init actor rejected app event: {error}"))
+    pub fn try_send_app_event(
+        &self,
+        event: ComponentAppEvent,
+    ) -> std::result::Result<(), ComponentActorSendError<ComponentAppEvent>> {
+        try_send_typed(&self.commands, RuntimeCommand::App(event), |command| {
+            let RuntimeCommand::App(event) = command else {
+                unreachable!()
+            };
+            event
+        })
     }
 
     /// Snapshot cumulative mailbox delivery counters.
@@ -2281,6 +2365,10 @@ impl ComponentActor {
     }
 
     fn release_observer_result_bytes(&self, event: &ComponentActorEvent) {
+        if matches!(event, ComponentActorEvent::DispatcherReturned) {
+            self.dispatcher_returned_pending
+                .store(false, Ordering::Release);
+        }
         let worker = match event {
             ComponentActorEvent::WorkerFinished { worker, .. }
             | ComponentActorEvent::WorkerFailed { worker, .. } => Some(*worker),
@@ -2323,6 +2411,22 @@ fn increment_saturating(counter: &AtomicU64) {
     let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
         Some(current.saturating_add(1))
     });
+}
+
+fn try_send_typed<T>(
+    commands: &mpsc::Sender<RuntimeCommand>,
+    command: RuntimeCommand,
+    recover: impl FnOnce(RuntimeCommand) -> T,
+) -> std::result::Result<(), ComponentActorSendError<T>> {
+    match commands.try_send(command) {
+        Ok(()) => Ok(()),
+        Err(mpsc::error::TrySendError::Full(command)) => {
+            Err(ComponentActorSendError::Full(recover(command)))
+        }
+        Err(mpsc::error::TrySendError::Closed(command)) => {
+            Err(ComponentActorSendError::Closed(recover(command)))
+        }
+    }
 }
 
 fn try_enqueue_mailbox(
@@ -2521,7 +2625,7 @@ async fn run_component_event_loop(
     let mut dispatch_lane = 0_usize;
 
     loop {
-        if !dispatcher_busy {
+        if component_dispatch_can_start(dispatcher_busy, event_observer) {
             let event = pop_component_dispatch(
                 &mut dispatch_lane,
                 &mut completion_queue,
@@ -2554,7 +2658,26 @@ async fn run_component_event_loop(
         }
 
         tokio::select! {
-            command = commands.recv() => match command {
+            permits = event_observer.sender.reserve_many(ComponentActorEventObserver::TERMINAL_RESERVE + 1), if !event_observer.has_ordinary_capacity(1) => {
+                // Waiting on a real channel permit makes observer saturation
+                // pause this actor without polling or allocating a side queue.
+                drop(permits);
+            }
+            permits = event_observer.sender.reserve_many(
+                config.command_capacity
+                    .saturating_add(ComponentActorEventObserver::TERMINAL_RESERVE + 1)
+            ), if !calls.is_empty()
+                && !event_observer.has_ordinary_capacity(config.command_capacity.saturating_add(1)) => {
+                // A completed dispatch can return `command_capacity` observed
+                // host records plus DispatcherReturned. Register a capacity
+                // waiter so the actor is woken when the host drains output;
+                // merely disabling `calls.next()` would sleep forever.
+                drop(permits);
+            }
+            command = commands.recv(), if event_observer.has_ordinary_capacity(1)
+                && presentation_queue.len() < config.presentation_backlog
+                && system_queue.len() < component_system_capacity(config)
+                && mailbox_queue.len() < config.mailbox_backlog => match command {
                 Some(RuntimeCommand::Mailbox { sender, body, permit, byte_permit }) => {
                     // The sender acquired one of exactly `mailbox_backlog`
                     // permits before the command was accepted, so this queue
@@ -2577,7 +2700,7 @@ async fn run_component_event_loop(
                         event_observer,
                         config,
                         byte_permit,
-                    )?;
+                    );
                     if started {
                         let _ = event_observer.try_send(ComponentActorEvent::WorkerStarted { worker });
                     }
@@ -2596,7 +2719,7 @@ async fn run_component_event_loop(
                         &mut system_queue,
                         component_system_capacity(config),
                         component_lifecycle_to_guest(event),
-                    )?;
+                    );
                     pending_lifecycle = Some(reply);
                 }
                 Some(RuntimeCommand::Child(event)) => {
@@ -2604,38 +2727,39 @@ async fn run_component_event_loop(
                         &mut system_queue,
                         component_system_capacity(config),
                         component_child_to_guest(event),
-                    )?;
+                    );
                 }
                 Some(RuntimeCommand::App(event)) => {
                     enqueue_dispatch(
                         &mut system_queue,
                         component_system_capacity(config),
                         component_app_to_guest(event),
-                    )?;
+                    );
                 }
                 Some(RuntimeCommand::Presentation(event)) => {
                     enqueue_presentation_dispatch(
                         &mut presentation_queue,
                         config.presentation_backlog,
                         event,
-                    )?;
+                    );
                 }
                 Some(RuntimeCommand::Session(event)) => {
                     enqueue_dispatch(
                         &mut system_queue,
                         component_system_capacity(config),
                         component_session_to_guest(event),
-                    )?;
+                    );
                 }
                 Some(RuntimeCommand::Shutdown) | None => break,
             },
-            completion = io_completions.recv(), if completion_queue.len() < config.max_outstanding_io => {
+            completion = io_completions.recv(), if completion_queue.len() < config.max_outstanding_io
+                && event_observer.has_ordinary_capacity(1) => {
                 let Some(completion) = completion else { continue; };
                 enqueue_dispatch(
                     &mut completion_queue,
                     config.max_outstanding_io,
                     completion_to_guest(&completion),
-                )?;
+                );
                 let _ = completion_observer.try_send(completion.clone());
                 let _ = event_observer.try_send(ComponentActorEvent::CompletionDelivered(completion));
             }
@@ -2643,7 +2767,10 @@ async fn run_component_event_loop(
                 let Some(notification) = notification else { continue; };
                 notification_queue.push_back(notification);
             }
-            outcome = calls.next(), if !calls.is_empty() => {
+            outcome = calls.next(), if !calls.is_empty()
+                && event_observer.has_ordinary_capacity(config.command_capacity.saturating_add(1))
+                && system_queue.len().saturating_add(config.command_capacity)
+                    <= component_system_capacity(config) => {
                 let Some(outcome) = outcome else { continue; };
                 match outcome {
                     GuestCallOutcome::Dispatch(result) => {
@@ -2669,7 +2796,7 @@ async fn run_component_event_loop(
                                                             worker: worker.raw(),
                                                             message: error.to_string(),
                                                         })),
-                                                    )?;
+                                                    );
                                                     continue;
                                                 }
                                             };
@@ -2684,7 +2811,7 @@ async fn run_component_event_loop(
                                                 event_observer,
                                                 config,
                                                 byte_permit,
-                                            )?;
+                                            );
                                             if started {
                                                 let _ = event_observer.try_send(ComponentActorEvent::WorkerStarted { worker });
                                             }
@@ -2861,7 +2988,7 @@ async fn run_component_event_loop(
                                 &mut system_queue,
                                 component_system_capacity(config),
                                 abi::Event::Worker(abi::WorkerEvent::Cancelled(worker.raw())),
-                            )?;
+                            );
                             let _ = event_observer.try_send(ComponentActorEvent::WorkerCancelled { worker });
                             continue;
                         }
@@ -2876,7 +3003,7 @@ async fn run_component_event_loop(
                                             worker: worker.raw(),
                                             message: message.clone(),
                                         })),
-                                    )?;
+                                    );
                                     let _ = event_observer.try_send(ComponentActorEvent::WorkerFailed { worker, message });
                                     continue;
                                 }
@@ -2894,7 +3021,7 @@ async fn run_component_event_loop(
                                                 worker: worker.raw(),
                                                 message: message.clone(),
                                             })),
-                                        )?;
+                                        );
                                         let _ = event_observer.try_send(ComponentActorEvent::WorkerFailed { worker, message });
                                         continue;
                                     }
@@ -2907,7 +3034,7 @@ async fn run_component_event_loop(
                                         output: output.clone(),
                                     })),
                                     result_permits.0,
-                                )?;
+                                );
                                 observe_retained_worker_event(
                                     event_observer,
                                     observer_result_bytes,
@@ -2944,7 +3071,7 @@ async fn run_component_event_loop(
                                         component_system_capacity(config),
                                         event,
                                         system_permit,
-                                    )?;
+                                    );
                                     observe_retained_worker_event(
                                         event_observer,
                                         observer_result_bytes,
@@ -2957,7 +3084,7 @@ async fn run_component_event_loop(
                                         &mut system_queue,
                                         component_system_capacity(config),
                                         event,
-                                    )?;
+                                    );
                                     let _ = event_observer.try_send(ComponentActorEvent::WorkerFailed { worker, message });
                                 }
                             }
@@ -2970,7 +3097,7 @@ async fn run_component_event_loop(
                                         worker: worker.raw(),
                                         message: message.clone(),
                                     })),
-                                )?;
+                                );
                                 let _ = event_observer.try_send(ComponentActorEvent::WorkerFailed { worker, message });
                             }
                         }
@@ -3334,26 +3461,26 @@ fn enqueue_presentation_dispatch(
     queue: &mut VecDeque<PresentationEvent>,
     capacity: usize,
     event: PresentationEvent,
-) -> Result<()> {
+) {
     match &event {
         PresentationEvent::PointerMoved { pane, .. } => {
             if let Some(queued) = queue.back_mut()
                 && matches!(queued, PresentationEvent::PointerMoved { pane: queued_pane, .. } if *queued_pane == *pane)
             {
                 *queued = event;
-                return Ok(());
+                return;
             }
             if queue.len() < capacity {
                 queue.push_back(event);
             }
-            return Ok(());
+            return;
         }
         PresentationEvent::PaneResized { pane, .. } => {
             if let Some(queued) = queue.back_mut()
                 && matches!(queued, PresentationEvent::PaneResized { pane: queued_pane, .. } if *queued_pane == *pane)
             {
                 *queued = event;
-                return Ok(());
+                return;
             }
         }
         PresentationEvent::PaneCreated { .. }
@@ -3367,45 +3494,37 @@ fn enqueue_presentation_dispatch(
         | PresentationEvent::Image { .. } => {}
     }
 
-    if queue.len() >= capacity {
-        if let Some(index) = queue
+    if queue.len() >= capacity
+        && let Some(index) = queue
             .iter()
             .position(|queued| matches!(queued, PresentationEvent::PointerMoved { .. }))
-        {
-            queue.remove(index);
-        } else {
-            anyhow::bail!("actor presentation dispatch backlog is full");
-        }
+    {
+        queue.remove(index);
     }
     queue.push_back(event);
-    Ok(())
 }
 
 fn enqueue_dispatch(
     queue: &mut VecDeque<QueuedGuestEvent>,
-    capacity: usize,
+    _soft_capacity: usize,
     event: GuestEvent,
-) -> Result<()> {
-    ensure!(queue.len() < capacity, "actor dispatch backlog is full");
+) {
     queue.push_back(QueuedGuestEvent {
         event,
         _byte_permit: None,
     });
-    Ok(())
 }
 
 fn enqueue_retained_dispatch(
     queue: &mut VecDeque<QueuedGuestEvent>,
-    capacity: usize,
+    _soft_capacity: usize,
     event: GuestEvent,
     byte_permit: GenerationBytePermit,
-) -> Result<()> {
-    ensure!(queue.len() < capacity, "actor dispatch backlog is full");
+) {
     queue.push_back(QueuedGuestEvent {
         event,
         _byte_permit: Some(byte_permit),
     });
-    Ok(())
 }
 
 fn observe_retained_worker_event(
@@ -3450,7 +3569,7 @@ fn start_worker<'a>(
     event_observer: &ComponentActorEventObserver,
     config: &ComponentActorConfig,
     byte_permit: GenerationBytePermit,
-) -> Result<bool> {
+) -> bool {
     use bindings::exports::brood::plugin::actor as abi;
     use futures::FutureExt;
 
@@ -3474,9 +3593,9 @@ fn start_worker<'a>(
                 worker: worker.raw(),
                 message: message.clone(),
             })),
-        )?;
+        );
         let _ = event_observer.try_send(ComponentActorEvent::WorkerFailed { worker, message });
-        return Ok(false);
+        return false;
     }
 
     active_workers.insert(worker);
@@ -3500,16 +3619,16 @@ fn start_worker<'a>(
                     worker: worker.raw(),
                     message: message.clone(),
                 })),
-            )?;
+            );
             let _ = event_observer.try_send(ComponentActorEvent::WorkerFailed { worker, message });
-            return Ok(false);
+            return false;
         }
     };
     enqueue_dispatch(
         system_queue,
         component_system_capacity(config),
         abi::Event::Worker(abi::WorkerEvent::Started(worker.raw())),
-    )?;
+    );
     calls.push(
         async move {
             let _byte_permit = byte_permit;
@@ -3521,7 +3640,7 @@ fn start_worker<'a>(
         }
         .boxed(),
     );
-    Ok(true)
+    true
 }
 
 fn request_component_worker_cancellation(
@@ -3548,6 +3667,13 @@ const fn component_system_capacity(config: &ComponentActorConfig) -> usize {
         .max_workers
         .saturating_mul(2)
         .saturating_add(config.command_capacity)
+}
+
+fn component_dispatch_can_start(
+    dispatcher_busy: bool,
+    event_observer: &ComponentActorEventObserver,
+) -> bool {
+    !dispatcher_busy && event_observer.has_ordinary_capacity(1)
 }
 
 fn completion_to_guest(completion: &ActorCompletion) -> GuestEvent {
@@ -3578,10 +3704,84 @@ mod tests {
     use super::*;
 
     #[test]
+    fn one_pending_observer_record_does_not_starve_the_next_dispatch() {
+        let (sender, _receiver) = mpsc::channel(8);
+        let observer = ComponentActorEventObserver::new(sender, None);
+        observer
+            .try_send(ComponentActorEvent::DispatcherReturned)
+            .unwrap();
+
+        assert!(component_dispatch_can_start(false, &observer));
+        assert!(!component_dispatch_can_start(true, &observer));
+    }
+
+    #[test]
+    fn saturated_component_command_lane_returns_the_unadmitted_event() {
+        let (sender, _receiver) = mpsc::channel(1);
+        sender
+            .try_send(RuntimeCommand::Presentation(
+                PresentationEvent::PaneFocused {
+                    pane: 1,
+                    focused: true,
+                },
+            ))
+            .unwrap();
+        let pending = PresentationEvent::Key {
+            pane: 1,
+            physical_key: 42,
+            logical_key: "x".to_string(),
+            pressed: true,
+            repeat: false,
+            modifiers: 0,
+        };
+        let error = try_send_typed(&sender, RuntimeCommand::Presentation(pending), |command| {
+            let RuntimeCommand::Presentation(event) = command else {
+                unreachable!()
+            };
+            event
+        })
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ComponentActorSendError::Full(PresentationEvent::Key {
+                physical_key: 42,
+                ..
+            })
+        ));
+        assert_eq!(sender.capacity(), 0);
+    }
+
+    #[test]
+    fn critical_presentation_queue_never_exceeds_admission_capacity() {
+        let mut queue = VecDeque::new();
+        for physical_key in 0..128 {
+            if queue.len() == 8 {
+                assert!(matches!(
+                    queue.pop_front(),
+                    Some(PresentationEvent::Key { .. })
+                ));
+            }
+            enqueue_presentation_dispatch(
+                &mut queue,
+                8,
+                PresentationEvent::Key {
+                    pane: 7,
+                    physical_key,
+                    logical_key: physical_key.to_string(),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: 0,
+                },
+            );
+            assert!(queue.len() <= 8);
+        }
+    }
+
+    #[test]
     fn actor_event_observer_wakes_only_after_queueing_work() {
         let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observed_wakes = Arc::clone(&wakes);
-        let (sender, mut receiver) = mpsc::channel(1);
+        let (sender, mut receiver) = mpsc::channel(6);
         let observer = ComponentActorEventObserver::new(
             sender,
             Some(ComponentActorEventWaker::new(move || {
@@ -3589,24 +3789,57 @@ mod tests {
             })),
         );
 
+        for worker in 1..=4 {
+            assert!(
+                observer
+                    .try_send(ComponentActorEvent::WorkerStarted {
+                        worker: WorkerId(worker)
+                    })
+                    .is_ok()
+            );
+        }
+        assert!(matches!(
+            observer.try_send(ComponentActorEvent::WorkerStarted {
+                worker: WorkerId(5)
+            }),
+            Err(mpsc::error::TrySendError::Full(
+                ComponentActorEvent::WorkerStarted {
+                    worker: WorkerId(5)
+                }
+            ))
+        ));
         assert!(
             observer
-                .try_send(ComponentActorEvent::DispatcherReturned)
+                .try_send(ComponentActorEvent::DispatcherFailed {
+                    message: "failed".to_string()
+                })
                 .is_ok()
         );
-        assert_eq!(wakes.load(Ordering::Relaxed), 1);
+        assert!(observer.try_send(ComponentActorEvent::Stopped).is_ok());
+        assert_eq!(sender_capacity(&observer), 0);
+        for worker in 1..=4 {
+            assert_eq!(
+                receiver.try_recv().ok(),
+                Some(ComponentActorEvent::WorkerStarted {
+                    worker: WorkerId(worker)
+                })
+            );
+        }
         assert_eq!(
             receiver.try_recv().ok(),
-            Some(ComponentActorEvent::DispatcherReturned)
+            Some(ComponentActorEvent::DispatcherFailed {
+                message: "failed".to_string()
+            })
         );
+        assert_eq!(receiver.try_recv().ok(), Some(ComponentActorEvent::Stopped));
 
         drop(receiver);
-        assert!(
-            observer
-                .try_send(ComponentActorEvent::DispatcherReturned)
-                .is_err()
-        );
-        assert_eq!(wakes.load(Ordering::Relaxed), 1);
+        assert!(observer.try_send(ComponentActorEvent::Stopped).is_err());
+        assert_eq!(wakes.load(Ordering::Relaxed), 6);
+    }
+
+    fn sender_capacity(observer: &ComponentActorEventObserver) -> usize {
+        observer.sender.capacity()
     }
 
     #[cfg(unix)]
@@ -3712,39 +3945,30 @@ mod tests {
     #[test]
     fn presentation_backlog_never_discards_text() {
         let mut queue = VecDeque::new();
-        assert!(
-            enqueue_presentation_dispatch(
-                &mut queue,
-                2,
-                PresentationEvent::Text {
-                    pane: 1,
-                    text: "a".to_string(),
-                },
-            )
-            .is_ok()
+        enqueue_presentation_dispatch(
+            &mut queue,
+            2,
+            PresentationEvent::Text {
+                pane: 1,
+                text: "a".to_string(),
+            },
         );
-        assert!(
-            enqueue_presentation_dispatch(
-                &mut queue,
-                2,
-                PresentationEvent::Text {
-                    pane: 1,
-                    text: "b".to_string(),
-                },
-            )
-            .is_ok()
+        enqueue_presentation_dispatch(
+            &mut queue,
+            2,
+            PresentationEvent::Text {
+                pane: 1,
+                text: "b".to_string(),
+            },
         );
 
-        assert!(
-            enqueue_presentation_dispatch(
-                &mut queue,
-                2,
-                PresentationEvent::Text {
-                    pane: 1,
-                    text: "c".to_string(),
-                },
-            )
-            .is_err()
+        enqueue_presentation_dispatch(
+            &mut queue,
+            2,
+            PresentationEvent::Text {
+                pane: 1,
+                text: "c".to_string(),
+            },
         );
         assert_eq!(
             queue.into_iter().collect::<Vec<_>>(),
@@ -3756,6 +3980,10 @@ mod tests {
                 PresentationEvent::Text {
                     pane: 1,
                     text: "b".to_string(),
+                },
+                PresentationEvent::Text {
+                    pane: 1,
+                    text: "c".to_string(),
                 },
             ]
         );
@@ -3775,16 +4003,13 @@ mod tests {
             },
         ]);
 
-        assert!(
-            enqueue_presentation_dispatch(
-                &mut queue,
-                2,
-                PresentationEvent::Text {
-                    pane: 1,
-                    text: "b".to_string(),
-                },
-            )
-            .is_ok()
+        enqueue_presentation_dispatch(
+            &mut queue,
+            2,
+            PresentationEvent::Text {
+                pane: 1,
+                text: "b".to_string(),
+            },
         );
 
         assert_eq!(
@@ -3812,19 +4037,16 @@ mod tests {
             resize_epoch: Some(41),
         }]);
 
-        assert!(
-            enqueue_presentation_dispatch(
-                &mut queue,
-                1,
-                PresentationEvent::PaneResized {
-                    pane: 7,
-                    width: 1280.0,
-                    height: 720.0,
-                    scale: 1.25,
-                    resize_epoch: Some(42),
-                },
-            )
-            .is_ok()
+        enqueue_presentation_dispatch(
+            &mut queue,
+            1,
+            PresentationEvent::PaneResized {
+                pane: 7,
+                width: 1280.0,
+                height: 720.0,
+                scale: 1.25,
+                resize_epoch: Some(42),
+            },
         );
         assert_eq!(
             queue.into_iter().collect::<Vec<_>>(),

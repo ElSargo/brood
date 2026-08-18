@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+. "$ROOT/tools/smoke-lib.sh"
 
 for tool in cargo cc grim jq magick pkg-config python3 rg rustc sha256sum sway swaymsg; do
   if ! command -v "$tool" > /dev/null 2>&1; then
@@ -48,21 +49,6 @@ POINTER_PRESSED=0
 WAYLAND_SOCKET=""
 SWAY_SOCKET=""
 
-terminate_process() {
-  local pid="$1"
-  [[ -n "$pid" ]] || return 0
-  kill -0 "$pid" 2> /dev/null || return 0
-  kill "$pid" > /dev/null 2>&1 || true
-  for _ in $(seq 1 40); do
-    kill -0 "$pid" 2> /dev/null || break
-    sleep 0.025
-  done
-  if kill -0 "$pid" 2> /dev/null; then
-    kill -KILL "$pid" > /dev/null 2>&1 || true
-  fi
-  wait "$pid" > /dev/null 2>&1 || true
-}
-
 cleanup() {
   local result=$?
   set +e
@@ -74,9 +60,9 @@ cleanup() {
       printf 'quit\n' >&"$POINTER_WRITE_FD"
     fi
   fi
-  terminate_process "$POINTER_PID"
-  terminate_process "$CLIENT_PID"
-  terminate_process "$COMPOSITOR_PID"
+  terminate_process_bounded "$POINTER_PID"
+  terminate_process_bounded "$CLIENT_PID"
+  terminate_process_bounded "$COMPOSITOR_PID"
   rm -rf -- "$RUNTIME_DIR"
   cat "$POINTER_PROTOCOL_LOG" "$POINTER_STDERR_LOG" > "$POINTER_LOG" 2> /dev/null || true
   if ((result != 0)); then
@@ -404,7 +390,7 @@ start_proof_client() {
 
 stop_proof_client() {
   local stopped_pid="$CLIENT_PID"
-  terminate_process "$CLIENT_PID"
+  terminate_process_bounded "$CLIENT_PID"
   CLIENT_PID=""
   for _ in $(seq 1 200); do
     if ! wayland_env swaymsg -t get_tree -r \

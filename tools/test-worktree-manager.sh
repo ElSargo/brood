@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+. "$ROOT/tools/smoke-lib.sh"
 
 if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
   exec dbus-run-session -- "$0" "$@"
@@ -27,10 +28,7 @@ mkdir -p "$PACKAGE" "$PROJECT" "$DATA_HOME"
 SERVER_PID=""
 cleanup() {
   local result=$?
-  if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2> /dev/null; then
-    kill "$SERVER_PID" > /dev/null 2>&1 || true
-    wait "$SERVER_PID" > /dev/null 2>&1 || true
-  fi
+  terminate_process_bounded "$SERVER_PID"
   if ((result != 0)); then
     echo "server_log=$SERVER_LOG" >&2
     tail -n 160 "$SERVER_LOG" >&2 || true

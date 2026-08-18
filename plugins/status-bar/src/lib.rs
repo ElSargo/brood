@@ -7,7 +7,7 @@ use brood_plugin_sdk::{
         Command as ActorCommand, Event, Guest, LifecycleEvent, LocalActorMessage,
         PresentationEvent, SessionEvent,
     },
-    graphics::{drop_resources, layout_ui_text, submit_packet_for_resize},
+    graphics::UiFrame,
 };
 use serde::Deserialize;
 
@@ -150,7 +150,7 @@ fn redraw(state: &mut StatusBarState, resize_epoch: Option<u64>) -> Result<(), S
     if state.pane == 0 {
         return Ok(());
     }
-    let stale_resources = std::mem::take(&mut state.text_resources);
+    let mut frame = UiFrame::new(state.pane);
     let mut packet = Packet::new();
     packet.push(Command::FillRect {
         rect: Rect::new(0.0, 0.0, state.width, state.height),
@@ -161,44 +161,25 @@ fn redraw(state: &mut StatusBarState, resize_epoch: Option<u64>) -> Result<(), S
         color: BORDER,
     });
     let text = status_bar_text(state, state.width);
-    let layout = match layout_ui_text(
-        state.pane,
+    if let Err(error) = frame.draw_text_clipped(
+        &mut packet,
         &text,
         12.0,
         state.width - 24.0,
         16.0,
         TEXT,
+        12.0,
+        ((state.height - 16.0) * 0.5).max(3.0),
     ) {
-        Ok(layout) => layout,
-        Err(error) => {
-            // Establish the pane's canvas even if text shaping is temporarily
-            // unavailable. The accepted layout can then resize the pane and a
-            // later resize/session event retries the complete packet.
-            submit_redraw_packet(state.pane, resize_epoch, &packet)?;
-            drop_resources(state.pane, stale_resources);
-            state.text_resources.clear();
-            return Err(format!("layout status bar text: {error}"));
-        }
-    };
-    let handle = layout.handle;
-    packet.push(Command::DrawTextLayout {
-        layout: handle,
-        x: 12.0,
-        y: ((state.height - 16.0) * 0.5).max(3.0),
-    });
-    submit_redraw_packet(state.pane, resize_epoch, &packet)?;
-    drop_resources(state.pane, stale_resources);
-    state.text_resources = vec![handle];
+        // Establish the pane's canvas even if text shaping is temporarily
+        // unavailable. The accepted layout can then resize the pane and a
+        // later resize/session event retries the complete packet.
+        frame.submit(resize_epoch, &packet, &mut state.text_resources)?;
+        return Err(format!("layout status bar text: {error}"));
+    }
+    frame.submit(resize_epoch, &packet, &mut state.text_resources)?;
     state.error.clear();
     Ok(())
-}
-
-fn submit_redraw_packet(
-    pane: u64,
-    resize_epoch: Option<u64>,
-    packet: &Packet,
-) -> Result<u64, String> {
-    submit_packet_for_resize(pane, resize_epoch, packet)
 }
 
 fn status_bar_text(state: &StatusBarState, width: f32) -> String {

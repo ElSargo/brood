@@ -15,7 +15,7 @@ use std::{
     path::PathBuf,
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
@@ -97,7 +97,6 @@ pub(crate) static PLUGIN_SCROLL_BENCH_ACTIVE: AtomicBool = AtomicBool::new(false
 const WINDOW_RESIZE_SETTLE_DELAY: Duration = Duration::from_millis(120);
 const SYNCHRONIZED_RESIZE_TIMEOUT: Duration = Duration::from_millis(250);
 const MAX_PENDING_SYNCHRONIZED_LAYOUT_NOTIFICATIONS: usize = 64;
-const MAX_DEFERRED_ACTOR_HOST_MESSAGES: usize = 128;
 const MAX_POINTER_INTERACTIONS: usize = 64;
 const MAX_POINTER_INTERACTION_SEQUENCES: usize = 64;
 const MAX_ACTIVE_RESIZE_REGIONS: usize = 32;
@@ -345,7 +344,7 @@ fn main() -> Result<()> {
         wasm_actor_specs.push(format!("{provider}={path}"));
     }
     if args.check_wasm_actors {
-        let mut runtime = PresentationWasmRuntime::start(
+        let runtime = PresentationWasmRuntime::start(
             &wasm_actor_specs,
             init_actor.as_deref(),
             Some((BackendId(1), 1)),
@@ -355,7 +354,6 @@ fn main() -> Result<()> {
         runtime
             .shutdown()
             .context("stop checked presentation WASM runtime")?;
-        drop(runtime);
         eprintln!("presentation WASM actor check passed");
         return Ok(());
     }
@@ -946,7 +944,7 @@ fn main() -> Result<()> {
     }
     let shutdown_result = application
         .wasm_runtime
-        .as_mut()
+        .take()
         .map_or(Ok(()), PresentationWasmRuntime::shutdown)
         .context("stop presentation WASM runtime");
     if let Some(graphics) = application.plugin_graphics.as_ref()
@@ -1130,6 +1128,7 @@ enum ClientEvent {
     },
     WaylandDroppedFile(WaylandDropEvent),
     ActorHostMessagesReady,
+    ActorLifecycleReady,
     BackendActorMessage {
         backend: BackendId,
         realm: BackendActorRealm,
@@ -1942,6 +1941,8 @@ struct LocalInputLane {
     pane_routes: BTreeMap<u64, u64>,
 }
 
+const RETAINED_LANE_BACKLOG: usize = actor_runtime::ACTOR_OUTPUT_BACKLOG;
+
 enum ActorMessageLane {
     Local(LocalActorMessageLane),
     Remote(remote::RemoteActorMessageLane),
@@ -1972,10 +1973,12 @@ impl LocalActorMessageLane {
             &message.body,
         )?;
         if self.has_deferred() {
-            return self.defer(record);
+            self.defer(record);
+            return Ok(());
         }
         if let Err(record) = self.producer.try_send(record) {
-            return self.defer(record);
+            self.defer(record);
+            return Ok(());
         }
         self.notifications.notify()?;
         Ok(())
@@ -1995,13 +1998,9 @@ impl LocalActorMessageLane {
         }
     }
 
-    fn defer(&mut self, record: Box<brood_ipc::ActorMessageRecord>) -> Result<()> {
-        anyhow::ensure!(
-            self.deferred.len() < 64,
-            "presentation actor-message backlog is full"
-        );
+    fn defer(&mut self, record: Box<brood_ipc::ActorMessageRecord>) {
+        debug_assert!(self.deferred.len() < RETAINED_LANE_BACKLOG);
         self.deferred.push_back(record);
-        Ok(())
     }
 
     fn has_deferred(&self) -> bool {
@@ -2149,6 +2148,7 @@ impl LocalInputLane {
         if self.deferred.is_empty() {
             eprintln!("presentation input lane backpressured; deferring input records");
         }
+        debug_assert!(self.deferred.len() < RETAINED_LANE_BACKLOG);
         self.deferred.push_back(record);
         self.deferred_high_water = self.deferred_high_water.max(self.deferred.len());
     }
@@ -2360,6 +2360,7 @@ enum BackendCommandLane {
 
 struct LocalBackendCommandLane {
     sender: Option<mpsc::SyncSender<BackendRequest>>,
+    deferred: Mutex<VecDeque<BackendRequest>>,
     worker: Option<thread::JoinHandle<()>>,
 }
 
@@ -2415,27 +2416,86 @@ impl LocalBackendCommandLane {
             .context("spawn presentation backend command worker")?;
         Ok(Self {
             sender: Some(sender),
+            deferred: Mutex::new(VecDeque::new()),
             worker: Some(worker),
         })
     }
 
     fn try_send(&self, description: impl Into<String>, argv: Vec<String>) -> Result<()> {
-        self.sender
-            .as_ref()
-            .context("presentation backend command worker is stopped")?
-            .try_send(BackendRequest::Control(BackendCommand {
-                description: description.into(),
-                argv,
-            }))
-            .context("presentation backend command queue is full or closed")
+        self.send_request(BackendRequest::Control(BackendCommand {
+            description: description.into(),
+            argv,
+        }))
     }
 
     fn try_send_session(&self, command: actor_runtime::SessionCommandEnvelope) -> Result<()> {
-        self.sender
+        self.send_request(BackendRequest::Session(command))
+    }
+
+    fn send_request(&self, request: BackendRequest) -> Result<()> {
+        let sender = self
+            .sender
             .as_ref()
-            .context("presentation backend command worker is stopped")?
-            .try_send(BackendRequest::Session(command))
-            .context("presentation session-command queue is full or closed")
+            .context("presentation backend command worker is stopped")?;
+        let mut deferred = self.deferred.lock().map_err(|error| {
+            anyhow!("presentation backend command backlog is poisoned: {error}")
+        })?;
+        if !deferred.is_empty() {
+            anyhow::ensure!(
+                deferred.len() < RETAINED_LANE_BACKLOG,
+                "presentation backend command backlog is full"
+            );
+            deferred.push_back(request);
+            drop(deferred);
+            return Ok(());
+        }
+        match sender.try_send(request) {
+            Ok(()) => {
+                drop(deferred);
+                Ok(())
+            }
+            Err(mpsc::TrySendError::Full(request)) => {
+                anyhow::ensure!(
+                    deferred.len() < RETAINED_LANE_BACKLOG,
+                    "presentation backend command backlog is full"
+                );
+                deferred.push_back(request);
+                drop(deferred);
+                Ok(())
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                drop(deferred);
+                anyhow::bail!("presentation backend command queue is closed")
+            }
+        }
+    }
+
+    fn flush_deferred(&self) {
+        let Some(sender) = self.sender.as_ref() else {
+            return;
+        };
+        let Ok(mut deferred) = self.deferred.lock() else {
+            return;
+        };
+        while let Some(request) = deferred.pop_front() {
+            match sender.try_send(request) {
+                Ok(()) => {}
+                Err(mpsc::TrySendError::Full(request)) => {
+                    deferred.push_front(request);
+                    break;
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    deferred.clear();
+                    break;
+                }
+            }
+        }
+    }
+
+    fn has_deferred(&self) -> bool {
+        self.deferred
+            .lock()
+            .is_ok_and(|deferred| !deferred.is_empty())
     }
 
     fn shutdown(&mut self) -> Result<()> {
@@ -2450,6 +2510,22 @@ impl LocalBackendCommandLane {
 }
 
 impl BackendCommandLane {
+    fn flush_deferred(&self) {
+        match self {
+            Self::Local(lane) => lane.flush_deferred(),
+            Self::Remote(lane) => lane.flush_deferred(),
+            Self::Multi { lanes, .. } => lanes.values().for_each(|lane| lane.flush_deferred()),
+        }
+    }
+
+    fn has_deferred(&self) -> bool {
+        match self {
+            Self::Local(lane) => lane.has_deferred(),
+            Self::Remote(lane) => lane.has_deferred(),
+            Self::Multi { lanes, .. } => lanes.values().any(|lane| lane.has_deferred()),
+        }
+    }
+
     fn remove_backend(&mut self, backend: BackendId) -> Result<bool> {
         let Self::Multi { lanes, default, .. } = self else {
             return Ok(false);
@@ -4610,7 +4686,8 @@ impl Application {
         let releases = self
             .renderer
             .as_mut()
-            .map_or_else(Vec::new, Renderer::take_managed_resource_releases);
+            .map_or_else(BTreeSet::new, Renderer::take_managed_resource_releases);
+        let mut retained = Vec::new();
         for (backend, resource) in releases {
             let released_local = self
                 .input_sender
@@ -4625,10 +4702,16 @@ impl Application {
                 .context("backend command lane is unavailable")
                 .and_then(|commands| commands.release_resource_to(backend, resource));
             if let Err(error) = result {
+                retained.push((backend, resource));
                 eprintln!(
                     "could not release retired managed resize resource backend={} resource={resource}: {error:#}",
                     backend.0
                 );
+            }
+        }
+        if let Some(renderer) = self.renderer.as_mut() {
+            for (backend, resource) in retained {
+                renderer.retain_managed_resource_release(backend, resource);
             }
         }
     }
@@ -4748,6 +4831,11 @@ impl Application {
             }
             ClientEvent::ActorHostMessagesReady => {
                 return Err(anyhow!("actor host message reached scene transport path"));
+            }
+            ClientEvent::ActorLifecycleReady => {
+                return Err(anyhow!(
+                    "actor lifecycle event reached scene transport path"
+                ));
             }
             ClientEvent::BackendActorMessage { .. } => {
                 return Err(anyhow!(
@@ -7661,7 +7749,6 @@ impl Application {
         } else {
             std::mem::take(&mut self.deferred_actor_host_messages)
         };
-        debug_assert!(messages.len() <= MAX_DEFERRED_ACTOR_HOST_MESSAGES);
         while self.pending_synchronized_layout_notifications.is_empty() {
             let Some(actor_message) = messages.pop_front() else {
                 break;
@@ -8240,10 +8327,6 @@ impl Application {
             renderer.window.request_redraw();
         }
         if !messages.is_empty() {
-            debug_assert!(
-                self.deferred_actor_host_messages.len() + messages.len()
-                    <= MAX_DEFERRED_ACTOR_HOST_MESSAGES
-            );
             self.deferred_actor_host_messages.append(&mut messages);
         }
         Ok(())
@@ -8256,6 +8339,21 @@ impl Application {
         // while `apply_actor_host_messages` is intentionally paused.
         self.flush_synchronized_layout_terminal_notifications();
         if !self.pending_synchronized_layout_notifications.is_empty() {
+            return true;
+        }
+        // `Full` retains the record in the outbound lane. Pause actor output
+        // admission until the consumer catches up; the actor observer remains
+        // a lossless FIFO meanwhile.
+        if self.actor_message_sender.as_mut().is_some_and(|lane| {
+            lane.flush_deferred();
+            lane.has_deferred()
+        }) {
+            return true;
+        }
+        if self.backend_commands.as_ref().is_some_and(|lane| {
+            lane.flush_deferred();
+            lane.has_deferred()
+        }) {
             return true;
         }
         let result = (|| {
@@ -8565,35 +8663,8 @@ impl Application {
                 "renderer recovery failed repeatedly after: {message}"
             ));
         }
-        let old = self
-            .renderer
-            .take()
-            .context("lost renderer during recovery")?;
-        // Recompile from bridge-visible snapshots. A failed render may already
-        // have installed epoch-tagged GPU scenes, but those must not become the
-        // replacement renderer's visible baseline before a successful present.
-        let replay = old.plugin_panes.keys().copied().collect::<Vec<_>>();
-        let available_windows = old.available_windows.clone();
-        let active_session = old.active_session;
-        let active_backend = old.active_backend;
-        let active_sessions = old.active_sessions.clone();
-        let plugin_pane_realms = old.plugin_pane_realms.clone();
-        let focused_pane = old.focused_pane_id();
-        let pending_focus_pane = old.pending_focus_pane;
-        let layout_source = old.layout_source;
-        let layout_state_dirty = old.layout_state_dirty;
-        let window_resize_in_progress = old.window_resize_in_progress;
-        let accepted_layout = old.accepted_layout.clone();
-        let accepted_zones = old.accepted_zones.clone();
-        let accepted_dividers = old.accepted_dividers.clone();
-        let presented_layout = old.presented_layout.clone();
-        let presented_zones = old.presented_zones.clone();
-        let presented_dividers = old.presented_dividers.clone();
-        let settled_layout = old.settled_layout.clone();
-        let settled_zones = old.settled_zones.clone();
-        let settled_dividers = old.settled_dividers.clone();
-        let window = Arc::clone(&old.window);
-        drop(old);
+        let window = Arc::clone(&current.window);
+        let graphics = current.plugin_graphics.clone();
         let generation = self.allocate_renderer_generation()?;
         let proxy = self
             .event_proxy
@@ -8602,77 +8673,77 @@ impl Application {
         eprintln!(
             "recovering renderer generation={failed_generation} replacement={generation}: {message}"
         );
-        let graphics = self
-            .plugin_graphics
-            .clone()
-            .context("plugin graphics bridge is unavailable")?;
+        // Build the new GPU device before transferring ownership. If device
+        // creation fails, the old renderer still owns every protocol resource
+        // and can be torn down by the normal application shutdown path.
         let mut replacement =
             Renderer::new(window, self.fast_path_enabled, graphics, generation, proxy)?;
-        replacement.available_windows = available_windows;
-        replacement.active_session = active_session;
-        replacement.active_backend = active_backend;
-        replacement.active_sessions = active_sessions;
-        replacement.plugin_pane_realms = plugin_pane_realms;
-        replacement.pending_focus_pane = pending_focus_pane;
-        replacement.layout_source = layout_source;
-        replacement.window_resize_in_progress = window_resize_in_progress;
-        let recovering_synchronized_resize = self.active_synchronized_resize.is_some();
-        replacement.accepted_layout = if recovering_synchronized_resize {
-            presented_layout.clone()
-        } else {
-            accepted_layout
-        };
-        replacement.accepted_zones = if recovering_synchronized_resize {
-            presented_zones.clone()
-        } else {
-            accepted_zones
-        };
-        replacement.accepted_dividers = if recovering_synchronized_resize {
-            presented_dividers.clone()
-        } else {
-            accepted_dividers
-        };
-        replacement.presented_layout = presented_layout;
-        replacement.presented_zones = presented_zones;
-        replacement.presented_dividers = presented_dividers;
-        replacement.settled_layout = settled_layout;
-        replacement.settled_zones = settled_zones;
-        replacement.settled_dividers = settled_dividers;
-        let _focus_change = replacement.project_accepted_layout(focused_pane);
-        for pane in replay {
-            replacement.refresh_plugin_graphics(pane, 0)?;
-        }
+        let old = self
+            .renderer
+            .take()
+            .context("lost renderer during recovery")?;
+        let mut recovery = old.into_recovery_state();
+        let replay = recovery.visible_plugin_panes.clone();
+        let mut staged_replay = recovery.staged_plugin_scenes.clone();
+
+        // A failed present may have promoted CPU layout state without making
+        // it compositor-visible. Re-arm that transaction at its last presented
+        // baseline. Managed panes whose textures died are removed from the
+        // ready set and their expectations have already returned to PendingSend.
         if let Some(active) = self.active_synchronized_resize.as_mut() {
-            let composed = active
-                .target_tree
-                .compose()
-                .context("recompose synchronized layout during renderer recovery")?;
-            let _focus_change = replacement.project_staged_layout(active.epoch.id, composed);
-            for pane in &active.ready_panes {
-                replacement.refresh_staged_plugin_graphics(*pane, active.epoch.id, 0)?;
-            }
-            if let SynchronizedResizePresentation::Promoted {
-                degraded,
-                missing_panes,
-            } = active.presentation.clone()
-            {
-                active.presentation = SynchronizedResizePresentation::Ready {
+            invalidate_synchronized_ready_panes(
+                &mut active.ready_panes,
+                &recovery.invalidated_staged_managed_panes,
+            );
+            if matches!(
+                &active.presentation,
+                SynchronizedResizePresentation::Promoted { .. }
+            ) {
+                recovery
+                    .accepted_layout
+                    .clone_from(&recovery.presented_layout);
+                recovery
+                    .accepted_zones
+                    .clone_from(&recovery.presented_zones);
+                recovery
+                    .accepted_dividers
+                    .clone_from(&recovery.presented_dividers);
+                let composed = active
+                    .target_tree
+                    .compose()
+                    .context("recompose synchronized layout during renderer recovery")?;
+                recovery.staged_layouts.clear();
+                recovery.staged_layouts.insert(active.epoch.id, composed);
+                if let SynchronizedResizePresentation::Promoted {
                     degraded,
                     missing_panes,
-                };
+                } = active.presentation.clone()
+                {
+                    active.presentation = SynchronizedResizePresentation::Ready {
+                        degraded,
+                        missing_panes,
+                    };
+                }
             }
+            staged_replay = synchronized_plugin_replay_plan(
+                staged_replay,
+                active.epoch.id,
+                &active.ready_panes,
+                &recovery.plugin_pane_realms,
+            );
             eprintln!(
-                "reconstructed synchronized resize request={} epoch={} ready={}/{} after renderer recovery",
+                "re-armed synchronized resize request={} epoch={} ready={}/{} after renderer recovery",
                 active.request_id,
                 active.epoch.id,
                 active.ready_panes.len(),
                 active.wait_panes.len(),
             );
         }
-        // Snapshot replay discovers every pane again. Preserve the old dirty
-        // bit only after replay so recovery itself cannot force an active
-        // synchronized transaction down the inventory-change/degraded path.
-        replacement.layout_state_dirty = layout_state_dirty;
+        let focused_pane = recovery.focused_pane.map(|focus| match focus {
+            FocusedPane::Plugin(pane) | FocusedPane::Managed(pane) => pane,
+        });
+        replacement.restore_recovery_state(recovery);
+        let _focus_change = replacement.project_accepted_layout(focused_pane);
         if let Some(capture) = self.policy_pointer_capture.as_ref() {
             let cursor = replacement
                 .presented_zones
@@ -8683,7 +8754,17 @@ impl Application {
         }
         replacement.window.request_redraw();
         self.renderer = Some(replacement);
+        // Publish the recovered ownership state before any replay operation
+        // which can fail. This guarantees queued releases remain reachable.
+        self.flush_managed_resource_releases();
         if let Some(renderer) = self.renderer.as_mut() {
+            for pane in replay {
+                renderer.refresh_plugin_graphics(pane, 0)?;
+            }
+            for (pane, epoch) in staged_replay {
+                renderer.refresh_staged_plugin_graphics(pane, epoch, 0)?;
+            }
+            flush_renderer_managed_resize_requests(self.input_sender.as_mut(), renderer);
             flush_renderer_plugin_resize_events_best_effort(
                 self.wasm_runtime.as_ref(),
                 renderer,
@@ -9294,6 +9375,9 @@ impl ApplicationHandler<ClientEvent> for Application {
                     self.fail(event_loop, error);
                 }
             }
+            // Lifecycle completions are drained by the common pre-dispatch
+            // pass at the top of `user_event`.
+            ClientEvent::ActorLifecycleReady => {}
             ClientEvent::BackendActorMessage {
                 backend,
                 realm,
@@ -9505,6 +9589,10 @@ impl ApplicationHandler<ClientEvent> for Application {
             lane.flush_deferred();
             lane.has_deferred()
         });
+        let backend_command_backpressured = self.backend_commands.as_ref().is_some_and(|lane| {
+            lane.flush_deferred();
+            lane.has_deferred()
+        });
         let synchronized_notification_backpressured =
             !self.pending_synchronized_layout_notifications.is_empty();
         // A full actor lane keeps the latest position for the next Winit turn.
@@ -9560,6 +9648,7 @@ impl ApplicationHandler<ClientEvent> for Application {
         };
         if input_backpressured
             || actor_message_backpressured
+            || backend_command_backpressured
             || synchronized_notification_backpressured
             || plugin_resize_backpressured
         {
@@ -10829,6 +10918,75 @@ impl ManagedResizeState {
     }
 }
 
+fn prepare_managed_state_for_gpu_loss(
+    current_windows: &mut [SceneWindow],
+    managed_resizes: &mut ManagedResizeState,
+    frame_keys: &BTreeMap<(BackendId, u64), u64>,
+    sent_managed_sizes: &mut HashMap<u64, (u32, u32)>,
+    pending_ordinary_recovery: &mut BTreeSet<u64>,
+    pending_releases: &mut BTreeSet<(BackendId, u64)>,
+) -> BTreeSet<u64> {
+    // Every imported texture belongs to the failed device. Release its
+    // producer resource even when it was superseded between scene snapshots.
+    pending_releases.extend(frame_keys.keys().copied());
+
+    let expected_panes = managed_resizes
+        .expectations
+        .keys()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    for window in current_windows {
+        if window.transport_resource_owned {
+            pending_releases.insert((window.backend, window.transport_resource_id));
+            window.transport_resource_owned = false;
+        }
+        if !expected_panes.contains(&window.window_id) {
+            sent_managed_sizes.remove(&window.window_id);
+            pending_ordinary_recovery.insert(window.window_id);
+        }
+    }
+
+    let mut invalidated_staged_panes = BTreeSet::new();
+    for (pane, expectation) in &mut managed_resizes.expectations {
+        let ManagedResizeExpectationState::Staged(frame) = &expectation.state else {
+            continue;
+        };
+        pending_releases.insert((frame.backend, frame.transport_resource_id));
+        invalidated_staged_panes.insert(*pane);
+        // The producer already knows the epoch, but the tagged resource was
+        // tied to the failed device. Reissuing the same request is the only
+        // state which can produce a fresh exact frame and make the wait ready.
+        expectation.state = ManagedResizeExpectationState::PendingSend;
+    }
+    invalidated_staged_panes
+}
+
+fn invalidate_synchronized_ready_panes(
+    ready_panes: &mut BTreeSet<u64>,
+    invalidated_staged_managed_panes: &BTreeSet<u64>,
+) {
+    ready_panes.retain(|pane| !invalidated_staged_managed_panes.contains(pane));
+}
+
+fn synchronized_plugin_replay_plan(
+    mut staged_scenes: Vec<(u64, u64)>,
+    epoch: u64,
+    ready_panes: &BTreeSet<u64>,
+    plugin_panes: &BTreeMap<u64, Option<(BackendId, u64)>>,
+) -> Vec<(u64, u64)> {
+    staged_scenes
+        .retain(|(pane, staged_epoch)| *staged_epoch == epoch && ready_panes.contains(pane));
+    staged_scenes.extend(
+        ready_panes
+            .iter()
+            .filter(|pane| plugin_panes.contains_key(pane))
+            .map(|pane| (*pane, epoch)),
+    );
+    staged_scenes.sort_unstable();
+    staged_scenes.dedup();
+    staged_scenes
+}
+
 struct Renderer {
     generation: u64,
     window: Arc<Window>,
@@ -10883,9 +11041,53 @@ struct Renderer {
     sent_managed_sizes: HashMap<u64, (u32, u32)>,
     managed_resizes: ManagedResizeState,
     pending_ordinary_managed_recovery: BTreeSet<u64>,
-    pending_managed_resource_releases: Vec<(BackendId, u64)>,
+    pending_managed_resource_releases: BTreeSet<(BackendId, u64)>,
     sent_plugin_sizes: HashMap<u64, PluginPaneSize>,
     window_resize_in_progress: bool,
+}
+
+/// CPU-side state which survives a renderer/device replacement.
+///
+/// `Renderer::into_recovery_state` destructures `Renderer` exhaustively, so a
+/// newly-added field must be classified here or explicitly classified as GPU
+/// state at compile time. This is the single ownership boundary for recovery;
+/// recovery code must not grow another field-by-field copy list.
+struct RendererRecoveryState {
+    next_frame_key: u64,
+    available_windows: Vec<AvailableWindow>,
+    active_session: u64,
+    active_backend: Option<BackendId>,
+    active_sessions: BTreeMap<BackendId, u64>,
+    current_windows: Vec<SceneWindow>,
+    current_sequence: Option<u64>,
+    current_sequences: BTreeMap<BackendId, u64>,
+    visible_plugin_panes: Vec<u64>,
+    projected_plugin_scenes: ProjectedPluginScenes,
+    staged_plugin_scenes: Vec<(u64, u64)>,
+    plugin_pane_realms: BTreeMap<u64, Option<(BackendId, u64)>>,
+    focused_pane: Option<FocusedPane>,
+    pending_focus_pane: Option<u64>,
+    accepted_layout: ResolvedLayout,
+    accepted_zones: Vec<ComposedInteractionZone>,
+    accepted_dividers: Vec<ComposedDivider>,
+    presented_layout: ResolvedLayout,
+    presented_zones: Vec<ComposedInteractionZone>,
+    presented_dividers: Vec<ComposedDivider>,
+    settled_layout: ResolvedLayout,
+    settled_zones: Vec<ComposedInteractionZone>,
+    settled_dividers: Vec<ComposedDivider>,
+    staged_layouts: BTreeMap<u64, ComposedLayout>,
+    hovered_zone: Option<ComposedZoneId>,
+    captured_zone: Option<ComposedZoneId>,
+    layout_source: LayoutSource,
+    layout_state_dirty: bool,
+    sent_managed_sizes: HashMap<u64, (u32, u32)>,
+    managed_resizes: ManagedResizeState,
+    pending_ordinary_managed_recovery: BTreeSet<u64>,
+    pending_managed_resource_releases: BTreeSet<(BackendId, u64)>,
+    sent_plugin_sizes: HashMap<u64, PluginPaneSize>,
+    window_resize_in_progress: bool,
+    invalidated_staged_managed_panes: BTreeSet<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -10960,6 +11162,10 @@ struct SceneWindow {
     backend: BackendId,
     window_id: u64,
     transport_resource_id: u64,
+    /// The GPU scene may outlive ownership of its transport resource during
+    /// renderer recovery. Keeping this explicit prevents a later resize
+    /// promotion from releasing the same producer resource twice.
+    transport_resource_owned: bool,
     resource_id: u64,
     source_rect: [i32; 4],
     rect: [i32; 4],
@@ -13115,6 +13321,179 @@ fn srgb_surface_format(
 }
 
 impl Renderer {
+    fn into_recovery_state(mut self) -> RendererRecoveryState {
+        let invalidated_staged_managed_panes = prepare_managed_state_for_gpu_loss(
+            &mut self.current_windows,
+            &mut self.managed_resizes,
+            &self.frame_keys,
+            &mut self.sent_managed_sizes,
+            &mut self.pending_ordinary_managed_recovery,
+            &mut self.pending_managed_resource_releases,
+        );
+        let Self {
+            generation: _,
+            window: _,
+            surface: _,
+            device: _,
+            queue: _,
+            config: _,
+            frame_bind_group_layout: _,
+            frame_sampler: _,
+            frame_pipeline: _,
+            placeholder_pipeline: _,
+            divider_pipeline: _,
+            divider_hover_pipeline: _,
+            divider_active_pipeline: _,
+            plugin_canvas: _,
+            imported_frames: _,
+            frame_keys: _,
+            next_frame_key,
+            available_windows,
+            active_session,
+            active_backend,
+            active_sessions,
+            current_windows,
+            current_sequence,
+            current_sequences,
+            plugin_graphics: _,
+            plugin_panes,
+            projected_plugin_scenes,
+            staged_plugin_panes,
+            plugin_pane_realms,
+            focused_pane,
+            pending_focus_pane,
+            accepted_layout,
+            accepted_zones,
+            accepted_dividers,
+            presented_layout,
+            presented_zones,
+            presented_dividers,
+            settled_layout,
+            settled_zones,
+            settled_dividers,
+            staged_layouts,
+            hovered_zone,
+            captured_zone,
+            layout_source,
+            layout_state_dirty,
+            sent_managed_sizes,
+            managed_resizes,
+            pending_ordinary_managed_recovery,
+            pending_managed_resource_releases,
+            sent_plugin_sizes,
+            window_resize_in_progress,
+        } = self;
+        RendererRecoveryState {
+            next_frame_key,
+            available_windows,
+            active_session,
+            active_backend,
+            active_sessions,
+            current_windows,
+            current_sequence,
+            current_sequences,
+            visible_plugin_panes: plugin_panes.into_keys().collect(),
+            projected_plugin_scenes,
+            staged_plugin_scenes: staged_plugin_panes.into_keys().collect(),
+            plugin_pane_realms,
+            focused_pane,
+            pending_focus_pane,
+            accepted_layout,
+            accepted_zones,
+            accepted_dividers,
+            presented_layout,
+            presented_zones,
+            presented_dividers,
+            settled_layout,
+            settled_zones,
+            settled_dividers,
+            staged_layouts,
+            hovered_zone,
+            captured_zone,
+            layout_source,
+            layout_state_dirty,
+            sent_managed_sizes,
+            managed_resizes,
+            pending_ordinary_managed_recovery,
+            pending_managed_resource_releases,
+            sent_plugin_sizes,
+            window_resize_in_progress,
+            invalidated_staged_managed_panes,
+        }
+    }
+
+    fn restore_recovery_state(&mut self, state: RendererRecoveryState) {
+        let RendererRecoveryState {
+            next_frame_key,
+            available_windows,
+            active_session,
+            active_backend,
+            active_sessions,
+            current_windows,
+            current_sequence,
+            current_sequences,
+            visible_plugin_panes: _,
+            projected_plugin_scenes,
+            staged_plugin_scenes: _,
+            plugin_pane_realms,
+            focused_pane,
+            pending_focus_pane,
+            accepted_layout,
+            accepted_zones,
+            accepted_dividers,
+            presented_layout,
+            presented_zones,
+            presented_dividers,
+            settled_layout,
+            settled_zones,
+            settled_dividers,
+            staged_layouts,
+            hovered_zone,
+            captured_zone,
+            layout_source,
+            layout_state_dirty,
+            sent_managed_sizes,
+            managed_resizes,
+            pending_ordinary_managed_recovery,
+            pending_managed_resource_releases,
+            sent_plugin_sizes,
+            window_resize_in_progress,
+            invalidated_staged_managed_panes: _,
+        } = state;
+        self.next_frame_key = next_frame_key;
+        self.available_windows = available_windows;
+        self.active_session = active_session;
+        self.active_backend = active_backend;
+        self.active_sessions = active_sessions;
+        self.current_windows = current_windows;
+        self.current_sequence = current_sequence;
+        self.current_sequences = current_sequences;
+        self.projected_plugin_scenes = projected_plugin_scenes;
+        self.plugin_pane_realms = plugin_pane_realms;
+        self.focused_pane = focused_pane;
+        self.pending_focus_pane = pending_focus_pane;
+        self.accepted_layout = accepted_layout;
+        self.accepted_zones = accepted_zones;
+        self.accepted_dividers = accepted_dividers;
+        self.presented_layout = presented_layout;
+        self.presented_zones = presented_zones;
+        self.presented_dividers = presented_dividers;
+        self.settled_layout = settled_layout;
+        self.settled_zones = settled_zones;
+        self.settled_dividers = settled_dividers;
+        self.staged_layouts = staged_layouts;
+        self.hovered_zone = hovered_zone;
+        self.captured_zone = captured_zone;
+        self.layout_source = layout_source;
+        self.layout_state_dirty = layout_state_dirty;
+        self.sent_managed_sizes = sent_managed_sizes;
+        self.managed_resizes = managed_resizes;
+        self.pending_ordinary_managed_recovery = pending_ordinary_managed_recovery;
+        self.pending_managed_resource_releases = pending_managed_resource_releases;
+        self.sent_plugin_sizes = sent_plugin_sizes;
+        self.window_resize_in_progress = window_resize_in_progress;
+    }
+
     fn new(
         window: Arc<Window>,
         fast_path_enabled: bool,
@@ -13275,7 +13654,7 @@ impl Renderer {
             sent_managed_sizes: HashMap::new(),
             managed_resizes: ManagedResizeState::default(),
             pending_ordinary_managed_recovery: BTreeSet::new(),
-            pending_managed_resource_releases: Vec::new(),
+            pending_managed_resource_releases: BTreeSet::new(),
             sent_plugin_sizes: HashMap::new(),
             window_resize_in_progress: false,
         })
@@ -13350,7 +13729,7 @@ impl Renderer {
                 && let ManagedResizeExpectationState::Staged(frame) = expectation.state
             {
                 self.pending_managed_resource_releases
-                    .push((frame.backend, frame.transport_resource_id));
+                    .insert((frame.backend, frame.transport_resource_id));
             }
         }
         let mut merged_windows = self
@@ -13601,6 +13980,7 @@ impl Renderer {
                 backend,
                 window_id: window.window_id,
                 transport_resource_id: window.resource_id,
+                transport_resource_owned: true,
                 resource_id: resource_key,
                 source_rect: window.rect,
                 rect: previous_rect,
@@ -13675,7 +14055,9 @@ impl Renderer {
             .cloned()
             .collect::<Vec<_>>();
         for current in preserved {
-            live_resources.insert(current.transport_resource_id);
+            if current.transport_resource_owned {
+                live_resources.insert(current.transport_resource_id);
+            }
             scene_windows.push(current);
         }
         for expectation in self.managed_resizes.expectations.values() {
@@ -15229,9 +15611,11 @@ impl Renderer {
                     .iter_mut()
                     .find(|window| window.window_id == expectation.route.view_pane)
                 {
-                    if current.transport_resource_id != staged.transport_resource_id {
+                    if current.transport_resource_owned
+                        && current.transport_resource_id != staged.transport_resource_id
+                    {
                         self.pending_managed_resource_releases
-                            .push((current.backend, current.transport_resource_id));
+                            .insert((current.backend, current.transport_resource_id));
                     }
                     staged.rect = current.rect;
                     *current = staged;
@@ -15247,7 +15631,7 @@ impl Renderer {
                 }
             } else {
                 self.pending_managed_resource_releases
-                    .push((staged.backend, staged.transport_resource_id));
+                    .insert((staged.backend, staged.transport_resource_id));
             }
         }
     }
@@ -15285,8 +15669,13 @@ impl Renderer {
             .collect()
     }
 
-    fn take_managed_resource_releases(&mut self) -> Vec<(BackendId, u64)> {
+    fn take_managed_resource_releases(&mut self) -> BTreeSet<(BackendId, u64)> {
         std::mem::take(&mut self.pending_managed_resource_releases)
+    }
+
+    fn retain_managed_resource_release(&mut self, backend: BackendId, resource: u64) {
+        self.pending_managed_resource_releases
+            .insert((backend, resource));
     }
 }
 
@@ -15880,6 +16269,100 @@ mod tests {
     use brood_layout::LayoutItemId;
     use default_workspace_backend_layout::{PanePlacement, pane_placement};
 
+    #[test]
+    fn local_critical_input_is_retained_fifo_beyond_ring_capacity() {
+        const GENERATION: u64 = 9;
+        let file = brood_ipc::CriticalLaneFile::create(GENERATION).unwrap();
+        let producer = brood_ipc::CriticalProducer::map(file.as_fd(), GENERATION).unwrap();
+        let mut consumer = brood_ipc::CriticalConsumer::map(file.as_fd(), GENERATION).unwrap();
+        let mut lane = LocalInputLane {
+            producer,
+            notifications: brood_ipc::EventNotifier::create().unwrap(),
+            generation: GENERATION,
+            sequence: 0,
+            deferred: VecDeque::new(),
+            deferred_high_water: 0,
+            coalesced_motion: 0,
+            pane_routes: BTreeMap::new(),
+        };
+
+        for _ in 0..256 {
+            assert!(lane.send(ClientMessage::Input(InputEvent::KeyboardReset)));
+            assert!(lane.deferred.len() <= RETAINED_LANE_BACKLOG);
+        }
+        for expected in 1..=256 {
+            let record = consumer.try_recv().expect("next retained input record");
+            assert_eq!(record.sequence, expected);
+            assert_eq!(
+                brood_ipc::decode_client_record(&record).unwrap(),
+                ClientMessage::Input(InputEvent::KeyboardReset)
+            );
+            drop(record);
+            lane.flush_deferred();
+        }
+        assert!(!lane.has_deferred());
+    }
+
+    #[test]
+    fn local_actor_messages_are_retained_fifo_beyond_ring_capacity() {
+        const GENERATION: u64 = 11;
+        let file = brood_ipc::ActorMessageLaneFile::create(GENERATION).unwrap();
+        let producer = brood_ipc::ActorMessageProducer::map(file.as_fd(), GENERATION).unwrap();
+        let mut consumer = brood_ipc::ActorMessageConsumer::map(file.as_fd(), GENERATION).unwrap();
+        let mut lane = LocalActorMessageLane {
+            producer,
+            notifications: brood_ipc::EventNotifier::create().unwrap(),
+            generation: GENERATION,
+            sequence: 0,
+            deferred: VecDeque::new(),
+        };
+
+        for sequence in 1_u16..=256 {
+            lane.send(&actor_runtime::BackendActorMessageRequest {
+                backend: BackendId(1),
+                sender: "source".to_string(),
+                realm: BackendActorRealm::Daemon,
+                actor: "sink".to_string(),
+                body: sequence.to_le_bytes().to_vec(),
+            })
+            .unwrap();
+            assert!(lane.deferred.len() <= RETAINED_LANE_BACKLOG);
+        }
+        for sequence in 1_u16..=256 {
+            let record = consumer.try_recv().expect("next retained actor record");
+            assert_eq!(record.sequence(), u64::from(sequence));
+            assert_eq!(record.body().unwrap(), sequence.to_le_bytes());
+            drop(record);
+            lane.flush_deferred();
+        }
+        assert!(!lane.has_deferred());
+    }
+
+    #[test]
+    fn local_backend_commands_are_retained_fifo_beyond_worker_capacity() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let lane = LocalBackendCommandLane {
+            sender: Some(sender),
+            deferred: Mutex::new(VecDeque::new()),
+            worker: None,
+        };
+        for sequence in 0..256 {
+            lane.try_send(sequence.to_string(), vec![sequence.to_string()])
+                .unwrap();
+            assert!(lane.deferred.lock().unwrap().len() <= RETAINED_LANE_BACKLOG);
+        }
+        for sequence in 0..256 {
+            lane.flush_deferred();
+            let BackendRequest::Control(command) = receiver.try_recv().unwrap() else {
+                panic!("expected retained control command");
+            };
+            assert_eq!(command.description, sequence.to_string());
+            assert_eq!(command.argv, vec![sequence.to_string()]);
+        }
+        lane.flush_deferred();
+        assert!(!lane.has_deferred());
+    }
+
     fn managed_route(view_pane: u64) -> ManagedPaneRoute {
         ManagedPaneRoute {
             backend: BackendId(3),
@@ -15906,11 +16389,140 @@ mod tests {
             backend: BackendId(3),
             window_id: view_pane,
             transport_resource_id: resource,
+            transport_resource_owned: true,
             resource_id: resource + 1000,
             source_rect: [0, 0, 300, 150],
             rect: [10, 20, 300, 150],
             active: false,
         }
+    }
+
+    #[test]
+    fn renderer_gpu_loss_retires_each_current_resource_once_and_requests_fresh_frames() {
+        let mut current = vec![managed_scene(7, 70), managed_scene(8, 80)];
+        let mut managed = ManagedResizeState::default();
+        let frame_keys = BTreeMap::from([
+            ((BackendId(3), 70), 1070),
+            ((BackendId(3), 80), 1080),
+            ((BackendId(3), 90), 1090),
+        ]);
+        let mut sent_sizes = HashMap::from([(7, (200, 100)), (8, (200, 100))]);
+        let mut pending_ordinary = BTreeSet::new();
+        let mut releases = BTreeSet::from([(BackendId(3), 70)]);
+
+        let invalidated = prepare_managed_state_for_gpu_loss(
+            &mut current,
+            &mut managed,
+            &frame_keys,
+            &mut sent_sizes,
+            &mut pending_ordinary,
+            &mut releases,
+        );
+
+        assert!(invalidated.is_empty());
+        assert!(
+            current
+                .iter()
+                .all(|window| !window.transport_resource_owned)
+        );
+        assert_eq!(pending_ordinary, BTreeSet::from([7, 8]));
+        assert!(sent_sizes.is_empty());
+        assert_eq!(
+            releases,
+            BTreeSet::from([(BackendId(3), 70), (BackendId(3), 80), (BackendId(3), 90),])
+        );
+
+        // Re-entering preparation cannot manufacture a second release for a
+        // current scene whose ownership was already transferred.
+        prepare_managed_state_for_gpu_loss(
+            &mut current,
+            &mut managed,
+            &BTreeMap::new(),
+            &mut sent_sizes,
+            &mut pending_ordinary,
+            &mut releases,
+        );
+        assert_eq!(releases.len(), 3);
+    }
+
+    #[test]
+    fn renderer_gpu_loss_rearms_staged_managed_frame_and_unblocks_resize_wait() {
+        let mut current = vec![managed_scene(7, 70)];
+        let mut expectation = managed_expectation(7, 41, true);
+        expectation.state = ManagedResizeExpectationState::Staged(managed_scene(7, 71));
+        let mut managed = ManagedResizeState::default();
+        managed.expectations.insert(7, expectation);
+        let frame_keys = BTreeMap::from([((BackendId(3), 70), 1070), ((BackendId(3), 71), 1071)]);
+        let mut sent_sizes = HashMap::from([(7, (200, 100))]);
+        let mut pending_ordinary = BTreeSet::new();
+        let mut releases = BTreeSet::new();
+        let invalidated = prepare_managed_state_for_gpu_loss(
+            &mut current,
+            &mut managed,
+            &frame_keys,
+            &mut sent_sizes,
+            &mut pending_ordinary,
+            &mut releases,
+        );
+
+        assert_eq!(invalidated, BTreeSet::from([7]));
+        assert!(matches!(
+            managed.expectations[&7].state,
+            ManagedResizeExpectationState::PendingSend
+        ));
+        assert!(pending_ordinary.is_empty());
+        assert_eq!(
+            releases,
+            BTreeSet::from([(BackendId(3), 70), (BackendId(3), 71)])
+        );
+
+        let mut ready = BTreeSet::from([7, 9]);
+        invalidate_synchronized_ready_panes(&mut ready, &invalidated);
+        assert_eq!(ready, BTreeSet::from([9]));
+        assert_eq!(
+            managed
+                .expectations
+                .values()
+                .filter(|expectation| matches!(
+                    expectation.state,
+                    ManagedResizeExpectationState::PendingSend
+                ))
+                .count(),
+            1,
+            "the synchronized transaction can make progress by resending the exact request"
+        );
+    }
+
+    #[test]
+    fn queued_renderer_releases_retry_without_releasing_successes_twice() {
+        let mut pending =
+            BTreeSet::from([(BackendId(3), 70), (BackendId(3), 71), (BackendId(4), 70)]);
+        let attempted = std::mem::take(&mut pending);
+        assert_eq!(attempted.len(), 3);
+        // Model one failed lane send: only that ownership record is retained.
+        pending.insert((BackendId(3), 71));
+        let retried = std::mem::take(&mut pending);
+        assert_eq!(retried, BTreeSet::from([(BackendId(3), 71)]));
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn promoted_synchronized_resize_rebuilds_ready_plugin_stage_after_gpu_loss() {
+        // Promotion consumes the old GPU staged-scene map before presenting.
+        // Recovery still has to reconstruct tagged plugin content from the
+        // bridge so the re-armed transaction cannot wait or promote forever.
+        let ready = BTreeSet::from([7, 8]);
+        let plugin_panes = BTreeMap::from([(7, None)]);
+        let replay = synchronized_plugin_replay_plan(Vec::new(), 41, &ready, &plugin_panes);
+        assert_eq!(replay, vec![(7, 41)]);
+
+        let replay = synchronized_plugin_replay_plan(
+            vec![(7, 40), (7, 41), (9, 41)],
+            41,
+            &ready,
+            &plugin_panes,
+        );
+        assert_eq!(replay, vec![(7, 41)]);
     }
 
     #[test]

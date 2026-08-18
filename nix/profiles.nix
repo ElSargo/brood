@@ -74,6 +74,22 @@ let
     ]
   );
 
+  # The container's /etc/dbus-1/session.conf is only a distro redirect stub,
+  # while the Nix D-Bus daemon is not patched to follow that distro layout.
+  # Keep ordinary `dbus-run-session` test invocations working by replacing its
+  # --session argument with the complete configuration in the Nix closure.
+  dbusDaemonForDev = pkgs.writeShellScriptBin "dbus-daemon" ''
+    args=()
+    for arg in "$@"; do
+      if [[ "$arg" == --session ]]; then
+        args+=(--config-file=${pkgs.dbus}/share/dbus-1/session.conf)
+      else
+        args+=("$arg")
+      fi
+    done
+    exec ${pkgs.dbus}/bin/dbus-daemon "''${args[@]}"
+  '';
+
   appTools = [
     pkgs.coreutils
     pkgs.findutils
@@ -113,6 +129,7 @@ let
   wasmTools = [ pkgs.wasm-tools ];
 
   smokeTools = [
+    dbusDaemonForDev
     pkgs.dbus
     pkgs.foot
     pkgs.gobject-introspection
@@ -121,6 +138,7 @@ let
     pkgs.imagemagick
     pkgs.jq
     pkgs.mesa-demos
+    pkgs.nix
     pkgs.procps
     pkgs.sway
     pkgs.vulkan-tools

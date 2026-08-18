@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+. "$ROOT/tools/smoke-lib.sh"
 
 # The editor proof owns its bus and compositor. Never attach its backend,
 # presentation client, or local Neovim runtime to the caller's desktop.
@@ -94,12 +95,9 @@ COMPOSITOR_PID=""
 cleanup() {
   local result=$?
   set +e
-  for pid in "$CLIENT_PID" "$SERVER_PID" "$COMPOSITOR_PID"; do
-    if [[ -n "$pid" ]] && kill -0 "$pid" 2> /dev/null; then
-      kill "$pid" > /dev/null 2>&1
-      wait "$pid" > /dev/null 2>&1
-    fi
-  done
+  terminate_process_bounded "$CLIENT_PID"
+  terminate_process_bounded "$SERVER_PID"
+  terminate_process_bounded "$COMPOSITOR_PID"
   mkdir -p "$OUT/fixtures"
   [[ -f "$EDIT_FILE" ]] && cp "$EDIT_FILE" "$OUT/fixtures/tracked.txt"
   [[ -f "$INBOUND_FILE" ]] && cp "$INBOUND_FILE" "$OUT/fixtures/inbound.txt"

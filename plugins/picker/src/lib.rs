@@ -8,7 +8,7 @@ use brood_plugin_sdk::{
         Command as ActorCommand, Event, Guest, LifecycleEvent, PresentationEvent, WorkerEvent,
         WorkerRequest,
     },
-    graphics::{drop_resources, layout_ui_text, submit_packet_for_resize},
+    graphics::UiFrame,
     input::BUTTON_PRIMARY as LEFT_BUTTON,
     runtime::sleep,
     text::{truncate, truncate_to_width},
@@ -993,7 +993,7 @@ fn redraw_for_resize_or_record_error(state: &mut PickerState, resize_epoch: Opti
 
 fn redraw(state: &mut PickerState, resize_epoch: Option<u64>) -> Result<(), String> {
     let mut packet = Packet::new();
-    let mut resources = Vec::new();
+    let mut frame = UiFrame::new(state.pane);
     packet.push(Command::FillRoundedRect {
         rect: Rect::new(0.0, 0.0, state.width, state.height),
         radius: CONTAINER_RADIUS,
@@ -1033,7 +1033,7 @@ fn redraw(state: &mut PickerState, resize_epoch: Option<u64>) -> Result<(), Stri
         add_text(
             state,
             &mut packet,
-            &mut resources,
+            &mut frame,
             &truncate_to_width(title, title_width, 17.0),
             17.0,
             TEXT,
@@ -1065,7 +1065,7 @@ fn redraw(state: &mut PickerState, resize_epoch: Option<u64>) -> Result<(), Stri
         add_text(
             state,
             &mut packet,
-            &mut resources,
+            &mut frame,
             &truncate_to_width(&query, query_width - 16.0, 14.0),
             14.0,
             if active.query.is_empty() { MUTED } else { FG },
@@ -1120,7 +1120,7 @@ fn redraw(state: &mut PickerState, resize_epoch: Option<u64>) -> Result<(), Stri
             add_text(
                 state,
                 &mut packet,
-                &mut resources,
+                &mut frame,
                 &truncate_to_width(&item.label, state.width - SIDE_MARGIN * 2.0, 13.0),
                 13.0,
                 FG,
@@ -1132,7 +1132,7 @@ fn redraw(state: &mut PickerState, resize_epoch: Option<u64>) -> Result<(), Stri
                 add_text(
                     state,
                     &mut packet,
-                    &mut resources,
+                    &mut frame,
                     &truncate_to_width(detail, state.width - SIDE_MARGIN * 2.0, 10.0),
                     10.0,
                     MUTED,
@@ -1159,7 +1159,7 @@ fn redraw(state: &mut PickerState, resize_epoch: Option<u64>) -> Result<(), Stri
             add_text(
                 state,
                 &mut packet,
-                &mut resources,
+                &mut frame,
                 loading_label,
                 13.0,
                 MUTED,
@@ -1171,7 +1171,7 @@ fn redraw(state: &mut PickerState, resize_epoch: Option<u64>) -> Result<(), Stri
             add_text(
                 state,
                 &mut packet,
-                &mut resources,
+                &mut frame,
                 "No matching items",
                 13.0,
                 MUTED,
@@ -1215,7 +1215,7 @@ fn redraw(state: &mut PickerState, resize_epoch: Option<u64>) -> Result<(), Stri
         add_text(
             state,
             &mut packet,
-            &mut resources,
+            &mut frame,
             &truncate_to_width(&footer, state.width - SIDE_MARGIN * 2.0, 10.0),
             10.0,
             if state.error { RED } else { MUTED },
@@ -1232,9 +1232,7 @@ fn redraw(state: &mut PickerState, resize_epoch: Option<u64>) -> Result<(), Stri
         width: 1.0,
     });
 
-    submit_packet_for_resize(state.pane, resize_epoch, &packet)?;
-    drop_resources(state.pane, state.text_resources.drain(..));
-    state.text_resources = resources;
+    frame.submit(resize_epoch, &packet, &mut state.text_resources)?;
     Ok(())
 }
 
@@ -1263,9 +1261,9 @@ fn draw_spinner(packet: &mut Packet, phase: usize, center_y: f32) {
 
 #[allow(clippy::too_many_arguments)]
 fn add_text(
-    state: &PickerState,
+    _state: &PickerState,
     packet: &mut Packet,
-    resources: &mut Vec<u64>,
+    frame: &mut UiFrame,
     text: &str,
     size: f32,
     color: Color,
@@ -1273,22 +1271,18 @@ fn add_text(
     y: f32,
     max_width: f32,
 ) -> Result<(), String> {
-    let layout = layout_ui_text(state.pane, text, size, max_width, size + 4.0, color)
+    frame
+        .draw_text_clipped(
+            packet,
+            text,
+            size,
+            max_width,
+            size + 4.0,
+            color,
+            x,
+            y,
+        )
         .map_err(|error| format!("layout picker text: {error}"))?;
-    resources.push(layout.handle);
-    packet.push(Command::Save);
-    packet.push(Command::ClipRect(Rect::new(
-        x,
-        y,
-        max_width.max(1.0),
-        size + 4.0,
-    )));
-    packet.push(Command::DrawTextLayout {
-        layout: layout.handle,
-        x,
-        y,
-    });
-    packet.push(Command::Restore);
     Ok(())
 }
 

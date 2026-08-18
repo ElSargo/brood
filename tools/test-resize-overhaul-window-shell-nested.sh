@@ -9,6 +9,7 @@ set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+. "$ROOT/tools/smoke-lib.sh"
 
 check_gated_capture_release_structure() {
   local actual expected
@@ -82,23 +83,9 @@ WINDOW_CAPTURE_GATE_ACTIVE=false
 cleanup() {
   local result=$?
   set +e
-  if [[ -n "$POINTER_PID" ]] && kill -0 "$POINTER_PID" 2> /dev/null; then
-    kill "$POINTER_PID" > /dev/null 2>&1 || true
-    wait "$POINTER_PID" > /dev/null 2>&1 || true
-  fi
-  if [[ -n "$CAPTURE_PID" ]] && kill -0 "$CAPTURE_PID" 2> /dev/null; then
-    kill "$CAPTURE_PID" > /dev/null 2>&1 || true
-    wait "$CAPTURE_PID" > /dev/null 2>&1 || true
-  fi
-  if [[ -n "$CLIENT_PID" ]] && kill -0 "$CLIENT_PID" 2> /dev/null; then
-    kill "$CLIENT_PID" > /dev/null 2>&1 || true
-    for _ in $(seq 1 80); do
-      kill -0 "$CLIENT_PID" 2> /dev/null || break
-      sleep 0.025
-    done
-    kill -KILL "$CLIENT_PID" > /dev/null 2>&1 || true
-    wait "$CLIENT_PID" > /dev/null 2>&1 || true
-  fi
+  terminate_process_bounded "$POINTER_PID"
+  terminate_process_bounded "$CAPTURE_PID"
+  terminate_process_bounded "$CLIENT_PID" 80
   if ((result != 0)); then
     {
       echo "window_shell_resize_proof=failed"

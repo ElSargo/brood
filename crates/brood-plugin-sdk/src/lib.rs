@@ -7,6 +7,7 @@
 pub mod actor;
 pub mod graphics;
 pub mod input;
+pub mod layout;
 pub mod runtime;
 pub mod text;
 

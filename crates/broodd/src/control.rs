@@ -2819,6 +2819,7 @@ fn open_presentation_fast_path(
         presentation_message_notifications,
         presentation_message_sequence: 0,
         deferred_presentation_messages: std::collections::VecDeque::new(),
+        deferred_managed_resize_statuses: std::collections::VecDeque::new(),
         resources: std::collections::HashMap::new(),
         buffers: std::collections::HashMap::new(),
         resource_app_ids: std::collections::HashMap::new(),
@@ -2940,6 +2941,13 @@ fn drain_fast_path_input(state: &mut Brood) {
     let mut request_redraw = false;
     let mut disconnected = false;
     loop {
+        crate::state::flush_managed_resize_statuses(&mut fast_path);
+        if !fast_path.deferred_managed_resize_statuses.is_empty() {
+            // The unread shared-memory input records remain owned by the
+            // producer. Stop admission until the lossless acknowledgement can
+            // be published instead of growing an unbounded side queue.
+            break;
+        }
         let message = {
             let Some(record) = fast_path.input.try_recv() else {
                 break;

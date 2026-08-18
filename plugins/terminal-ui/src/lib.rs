@@ -937,23 +937,33 @@ fn selection_text(snapshot: Option<&Snapshot>, selection: Selection) -> Option<S
 }
 
 fn snapshot_row_cells(snapshot: &Snapshot, row: u16) -> Vec<String> {
-    let mut cells = vec![" ".to_string(); usize::from(snapshot.cols)];
     let Some(runs) = snapshot.rows_data.get(usize::from(row)) else {
-        return cells;
+        return vec![" ".to_string(); usize::from(snapshot.cols)];
     };
+    row_cells(snapshot.cols, runs)
+}
+
+fn row_cells(cols: u16, runs: &[Run]) -> Vec<String> {
+    let mut cells = vec![" ".to_string(); usize::from(cols)];
     for run in runs {
         let mut col = usize::from(run.start);
+        let mut lead_col: Option<usize> = None;
         for character in run.text.chars() {
             let width = UnicodeWidthChar::width(character).unwrap_or(1);
             if width == 0 {
-                if let Some(previous) = cells.get_mut(col.saturating_sub(1)) {
-                    previous.push(character);
+                if let Some(lead) = lead_col
+                    && let Some(cell) = cells.get_mut(lead)
+                {
+                    cell.push(character);
                 }
                 continue;
             }
             if let Some(cell) = cells.get_mut(col) {
                 cell.clear();
                 cell.push(character);
+                lead_col = Some(col);
+            } else {
+                lead_col = None;
             }
             for continuation in 1..width {
                 if let Some(cell) = cells.get_mut(col.saturating_add(continuation)) {
@@ -1662,10 +1672,65 @@ bindings::export!(TerminalUi with_types_in bindings);
 #[cfg(test)]
 mod tests {
     use super::{
-        Command, FOCUS_MESSAGE, STATE, UiState, focus_commands_for_mailbox, paste_bytes,
+        Command, DEFAULT_BG, FOCUS_MESSAGE, SNAPSHOT_FULL, SNAPSHOT_MAGIC, SNAPSHOT_VERSION, STATE,
+        UiState, decode_chunk, focus_commands_for_mailbox, paste_bytes, row_cells,
         terminal_focuses_on_create, terminal_ready_commands, terminal_session_actor,
         terminal_text_clusters,
     };
+    use brood_graphics::theme::ashen;
+
+    fn one_row_snapshot(cols: u16, run_cells: u16, text: &str) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(SNAPSHOT_MAGIC);
+        bytes.push(SNAPSHOT_VERSION);
+        bytes.push(SNAPSHOT_FULL);
+        bytes.extend_from_slice(&7_u64.to_le_bytes());
+        bytes.extend_from_slice(&4_u64.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&cols.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.push(1);
+        bytes.push(0);
+        bytes.push(0);
+        bytes.extend_from_slice(&i32::MIN.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&2_u64.to_le_bytes());
+        bytes.extend_from_slice(&32_u64.to_le_bytes());
+        bytes.extend_from_slice(&1_u64.to_le_bytes());
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        bytes.extend_from_slice(&2_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.extend_from_slice(&run_cells.to_le_bytes());
+        bytes.extend_from_slice(&ashen::TEXT_RGB.to_le_bytes());
+        bytes.extend_from_slice(&DEFAULT_BG.to_le_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(&(text.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(text.as_bytes());
+        bytes
+    }
+
+    #[test]
+    fn decoder_accepts_resized_history_with_wide_combining_text() {
+        let bytes = one_row_snapshot(3, 3, "界\u{301} ");
+        let (header, chunk_index, chunk_count, row_start, rows) =
+            decode_chunk(&bytes).expect("terminal-session compatible snapshot");
+        assert_eq!((header.rows, header.cols), (1, 3));
+        assert_eq!((header.viewport_offset, header.max_viewport_offset), (1, 2));
+        assert_eq!((chunk_index, chunk_count, row_start), (0, 1, 0));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].len(), 1);
+        assert_eq!(rows[0][0].cells, 3);
+        assert_eq!(rows[0][0].text, "界\u{301} ");
+        assert_eq!(row_cells(header.cols, &rows[0]), vec!["界\u{301}", "", " "]);
+
+        let invalid = one_row_snapshot(3, 4, "broken");
+        assert!(decode_chunk(&invalid).is_err());
+    }
 
     #[test]
     fn backend_scoped_default_ui_targets_default_terminal() {

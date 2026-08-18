@@ -12,10 +12,13 @@ use brood_plugin_sdk::{
         LocalActorMessage, PresentationEvent, SessionActorMessage, SessionCommand,
         SessionCommandCompleted, SessionEvent, SessionOperation, SessionSnapshot,
     },
-    graphics::{
-        drop_resources, layout_ui_text, reuse_pane_content, submit_packet_for_resize,
-    },
+    graphics::{TextLayoutCache, reuse_pane_content},
     input::{BUTTON_PRIMARY as LEFT_BUTTON, BUTTON_SECONDARY as RIGHT_BUTTON},
+    layout::{
+        Axis, DelegateLayoutRest, DividerItem, InputZone, ItemKind, LayoutFragment, LayoutItem,
+        LayoutRest, Lease, ResolvedLayout, SetPointerPolicy, SetResolvedLayout,
+        SubmitLayoutRegion, SubmitSynchronizedLayout, Transform,
+    },
     text::truncate_to_width,
 };
 use brood_protocol::backend_catalogue::{BackendCatalogueEntry, BackendCatalogueMessage};
@@ -58,7 +61,7 @@ const SIDEBAR_DIVIDER_ZONE_ID: u64 = 0x8000_4252_4f4f_5301;
 const INBOX_DIVIDER_ZONE_ID: u64 = 0x8000_4252_4f4f_5302;
 const SIDEBAR_DIVIDER_ITEM_ID: u64 = 0x8000_4252_4f4f_5311;
 const INBOX_DIVIDER_ITEM_ID: u64 = 0x8000_4252_4f4f_5312;
-const DIVIDER_EVENT_MASK: u8 = 0b1111;
+const DIVIDER_EVENT_MASK: u32 = 0b1111;
 const STATUS_BAR_HEIGHT: f64 = 34.0;
 const MAX_PENDING_LAYOUT_REQUESTS: usize = 64;
 const MAX_NATIVE_RESIZE_RETRIES: u8 = 2;
@@ -161,7 +164,7 @@ struct SwitcherState {
     terminal_uis: BTreeMap<String, (u64, u64)>,
     neovim_uis_starting: BTreeMap<(u64, u64), String>,
     neovim_uis: BTreeMap<(u64, u64), String>,
-    text_resources: Vec<u64>,
+    text_cache: Option<TextLayoutCache>,
     layout: Option<LayoutContext>,
     workspace_focus: Option<u64>,
     picker_pane: Option<u64>,
@@ -614,7 +617,7 @@ impl SwitcherState {
             terminal_uis: BTreeMap::new(),
             neovim_uis_starting: BTreeMap::new(),
             neovim_uis: BTreeMap::new(),
-            text_resources: Vec::new(),
+            text_cache: None,
             layout: None,
             workspace_focus: None,
             picker_pane: None,
@@ -1558,56 +1561,24 @@ fn publish_layout_region_response(
     if let Some(context) = state.layout.as_mut() {
         context.size = message.size;
     }
-    let ordinary_commands = publish_layout(state, false, focus);
+    let publication = resolve_shell_layout(state, false, focus);
     if let Some(context) = state.layout.as_mut() {
         context.size = old_size;
     }
-    let Some(mut ordinary) = ordinary_commands.iter().find_map(|command| {
-        let ActorCommand::SendHostMessage(body) = command else {
-            return None;
-        };
-        let value = serde_json::from_slice::<serde_json::Value>(body).ok()?;
-        (value["type"] == "set-resolved-layout").then_some(value)
-    }) else {
+    let Some(publication) = publication else {
         return vec![layout_region_failure_command(
             message,
             "the shell fragment is not available",
         )];
     };
-    let Some(layout) = ordinary.get_mut("layout").map(serde_json::Value::take) else {
-        return vec![layout_region_failure_command(
-            message,
-            "the shell fragment has no layout",
-        )];
-    };
-    let rest = ordinary
-        .get_mut("rest")
-        .map(serde_json::Value::take)
-        .filter(|rest| !rest.is_null());
-    let mut fragment = serde_json::Map::new();
-    fragment.insert("layout".to_string(), layout);
-    if let Some(rest) = rest {
-        fragment.insert("rest".to_string(), rest);
-    }
-    let mut response = serde_json::Map::new();
-    response.insert(
-        "type".to_string(),
-        serde_json::Value::String("submit-layout-region".to_string()),
-    );
-    let Ok(epoch) = serde_json::to_value(message.resize_epoch) else {
-        return Vec::new();
-    };
-    let Ok(lease) = serde_json::to_value(message.lease) else {
-        return Vec::new();
-    };
-    response.insert("resize_epoch".to_string(), epoch);
-    response.insert("lease".to_string(), lease);
-    response.insert("inventory_revision".to_string(), revision.into());
-    response.insert("fragment".to_string(), fragment.into());
-    if let Some(focus) = focus {
-        response.insert("focus".to_string(), focus.into());
-    }
-    serde_json::to_vec(&response)
+    serde_json::to_vec(&SubmitLayoutRegion {
+        message_type: "submit-layout-region",
+        resize_epoch: message.resize_epoch,
+        lease: publication.lease,
+        inventory_revision: revision,
+        fragment: &publication.fragment,
+        focus,
+    })
         .ok()
         .map(ActorCommand::SendHostMessage)
         .into_iter()
@@ -3183,30 +3154,55 @@ fn shell_column_geometry(
     }
 }
 
-fn divider_json(id: u64, zone: u64, center: f64, width: f64, content_size: f64) -> String {
+fn divider_item(id: u64, zone: u64, center: f64, width: f64, content_size: f64) -> DividerItem {
     let divider_width = (2.0 / width).clamp(0.001, 0.02);
-    format!(
-        "{{\"id\":{id},\"zone\":{zone},\"z\":81,\"transform\":{{\"offset\":{{\"u\":{},\"v\":-1}},\"size\":{{\"u\":{divider_width},\"v\":{content_size}}}}},\"axis\":\"vertical\",\"role\":\"split\"}}",
-        center - divider_width * 0.5,
-    )
+    DividerItem {
+        id,
+        zone,
+        z: 81,
+        transform: Transform::new(
+            center - divider_width * 0.5,
+            -1.0,
+            divider_width,
+            content_size,
+        ),
+        axis: "vertical",
+        role: "split",
+    }
 }
 
-fn divider_zone_json(id: u64, center: f64, width: f64, content_size: f64) -> String {
+fn divider_zone(id: u64, center: f64, width: f64, content_size: f64) -> InputZone {
     let zone_width = (16.0 / width).clamp(0.005, 0.05);
-    format!(
-        "{{\"id\":{id},\"transform\":{{\"offset\":{{\"u\":{},\"v\":-1}},\"size\":{{\"u\":{zone_width},\"v\":{content_size}}}}},\"z\":80,\"event_mask\":{DIVIDER_EVENT_MASK},\"cursor\":\"col-resize\",\"input\":\"drag\"}}",
-        center - zone_width * 0.5,
-    )
+    InputZone {
+        id,
+        transform: Transform::new(
+            center - zone_width * 0.5,
+            -1.0,
+            zone_width,
+            content_size,
+        ),
+        z: 80,
+        event_mask: DIVIDER_EVENT_MASK,
+        cursor: "col-resize",
+        input: "drag",
+    }
 }
 
-fn publish_layout(
+struct ShellPublication {
+    lease: Lease,
+    revision: u64,
+    delegated: Vec<u64>,
+    needs_rest_delegation: bool,
+    fragment: LayoutFragment,
+    focus: Option<u64>,
+}
+
+fn resolve_shell_layout(
     state: &SwitcherState,
     allow_delegation: bool,
     requested_focus: Option<u64>,
-) -> Vec<ActorCommand> {
-    let Some(message) = state.layout.as_ref() else {
-        return Vec::new();
-    };
+) -> Option<ShellPublication> {
+    let message = state.layout.as_ref()?;
     // The global shell actors are started together, but their pane-created
     // messages race the first root layout-state publication.  Publishing
     // before every shell pane is known can delegate a late pane to the
@@ -3219,7 +3215,7 @@ fn publish_layout(
         || state.inbox_pane.is_none()
         || state.status_bar_pane.is_none()
     {
-        return Vec::new();
+        return None;
     }
     let pane = state.pane;
     let picker_pane = state.picker_pane;
@@ -3285,79 +3281,70 @@ fn publish_layout(
     let content_size = status_offset + 1.0;
     let status_size = 1.0 - status_offset;
 
-    let mut commands = vec![ActorCommand::SendHostMessage(
-        format!(
-            "{{\"type\":\"set-pointer-policy\",\"lease\":{{\"id\":{},\"generation\":{}}},\"provider\":\"workspace\"}}",
-            message.lease.id, message.lease.generation
-        )
-        .into_bytes(),
-    )];
-    if needs_rest {
-        let panes = delegated
-            .iter()
-            .map(u64::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
-        commands.push(ActorCommand::SendHostMessage(
-            format!(
-                "{{\"type\":\"delegate-layout-rest\",\"lease\":{{\"id\":{},\"generation\":{}}},\"revision\":{},\"actor\":\"workspace\",\"panes\":[{}]}}",
-                message.lease.id, message.lease.generation, message.revision, panes
-            )
-            .into_bytes(),
-        ));
-    }
-
     let mut layout_items = Vec::new();
     if pane_visible {
-        layout_items.push(format!(
-            "{{\"id\":{},\"kind\":{{\"type\":\"pane\",\"pane\":{}}},\"z\":1,\"transform\":{{\"offset\":{{\"u\":{},\"v\":-1}},\"size\":{{\"u\":{},\"v\":{}}}}},\"input\":\"pane\"}}",
-            pane, pane, sidebar_offset, sidebar_size, content_size
-        ));
+        layout_items.push(LayoutItem {
+            id: pane,
+            kind: ItemKind::Pane { pane },
+            z: 1,
+            transform: Transform::new(sidebar_offset, -1.0, sidebar_size, content_size),
+            input: "pane",
+        });
     }
     if inbox_visible && let Some(inbox) = inbox_pane {
-        layout_items.push(format!(
-            "{{\"id\":{},\"kind\":{{\"type\":\"pane\",\"pane\":{}}},\"z\":2,\"transform\":{{\"offset\":{{\"u\":{},\"v\":-1}},\"size\":{{\"u\":{},\"v\":{}}}}},\"input\":\"pane\"}}",
-            inbox, inbox, inbox_offset, inbox_size, content_size
-        ));
+        layout_items.push(LayoutItem {
+            id: inbox,
+            kind: ItemKind::Pane { pane: inbox },
+            z: 2,
+            transform: Transform::new(inbox_offset, -1.0, inbox_size, content_size),
+            input: "pane",
+        });
     }
     if status_bar_visible && let Some(status) = status_bar_pane {
-        layout_items.push(format!(
-            "{{\"id\":{},\"kind\":{{\"type\":\"pane\",\"pane\":{}}},\"z\":90,\"transform\":{{\"offset\":{{\"u\":-1,\"v\":{}}},\"size\":{{\"u\":2,\"v\":{}}}}},\"input\":\"pane\"}}",
-            status, status, status_offset, status_size
-        ));
+        layout_items.push(LayoutItem {
+            id: status,
+            kind: ItemKind::Pane { pane: status },
+            z: 90,
+            transform: Transform::new(-1.0, status_offset, 2.0, status_size),
+            input: "pane",
+        });
     }
     if picker_visible && let Some(picker) = picker_pane {
         let picker_width = (720.0 / width).clamp(0.45, 0.88);
         let picker_height = (480.0 / height).clamp(0.40, 0.82);
-        layout_items.push(format!(
-            "{{\"id\":{},\"kind\":{{\"type\":\"overlay-pane\",\"pane\":{}}},\"z\":100,\"transform\":{{\"offset\":{{\"u\":{},\"v\":{}}},\"size\":{{\"u\":{},\"v\":{}}}}},\"input\":\"pane\"}}",
-            picker,
-            picker,
-            -picker_width,
-            -picker_height,
-            picker_width * 2.0,
-            picker_height * 2.0
-        ));
+        layout_items.push(LayoutItem {
+            id: picker,
+            kind: ItemKind::OverlayPane { pane: picker },
+            z: 100,
+            transform: Transform::new(
+                -picker_width,
+                -picker_height,
+                picker_width * 2.0,
+                picker_height * 2.0,
+            ),
+            input: "pane",
+        });
     }
     if keybindings_visible && let Some(keybindings) = keybindings_pane {
-        layout_items.push(format!(
-            "{{\"id\":{},\"kind\":{{\"type\":\"overlay-pane\",\"pane\":{}}},\"z\":110,\"transform\":{{\"offset\":{{\"u\":-1,\"v\":-1}},\"size\":{{\"u\":2,\"v\":2}}}},\"input\":\"pane\"}}",
-            keybindings,
-            keybindings
-        ));
+        layout_items.push(LayoutItem {
+            id: keybindings,
+            kind: ItemKind::OverlayPane { pane: keybindings },
+            z: 110,
+            transform: Transform::new(-1.0, -1.0, 2.0, 2.0),
+            input: "pane",
+        });
     }
-    let layout_items = layout_items.join(",");
     let mut zones = Vec::new();
     let mut dividers = Vec::new();
     if has_rest && pane_visible {
         let center = -1.0 + 2.0 * rest_fraction;
-        zones.push(divider_zone_json(
+        zones.push(divider_zone(
             SIDEBAR_DIVIDER_ZONE_ID,
             center,
             width,
             content_size,
         ));
-        dividers.push(divider_json(
+        dividers.push(divider_item(
             SIDEBAR_DIVIDER_ITEM_ID,
             SIDEBAR_DIVIDER_ZONE_ID,
             center,
@@ -3367,13 +3354,13 @@ fn publish_layout(
     }
     if has_rest && inbox_visible {
         let center = 1.0 - 2.0 * inbox_fraction;
-        zones.push(divider_zone_json(
+        zones.push(divider_zone(
             INBOX_DIVIDER_ZONE_ID,
             center,
             width,
             content_size,
         ));
-        dividers.push(divider_json(
+        dividers.push(divider_item(
             INBOX_DIVIDER_ITEM_ID,
             INBOX_DIVIDER_ZONE_ID,
             center,
@@ -3381,41 +3368,77 @@ fn publish_layout(
             content_size,
         ));
     }
-    let zones = if zones.is_empty() {
-        String::new()
-    } else {
-        format!(",\"zones\":[{}]", zones.join(","))
-    };
-    let dividers = if dividers.is_empty() {
-        String::new()
-    } else {
-        format!(",\"dividers\":[{}]", dividers.join(","))
-    };
     let rest = if has_rest {
-        let mut rest = format!(
-            ",\"rest\":{{\"z\":0,\"transform\":{{\"offset\":{{\"u\":-1,\"v\":-1}},\"size\":{{\"u\":{rest_size},\"v\":"
-        );
-        rest.push_str(&content_size.to_string());
-        rest.push_str("}}}");
-        rest
+        Some(LayoutRest {
+            z: 0,
+            transform: Transform::new(-1.0, -1.0, rest_size, content_size),
+        })
     } else {
-        String::new()
+        None
     };
-    let focus = requested_focus.map_or_else(|| "null".to_string(), |focus| focus.to_string());
-    commands.push(ActorCommand::SendHostMessage(
-        format!(
-            "{{\"type\":\"set-resolved-layout\",\"lease\":{{\"id\":{},\"generation\":{}}},\"revision\":{},\"layout\":{{\"items\":[{}]{}{}}}{},\"focus\":{}}}",
-            message.lease.id,
-            message.lease.generation,
-            message.revision,
-            layout_items,
-            zones,
-            dividers,
+    Some(ShellPublication {
+        lease: Lease {
+            id: message.lease.id,
+            generation: message.lease.generation,
+        },
+        revision: message.revision,
+        delegated,
+        needs_rest_delegation: needs_rest,
+        fragment: LayoutFragment {
+            layout: ResolvedLayout {
+                items: layout_items,
+                zones,
+                dividers,
+            },
             rest,
-            focus
-        )
-        .into_bytes(),
-    ));
+        },
+        focus: requested_focus,
+    })
+}
+
+fn serialize_host_message<T: Serialize>(message: &T) -> Option<ActorCommand> {
+    serde_json::to_vec(message)
+        .ok()
+        .map(ActorCommand::SendHostMessage)
+}
+
+fn publish_layout(
+    state: &SwitcherState,
+    allow_delegation: bool,
+    requested_focus: Option<u64>,
+) -> Vec<ActorCommand> {
+    let Some(publication) = resolve_shell_layout(state, allow_delegation, requested_focus) else {
+        return Vec::new();
+    };
+    let mut commands = Vec::with_capacity(3);
+    if let Some(command) = serialize_host_message(&SetPointerPolicy {
+        message_type: "set-pointer-policy",
+        lease: publication.lease,
+        provider: "workspace",
+    }) {
+        commands.push(command);
+    }
+    if publication.needs_rest_delegation
+        && let Some(command) = serialize_host_message(&DelegateLayoutRest {
+            message_type: "delegate-layout-rest",
+            lease: publication.lease,
+            revision: publication.revision,
+            actor: "workspace",
+            panes: &publication.delegated,
+        })
+    {
+        commands.push(command);
+    }
+    if let Some(command) = serialize_host_message(&SetResolvedLayout {
+        message_type: "set-resolved-layout",
+        lease: publication.lease,
+        revision: publication.revision,
+        layout: &publication.fragment.layout,
+        rest: publication.fragment.rest.as_ref(),
+        focus: publication.focus,
+    }) {
+        commands.push(command);
+    }
     commands
 }
 
@@ -3476,32 +3499,18 @@ fn publish_synchronized_layout_attempt(
         state.status = "Layout transaction backlog is full".to_string();
         return Vec::new();
     }
-    let ordinary_commands = publish_layout(state, false, requested_focus);
+    let Some(publication) = resolve_shell_layout(state, false, requested_focus) else {
+        return Vec::new();
+    };
     let pointer_selection = native_resize_revision.and_then(|_| {
-        ordinary_commands.iter().find_map(|command| {
-            let ActorCommand::SendHostMessage(body) = command else {
-                return None;
-            };
-            let value = serde_json::from_slice::<serde_json::Value>(body).ok()?;
-            (value["type"] == "set-pointer-policy").then(|| body.clone())
+        serde_json::to_vec(&SetPointerPolicy {
+            message_type: "set-pointer-policy",
+            lease: publication.lease,
+            provider: "workspace",
         })
+        .ok()
     });
-    let Some(mut ordinary) = ordinary_commands.iter().find_map(|command| {
-        let ActorCommand::SendHostMessage(body) = command else {
-            return None;
-        };
-        let value = serde_json::from_slice::<serde_json::Value>(body).ok()?;
-        (value["type"] == "set-resolved-layout").then_some(value)
-    }) else {
-        return Vec::new();
-    };
-    let Some(layout) = ordinary.get_mut("layout").map(serde_json::Value::take) else {
-        return Vec::new();
-    };
-    let rest = ordinary
-        .get_mut("rest")
-        .map(serde_json::Value::take)
-        .filter(|rest| !rest.is_null());
+    let LayoutFragment { layout, rest } = publication.fragment;
     let Some(context) = state.layout.as_ref() else {
         return Vec::new();
     };
@@ -3513,17 +3522,7 @@ fn publish_synchronized_layout_attempt(
         return Vec::new();
     }
 
-    let item_pane = |item: &serde_json::Value| {
-        item["kind"]["pane"]
-            .as_u64()
-            .or_else(|| item["kind"]["overlay-pane"]["pane"].as_u64())
-    };
-    let explicit_panes = layout["items"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(item_pane)
-        .collect::<BTreeSet<_>>();
+    let explicit_panes = layout.pane_ids().collect::<BTreeSet<_>>();
     let shell_panes = [
         Some(state.pane),
         state.picker_pane,
@@ -3551,36 +3550,33 @@ fn publish_synchronized_layout_attempt(
         .filter(|pane| target_panes.contains(pane))
         .collect::<Vec<_>>();
 
-    let item_extent = |pane: Option<u64>, axis: &str, pixels: f64| {
-        pane.and_then(|pane| {
-            layout["items"]
-                .as_array()?
-                .iter()
-                .find(|item| item_pane(item) == Some(pane))?["transform"]["size"][axis]
-                .as_f64()
-                .map(|normalized| normalized * pixels / 2.0)
-        })
-        .unwrap_or(0.0)
-    };
     let rest_width = rest
         .as_ref()
-        .and_then(|rest| rest["transform"]["size"]["u"].as_f64())
-        .map_or(0.0, |normalized| {
-            normalized * f64::from(context.size.w.max(1)) / 2.0
-        });
+        .map(|rest| rest.transform.size.u * f64::from(context.size.w.max(1)) / 2.0)
+        .unwrap_or(0.0);
     let rest_height = rest
         .as_ref()
-        .and_then(|rest| rest["transform"]["size"]["v"].as_f64())
-        .map_or(0.0, |normalized| {
-            normalized * f64::from(context.size.height.max(1)) / 2.0
-        });
-    let sidebar_width = item_extent(Some(state.pane), "u", f64::from(context.size.w.max(1)));
-    let inbox_width = item_extent(state.inbox_pane, "u", f64::from(context.size.w.max(1)));
-    let status_height = item_extent(
-        state.status_bar_pane,
-        "v",
-        f64::from(context.size.height.max(1)),
+        .map(|rest| rest.transform.size.v * f64::from(context.size.height.max(1)) / 2.0)
+        .unwrap_or(0.0);
+    let sidebar_width = layout.pane_extent(
+        state.pane,
+        Axis::Horizontal,
+        f64::from(context.size.w.max(1)),
     );
+    let inbox_width = state.inbox_pane.map_or(0.0, |pane| {
+        layout.pane_extent(
+            pane,
+            Axis::Horizontal,
+            f64::from(context.size.w.max(1)),
+        )
+    });
+    let status_height = state.status_bar_pane.map_or(0.0, |pane| {
+        layout.pane_extent(
+            pane,
+            Axis::Vertical,
+            f64::from(context.size.height.max(1)),
+        )
+    });
 
     let Some(request_id) = state.next_layout_request.checked_add(1) else {
         state.error = true;
@@ -3594,60 +3590,21 @@ fn publish_synchronized_layout_attempt(
         native_resize_revision.unwrap_or(0),
         requested_focus.unwrap_or(0),
     );
-    let mut fragment = serde_json::Map::new();
-    fragment.insert("layout".to_string(), layout);
-    if let Some(rest) = rest {
-        fragment.insert("rest".to_string(), rest);
-    }
-    let mut request = serde_json::Map::new();
-    request.insert(
-        "type".to_string(),
-        serde_json::Value::String("submit-synchronized-layout".to_string()),
-    );
-    request.insert("request_id".to_string(), request_id.into());
-    if let Some(event_sequence) = pointer_event_sequence {
-        request.insert("event_sequence".to_string(), event_sequence.into());
-    }
-    if let Some(interaction) = interaction {
-        request.insert("interaction".to_string(), interaction.into());
-    }
-    if let Some(native_resize_revision) = native_resize_revision {
-        request.insert(
-            "native_resize_revision".to_string(),
-            native_resize_revision.into(),
-        );
-    }
-    request.insert(
-        "lease".to_string(),
-        serde_json::json!({
-            "id": context.lease.id,
-            "generation": context.lease.generation,
-        }),
-    );
-    request.insert("inventory_revision".to_string(), context.revision.into());
-    request.insert(
-        "base_layout_revision".to_string(),
-        context.presented_layout_revision.into(),
-    );
-    request.insert("fragment".to_string(), fragment.into());
-    if let Some(focus) = requested_focus {
-        request.insert("focus".to_string(), focus.into());
-    }
-    request.insert(
-        "wait_for_panes".to_string(),
-        serde_json::Value::Array(
-            wait_for_panes
-                .iter()
-                .copied()
-                .map(serde_json::Value::from)
-                .collect(),
-        ),
-    );
-    request.insert(
-        "presentation".to_string(),
-        serde_json::Value::String("scale-then-atomic".to_string()),
-    );
-    let Ok(body) = serde_json::to_vec(&request) else {
+    let fragment = LayoutFragment { layout, rest };
+    let Ok(body) = serde_json::to_vec(&SubmitSynchronizedLayout {
+        message_type: "submit-synchronized-layout",
+        request_id,
+        event_sequence: pointer_event_sequence,
+        interaction,
+        native_resize_revision,
+        lease: publication.lease,
+        inventory_revision: context.revision,
+        base_layout_revision: context.presented_layout_revision,
+        fragment: &fragment,
+        focus: requested_focus,
+        wait_for_panes: &wait_for_panes,
+        presentation: "scale-then-atomic",
+    }) else {
         return Vec::new();
     };
     state.pending_shell_layouts.insert(
@@ -4131,8 +4088,26 @@ fn redraw_for_resize_or_record_error(state: &mut SwitcherState, resize_epoch: Op
 }
 
 fn redraw(state: &mut SwitcherState, resize_epoch: Option<u64>) -> Result<(), String> {
+    let mut cache = state
+        .text_cache
+        .take()
+        .unwrap_or_else(|| TextLayoutCache::new(state.pane));
+    cache.set_pane(state.pane);
+    cache.begin_frame();
+    let result = redraw_with_cache(state, resize_epoch, &mut cache);
+    if result.is_err() {
+        cache.abort_frame();
+    }
+    state.text_cache = Some(cache);
+    result
+}
+
+fn redraw_with_cache(
+    state: &mut SwitcherState,
+    resize_epoch: Option<u64>,
+    cache: &mut TextLayoutCache,
+) -> Result<(), String> {
     let mut packet = Packet::new();
-    let mut resources = Vec::new();
     packet.push(Command::FillRect {
         rect: Rect::new(0.0, 0.0, state.width, state.height),
         color: BG,
@@ -4150,7 +4125,7 @@ fn redraw(state: &mut SwitcherState, resize_epoch: Option<u64>) -> Result<(), St
     add_text(
         state,
         &mut packet,
-        &mut resources,
+        cache,
         if header.narrow_title { "S" } else { "Sessions" },
         17.0,
         TEXT,
@@ -4193,7 +4168,7 @@ fn redraw(state: &mut SwitcherState, resize_epoch: Option<u64>) -> Result<(), St
     add_text(
         state,
         &mut packet,
-        &mut resources,
+        cache,
         &truncate_to_width(&prompt, header.input_width - 16.0, 14.0),
         14.0,
         if state.query.is_empty() { MUTED } else { FG },
@@ -4221,7 +4196,7 @@ fn redraw(state: &mut SwitcherState, resize_epoch: Option<u64>) -> Result<(), St
     add_text(
         state,
         &mut packet,
-        &mut resources,
+        cache,
         if state.pending.is_some() {
             "…"
         } else if state.mode == EditMode::Search {
@@ -4275,7 +4250,7 @@ fn redraw(state: &mut SwitcherState, resize_epoch: Option<u64>) -> Result<(), St
                 add_text(
                     state,
                     &mut packet,
-                    &mut resources,
+                    cache,
                     if collapsed { "▸" } else { "▾" },
                     12.0,
                     MUTED,
@@ -4286,7 +4261,7 @@ fn redraw(state: &mut SwitcherState, resize_epoch: Option<u64>) -> Result<(), St
                 add_text(
                     state,
                     &mut packet,
-                    &mut resources,
+                    cache,
                     &truncate_to_width(&project.name, state.width - 126.0, 13.0),
                     13.0,
                     TEXT,
@@ -4297,7 +4272,7 @@ fn redraw(state: &mut SwitcherState, resize_epoch: Option<u64>) -> Result<(), St
                 add_text(
                     state,
                     &mut packet,
-                    &mut resources,
+                    cache,
                     &project.sessions.len().to_string(),
                     10.0,
                     MUTED,
@@ -4318,7 +4293,7 @@ fn redraw(state: &mut SwitcherState, resize_epoch: Option<u64>) -> Result<(), St
                     add_text(
                         state,
                         &mut packet,
-                        &mut resources,
+                        cache,
                         "+",
                         16.0,
                         YELLOW,
@@ -4381,7 +4356,7 @@ fn redraw(state: &mut SwitcherState, resize_epoch: Option<u64>) -> Result<(), St
                 add_text(
                     state,
                     &mut packet,
-                    &mut resources,
+                    cache,
                     &truncate_to_width(&session.name, name_width, 13.0),
                     13.0,
                     FG,
@@ -4400,7 +4375,7 @@ fn redraw(state: &mut SwitcherState, resize_epoch: Option<u64>) -> Result<(), St
                     add_text(
                         state,
                         &mut packet,
-                        &mut resources,
+                        cache,
                         &count,
                         10.0,
                         if session.active { TEXT } else { MUTED },
@@ -4412,7 +4387,7 @@ fn redraw(state: &mut SwitcherState, resize_epoch: Option<u64>) -> Result<(), St
                 add_text(
                     state,
                     &mut packet,
-                    &mut resources,
+                    cache,
                     "×",
                     16.0,
                     RED,
@@ -4469,7 +4444,7 @@ fn redraw(state: &mut SwitcherState, resize_epoch: Option<u64>) -> Result<(), St
     add_text(
         state,
         &mut packet,
-        &mut resources,
+        cache,
         &truncate_to_width(&footer, state.width - 28.0, 10.0),
         10.0,
         if state.error { RED } else { MUTED },
@@ -4478,12 +4453,7 @@ fn redraw(state: &mut SwitcherState, resize_epoch: Option<u64>) -> Result<(), St
         state.width - 28.0,
     )?;
 
-    if let Err(error) = submit_packet_for_resize(state.pane, resize_epoch, &packet) {
-        drop_resources(state.pane, resources);
-        return Err(error);
-    }
-    drop_resources(state.pane, state.text_resources.drain(..));
-    state.text_resources = resources;
+    cache.submit(resize_epoch, &packet)?;
     Ok(())
 }
 
@@ -4523,9 +4493,9 @@ const fn item_height(item: &ListItem) -> f32 {
 
 #[allow(clippy::too_many_arguments)]
 fn add_text(
-    state: &SwitcherState,
+    _state: &SwitcherState,
     packet: &mut Packet,
-    resources: &mut Vec<u64>,
+    cache: &mut TextLayoutCache,
     text: &str,
     size: f32,
     color: Color,
@@ -4533,22 +4503,18 @@ fn add_text(
     y: f32,
     max_width: f32,
 ) -> Result<(), String> {
-    let layout = layout_ui_text(state.pane, text, size, max_width, size + 4.0, color)
+    cache
+        .draw_text_clipped(
+            packet,
+            text,
+            size,
+            max_width,
+            size + 4.0,
+            color,
+            x,
+            y,
+        )
         .map_err(|error| format!("layout session switcher text: {error}"))?;
-    resources.push(layout.handle);
-    packet.push(Command::Save);
-    packet.push(Command::ClipRect(Rect::new(
-        x,
-        y,
-        max_width.max(1.0),
-        size + 4.0,
-    )));
-    packet.push(Command::DrawTextLayout {
-        layout: layout.handle,
-        x,
-        y,
-    });
-    packet.push(Command::Restore);
     Ok(())
 }
 

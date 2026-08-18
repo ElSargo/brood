@@ -4620,6 +4620,9 @@ impl Brood {
     /// actor. This is safe to call on every compositor turn.
     pub(crate) fn service_realm_init_actor(&mut self) {
         self.flush_presentation_actor_messages();
+        if let Some(fast_path) = self.dmabuf.fast_path.as_mut() {
+            flush_managed_resize_statuses(fast_path);
+        }
         self.drain_hosted_actor_events();
         let completed = self
             .realm_inits
@@ -6813,6 +6816,9 @@ pub struct PresentationFastPath {
     pub presentation_message_notifications: brood_ipc::EventNotifier,
     pub presentation_message_sequence: u64,
     pub deferred_presentation_messages: VecDeque<Box<brood_ipc::ActorMessageRecord>>,
+    /// Lossless control records waiting for capacity in the shared frame
+    /// ring. Resize acknowledgements are ordered and never coalesced.
+    pub deferred_managed_resize_statuses: VecDeque<brood_ipc::CriticalRecord>,
     pub resources: HashMap<WeakDmabuf, u64>,
     pub buffers: HashMap<u64, Dmabuf>,
     pub resource_app_ids: HashMap<u64, String>,
@@ -7291,6 +7297,17 @@ pub(crate) fn emit_managed_resize_status(
                 return;
             }
         };
+    flush_managed_resize_statuses(fast_path);
+    if !fast_path.deferred_managed_resize_statuses.is_empty() {
+        // Input draining stops while this queue is non-empty, and one admitted
+        // input can retire at most the globally bounded correlation set.
+        debug_assert!(
+            fast_path.deferred_managed_resize_statuses.len() < MAX_MANAGED_RESIZE_SNAPSHOTS,
+            "managed resize input admission must pause at the correlation bound"
+        );
+        fast_path.deferred_managed_resize_statuses.push_back(record);
+        return;
+    }
     if let Err(record) = fast_path.frames.try_send(record) {
         warn!(
             pane,
@@ -7298,6 +7315,13 @@ pub(crate) fn emit_managed_resize_status(
             opcode = record.opcode,
             "managed resize status lane is full"
         );
+        // See the admission proof above: no second input is decoded until all
+        // retained statuses from this bounded correlation batch are flushed.
+        debug_assert!(
+            fast_path.deferred_managed_resize_statuses.len() < MAX_MANAGED_RESIZE_SNAPSHOTS,
+            "managed resize input admission must pause at the correlation bound"
+        );
+        fast_path.deferred_managed_resize_statuses.push_back(record);
         return;
     }
     if let Err(error) = fast_path.frame_notifications.notify() {
@@ -7310,6 +7334,38 @@ pub(crate) fn emit_managed_resize_status(
         return;
     }
     info!(pane, epoch, ?result, "managed resize status emitted");
+}
+
+pub(crate) fn flush_managed_resize_statuses(fast_path: &mut PresentationFastPath) {
+    let published = flush_retained_critical_records(
+        &mut fast_path.frames,
+        &fast_path.frame_notifications,
+        &mut fast_path.deferred_managed_resize_statuses,
+    );
+    if let Err(error) = published {
+        warn!(?error, "failed to notify retained managed resize statuses");
+    }
+}
+
+fn flush_retained_critical_records(
+    producer: &mut brood_ipc::CriticalProducer,
+    notifications: &brood_ipc::EventNotifier,
+    retained: &mut VecDeque<brood_ipc::CriticalRecord>,
+) -> std::result::Result<usize, brood_ipc::CriticalLaneError> {
+    let mut published = false;
+    let mut count = 0;
+    while let Some(record) = retained.pop_front() {
+        if let Err(record) = producer.try_send(record) {
+            retained.push_front(record);
+            break;
+        }
+        published = true;
+        count += 1;
+    }
+    if published {
+        notifications.notify()?;
+    }
+    Ok(count)
 }
 
 #[allow(dead_code)]
@@ -7393,6 +7449,66 @@ impl ClientData for ClientState {
 #[cfg(test)]
 mod managed_resize_tests {
     use super::*;
+    use std::os::fd::AsFd;
+
+    #[test]
+    fn managed_resize_statuses_survive_a_saturated_frame_ring_in_order() {
+        const GENERATION: u64 = 17;
+        let file = brood_ipc::CriticalLaneFile::create(GENERATION).unwrap();
+        let mut producer = brood_ipc::CriticalProducer::map(file.as_fd(), GENERATION).unwrap();
+        let mut consumer = brood_ipc::CriticalConsumer::map(file.as_fd(), GENERATION).unwrap();
+        let notifications = brood_ipc::EventNotifier::create().unwrap();
+        for sequence in 0..brood_ipc::CRITICAL_CAPACITY as u64 {
+            producer
+                .try_send(brood_ipc::CriticalRecord {
+                    sequence,
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        let mut retained = (100..110)
+            .map(|sequence| {
+                brood_ipc::encode_managed_resize_status_record(
+                    brood_protocol::ManagedResizeStatus {
+                        pane: 7,
+                        resize_epoch: sequence,
+                        result: brood_protocol::ManagedResizeStatusResult::Rejected {
+                            reason: brood_protocol::ManagedResizeRejectionReason::PaneUnavailable,
+                        },
+                    },
+                    GENERATION,
+                    sequence,
+                )
+                .unwrap()
+            })
+            .collect::<VecDeque<_>>();
+
+        assert_eq!(
+            flush_retained_critical_records(&mut producer, &notifications, &mut retained).unwrap(),
+            0
+        );
+        assert_eq!(retained.len(), 10);
+        for _ in 0..brood_ipc::CRITICAL_CAPACITY {
+            drop(consumer.try_recv().unwrap());
+        }
+        assert_eq!(
+            flush_retained_critical_records(&mut producer, &notifications, &mut retained).unwrap(),
+            10
+        );
+        assert!(retained.is_empty());
+        for sequence in 100..110 {
+            let record = consumer.try_recv().unwrap();
+            let status = brood_ipc::decode_managed_resize_status_record(&record).unwrap();
+            assert_eq!(status.pane, 7);
+            assert_eq!(status.resize_epoch, sequence);
+            assert_eq!(
+                status.result,
+                brood_protocol::ManagedResizeStatusResult::Rejected {
+                    reason: brood_protocol::ManagedResizeRejectionReason::PaneUnavailable,
+                }
+            );
+        }
+    }
 
     fn correlation(
         epoch: u64,
