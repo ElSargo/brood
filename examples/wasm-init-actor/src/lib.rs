@@ -190,6 +190,7 @@ fn start_agent(id: &str) -> Command {
         capabilities: vec![
             "filesystem:workspace-write".to_string(),
             "subprocess:brood-agent".to_string(),
+            "computer-use".to_string(),
         ],
         presentation_scope: PresentationScope::Global,
     })
@@ -781,8 +782,8 @@ fn editor_reply_with_message(
 mod tests {
     use super::{
         Command, EditorOpen, InitState, LocalActorMessage, MAX_PENDING_EDITORS, NEOVIM_FILES,
-        PendingEditor, STATE, WireAgent, WireMessage, handle_mailbox, start_editor_files,
-        terminal_command_body, valid_editor_client_actor, valid_editor_open,
+        PendingEditor, STATE, WireAgent, WireMessage, handle_mailbox, start_agent,
+        start_editor_files, terminal_command_body, valid_editor_client_actor, valid_editor_open,
     };
     use std::sync::Mutex;
 
@@ -848,6 +849,23 @@ mod tests {
             line: Some(0),
             column: None,
         }));
+    }
+
+    #[test]
+    fn coding_agent_gets_native_computer_use_authority() {
+        let Command::StartActor(started) = start_agent("coding-agent-2") else {
+            panic!("coding agent actor was not started");
+        };
+        assert_eq!(started.id, "coding-agent-2");
+        assert_eq!(started.path, "brood_coding_agent_plugin.component.wasm");
+        assert_eq!(
+            started.capabilities,
+            [
+                "filesystem:workspace-write",
+                "subprocess:brood-agent",
+                "computer-use"
+            ]
+        );
     }
 
     #[test]

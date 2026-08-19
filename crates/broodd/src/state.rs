@@ -670,6 +670,12 @@ impl Default for ConfiguredPluginResources {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeToolAccess {
+    None,
+    ComputerUse,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConfiguredPluginLifecycle {
     pub start_timeout: Duration,
@@ -785,6 +791,7 @@ pub struct Brood {
     pub(crate) host_dbus_address: Option<String>,
     pub(crate) brood_dbus_destination: Option<String>,
     pub(crate) brood_dbus_address: Option<String>,
+    pub(crate) brood_native_tool_socket: Option<OsString>,
     hosted_children: Vec<HostedChild>,
     hosted_child_event_sender: channel::Sender<HostedChildEvent>,
     async_runtime: Option<tokio::runtime::Handle>,
@@ -918,6 +925,7 @@ impl Brood {
                 .or_else(|| std::env::var("DBUS_SESSION_BUS_ADDRESS").ok()),
             brood_dbus_destination: None,
             brood_dbus_address: None,
+            brood_native_tool_socket: None,
             hosted_children: Vec::new(),
             hosted_child_event_sender,
             async_runtime: None,
@@ -4198,6 +4206,7 @@ impl Brood {
                 ],
                 ..brood_wasm::RuntimeIoCapabilities::default()
             },
+            NativeToolAccess::None,
             true,
             false,
             None,
@@ -4624,6 +4633,7 @@ impl Brood {
             Some(&(lifecycle.clone(), brood_wasm::PluginStartReason::Initial)),
             ConfiguredPluginResources::default(),
             brood_wasm::RuntimeIoCapabilities::default(),
+            NativeToolAccess::None,
             true,
             true,
             Some(session),
@@ -4837,6 +4847,7 @@ impl Brood {
                         | "filesystem:workspace-write"
                         | "pty"
                         | "network:loopback"
+                        | "computer-use"
                 ) || capability
                     .strip_prefix("subprocess:")
                     .is_some_and(|command| !command.trim().is_empty())
@@ -4871,6 +4882,14 @@ impl Brood {
             Some(&lifecycle_request),
             ConfiguredPluginResources::default(),
             runtime_io,
+            if capabilities
+                .iter()
+                .any(|capability| capability == "computer-use")
+            {
+                NativeToolAccess::ComputerUse
+            } else {
+                NativeToolAccess::None
+            },
             false,
             false,
             Some(session),
@@ -5319,6 +5338,7 @@ impl Brood {
                         lifecycle.as_ref(),
                         resources,
                         runtime_io,
+                        NativeToolAccess::None,
                         false,
                         false,
                         Some(self.sessions.active()),
@@ -5367,6 +5387,7 @@ impl Brood {
         lifecycle: Option<&(ConfiguredPluginLifecycle, brood_wasm::PluginStartReason)>,
         resources: ConfiguredPluginResources,
         runtime_io: brood_wasm::RuntimeIoCapabilities,
+        native_tool_access: NativeToolAccess,
         actor_management: bool,
         app_management: bool,
         lifecycle_session: Option<SurfaceSessionId>,
@@ -5390,9 +5411,36 @@ impl Brood {
             .and_then(|session| self.sessions.working_directory(session))
             .map(PathBuf::from)
             .or_else(|| filesystem.map(|grant| grant.host_path.clone()));
-        let environment = lifecycle_session
+        let mut environment = lifecycle_session
             .map(|session| self.session_process_environment(session))
             .unwrap_or_default();
+        let mut removed_environment = BTreeSet::new();
+        if native_tool_access == NativeToolAccess::ComputerUse {
+            if let Some(socket) = self.brood_native_tool_socket.as_ref() {
+                environment.insert(
+                    OsString::from(crate::BROOD_NATIVE_TOOL_SOCKET_ENV),
+                    socket.clone(),
+                );
+            }
+            for variable in [
+                BROODD_DBUS_DESTINATION_ENV,
+                BROODD_DBUS_ADDRESS_ENV,
+                "DBUS_SESSION_BUS_ADDRESS",
+            ] {
+                environment.remove(std::ffi::OsStr::new(variable));
+                removed_environment.insert(OsString::from(variable));
+            }
+        } else {
+            environment.remove(std::ffi::OsStr::new(crate::BROOD_NATIVE_TOOL_SOCKET_ENV));
+            removed_environment.insert(OsString::from(crate::BROOD_NATIVE_TOOL_SOCKET_ENV));
+        }
+        info!(
+            actor = actor_name,
+            computer_use = native_tool_access == NativeToolAccess::ComputerUse,
+            native_tool =
+                environment.contains_key(std::ffi::OsStr::new(crate::BROOD_NATIVE_TOOL_SOCKET_ENV)),
+            "configured component actor process environment"
+        );
         let actor = runtime.block_on(brood_wasm::ComponentActor::load(
             path,
             brood_wasm::ComponentActorConfig {
@@ -5410,6 +5458,7 @@ impl Brood {
                     capabilities: runtime_io,
                     working_directory,
                     environment,
+                    removed_environment,
                     ..brood_wasm::RuntimeIoConfig::default()
                 },
                 actor_management,

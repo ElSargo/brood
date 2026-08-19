@@ -2,13 +2,13 @@ use std::{
     collections::BTreeSet,
     env,
     io::{self, BufRead, Write},
+    os::unix::net::UnixStream,
     thread,
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use brood_cli::control::{ControlTarget, request_dbus_command, resolve_control_target};
 use brood_computer_use::{
     COMPUTER_USE_PROTOCOL_VERSION, ComputerUseLimits, ComputerUsePolicy, ComputerUseStartRequest,
 };
@@ -17,6 +17,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 const SURFACE_SESSION_ENV: &str = "BROOD_SURFACE_SESSION_ID";
+const NATIVE_TOOL_SOCKET_ENV: &str = "BROOD_NATIVE_TOOL_SOCKET";
 const DEFAULT_LEASE_DURATION_MS: u64 = 300_000;
 const DEFAULT_LAUNCH_TIMEOUT_MS: u64 = 10_000;
 const MAX_LAUNCH_TIMEOUT_MS: u64 = 30_000;
@@ -45,7 +46,7 @@ struct JsonRpcRequest {
 }
 
 struct Adapter {
-    target: ControlTarget,
+    native_tool_socket: String,
     session: Option<u64>,
     principal: String,
     owned_tasks: BTreeSet<String>,
@@ -55,6 +56,14 @@ struct Adapter {
 struct ToolOutput {
     text: String,
     images: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct NativeToolResponse {
+    protocol_version: u32,
+    ok: bool,
+    output: Option<String>,
+    error: Option<String>,
 }
 
 impl ToolOutput {
@@ -98,7 +107,8 @@ impl Adapter {
             .unwrap_or_else(|| "local-mcp-agent".to_string());
         ensure!(!principal.trim().is_empty(), "principal must not be empty");
         Ok(Self {
-            target: resolve_control_target(None, None),
+            native_tool_socket: env::var(NATIVE_TOOL_SOCKET_ENV)
+                .context("BROOD_NATIVE_TOOL_SOCKET is required for computer use")?,
             session,
             principal,
             owned_tasks: BTreeSet::new(),
@@ -213,7 +223,7 @@ impl Adapter {
             }
             _ => anyhow::bail!("unknown MCP computer-use tool {name}"),
         };
-        let response = request_dbus_command(&self.target, &command, false)?;
+        let response = request_native_command(&self.native_tool_socket, &command)?;
         if let Some(task) = started_task {
             self.owned_tasks.insert(task);
         }
@@ -278,7 +288,7 @@ impl Adapter {
             command.clone(),
         ];
         spawn.extend(args.iter().cloned());
-        let response = request_dbus_command(&self.target, &spawn, false)?;
+        let response = request_native_command(&self.native_tool_socket, &spawn)?;
         let pane = response
             .split_whitespace()
             .find_map(|field| field.strip_prefix("pane_id="))
@@ -286,10 +296,9 @@ impl Adapter {
             .context("Brood launch response did not contain a pane ID")?;
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
         loop {
-            let status = request_dbus_command(
-                &self.target,
+            let status = request_native_command(
+                &self.native_tool_socket,
                 &["hosted-child-status".to_string(), pane.to_string()],
-                false,
             )?;
             let last_status: Value =
                 serde_json::from_str(status.trim()).context("decode hosted application status")?;
@@ -443,13 +452,39 @@ impl Adapter {
     fn stop_owned_tasks(&mut self) {
         let tasks = std::mem::take(&mut self.owned_tasks);
         for task in tasks {
-            let _result = request_dbus_command(
-                &self.target,
+            let _result = request_native_command(
+                &self.native_tool_socket,
                 &["computer-use".to_string(), "stop".to_string(), task],
-                false,
             );
         }
     }
+}
+
+fn request_native_command(socket_path: &str, command: &[String]) -> Result<String> {
+    let mut stream = UnixStream::connect(socket_path)
+        .with_context(|| format!("connect native computer tool socket {socket_path}"))?;
+    serde_json::to_writer(&mut stream, &json!({"command": command}))
+        .context("encode native computer tool request")?;
+    stream
+        .write_all(b"\n")
+        .context("write native computer tool request delimiter")?;
+    stream
+        .shutdown(std::net::Shutdown::Write)
+        .context("finish native computer tool request")?;
+    let response: NativeToolResponse = serde_json::from_reader(io::BufReader::new(stream))
+        .context("decode native computer tool response")?;
+    ensure!(
+        response.protocol_version == COMPUTER_USE_PROTOCOL_VERSION,
+        "native computer tool protocol version mismatch"
+    );
+    ensure!(
+        response.ok,
+        "{}",
+        response
+            .error
+            .unwrap_or_else(|| "native computer tool failed".to_string())
+    );
+    Ok(response.output.unwrap_or_default())
 }
 
 fn main() -> Result<()> {

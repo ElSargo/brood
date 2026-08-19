@@ -111,8 +111,8 @@ fn configure_session(
     config::load_runtime_settings(state, &config_path)?;
     let control_target =
         control::ControlTarget::new(args.dbus_name.clone(), args.dbus_address.clone());
-    control::listen(event_loop, control_target.clone(), runtime)?;
-    configure_control_environment(state, &control_target);
+    let native_tool_socket = control::listen(event_loop, control_target.clone(), runtime)?;
+    configure_control_environment(state, &control_target, &native_tool_socket);
     let backend_init_actor = if args.no_init {
         None
     } else {
@@ -170,7 +170,11 @@ fn configure_session(
     Ok(())
 }
 
-fn configure_control_environment(state: &mut Brood, target: &control::ControlTarget) {
+fn configure_control_environment(
+    state: &mut Brood,
+    target: &control::ControlTarget,
+    native_tool_socket: &std::path::Path,
+) {
     let address = target
         .address
         .clone()
@@ -178,6 +182,7 @@ fn configure_control_environment(state: &mut Brood, target: &control::ControlTar
     state.brood_session = Some(target.session_marker());
     state.brood_dbus_destination = Some(target.destination.clone());
     state.brood_dbus_address.clone_from(&address);
+    state.brood_native_tool_socket = Some(native_tool_socket.as_os_str().to_os_string());
     state.host_dbus_address = address;
 }
 

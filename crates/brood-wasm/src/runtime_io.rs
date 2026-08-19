@@ -5,7 +5,7 @@
 //! while workers project the notification into their ordinary poll path.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     env,
     ffi::OsString,
     io::{Read, Write},
@@ -83,6 +83,8 @@ pub struct RuntimeIoConfig {
     /// Host-controlled session environment overrides inherited by admitted
     /// subprocesses. Guests cannot add or replace entries at spawn time.
     pub environment: BTreeMap<OsString, OsString>,
+    /// Ambient host variables removed before applying `environment`.
+    pub removed_environment: BTreeSet<OsString>,
     /// Maximum streams, children, and timers owned at once.
     pub max_resources: usize,
     /// Maximum live child processes.
@@ -101,6 +103,7 @@ impl Default for RuntimeIoConfig {
             capabilities: RuntimeIoCapabilities::default(),
             working_directory: None,
             environment: BTreeMap::new(),
+            removed_environment: BTreeSet::new(),
             max_resources: 64,
             max_children: 8,
             max_timers: 32,
@@ -520,6 +523,9 @@ impl RuntimeIoHub {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        for variable in &self.inner.config.removed_environment {
+            command.env_remove(variable);
+        }
         command.envs(&self.inner.config.environment);
         if let Some(directory) = &self.inner.config.working_directory {
             command.current_dir(directory);
@@ -611,6 +617,9 @@ impl RuntimeIoHub {
         // `portable-pty` otherwise falls back to `$HOME`, unlike
         // `std::process::Command`, which inherits the caller's cwd.
         builder.cwd(cwd);
+        for variable in &self.inner.config.removed_environment {
+            builder.env_remove(variable);
+        }
         for (key, value) in &self.inner.config.environment {
             builder.env(key, value);
         }

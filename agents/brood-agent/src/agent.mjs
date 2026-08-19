@@ -2,8 +2,8 @@ import { spawn } from "node:child_process";
 import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { createInterface } from "node:readline";
 import { randomUUID } from "node:crypto";
+import { NativeComputerUseClient } from "./computer-use.mjs";
 
 const MAX_STEPS = 32;
 const MAX_MODEL_ATTEMPTS = 4;
@@ -12,7 +12,7 @@ const CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token";
 const CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses";
 const OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
-const COMPUTER_USE_INSTRUCTIONS = "You are operating inside a Brood session. For any request to open, start, or launch a graphical application in the session, call brood_computer_use__computer_launch before doing anything else. Never launch a graphical application through the shell: a shell process is not a Brood-managed application and cannot reliably connect to the session display. Do not claim that an application opened unless computer_launch returned visible=true. Use the brood_computer_use tools for subsequent interaction with session applications.";
+const COMPUTER_USE_INSTRUCTIONS = "You are operating inside a Brood session. Computer use is provided as native computer_* tools scoped to this session. For any request to open, start, or launch a graphical application, call computer_launch before doing anything else. Never launch a graphical application through the shell: a shell process is not a Brood-managed application and cannot reliably connect to the session display. Do not claim that an application opened unless computer_launch returned visible=true. Use the other computer_* tools for subsequent interaction.";
 
 const BASE_INSTRUCTIONS = `You are Brood's independent session agent. Work directly toward the user's requested outcome. You have a shell for files and commands in the session workspace and session-scoped computer-use tools for graphical applications. Inspect relevant state before changing it, preserve unrelated work, and verify changes with the real workload when practical. Keep user-facing prose concise.\n\n${COMPUTER_USE_INSTRUCTIONS}`;
 
@@ -306,114 +306,6 @@ export async function resolveModelBackend(env = process.env, fetchImpl = fetch) 
   };
 }
 
-export class McpClient {
-  constructor(command, args, options = {}) {
-    this.command = command;
-    this.args = args;
-    this.options = options;
-    this.nextId = 1;
-    this.pending = new Map();
-  }
-
-  async start() {
-    this.child = spawn(this.command, this.args, {
-      cwd: this.options.cwd,
-      env: this.options.env ?? process.env,
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-    this.child.once("error", (error) => this.rejectAll(error));
-    this.child.once("exit", (code) => {
-      if (code !== 0) this.rejectAll(new Error(`${this.command} exited with status ${code}`));
-    });
-    createInterface({ input: this.child.stdout }).on("line", (line) => {
-      let message;
-      try {
-        message = JSON.parse(line);
-      } catch {
-        return;
-      }
-      if (message.id === undefined) return;
-      const pending = this.pending.get(message.id);
-      if (!pending) return;
-      this.pending.delete(message.id);
-      if (message.error) pending.reject(new Error(message.error.message ?? "MCP request failed"));
-      else pending.resolve(message.result);
-    });
-    createInterface({ input: this.child.stderr }).on("line", (line) => {
-      if (line.trim()) emit("status", { text: bytePrefix(line.trim(), 4000) });
-    });
-    await this.request("initialize", {
-      protocolVersion: "2025-06-18",
-      capabilities: {},
-      clientInfo: { name: "brood-agent", version: "0.1.0" },
-    });
-    this.notify("notifications/initialized", {});
-    return this;
-  }
-
-  request(method, params) {
-    const id = this.nextId++;
-    const promise = new Promise((resolve, reject) => this.pending.set(id, { resolve, reject }));
-    this.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
-    return promise;
-  }
-
-  notify(method, params) {
-    this.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method, params })}\n`);
-  }
-
-  rejectAll(error) {
-    for (const { reject } of this.pending.values()) reject(error);
-    this.pending.clear();
-  }
-
-  async tools() {
-    const result = await this.request("tools/list", {});
-    return result.tools ?? [];
-  }
-
-  call(name, args) {
-    return this.request("tools/call", { name, arguments: args });
-  }
-
-  async close() {
-    if (!this.child) return;
-    this.child.stdin.end();
-    await Promise.race([
-      new Promise((resolve) => this.child.once("exit", resolve)),
-      new Promise((resolve) => setTimeout(resolve, 2000)),
-    ]);
-    if (this.child.exitCode === null) this.child.kill("SIGTERM");
-  }
-}
-
-function mcpFunctionName(name) {
-  return `brood_computer_use__${name}`;
-}
-
-export function mcpToolDefinition(tool) {
-  const parameters = tool.name === "computer_action"
-    ? tool.inputSchema?.properties?.arguments ?? tool.inputSchema
-    : tool.inputSchema;
-  return {
-    type: "function",
-    name: mcpFunctionName(tool.name),
-    description: tool.description ?? `Call ${tool.name} in the bound Brood session`,
-    parameters: parameters ?? { type: "object", properties: {} },
-    strict: false,
-  };
-}
-
-export function mcpCallArguments(name, callId, args) {
-  if (name === "computer_action") {
-    return {
-      tool_call_id: callId,
-      arguments: { ...args, call_id: callId },
-    };
-  }
-  return args;
-}
-
 const SHELL_TOOL = {
   type: "function",
   name: "shell",
@@ -462,26 +354,6 @@ async function runShell(args, signal) {
   });
 }
 
-function mcpResultContent(result) {
-  const entries = result?.content ?? [];
-  const text = entries
-    .filter((entry) => entry.type === "text")
-    .map((entry) => entry.text ?? "")
-    .join("\n");
-  const output = [];
-  if (text) output.push({ type: "input_text", text: bytePrefix(text) });
-  for (const entry of entries) {
-    if (entry.type === "image" && entry.data && entry.mimeType) {
-      output.push({
-        type: "input_image",
-        image_url: `data:${entry.mimeType};base64,${entry.data}`,
-      });
-    }
-  }
-  if (output.length === 0) output.push({ type: "input_text", text: "Tool completed." });
-  return { output, text: text || "Tool completed.", isError: Boolean(result?.isError) };
-}
-
 function parseArguments(call) {
   try {
     return JSON.parse(call.arguments || "{}");
@@ -490,7 +362,7 @@ function parseArguments(call) {
   }
 }
 
-async function callTool(call, mcp, signal) {
+async function callTool(call, computerUse, signal) {
   const args = parseArguments(call);
   emit("tool_start", { tool: call.name, arguments: args });
   try {
@@ -499,11 +371,8 @@ async function callTool(call, mcp, signal) {
       result = await runShell(args, signal);
       result.output = [{ type: "input_text", text: result.content }];
       result.text = result.content;
-    } else if (call.name.startsWith("brood_computer_use__")) {
-      const mcpName = call.name.slice("brood_computer_use__".length);
-      result = mcpResultContent(
-        await mcp.call(mcpName, mcpCallArguments(mcpName, call.call_id, args)),
-      );
+    } else if (call.name.startsWith("computer_")) {
+      result = await computerUse.call(call.name, args, call.call_id);
     } else {
       throw new Error(`unknown tool ${call.name}`);
     }
@@ -544,15 +413,12 @@ export async function runAgent(request, options = {}) {
   const signal = options.signal;
   const modelRetryBaseMs = options.modelRetryBaseMs ?? 500;
   const backend = options.backend ?? (await resolveModelBackend(process.env, fetchImpl));
-  const mcp = options.mcp ?? (await new McpClient("brood-computer-use-mcp", [
-    "--session",
-    String(request.session_id),
-    "--principal",
-    request.agent,
-  ]).start());
+  const computerUse = options.computerUse ?? new NativeComputerUseClient({
+    session: request.session_id,
+    principal: request.agent,
+  });
   try {
-    const mcpTools = await mcp.tools();
-    const tools = [SHELL_TOOL, ...mcpTools.map(mcpToolDefinition)];
+    const tools = [SHELL_TOOL, ...computerUse.tools()];
     const currentUserContent = [{ type: "input_text", text: request.prompt }];
     for (const image of request.images ?? []) currentUserContent.push(await imageInput(image));
     const input = [
@@ -613,11 +479,11 @@ export async function runAgent(request, options = {}) {
         emit("result", { history, usage });
         return history;
       }
-      for (const call of calls) input.push(await callTool(call, mcp, signal));
+      for (const call of calls) input.push(await callTool(call, computerUse, signal));
     }
     throw new Error(`agent exceeded ${MAX_STEPS} model steps`);
   } finally {
-    if (!options.mcp) await mcp.close();
+    if (!options.computerUse) await computerUse.close();
   }
 }
 

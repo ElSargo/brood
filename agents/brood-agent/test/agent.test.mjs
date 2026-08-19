@@ -1,16 +1,21 @@
 import assert from "node:assert/strict";
 import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { createServer } from "node:net";
 import { join } from "node:path";
 import test from "node:test";
 
 import {
-  mcpCallArguments,
-  mcpToolDefinition,
   parseSsePayloads,
   resolveModelBackend,
   runAgent,
 } from "../src/agent.mjs";
+import {
+  NativeComputerUseClient,
+  computerUseTools,
+  nativeToolResult,
+  requestNativeTool,
+} from "../src/computer-use.mjs";
 
 function fakeJwt(accountId, expiresAtSeconds) {
   const encode = (value) => Buffer.from(JSON.stringify(value)).toString("base64url");
@@ -112,39 +117,89 @@ test("refreshes an expired imported login into the selected Brood auth file", as
   assert.equal((await stat(authPath)).mode & 0o777, 0o600);
 });
 
-test("computer actions hide and restore the MCP transport envelope", () => {
-  const directActionSchema = {
-    type: "object",
-    required: ["task", "actions"],
-    properties: { task: { type: "string" }, actions: { type: "array" } },
+test("computer actions are native model tools with a hidden host envelope", async () => {
+  const definition = computerUseTools(7).find((tool) => tool.name === "computer_action");
+  assert.equal(definition.name, "computer_action");
+  assert(definition.parameters.required.includes("task"));
+  assert(!definition.parameters.properties.tool_call_id);
+
+  const commands = [];
+  const client = new NativeComputerUseClient({ socketPath: "/unused", session: 7, principal: "agent-1" });
+  client.command = async (command) => {
+    commands.push(command);
+    return "{}";
   };
-  const definition = mcpToolDefinition({
-    name: "computer_action",
-    inputSchema: {
-      type: "object",
-      required: ["tool_call_id", "arguments"],
-      properties: {
-        tool_call_id: { type: "string" },
-        arguments: directActionSchema,
-      },
-    },
+  await client.call("computer_start", { task: "task-1" }, "start-call");
+  await client.call("computer_action", {
+    protocol_version: 1,
+    task: "task-1",
+    lease_generation: 1,
+    expected_sequence: 1,
+    actions: [{ type: "screenshot" }],
+  }, "model-call-7");
+  const envelope = JSON.parse(commands[1][2]);
+  assert.equal(commands[1][1], "native-call");
+  assert.equal(envelope.tool_call_id, "model-call-7");
+  assert.equal(envelope.arguments.target_session, 7);
+  assert.equal(envelope.arguments.call_id, "model-call-7");
+});
+
+test("native computer results extract PNGs from model-visible text", () => {
+  const result = nativeToolResult(JSON.stringify({
+    sequence: 2,
+    observation: { png: [137, 80, 78, 71, 13, 10, 26, 10, 1] },
+  }));
+  assert.equal(result.output[0].type, "input_text");
+  assert(!result.output[0].text.includes("137,80,78,71"));
+  assert.equal(result.output[1].type, "input_image");
+});
+
+test("native computer transport frames commands and returns daemon output", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "brood-native-tool-test."));
+  const socketPath = join(root, "tool.sock");
+  let received;
+  const server = createServer((socket) => {
+    let request = "";
+    socket.on("data", (chunk) => { request += chunk.toString("utf8"); });
+    socket.on("end", () => {
+      received = JSON.parse(request.trim());
+      socket.end(`${JSON.stringify({ protocol_version: 1, ok: true, output: "ready" })}\n`);
+    });
+  });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(socketPath, resolve);
+  });
+  t.after(async () => {
+    await new Promise((resolve) => server.close(resolve));
+    await rm(root, { recursive: true, force: true });
   });
 
-  assert.equal(definition.name, "brood_computer_use__computer_action");
-  assert.deepEqual(definition.parameters, directActionSchema);
-  assert.deepEqual(
-    mcpCallArguments("computer_action", "model-call-7", {
-      task: "task-1",
-      actions: [{ type: "screenshot" }],
-    }),
-    {
-      tool_call_id: "model-call-7",
-      arguments: {
-        task: "task-1",
-        actions: [{ type: "screenshot" }],
-        call_id: "model-call-7",
-      },
-    },
+  assert.equal(await requestNativeTool(socketPath, ["computer-use", "status"]), "ready");
+  assert.deepEqual(received, { command: ["computer-use", "status"] });
+});
+
+test("native computer transport surfaces daemon errors", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "brood-native-tool-error-test."));
+  const socketPath = join(root, "tool.sock");
+  const server = createServer((socket) => {
+    socket.on("data", () => {});
+    socket.on("end", () => {
+      socket.end(`${JSON.stringify({ protocol_version: 1, ok: false, error: "denied" })}\n`);
+    });
+  });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(socketPath, resolve);
+  });
+  t.after(async () => {
+    await new Promise((resolve) => server.close(resolve));
+    await rm(root, { recursive: true, force: true });
+  });
+
+  await assert.rejects(
+    requestNativeTool(socketPath, ["computer-use", "status"]),
+    /denied/,
   );
 });
 
@@ -167,7 +222,7 @@ test("completed turns report aggregate model usage", async () => {
       },
       {
         backend: { url: "https://example.invalid", headers: {} },
-        mcp: { async tools() { return []; } },
+        computerUse: { tools() { return []; } },
         fetchImpl: async () => new Response(
           'data: {"type":"response.completed","response":{"output":[{"type":"message","content":[{"type":"output_text","text":"done"}]}],"usage":{"input_tokens":11,"input_tokens_details":{"cached_tokens":3},"output_tokens":7,"output_tokens_details":{"reasoning_tokens":5}}}}\n\ndata: [DONE]\n\n',
           { status: 200, headers: { "content-type": "text/event-stream" } },
@@ -177,7 +232,9 @@ test("completed turns report aggregate model usage", async () => {
   } finally {
     process.stdout.write = originalWrite;
   }
-  const events = writes.join("").trim().split("\n").map(JSON.parse);
+  const events = writes.join("").trim().split("\n")
+    .filter((line) => line.startsWith("{"))
+    .map(JSON.parse);
   assert.deepEqual(events.at(-1).usage, {
     requests: 1,
     input_tokens: 11,
@@ -207,7 +264,7 @@ test("transient model failures retry without losing the turn", async () => {
       },
       {
         backend: { url: "https://example.invalid", headers: {} },
-        mcp: { async tools() { return []; } },
+        computerUse: { tools() { return []; } },
         modelRetryBaseMs: 0,
         fetchImpl: async () => {
           requests += 1;
@@ -228,7 +285,9 @@ test("transient model failures retry without losing the turn", async () => {
   } finally {
     process.stdout.write = originalWrite;
   }
-  const events = writes.join("").trim().split("\n").map(JSON.parse);
+  const events = writes.join("").trim().split("\n")
+    .filter((line) => line.startsWith("{"))
+    .map(JSON.parse);
   assert.equal(requests, 3);
   assert(events.some((event) => event.type === "status" && event.text.includes("503")));
   assert(events.some((event) => event.type === "status" && event.text.includes("400")));

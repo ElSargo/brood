@@ -35,6 +35,8 @@ pub use brood_cli::{
     BROODD_DBUS_DESTINATION_ENV, CommandOutcome, CtlArgs, DEFAULT_BROOD_DBUS_NAME, EnterArgs,
     HideArgs, ListArgs, PlugArgs, RunArgs, SessionArgs, ShowArgs, ShowTarget, SwitchArgs, TestArgs,
 };
+
+pub const BROOD_NATIVE_TOOL_SOCKET_ENV: &str = "BROOD_NATIVE_TOOL_SOCKET";
 use clap::Parser;
 use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt};

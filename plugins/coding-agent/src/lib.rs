@@ -410,6 +410,7 @@ fn start_agent_command(id: &str) -> ActorCommand {
         vec![
             "filesystem:workspace-write".to_string(),
             "subprocess:brood-agent".to_string(),
+            "computer-use".to_string(),
         ],
     )
 }

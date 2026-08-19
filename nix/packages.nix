@@ -354,6 +354,7 @@ let
     agent_runtime="$out/share/brood-agent"
     mkdir -p "$agent_runtime/src"
     install -m 0644 ${src}/agents/brood-agent/src/agent.mjs "$agent_runtime/src/agent.mjs"
+    install -m 0644 ${src}/agents/brood-agent/src/computer-use.mjs "$agent_runtime/src/computer-use.mjs"
     install -m 0644 ${src}/agents/brood-agent/src/cli.mjs "$agent_runtime/src/cli.mjs"
     install -m 0644 ${src}/agents/brood-agent/LICENSE "$agent_runtime/LICENSE"
     install -m 0644 ${src}/agents/brood-agent/THIRD_PARTY_NOTICES.md "$agent_runtime/THIRD_PARTY_NOTICES.md"

@@ -10,6 +10,7 @@ code-links:
   - crates/broodd/src/input.rs
   - crates/broodd/src/control.rs
   - crates/broodd/src/bin/brood-computer-use-mcp.rs
+  - agents/brood-agent/src/computer-use.mjs
   - crates/broodd/src/debug_dump.rs
   - crates/brood-wasm/wit/brood-plugin.wit
   - plugins/coding-agent/src/lib.rs
@@ -216,36 +217,39 @@ external adapters:
 
 The initial external adapter should model the OpenAI computer-call loop closely
 enough that a trained model can use its familiar action and screenshot shapes.
-An MCP surface can expose the same direct-action and `exec_js` tools. DBus may
-support local diagnostics and observer UX, but should not become the remote
-streaming protocol.
+An optional MCP compatibility surface can expose the same direct-action and
+`exec_js` tools. DBus supports local diagnostics and observer UX only; built-in
+agent computer use does not depend on it and DBus is not a remote streaming
+protocol.
 
-The direct-action MCP adapter uses standard JSON-RPC over stdio and forwards
-typed calls to the session daemon. It has no input, capture, lease, or approval
-authority of its own. Presentation observers use the bounded actor-message
-lane and cursor-addressed updates, so disconnecting one observer never removes
-task history or observations from the daemon.
+The built-in agent receives ordinary Responses function tools named
+`computer_launch`, `computer_start`, `computer_action`, `computer_exec_js`, and
+the associated lifecycle operations. Their hidden transport is a private,
+mode-0600 Unix socket created by the owning `brood-sessiond` and inherited only
+by session-scoped children. The socket admits only computer-use, scoped launch,
+and launch-status requests. It has no input, capture, lease, or approval
+authority of its own. Presentation observers use the bounded actor-message lane
+and cursor-addressed updates, so disconnecting one observer never removes task
+history or observations from the daemon.
 
 ## Built-in agent integration
 
 Every turn launched from a built-in, session-scoped coding-agent pane receives
-a required `brood_computer_use` stdio MCP server automatically. The
-pane supplies the current surface-session identity and stable agent identity;
-the independent headless agent starts the adapter with those values, inherits
-only the Brood control environment needed to reach that daemon, and rejects
-tasks or actions that attempt to cross the bound session. Users do not
-configure an MCP server or copy task, lease, or session identifiers into their
-prompt.
+native computer tools automatically. The pane supplies the current
+surface-session identity and stable agent identity; the independent headless
+agent binds those values to the inherited native tool channel and rejects tasks
+or actions that attempt to cross the bound session. Users do not configure a
+tool server or copy task, lease, or session identifiers into their prompt.
 
-The server's MCP initialization instructions explain the observe-act-observe
-workflow and lease sequencing. Observation PNGs are returned as MCP image
-content, with compact metadata as text, so the model can inspect the hosted
-application directly. A session-bound adapter can also request that the daemon
+The agent's developer instructions explain the observe-act-observe workflow and
+lease sequencing. Observation PNGs are returned as native tool image inputs,
+with compact metadata as text, so the model can inspect the hosted application
+directly. The session-bound native tool can also request that the daemon
 launch a GUI application through the normal hosted-child path. The request has
 no shell interpretation, is bound to the pane's session, and does not succeed
 until the child creates a managed window; an early exit is returned as a tool
 error. This lets an agent start from an empty session without acquiring host
-desktop authority. The adapter owns only tasks created during that turn and
+desktop authority. The agent owns only tasks created during that turn and
 stops them when its input closes; the daemon remains authoritative for leases,
 scope validation, approvals, human-input policy, and eventual expiry.
 

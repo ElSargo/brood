@@ -17,13 +17,14 @@ use std::{
     future::Future,
     io::Write,
     os::fd::AsFd,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, Stdio},
     sync::{
         atomic::{AtomicU64, Ordering},
         mpsc,
     },
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -42,6 +43,10 @@ use smithay::{
         generic::Generic,
     },
     utils::Point,
+};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader as AsyncBufReader},
+    net::{UnixListener, UnixStream},
 };
 use tracing::{info, warn};
 use zbus::{fdo, message::Header, object_server::SignalEmitter, proxy, zvariant};
@@ -72,6 +77,8 @@ const EXTENSION_INTERFACE: &str = "org.brood.Extension";
 const PLUGIN_INTERFACE: &str = "org.brood.Plugin";
 const AGENT_INTERFACE: &str = "org.brood.Agent";
 const CONTROL_REPLY_TIMEOUT: Duration = Duration::from_secs(15);
+const NATIVE_TOOL_REPLY_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_NATIVE_TOOL_REQUEST_BYTES: u64 = 1024 * 1024;
 
 type DbusMetadata = BTreeMap<String, String>;
 type DbusSurfaceSession = (u64, String, bool, u64);
@@ -357,6 +364,29 @@ enum DbusStateRequest {
         window_id: String,
         response: BoolResponse,
     },
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct NativeToolRequest {
+    command: Vec<String>,
+}
+
+#[derive(serde::Serialize)]
+struct NativeToolResponse<'a> {
+    protocol_version: u32,
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<&'a str>,
+}
+
+struct NativeToolSocketGuard(PathBuf);
+
+impl Drop for NativeToolSocketGuard {
+    fn drop(&mut self) {
+        let _result = std::fs::remove_file(&self.0);
+    }
 }
 
 #[derive(Clone)]
@@ -1228,7 +1258,7 @@ pub fn listen(
     event_loop: &mut EventLoop<'static, Brood>,
     target: ControlTarget,
     runtime: tokio::runtime::Handle,
-) -> Result<()> {
+) -> Result<PathBuf> {
     let (sender, receiver) = channel::channel::<DbusStateRequest>();
     event_loop
         .handle()
@@ -1240,14 +1270,153 @@ pub fn listen(
         })
         .map_err(|err| anyhow::anyhow!("insert DBus control request channel: {err:?}"))?;
 
-    start_dbus_service(target.clone(), sender, runtime)?;
+    start_dbus_service(target.clone(), sender.clone(), runtime.clone())?;
+    let native_tool_socket = start_native_tool_service(sender, runtime)?;
 
     info!(
         dbus_destination = %target.destination,
         dbus_address = ?target.address,
         "DBus control service listening"
     );
+    info!(
+        path = %native_tool_socket.display(),
+        "native agent tool service listening"
+    );
+    Ok(native_tool_socket)
+}
+
+fn start_native_tool_service(
+    sender: channel::Sender<DbusStateRequest>,
+    runtime: tokio::runtime::Handle,
+) -> Result<PathBuf> {
+    let runtime_root = env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(env::temp_dir)
+        .join("brood");
+    std::fs::create_dir_all(&runtime_root).with_context(|| {
+        format!(
+            "create native tool runtime directory {}",
+            runtime_root.display()
+        )
+    })?;
+    std::fs::set_permissions(&runtime_root, std::fs::Permissions::from_mode(0o700)).with_context(
+        || {
+            format!(
+                "secure native tool runtime directory {}",
+                runtime_root.display()
+            )
+        },
+    )?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let path = runtime_root.join(format!("native-tool-{}-{nonce:x}.sock", std::process::id()));
+    let listener = {
+        let _runtime_context = runtime.enter();
+        UnixListener::bind(&path)
+            .with_context(|| format!("bind native agent tool socket {}", path.display()))?
+    };
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("secure native agent tool socket {}", path.display()))?;
+    let guard = NativeToolSocketGuard(path.clone());
+    let task = runtime.spawn(async move {
+        let _guard = guard;
+        loop {
+            match listener.accept().await {
+                Ok((stream, _address)) => {
+                    let sender = sender.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) = serve_native_tool_connection(stream, sender).await {
+                            warn!(%error, "native agent tool request failed");
+                        }
+                    });
+                }
+                Err(error) => {
+                    warn!(%error, "native agent tool accept failed");
+                    break;
+                }
+            }
+        }
+    });
+    drop(task);
+    Ok(path)
+}
+
+async fn serve_native_tool_connection(
+    stream: UnixStream,
+    sender: channel::Sender<DbusStateRequest>,
+) -> Result<()> {
+    let (reader, mut writer) = stream.into_split();
+    let mut request_bytes = Vec::new();
+    AsyncBufReader::new(reader)
+        .take(MAX_NATIVE_TOOL_REQUEST_BYTES + 1)
+        .read_until(b'\n', &mut request_bytes)
+        .await
+        .context("read native agent tool request")?;
+    ensure!(
+        u64::try_from(request_bytes.len()).unwrap_or(u64::MAX) <= MAX_NATIVE_TOOL_REQUEST_BYTES,
+        "native agent tool request exceeds {MAX_NATIVE_TOOL_REQUEST_BYTES} bytes"
+    );
+    let request: NativeToolRequest =
+        serde_json::from_slice(&request_bytes).context("decode native agent tool request")?;
+    validate_native_tool_command(&request.command)?;
+    let response = request_native_tool_state(&sender, request.command).await;
+    let (output, error) = match &response {
+        Ok(output) => (Some(output.as_str()), None),
+        Err(error) => (None, Some(error.as_str())),
+    };
+    let encoded = serde_json::to_vec(&NativeToolResponse {
+        protocol_version: 1,
+        ok: response.is_ok(),
+        output,
+        error,
+    })
+    .context("encode native agent tool response")?;
+    writer
+        .write_all(&encoded)
+        .await
+        .context("write native agent tool response")?;
+    writer
+        .write_all(b"\n")
+        .await
+        .context("write native agent tool response delimiter")?;
+    writer
+        .shutdown()
+        .await
+        .context("close native agent tool response")
+}
+
+fn validate_native_tool_command(command: &[String]) -> Result<()> {
+    let Some(name) = command.first().map(String::as_str) else {
+        bail!("native agent tool command is empty");
+    };
+    ensure!(
+        matches!(
+            name,
+            "computer-use" | "spawn-in-session" | "hosted-child-status"
+        ),
+        "native agent tool cannot call {name}"
+    );
     Ok(())
+}
+
+async fn request_native_tool_state(
+    sender: &channel::Sender<DbusStateRequest>,
+    command: Vec<String>,
+) -> std::result::Result<String, String> {
+    let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+    sender
+        .send(DbusStateRequest::ControlCommand {
+            command,
+            json: false,
+            response: response_tx,
+        })
+        .map_err(|error| format!("Brood session loop is not running: {error}"))?;
+    tokio::time::timeout(NATIVE_TOOL_REPLY_TIMEOUT, response_rx)
+        .await
+        .map_err(|error| format!("timed out waiting for native agent tool response: {error}"))?
+        .map_err(|error| format!("native agent tool response was dropped: {error}"))?
 }
 
 pub fn send(args: CtlArgs) -> Result<()> {
@@ -2409,7 +2578,7 @@ fn execute_state_request(request: DbusStateRequest, state: &mut Brood) {
                         let call_id = call.call_id.clone();
                         (call.into_batch(), Some(call_id))
                     }),
-                    "mcp-call" => {
+                    "mcp-call" | "native-call" => {
                         serde_json::from_str::<brood_computer_use::McpDirectActionCall>(payload)
                             .map(|call| {
                                 let call_id = call.tool_call_id.clone();
@@ -3685,8 +3854,13 @@ fn execute_tokens(tokens: &[String], state: &mut Brood) -> Result<String> {
                     .context("computer-use task was not found")?;
                 format!("{}\n", serde_json::to_string(task)?)
             }
-            [subcommand, _] if matches!(subcommand.as_str(), "batch" | "call" | "mcp-call") => {
-                bail!("computer-use action calls must be sent through the DBus control boundary")
+            [subcommand, _]
+                if matches!(
+                    subcommand.as_str(),
+                    "batch" | "call" | "mcp-call" | "native-call"
+                ) =>
+            {
+                bail!("computer-use action calls must be sent through an adapter boundary")
             }
             _ => bail!("unsupported computer-use command"),
         },

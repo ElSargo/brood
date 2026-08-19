@@ -6,6 +6,7 @@ cd "$ROOT"
 . "$ROOT/tools/smoke-lib.sh"
 SSH_TARGET="${BROOD_CODING_AGENT_SSH_TARGET:-}"
 COMPUTER_USE="${BROOD_CODING_AGENT_COMPUTER_USE:-}"
+CREATE_AGENT_ONLY="${BROOD_CODING_AGENT_CREATE_ONLY:-}"
 REMOTE_IMAGE_MARKER="REMOTE_IMAGE_PROOF: red green"
 
 if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
@@ -200,6 +201,7 @@ if [[ -z "$SSH_TARGET" ]]; then
   cd "$WORKSPACE"
   env -u brood_session \
     PATH="$ROOT/tools:$ROOT/target/debug:$PATH" \
+    BROOD_AGENT_REQUIRE_DBUS_FREE="${COMPUTER_USE:+1}" \
     RUST_LOG="$RUST_LOG" \
     "$ROOT/target/debug/brood-sessiond" \
     --headless \
@@ -333,7 +335,7 @@ fi
 # the real global shortcut. The rest of this proof continues through real
 # pointer and keyboard input inside the picker and agent UI.
 REQUIRED_LAYOUT_COMMITS=2
-[[ -z "$COMPUTER_USE" ]] || REQUIRED_LAYOUT_COMMITS=1
+[[ -z "$COMPUTER_USE" && -z "$CREATE_AGENT_ONLY" ]] || REQUIRED_LAYOUT_COMMITS=1
 for _ in $(seq 1 300); do
   if [[ "$(rg -a -c 'presented committed layout revision' "$CLIENT_LOG" || true)" -ge "$REQUIRED_LAYOUT_COMMITS" ]]; then
     break
@@ -341,6 +343,11 @@ for _ in $(seq 1 300); do
   sleep 0.1
 done
 [[ "$(rg -a -c 'presented committed layout revision' "$CLIENT_LOG" || true)" -ge "$REQUIRED_LAYOUT_COMMITS" ]]
+for _ in $(seq 1 300); do
+  rg -q 'finalized native window resize' "$CLIENT_LOG" && break
+  sleep 0.1
+done
+rg -q 'finalized native window resize' "$CLIENT_LOG"
 click_at 640 360
 sleep 0.2
 PICKER_PANE="$(
@@ -458,6 +465,65 @@ capture() {
 }
 
 capture "$OUT/agent-idle.png"
+
+if [[ -n "$CREATE_AGENT_ONLY" ]]; then
+  env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+    WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+    "$OUT/virtual-keyboard-key" --none 60
+  for _ in $(seq 1 300); do
+    if rg -q 'backend actor message .*"id":"coding-agent-2"' "$CLIENT_LOG" \
+      && rg -q 'backend actor message .*"agent":"coding-agent-2".*"status":"idle"' \
+        "$CLIENT_LOG"; then
+      break
+    fi
+    kill -0 "$CLIENT_PID" 2> /dev/null || {
+      echo "ERR presentation client exited while creating coding-agent-2" >&2
+      exit 1
+    }
+    sleep 0.1
+  done
+  rg -q 'backend actor message .*"id":"coding-agent-2"' "$CLIENT_LOG"
+  rg -q 'backend actor message .*"agent":"coding-agent-2".*"status":"idle"' "$CLIENT_LOG"
+  kill -0 "$CLIENT_PID"
+  capture "$OUT/agent-created.png"
+
+  env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+    WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+    "$OUT/virtual-keyboard-key" --none 15
+  sleep 0.5
+  kill -0 "$CLIENT_PID"
+  capture "$OUT/agent-selected.png"
+  if magick compare -metric RMSE "$OUT/agent-created.png" "$OUT/agent-selected.png" null: \
+    2> "$OUT/agent-selection-rmse.txt"; then
+    echo "ERR selecting coding-agent-2 did not change the rendered pane" >&2
+    exit 1
+  fi
+
+  SWAY_SOCKET="$(
+    find "$RUNTIME_DIR" -maxdepth 1 -type s -name 'sway-ipc.*.sock' | head -1
+  )"
+  [[ -n "$SWAY_SOCKET" ]]
+  env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+    WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+    SWAYSOCK="$SWAY_SOCKET" \
+    swaymsg '[title="^Brood$"] kill' > "$OUT/presentation-close.json"
+  wait "$CLIENT_PID"
+  CLIENT_PID=""
+  cat > "$OUT/proof.md" <<EOF
+# Coding agent creation proof
+
+- input: real F2 key release in the focused coding-agent pane
+- actor: coding-agent-2 started in session 1 and published idle state
+- UI: the registry rendered both agent tabs and Tab selected coding-agent-2
+- stability: the presentation client remained alive through creation, selection, and capture
+- captures: agent-created.png and agent-selected.png
+EOF
+  echo "coding_agent_create=verified"
+  echo "proof=$OUT/proof.md"
+  echo "created=$OUT/agent-created.png"
+  echo "selected=$OUT/agent-selected.png"
+  exit 0
+fi
 
 if [[ -z "$COMPUTER_USE" ]]; then
 IMAGE_EXPECTED="red green"
@@ -700,7 +766,7 @@ PY
 - settle input sequences: $INPUT_SEQUENCES
 - automation viewport: 1440x900
 - live presentation bounds at capture: 480x686; presentation layout did not control automation geometry
-- workload: the independent built-in agent used its automatically configured session MCP server to enter (12345*6789)-987654 and visually verified 82822551
+- workload: the independent built-in agent used native session computer tools to enter (12345*6789)-987654 and visually verified 82822551
 - input: real Ctrl+Alt+A picker shortcut, pointer selection, prompt typing, and server-side SpeedCrunch keyboard actions
 - captures: builtin-agent-final.png and agent-complete.png
 EOF
@@ -887,9 +953,9 @@ if [[ -n "$COMPUTER_USE" ]]; then
 # Built-in agent computer-use proof
 
 - input: a real prompt submitted through the built-in session-scoped coding-agent pane
-- binding: the Brood agent received a required stdio MCP server fixed to Brood session 1 and principal coding-agent-1
+- binding: the Brood agent received native computer tools fixed to Brood session 1 and principal coding-agent-1, with no DBus or MCP transport
 - application: real SpeedCrunch pane $SPEEDCRUNCH_PANE inside that session
-- work: the Brood agent started its own task, observed the application as MCP image content, entered (12345*6789)-987654, visually verified 82822551, and stopped the task
+- work: the Brood agent started its own task, observed the application as native image input, entered (12345*6789)-987654, visually verified 82822551, and stopped the task
 - lifecycle: task $COMPUTER_TASK retained at least two changing observations and ended stopped with no lease
 - artifact: builtin-agent-final.png is the final 1440x900 server observation
 - presentation: the same nested client remained attached for live spectator output and returned to the agent UI after stop

@@ -34,11 +34,12 @@ Every UI's top bar follows the complete session registry, including agents
 created from other UI panes. Closing a UI pane does not stop its session-side
 agents.
 
-Turns launched from this pane automatically receive the `brood_computer_use`
-MCP tools bound to the pane's Brood session and agent identity. The agent loop,
+Turns launched from this pane automatically receive native `computer_*` tools
+bound to the pane's Brood session and agent identity. The agent loop,
 conversation memory, tool execution, and provider stream are Brood-owned; no
-Codex process is involved. No per-user MCP setup is required. Ask the agent
-normally, for example: `Use SpeedCrunch to calculate
+Codex or MCP process is involved. The private agent-to-daemon tool channel is
+inherited from `brood-sessiond` and does not depend on the session DBus. Ask
+the agent normally, for example: `Use SpeedCrunch to calculate
 (12345*6789)-987654 and verify the result visually.` The agent can start a
 task, inspect screenshots, act through the compositor's normal input paths,
 and stop the task. If the application is not open, it can launch it through
