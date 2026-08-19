@@ -349,6 +349,8 @@ pub struct CatalogWindow {
     pub app_id: String,
     #[serde(default)]
     pub size_authority: ManagedWindowSizeAuthority,
+    #[serde(default)]
+    pub automation: ManagedWindowAutomationState,
 }
 
 /// Which endpoint chooses a managed application's configured logical size.
@@ -363,6 +365,36 @@ pub enum ManagedWindowSizeAuthority {
         logical_width: u32,
         logical_height: u32,
     },
+}
+
+/// Human-presentation state for a server-managed window under automation.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ManagedWindowAutomationState {
+    /// The window is under ordinary human control.
+    #[default]
+    Normal,
+    /// A computer-use task owns the window's stable automation viewport.
+    Automated {
+        task: String,
+        interaction: AutomationInteractionState,
+        cursor: Option<AutomationCursor>,
+    },
+}
+
+/// Whether human input may reach an automated managed window.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutomationInteractionState {
+    Locked,
+    Unlocked,
+}
+
+/// Automation pointer location in managed-window logical coordinates.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AutomationCursor {
+    pub x: u32,
+    pub y: u32,
 }
 
 /// Pointer position in pane-local logical coordinates.
@@ -781,9 +813,10 @@ pub enum ServerMessage {
 mod tests {
     use super::{
         ARTIFACT_ABI_VERSION, ArtifactKind, ArtifactManifest, ArtifactMessage, ArtifactRealm,
-        ArtifactValidationError, CarrierKind, EndpointCapabilities, FrameTransportKind, InputEvent,
-        MAX_ARTIFACT_CHUNK_BYTES, ManagedResizeRejectionReason, ManagedResizeStatus,
-        ManagedResizeStatusResult, ManagedWindowSizeAuthority, NegotiationError,
+        ArtifactValidationError, AutomationCursor, AutomationInteractionState, CarrierKind,
+        EndpointCapabilities, FrameTransportKind, InputEvent, MAX_ARTIFACT_CHUNK_BYTES,
+        ManagedResizeRejectionReason, ManagedResizeStatus, ManagedResizeStatusResult,
+        ManagedWindowAutomationState, ManagedWindowSizeAuthority, NegotiationError,
         PRESENTATION_PROTOCOL_VERSION, ServerMessage, TransportProfile, WindowFrame,
         negotiate_profile,
     };
@@ -847,6 +880,12 @@ mod tests {
             Some(ManagedWindowSizeAuthority::Presentation)
         );
 
+        let decoded = serde_json::from_slice::<super::CatalogWindow>(legacy);
+        assert_eq!(
+            decoded.ok().map(|window| window.automation),
+            Some(ManagedWindowAutomationState::Normal)
+        );
+
         let authority = ManagedWindowSizeAuthority::ServerPreferred {
             logical_width: 1440,
             logical_height: 900,
@@ -858,6 +897,20 @@ mod tests {
                 .ok()
                 .and_then(|bytes| serde_json::from_slice(&bytes).ok()),
             Some(authority)
+        );
+
+        let automation = ManagedWindowAutomationState::Automated {
+            task: "task-7".to_string(),
+            interaction: AutomationInteractionState::Locked,
+            cursor: Some(AutomationCursor { x: 720, y: 450 }),
+        };
+        let encoded = serde_json::to_vec(&automation);
+        assert!(encoded.is_ok());
+        assert_eq!(
+            encoded
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok()),
+            Some(automation)
         );
     }
 

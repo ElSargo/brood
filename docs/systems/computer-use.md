@@ -86,13 +86,14 @@ size authority changes with the live computer-use lease:
   its human layout;
 - with a lease, the server publishes `server_preferred` size authority and its
   preferred logical size in the managed-window catalogue;
-- on human takeover, lease revocation restores presentation authority and the
-  client applies its current layout once.
+- when the lease ends, presentation authority returns and the client applies
+  its current layout once.
 
 Catalogue authority, not screenshot arrival, controls this transition. The
-client scales server-sized managed frames or the newest spectator observation
-to its own presentation rectangle. Passive capture and debug dumps never
-configure an application's size.
+client aspect-fits each server-sized managed frame inside that pane's existing
+presentation rectangle. Letterbox space uses presentation-owned generic
+background chrome; it never changes the pane allocation. Passive capture and
+debug dumps never configure an application's size.
 
 The existing presentation design says the server never creates a native or
 offscreen presentation target. Implementing computer use requires narrowing
@@ -100,15 +101,21 @@ that invariant: the server still does not create a *human presentation target*,
 but it does create an isolated automation render target. The presentation
 protocol must not acquire automation-layout authority as a side effect.
 
-When automation is active, a presentation may replace its ordinary composed
-workspace with an aspect-fitted spectator image from the newest server
-observation. This is a read-only projection: it does not resize managed
-applications, select automation windows, change coordinates, or request a new
-capture cadence. State/history and the newest compressed frame travel as
-separate bounded observer updates when needed, and slow clients retain only the
-newest frame. Deliberate human primary input still follows the task's pause or
-revoke policy before ordinary interaction resumes. A paused task has no size
-authority unless it reacquires a lease.
+Automation is a first-class managed-window catalogue state. Every automated
+pane has a translucent blue border and the automation pointer is projected
+into its aspect-fitted content rectangle. It enters interaction-locked: human
+input addressed to that pane is ignored by both presentation and server, and a
+translucent overlay says `press esc to unlock`. Escape changes only the
+interaction lock; it does not resize the window, release the lease, or stop the
+task. Once unlocked, human and automation input may reach the pane while the
+automation state remains visible. When the lease ends, the pane returns to the
+normal state and all automation chrome disappears.
+
+State/history and the newest compressed observation still travel as separate
+bounded observer updates when needed, and slow clients retain only the newest
+frame. The presentation observer does not select automation windows, change
+machine coordinates, or request a new capture cadence. A paused task has no
+size authority unless it reacquires a lease.
 
 ## Automation viewport
 
@@ -197,9 +204,10 @@ current compositor seat and focus state are shared. The lease names the task's
 authorized session and window set even though exclusivity is daemon-wide.
 
 A connected presentation client can observe without holding the automation
-lease. Human primary input pauses the task or revokes the lease according to
-policy; it must never silently interleave with agent input. Approval-required
-actions block at the server and publish a request to all eligible observers.
+lease. Automated windows begin interaction-locked; Escape explicitly unlocks
+human input without transferring layout authority. Human input elsewhere may
+still pause or revoke the lease according to policy. Approval-required actions
+block at the server and publish a request to all eligible observers.
 The server applies the decision even if the requesting client disconnects.
 
 ## Internal protocol

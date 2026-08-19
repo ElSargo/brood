@@ -782,6 +782,7 @@ fn handle_reliable_message(
                     session: window.session,
                     app_id: window.app_id,
                     size_authority: window.size_authority,
+                    automation: window.automation,
                 })
                 .collect();
             ClientEvent::BackendSnapshot {

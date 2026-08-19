@@ -45,8 +45,9 @@ use brood_layout::{
     LayoutSize, LocalPoint, PointerEventMask, ResolvedLayout, ZoneHitResult,
 };
 use brood_protocol::{
-    ArtifactManifest, ArtifactRealm, BackendActorRealm, BackendId, ClientLifecycle, ClientMessage,
-    FrameTransportKind, InputEvent, ManagedWindowSizeAuthority, PanePosition,
+    ArtifactManifest, ArtifactRealm, AutomationInteractionState, BackendActorRealm, BackendId,
+    ClientLifecycle, ClientMessage, FrameTransportKind, InputEvent, ManagedWindowAutomationState,
+    ManagedWindowSizeAuthority, PanePosition,
     backend_catalogue::{
         BACKEND_CATALOGUE_ACTOR_ID, BACKEND_CATALOGUE_CLIENT_SENDER, BackendCatalogueEntry,
         BackendCatalogueMessage, BackendSessionEntry,
@@ -1511,6 +1512,8 @@ struct CatalogWireWindow {
     app_id: String,
     #[serde(default)]
     size_authority: ManagedWindowSizeAuthority,
+    #[serde(default)]
+    automation: ManagedWindowAutomationState,
 }
 
 struct PendingCatalog {
@@ -1640,6 +1643,7 @@ fn spawn_catalog_updates(
                                     session: window.session,
                                     app_id: window.app_id,
                                     size_authority: window.size_authority,
+                                    automation: window.automation,
                                 })
                                 .collect::<Vec<_>>();
                             eprintln!(
@@ -3867,6 +3871,7 @@ struct Application {
     proof_held_managed_frame: Option<(u64, ClientEvent)>,
     computer_use_observer_updates: BTreeMap<BackendId, ComputerUseObserverUpdate>,
     computer_use_frame_assemblies: BTreeMap<BackendId, ComputerUseFrameAssembly>,
+    automation_unlock_key_down: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -4021,6 +4026,25 @@ impl Application {
             .find(|(backend, _, _)| Some(*backend) == active_backend)
             .or_else(|| active_updates.first());
         let active_task = selected.map(|(_, _, lease)| lease.task.0.as_str());
+        let automation_presentation = selected.map(|(backend, _, lease)| {
+            let locked = !renderer.available_windows.iter().any(|window| {
+                window.backend == *backend
+                    && owned_panes.contains(&window.pane)
+                    && matches!(
+                        &window.automation,
+                        ManagedWindowAutomationState::Automated {
+                            task,
+                            interaction: AutomationInteractionState::Unlocked,
+                            ..
+                        } if task == &lease.task.0
+                    )
+            });
+            AutomationPresentationState {
+                backend: *backend,
+                task: lease.task.0.clone(),
+                locked,
+            }
+        });
         let frame = selected.and_then(|(_, update, lease)| {
             update
                 .frame
@@ -4031,7 +4055,12 @@ impl Application {
             .renderer
             .as_mut()
             .context("renderer disappeared while applying computer-use authority")?;
-        renderer.update_automation_spectator(frame, active_task, owned_panes)?;
+        renderer.update_automation_spectator(
+            frame,
+            active_task,
+            automation_presentation,
+            owned_panes,
+        )?;
         flush_renderer_managed_resize_requests(self.input_sender.as_mut(), renderer);
         Ok(())
     }
@@ -10035,6 +10064,18 @@ impl ApplicationHandler<ClientEvent> for Application {
                     );
                     return;
                 };
+                if pointer_target_for_cursor(renderer, position, self.pointer_grab.as_ref())
+                    .is_some_and(|target| {
+                        matches!(target, PanePointerTarget::Managed { pane, .. } if renderer.automated_pane_is_locked(pane))
+                    })
+                {
+                    self.pointer_routing.pending_plugin_motion = None;
+                    send_managed_pointer_leave(
+                        self.input_sender.as_mut(),
+                        &mut self.pointer_routing.managed_target,
+                    );
+                    return;
+                }
                 route_pointer_motion(
                     renderer,
                     position,
@@ -10157,6 +10198,10 @@ impl ApplicationHandler<ClientEvent> for Application {
                 else {
                     return;
                 };
+                if matches!(target, PanePointerTarget::Managed { pane, .. } if renderer.automated_pane_is_locked(pane))
+                {
+                    return;
+                }
                 eprintln!(
                     "presentation pointer button target={target:?} pressed={pressed} client_grab_active={}",
                     self.pointer_grab.is_some()
@@ -10220,6 +10265,10 @@ impl ApplicationHandler<ClientEvent> for Application {
                 ) else {
                     return;
                 };
+                if matches!(target, PanePointerTarget::Managed { pane, .. } if renderer.automated_pane_is_locked(pane))
+                {
+                    return;
+                }
                 eprintln!(
                     "presentation pointer scroll target={target:?} client_grab_active={}",
                     self.pointer_grab.is_some()
@@ -10372,6 +10421,52 @@ impl ApplicationHandler<ClientEvent> for Application {
                 let text_input =
                     plugin_text_input(&event.logical_key, event.text.as_deref(), self.modifiers);
                 let logical_key = plugin_logical_key(&event.logical_key);
+                if self.automation_unlock_key_down && logical_key == "Escape" {
+                    if event.state == ElementState::Released {
+                        self.automation_unlock_key_down = false;
+                    }
+                    return;
+                }
+                if let Some(pane) = renderer.focused_managed_window()
+                    && renderer.automated_pane_is_locked(pane)
+                {
+                    if logical_key == "Escape" && event.state == ElementState::Pressed {
+                        let Some((backend, task)) = renderer.locked_automation_task() else {
+                            return;
+                        };
+                        let body = match serde_json::to_vec(&ComputerUseObserverCommand::Unlock {
+                            task,
+                        }) {
+                            Ok(body) => body,
+                            Err(error) => {
+                                eprintln!("could not encode computer-use unlock: {error}");
+                                return;
+                            }
+                        };
+                        let Some(sender) = self.actor_message_sender.as_mut() else {
+                            eprintln!("computer-use unlock ignored without actor-message lane");
+                            return;
+                        };
+                        if let Err(error) =
+                            sender.send(&actor_runtime::BackendActorMessageRequest {
+                                backend,
+                                sender: COMPUTER_USE_OBSERVER_ACTOR.to_string(),
+                                realm: BackendActorRealm::Daemon,
+                                actor: COMPUTER_USE_SERVER_ACTOR.to_string(),
+                                body,
+                            })
+                        {
+                            eprintln!("computer-use unlock request failed: {error:#}");
+                            return;
+                        }
+                        self.automation_unlock_key_down = true;
+                        eprintln!(
+                            "computer-use interaction unlock requested backend={}",
+                            backend.0
+                        );
+                    }
+                    return;
+                }
                 if std::env::var_os("BROOD_TERMINAL_SCROLL_BENCH").is_some()
                     && matches!(logical_key.as_str(), "F11" | "F12")
                     && let Some(pane) = renderer.focused_plugin_pane()
@@ -11259,6 +11354,10 @@ struct Renderer {
     divider_pipeline: wgpu::RenderPipeline,
     divider_hover_pipeline: wgpu::RenderPipeline,
     divider_active_pipeline: wgpu::RenderPipeline,
+    automation_border_pipeline: wgpu::RenderPipeline,
+    automation_scrim_pipeline: wgpu::RenderPipeline,
+    automation_cursor_pipeline: wgpu::RenderPipeline,
+    automation_lock_overlay: AutomationLockOverlay,
     plugin_canvas: GpuCanvasRenderer,
     imported_frames: HashMap<u64, ImportedFrame>,
     frame_keys: BTreeMap<(BackendId, u64), u64>,
@@ -11304,6 +11403,7 @@ struct Renderer {
     window_resize_in_progress: bool,
     automation_owned_panes: BTreeSet<u64>,
     automation_spectator: Option<AutomationSpectatorFrame>,
+    automation_presentation: Option<AutomationPresentationState>,
 }
 
 /// CPU-side state which survives a renderer/device replacement.
@@ -11348,6 +11448,7 @@ struct RendererRecoveryState {
     sent_plugin_sizes: HashMap<u64, PluginPaneSize>,
     window_resize_in_progress: bool,
     automation_owned_panes: BTreeSet<u64>,
+    automation_presentation: Option<AutomationPresentationState>,
     invalidated_staged_managed_panes: BTreeSet<u64>,
 }
 
@@ -11440,6 +11541,7 @@ struct AvailableWindow {
     session: u64,
     app_id: String,
     size_authority: ManagedWindowSizeAuthority,
+    automation: ManagedWindowAutomationState,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
@@ -11514,11 +11616,24 @@ struct ImportedFrame {
 
 struct AutomationSpectatorFrame {
     _texture: wgpu::Texture,
-    bind_group: wgpu::BindGroup,
-    extent: (u32, u32),
+    _bind_group: wgpu::BindGroup,
+    _extent: (u32, u32),
     task: String,
     observation_sequence: u64,
     _frame_sequence: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AutomationPresentationState {
+    backend: BackendId,
+    task: String,
+    locked: bool,
+}
+
+struct AutomationLockOverlay {
+    _texture: wgpu::Texture,
+    bind_group: wgpu::BindGroup,
+    extent: (u32, u32),
 }
 
 enum ImportedFrameSource {
@@ -13315,6 +13430,100 @@ fn write_packed_image(
     Ok(())
 }
 
+const fn automation_lock_glyph(character: char) -> [u8; 7] {
+    match character {
+        'a' => [0x0e, 0x11, 0x11, 0x1f, 0x11, 0x11, 0x11],
+        'c' => [0x0e, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0e],
+        'e' => [0x1f, 0x10, 0x10, 0x1e, 0x10, 0x10, 0x1f],
+        'k' => [0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11],
+        'l' => [0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1f],
+        'n' => [0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11],
+        'o' => [0x0e, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0e],
+        'p' => [0x1e, 0x11, 0x11, 0x1e, 0x10, 0x10, 0x10],
+        'r' => [0x1e, 0x11, 0x11, 0x1e, 0x14, 0x12, 0x11],
+        's' => [0x0f, 0x10, 0x10, 0x0e, 0x01, 0x01, 0x1e],
+        't' => [0x1f, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04],
+        'u' => [0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0e],
+        _ => [0; 7],
+    }
+}
+
+fn create_automation_lock_overlay(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    layout: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+) -> Result<AutomationLockOverlay> {
+    const TEXT: &str = "press esc to unlock";
+    const SCALE: u32 = 3;
+    const PADDING: u32 = 12;
+    let glyph_advance = 6 * SCALE;
+    let width = PADDING * 2
+        + u32::try_from(TEXT.chars().count()).unwrap_or(u32::MAX) * glyph_advance
+        - SCALE;
+    let height = PADDING * 2 + 7 * SCALE;
+    let mut rgba = image::RgbaImage::new(width, height);
+    for (index, character) in TEXT.chars().enumerate() {
+        let origin_x = PADDING
+            + u32::try_from(index)
+                .unwrap_or(u32::MAX)
+                .saturating_mul(glyph_advance);
+        for (row, bits) in automation_lock_glyph(character).into_iter().enumerate() {
+            for column in 0..5u32 {
+                if bits & (1 << (4 - column)) == 0 {
+                    continue;
+                }
+                let origin_y = PADDING + u32::try_from(row).unwrap_or(u32::MAX) * SCALE;
+                for dy in 0..SCALE {
+                    for dx in 0..SCALE {
+                        rgba.put_pixel(
+                            origin_x + column * SCALE + dx,
+                            origin_y + dy,
+                            image::Rgba([245, 245, 245, 245]),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    image::imageops::flip_vertical_in_place(&mut rgba);
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("computer-use lock overlay"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    write_packed_image(&texture, queue, width, height, width * 4, rgba.as_raw())?;
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("computer-use lock overlay bind group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+        ],
+    });
+    Ok(AutomationLockOverlay {
+        _texture: texture,
+        bind_group,
+        extent: (width, height),
+    })
+}
+
 fn create_frame_pipeline(
     device: &wgpu::Device,
     target_format: wgpu::TextureFormat,
@@ -13505,6 +13714,25 @@ fn create_solid_pipeline(
     label: &str,
     color: [f32; 4],
 ) -> wgpu::RenderPipeline {
+    create_colored_pipeline(device, target_format, label, color, false)
+}
+
+fn create_translucent_solid_pipeline(
+    device: &wgpu::Device,
+    target_format: wgpu::TextureFormat,
+    label: &str,
+    color: [f32; 4],
+) -> wgpu::RenderPipeline {
+    create_colored_pipeline(device, target_format, label, color, true)
+}
+
+fn create_colored_pipeline(
+    device: &wgpu::Device,
+    target_format: wgpu::TextureFormat,
+    label: &str,
+    color: [f32; 4],
+    blend: bool,
+) -> wgpu::RenderPipeline {
     let source = format!(
         "@vertex fn vertex(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {{
             var positions = array<vec2<f32>, 3>(
@@ -13539,7 +13767,7 @@ fn create_solid_pipeline(
             entry_point: Some("fragment"),
             targets: &[Some(wgpu::ColorTargetState {
                 format: target_format,
-                blend: None,
+                blend: blend.then_some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
             compilation_options: wgpu::PipelineCompilationOptions::default(),
@@ -13615,6 +13843,10 @@ impl Renderer {
             divider_pipeline: _,
             divider_hover_pipeline: _,
             divider_active_pipeline: _,
+            automation_border_pipeline: _,
+            automation_scrim_pipeline: _,
+            automation_cursor_pipeline: _,
+            automation_lock_overlay: _,
             plugin_canvas: _,
             imported_frames: _,
             frame_keys: _,
@@ -13655,6 +13887,7 @@ impl Renderer {
             window_resize_in_progress,
             automation_owned_panes,
             automation_spectator: _,
+            automation_presentation,
         } = self;
         RendererRecoveryState {
             next_frame_key,
@@ -13692,6 +13925,7 @@ impl Renderer {
             sent_plugin_sizes,
             window_resize_in_progress,
             automation_owned_panes,
+            automation_presentation,
             invalidated_staged_managed_panes,
         }
     }
@@ -13733,6 +13967,7 @@ impl Renderer {
             sent_plugin_sizes,
             window_resize_in_progress,
             automation_owned_panes,
+            automation_presentation,
             invalidated_staged_managed_panes: _,
         } = state;
         self.next_frame_key = next_frame_key;
@@ -13768,6 +14003,7 @@ impl Renderer {
         self.sent_plugin_sizes = sent_plugin_sizes;
         self.window_resize_in_progress = window_resize_in_progress;
         self.automation_owned_panes = automation_owned_panes;
+        self.automation_presentation = automation_presentation;
     }
 
     fn new(
@@ -13870,6 +14106,30 @@ impl Renderer {
             "captured native divider",
             [0.20, 0.78, 1.0, 1.0],
         );
+        let automation_border_pipeline = create_translucent_solid_pipeline(
+            &device,
+            config.format,
+            "computer-use border",
+            [0.03, 0.29, 0.58, 0.58],
+        );
+        let automation_scrim_pipeline = create_translucent_solid_pipeline(
+            &device,
+            config.format,
+            "computer-use lock scrim",
+            [0.018, 0.028, 0.05, 0.52],
+        );
+        let automation_cursor_pipeline = create_translucent_solid_pipeline(
+            &device,
+            config.format,
+            "computer-use cursor",
+            [0.30, 0.78, 0.95, 0.95],
+        );
+        let automation_lock_overlay = create_automation_lock_overlay(
+            &device,
+            &queue,
+            &frame_bind_group_layout,
+            &frame_sampler,
+        )?;
         let plugin_canvas =
             GpuCanvasRenderer::new(&device, &queue, &frame_bind_group_layout, &frame_sampler);
         surface.configure(&device, &config);
@@ -13895,6 +14155,10 @@ impl Renderer {
             divider_pipeline,
             divider_hover_pipeline,
             divider_active_pipeline,
+            automation_border_pipeline,
+            automation_scrim_pipeline,
+            automation_cursor_pipeline,
+            automation_lock_overlay,
             plugin_canvas,
             imported_frames: HashMap::new(),
             frame_keys: BTreeMap::new(),
@@ -13935,6 +14199,7 @@ impl Renderer {
             window_resize_in_progress: false,
             automation_owned_panes: BTreeSet::new(),
             automation_spectator: None,
+            automation_presentation: None,
         })
     }
 
@@ -13942,6 +14207,7 @@ impl Renderer {
         &mut self,
         frame: Option<&ComputerObservationFrame>,
         active_task: Option<&str>,
+        automation_presentation: Option<AutomationPresentationState>,
         owned_panes: BTreeSet<u64>,
     ) -> Result<()> {
         apply_automation_size_authority(
@@ -13951,12 +14217,24 @@ impl Renderer {
             &mut self.pending_ordinary_managed_recovery,
         );
         let Some(active_task) = active_task else {
+            self.automation_presentation = None;
             if self.automation_spectator.take().is_some() {
                 eprintln!("computer-use spectator stopped");
                 self.window.request_redraw();
             }
             return Ok(());
         };
+        let presentation_changed = self.automation_presentation != automation_presentation;
+        self.automation_presentation = automation_presentation;
+        if presentation_changed {
+            if let Some(state) = &self.automation_presentation {
+                eprintln!(
+                    "computer-use presentation task={} backend={} locked={} panes={:?}",
+                    state.task, state.backend.0, state.locked, self.automation_owned_panes
+                );
+            }
+            self.window.request_redraw();
+        }
         if self
             .automation_spectator
             .as_ref()
@@ -14062,8 +14340,8 @@ impl Renderer {
         );
         self.automation_spectator = Some(AutomationSpectatorFrame {
             _texture: texture,
-            bind_group,
-            extent: (rgba.width(), rgba.height()),
+            _bind_group: bind_group,
+            _extent: (rgba.width(), rgba.height()),
             task: frame.task.0.clone(),
             observation_sequence: frame.sequence,
             _frame_sequence: frame.settle.frame_sequence,
@@ -14098,6 +14376,7 @@ impl Renderer {
                     window.session,
                     window.app_id.clone(),
                     window.size_authority,
+                    window.automation.clone(),
                 )
             })
             .collect::<Vec<_>>();
@@ -14110,6 +14389,7 @@ impl Renderer {
                 session: window.session,
                 app_id: window.app_id,
                 size_authority: window.size_authority,
+                automation: window.automation,
             })
             .collect::<Vec<_>>();
         available_windows.sort_by_key(|window| window.pane);
@@ -14122,6 +14402,7 @@ impl Renderer {
                     window.session,
                     window.app_id.clone(),
                     window.size_authority,
+                    window.automation.clone(),
                 )
             })
             .collect::<Vec<_>>();
@@ -14587,6 +14868,33 @@ impl Renderer {
         }
     }
 
+    fn automation_state(&self, pane: u64) -> Option<&ManagedWindowAutomationState> {
+        self.available_windows
+            .iter()
+            .find(|window| window.pane == pane)
+            .map(|window| &window.automation)
+    }
+
+    fn automated_pane_is_locked(&self, pane: u64) -> bool {
+        match self.automation_state(pane) {
+            Some(ManagedWindowAutomationState::Automated { interaction, .. }) => {
+                *interaction == AutomationInteractionState::Locked
+            }
+            Some(ManagedWindowAutomationState::Normal) | None => self
+                .automation_presentation
+                .as_ref()
+                .is_some_and(|state| state.locked && self.automation_owned_panes.contains(&pane)),
+        }
+    }
+
+    fn locked_automation_task(&self) -> Option<(BackendId, TaskId)> {
+        let state = self
+            .automation_presentation
+            .as_ref()
+            .filter(|state| state.locked)?;
+        Some((state.backend, TaskId(state.task.clone())))
+    }
+
     fn focus_pane(&mut self, pane: u64) -> Option<FocusChange> {
         let Some(target) = focus_request_target(
             &self.presented_layout,
@@ -14808,7 +15116,7 @@ impl Renderer {
         let (x, y) = self.scene_position_for_window_point(x, y);
         let item = self.presented_layout.pane_item(pane)?;
         let rect = item.pixel_rect(self.layout_extent());
-        let rect = [rect.x, rect.y, rect.w, rect.h];
+        let mut rect = [rect.x, rect.y, rect.w, rect.h];
         if self.plugin_panes.contains_key(&pane) {
             let scale = self.window.scale_factor() as f32;
             let (x, y) = plugin_local_point(x, y, rect, scale);
@@ -14818,6 +15126,16 @@ impl Renderer {
             .current_windows
             .iter()
             .find(|window| window.window_id == pane)?;
+        if self.automation_owned_panes.contains(&pane) {
+            rect = aspect_fit_rect((window.source_rect[2], window.source_rect[3]), rect);
+            if x < f64::from(rect[0])
+                || y < f64::from(rect[1])
+                || x >= f64::from(rect[0].saturating_add(rect[2]))
+                || y >= f64::from(rect[1].saturating_add(rect[3]))
+            {
+                return None;
+            }
+        }
         let (x, y) = project_point_between_rects(x, y, rect, window.source_rect);
         Some(PanePointerTarget::Managed { pane, x, y })
     }
@@ -15691,21 +16009,10 @@ impl Renderer {
                 multiview_mask: None,
             });
             let extent = self.composition_extent();
-            if let Some(spectator) = &self.automation_spectator {
-                let viewport =
-                    aspect_fit_viewport(spectator.extent, (self.config.width, self.config.height));
-                render_pass.set_viewport(
-                    viewport[0],
-                    viewport[1],
-                    viewport[2],
-                    viewport[3],
-                    0.0,
-                    1.0,
-                );
-                render_pass.set_pipeline(&self.frame_pipeline);
-                render_pass.set_bind_group(0, &spectator.bind_group, &[]);
-                render_pass.draw(0..3, 0..1);
-            } else {
+            {
+                // Automation is presentation chrome on its managed pane, so
+                // it shares the ordinary layout paint order instead of
+                // replacing the complete composed workspace.
                 for target in self.layout_paint_targets() {
                     let LayoutPaintTarget::Pane(pane) = target else {
                         let LayoutPaintTarget::Divider(divider) = target else {
@@ -15779,8 +16086,35 @@ impl Renderer {
                         .iter()
                         .any(|window| window.pane == pane);
                     let frame_ready = imported.is_some();
-                    let viewport =
-                        scaled_viewport(rect, extent, (self.config.width, self.config.height));
+                    let automated = self.automation_owned_panes.contains(&pane);
+                    let automation_state = self.automation_state(pane).cloned();
+                    let locked = automated && self.automated_pane_is_locked(pane);
+                    let content_rect = if automated {
+                        window.map_or(rect, |window| {
+                            aspect_fit_rect((window.source_rect[2], window.source_rect[3]), rect)
+                        })
+                    } else {
+                        rect
+                    };
+                    if automated {
+                        let viewport =
+                            scaled_viewport(rect, extent, (self.config.width, self.config.height));
+                        render_pass.set_viewport(
+                            viewport[0],
+                            viewport[1],
+                            viewport[2],
+                            viewport[3],
+                            0.0,
+                            1.0,
+                        );
+                        render_pass.set_pipeline(&self.placeholder_pipeline);
+                        render_pass.draw(0..3, 0..1);
+                    }
+                    let viewport = scaled_viewport(
+                        content_rect,
+                        extent,
+                        (self.config.width, self.config.height),
+                    );
                     render_pass.set_viewport(
                         viewport[0],
                         viewport[1],
@@ -15792,12 +16126,127 @@ impl Renderer {
                     if let Some(imported) = imported {
                         render_pass.set_pipeline(&self.frame_pipeline);
                         render_pass.set_bind_group(0, &imported.bind_group, &[]);
-                    } else if managed_pane_uses_placeholder(available, frame_ready) {
+                    } else if !automated && managed_pane_uses_placeholder(available, frame_ready) {
                         render_pass.set_pipeline(&self.placeholder_pipeline);
-                    } else {
+                    } else if !automated {
                         continue;
                     }
-                    render_pass.draw(0..3, 0..1);
+                    if imported.is_some() || (!automated && available) {
+                        render_pass.draw(0..3, 0..1);
+                    }
+                    if !automated {
+                        continue;
+                    }
+
+                    if locked {
+                        let viewport =
+                            scaled_viewport(rect, extent, (self.config.width, self.config.height));
+                        render_pass.set_viewport(
+                            viewport[0],
+                            viewport[1],
+                            viewport[2],
+                            viewport[3],
+                            0.0,
+                            1.0,
+                        );
+                        render_pass.set_pipeline(&self.automation_scrim_pipeline);
+                        render_pass.draw(0..3, 0..1);
+
+                        let overlay_rect = aspect_fit_rect(
+                            (
+                                i32::try_from(self.automation_lock_overlay.extent.0)
+                                    .unwrap_or(i32::MAX),
+                                i32::try_from(self.automation_lock_overlay.extent.1)
+                                    .unwrap_or(i32::MAX),
+                            ),
+                            inset_rect(rect, 12),
+                        );
+                        let viewport = scaled_viewport(
+                            overlay_rect,
+                            extent,
+                            (self.config.width, self.config.height),
+                        );
+                        render_pass.set_viewport(
+                            viewport[0],
+                            viewport[1],
+                            viewport[2],
+                            viewport[3],
+                            0.0,
+                            1.0,
+                        );
+                        render_pass.set_pipeline(&self.frame_pipeline);
+                        render_pass.set_bind_group(
+                            0,
+                            &self.automation_lock_overlay.bind_group,
+                            &[],
+                        );
+                        render_pass.draw(0..3, 0..1);
+                    }
+
+                    if let Some(ManagedWindowAutomationState::Automated {
+                        cursor: Some(cursor),
+                        ..
+                    }) = automation_state
+                    {
+                        let cursor_x = content_rect[0].saturating_add(
+                            i32::try_from(
+                                u64::from(cursor.x)
+                                    .saturating_mul(u64::try_from(content_rect[2]).unwrap_or(0))
+                                    / u64::from(AUTOMATION_VIEWPORT_WIDTH.max(1)),
+                            )
+                            .unwrap_or(i32::MAX),
+                        );
+                        let cursor_y = content_rect[1].saturating_add(
+                            i32::try_from(
+                                u64::from(cursor.y)
+                                    .saturating_mul(u64::try_from(content_rect[3]).unwrap_or(0))
+                                    / u64::from(AUTOMATION_VIEWPORT_HEIGHT.max(1)),
+                            )
+                            .unwrap_or(i32::MAX),
+                        );
+                        for cursor_rect in [
+                            [cursor_x - 11, cursor_y - 2, 23, 5],
+                            [cursor_x - 2, cursor_y - 11, 5, 23],
+                        ] {
+                            let Some(cursor_rect) = intersect_rect(cursor_rect, content_rect)
+                            else {
+                                continue;
+                            };
+                            let viewport = scaled_viewport(
+                                cursor_rect,
+                                extent,
+                                (self.config.width, self.config.height),
+                            );
+                            render_pass.set_viewport(
+                                viewport[0],
+                                viewport[1],
+                                viewport[2],
+                                viewport[3],
+                                0.0,
+                                1.0,
+                            );
+                            render_pass.set_pipeline(&self.automation_cursor_pipeline);
+                            render_pass.draw(0..3, 0..1);
+                        }
+                    }
+
+                    for border_rect in border_rects(rect, 5) {
+                        let viewport = scaled_viewport(
+                            border_rect,
+                            extent,
+                            (self.config.width, self.config.height),
+                        );
+                        render_pass.set_viewport(
+                            viewport[0],
+                            viewport[1],
+                            viewport[2],
+                            viewport[3],
+                            0.0,
+                            1.0,
+                        );
+                        render_pass.set_pipeline(&self.automation_border_pipeline);
+                        render_pass.draw(0..3, 0..1);
+                    }
                 }
             }
             drop(render_pass);
@@ -16683,25 +17132,77 @@ fn scaled_viewport(
     ]
 }
 
-#[allow(
-    clippy::cast_precision_loss,
-    reason = "WGPU viewports require f32 while image and surface extents are integer pixels"
-)]
-fn aspect_fit_viewport(source: (u32, u32), target: (u32, u32)) -> [f32; 4] {
-    let source_aspect = source.0 as f32 / source.1.max(1) as f32;
-    let target_aspect = target.0 as f32 / target.1.max(1) as f32;
-    if target_aspect > source_aspect {
-        let width = target.1 as f32 * source_aspect;
-        [(target.0 as f32 - width) / 2.0, 0.0, width, target.1 as f32]
-    } else {
-        let height = target.0 as f32 / source_aspect;
-        [
-            0.0,
-            (target.1 as f32 - height) / 2.0,
-            target.0 as f32,
-            height,
-        ]
+fn aspect_fit_rect(source: (i32, i32), target: [i32; 4]) -> [i32; 4] {
+    let [target_x, target_y, target_width, target_height] = target;
+    if source.0 <= 0 || source.1 <= 0 || target_width <= 0 || target_height <= 0 {
+        return target;
     }
+    let source_width = i64::from(source.0);
+    let source_height = i64::from(source.1);
+    let target_width_64 = i64::from(target_width);
+    let target_height_64 = i64::from(target_height);
+    let (width, height) = if target_width_64 * source_height > target_height_64 * source_width {
+        (
+            (target_height_64 * source_width / source_height).max(1),
+            target_height_64,
+        )
+    } else {
+        (
+            target_width_64,
+            (target_width_64 * source_height / source_width).max(1),
+        )
+    };
+    let width = i32::try_from(width).unwrap_or(i32::MAX);
+    let height = i32::try_from(height).unwrap_or(i32::MAX);
+    [
+        target_x.saturating_add((target_width - width) / 2),
+        target_y.saturating_add((target_height - height) / 2),
+        width,
+        height,
+    ]
+}
+
+fn inset_rect(rect: [i32; 4], inset: i32) -> [i32; 4] {
+    let inset_x = inset.max(0).min(rect[2].saturating_sub(1) / 2);
+    let inset_y = inset.max(0).min(rect[3].saturating_sub(1) / 2);
+    [
+        rect[0].saturating_add(inset_x),
+        rect[1].saturating_add(inset_y),
+        rect[2].saturating_sub(inset_x.saturating_mul(2)).max(1),
+        rect[3].saturating_sub(inset_y.saturating_mul(2)).max(1),
+    ]
+}
+
+fn intersect_rect(left: [i32; 4], right: [i32; 4]) -> Option<[i32; 4]> {
+    let x = left[0].max(right[0]);
+    let y = left[1].max(right[1]);
+    let right_edge = left[0]
+        .saturating_add(left[2])
+        .min(right[0].saturating_add(right[2]));
+    let bottom_edge = left[1]
+        .saturating_add(left[3])
+        .min(right[1].saturating_add(right[3]));
+    (right_edge > x && bottom_edge > y).then_some([x, y, right_edge - x, bottom_edge - y])
+}
+
+fn border_rects(rect: [i32; 4], thickness: i32) -> [[i32; 4]; 4] {
+    let thickness = thickness.max(1).min(rect[2].max(1)).min(rect[3].max(1));
+    [
+        [rect[0], rect[1], rect[2], thickness],
+        [
+            rect[0],
+            rect[1].saturating_add(rect[3]).saturating_sub(thickness),
+            rect[2],
+            thickness,
+        ],
+        [rect[0], rect[1], thickness, rect[3]],
+        [
+            rect[0].saturating_add(rect[2]).saturating_sub(thickness),
+            rect[1],
+            thickness,
+            rect[3],
+        ],
+    ]
 }
 
 #[derive(Clone, Copy)]
@@ -16837,15 +17338,16 @@ mod tests {
     }
 
     #[test]
-    fn automation_spectator_preserves_source_aspect_ratio() {
+    fn automated_pane_preserves_source_aspect_ratio_without_resizing_its_allocation() {
         assert_eq!(
-            aspect_fit_viewport((1440, 900), (1280, 720)),
-            [64.0, 0.0, 1152.0, 720.0]
+            aspect_fit_rect((1440, 900), [0, 0, 1280, 720]),
+            [64, 0, 1152, 720]
         );
         assert_eq!(
-            aspect_fit_viewport((1440, 900), (1920, 1080)),
-            [96.0, 0.0, 1728.0, 1080.0]
+            aspect_fit_rect((1440, 900), [20, 30, 1920, 1080]),
+            [116, 30, 1728, 1080]
         );
+        assert_eq!(border_rects([20, 30, 1920, 1080], 5)[0], [20, 30, 1920, 5]);
     }
 
     #[test]
@@ -20100,6 +20602,7 @@ mod tests {
             session,
             app_id: format!("app-{pane}"),
             size_authority: ManagedWindowSizeAuthority::Presentation,
+            automation: ManagedWindowAutomationState::Normal,
         }
     }
 
@@ -20196,6 +20699,7 @@ mod tests {
             session: 4,
             app_id: "managed".to_string(),
             size_authority: ManagedWindowSizeAuthority::Presentation,
+            automation: ManagedWindowAutomationState::Normal,
         }];
         let plugin_realms = BTreeMap::from([
             (20, Some((BackendId(2), 7))),

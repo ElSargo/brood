@@ -3274,6 +3274,46 @@ impl Brood {
         })
     }
 
+    pub(crate) fn computer_use_pane_is_unlocked(&self, pane: u64) -> bool {
+        let Some(lease) = self.computer_use.lease() else {
+            return false;
+        };
+        self.computer_use_owns_pane(pane)
+            && self
+                .computer_use_automation
+                .lease_is_unlocked(lease.generation)
+    }
+
+    pub(crate) fn computer_use_automation_state(
+        &self,
+        pane: u64,
+    ) -> brood_protocol::ManagedWindowAutomationState {
+        let Some(lease) = self
+            .computer_use
+            .lease()
+            .filter(|_| self.computer_use_owns_pane(pane))
+        else {
+            return brood_protocol::ManagedWindowAutomationState::Normal;
+        };
+        let interaction = if self
+            .computer_use_automation
+            .lease_is_unlocked(lease.generation)
+        {
+            brood_protocol::AutomationInteractionState::Unlocked
+        } else {
+            brood_protocol::AutomationInteractionState::Locked
+        };
+        let cursor = self
+            .computer_use_automation
+            .cursor_position(pane)
+            .map(|(x, y)| brood_protocol::AutomationCursor { x, y });
+        brood_protocol::ManagedWindowAutomationState::Automated {
+            task: lease.task.0.clone(),
+            interaction,
+            cursor,
+        }
+    }
+
     pub(crate) fn configure_automation_pane_size(
         &mut self,
         pane: u64,

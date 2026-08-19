@@ -108,6 +108,7 @@ pub struct PresentationWindowSummary {
     pub session: u64,
     pub app_id: String,
     pub size_authority: brood_protocol::ManagedWindowSizeAuthority,
+    pub automation: brood_protocol::ManagedWindowAutomationState,
 }
 
 #[derive(Clone, Debug)]
@@ -337,6 +338,7 @@ pub fn list_presentation_windows(target: &ControlTarget) -> Result<Vec<Presentat
                     session,
                     app_id,
                     size_authority: brood_protocol::ManagedWindowSizeAuthority::Presentation,
+                    automation: brood_protocol::ManagedWindowAutomationState::Normal,
                 })
                 .collect()
         })

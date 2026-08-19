@@ -8,7 +8,7 @@ if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
   exec dbus-run-session -- "$0" "$@"
 fi
 
-for tool in cc jq magick pkg-config python3 sway wayland-scanner weston-simple-egl weston-simple-shm; do
+for tool in cc grim jq magick pkg-config python3 sway wayland-scanner weston-simple-egl weston-simple-shm wtype; do
   command -v "$tool" > /dev/null 2>&1 || {
     echo "ERR $tool is required for the computer-use proof" >&2
     exit 2
@@ -94,6 +94,11 @@ cc -std=c11 -Wall -Wextra -Werror -I "$OUT" \
   "$OUT/wlr-virtual-pointer-unstable-v1-protocol.c" \
   -o "$OUT/virtual-pointer-click" \
   "${WAYLAND_FLAGS[@]}"
+read -r -a KEYBOARD_FLAGS <<< "$(pkg-config --cflags --libs wayland-client xkbcommon)"
+cc -std=c11 -Wall -Wextra -Werror \
+  tools/virtual-keyboard-key.c \
+  -o "$OUT/virtual-keyboard-key" \
+  "${KEYBOARD_FLAGS[@]}"
 
 env -u brood_session \
   XDG_RUNTIME_DIR="$RUNTIME_DIR" \
@@ -216,7 +221,8 @@ jq -e '
 ' "$OUT/metrics.json" > /dev/null
 
 ACTION_STATE="$OUT/action-state.json"
-env XDG_RUNTIME_DIR="$RUNTIME_DIR" WAYLAND_DISPLAY="$WAYLAND_DISPLAY" \
+env GDK_BACKEND=wayland GTK_A11Y=none NO_AT_BRIDGE=1 \
+  XDG_RUNTIME_DIR="$RUNTIME_DIR" WAYLAND_DISPLAY="$WAYLAND_DISPLAY" \
   "$OUT/computer-use-proof-client" "$ACTION_STATE" > "$OUT/action-client.log" 2>&1 &
 APP_PID=$!
 for _ in $(seq 1 300); do
@@ -431,7 +437,8 @@ jq -e '.computer_use_batch_pending == false and .computer_use_held_buttons == 0 
 ctl computer-use stop target-cleanup > /dev/null
 
 HUMAN_STATE="$OUT/human-state.json"
-env XDG_RUNTIME_DIR="$RUNTIME_DIR" WAYLAND_DISPLAY="$WAYLAND_DISPLAY" \
+env GDK_BACKEND=wayland GTK_A11Y=none NO_AT_BRIDGE=1 \
+  XDG_RUNTIME_DIR="$RUNTIME_DIR" WAYLAND_DISPLAY="$WAYLAND_DISPLAY" \
   "$OUT/computer-use-proof-client" "$HUMAN_STATE" > "$OUT/human-app.log" 2>&1 &
 APP_PID=$!
 for _ in $(seq 1 300); do
@@ -493,6 +500,13 @@ sleep 0.5
 
 HUMAN_LEASE="$(ctl computer-use start human-takeover 1 "$HUMAN_PANE" 30000)"
 HUMAN_GENERATION="$(jq -r .generation <<< "$HUMAN_LEASE")"
+for _ in $(seq 1 300); do
+  rg -q 'computer-use presentation task=human-takeover .*locked=true' \
+    "$OUT/presentation-client.log" 2> /dev/null && break
+  sleep 0.05
+done
+rg -q 'computer-use presentation task=human-takeover .*locked=true' \
+  "$OUT/presentation-client.log"
 ctl computer-use batch "$(drag_batch human-takeover "$HUMAN_GENERATION")" \
   > "$OUT/human-takeover-response.json" &
 BATCH_PID=$!
@@ -505,16 +519,50 @@ done
 AUTOMATION_RESIZES="$(managed_resize_count)"
 sleep 0.1
 [[ "$(managed_resize_count)" == "$AUTOMATION_RESIZES" ]]
+for _ in $(seq 1 200); do
+  env XDG_RUNTIME_DIR="$PRESENT_RUNTIME_DIR" WAYLAND_DISPLAY="$PRESENT_DISPLAY" \
+    grim "$OUT/automation-locked.png"
+  LOCKED_COLORS="$(magick identify -format '%k' "$OUT/automation-locked.png")"
+  ((LOCKED_COLORS > 16)) && break
+  sleep 0.05
+done
+((LOCKED_COLORS > 16))
 env XDG_RUNTIME_DIR="$PRESENT_RUNTIME_DIR" WAYLAND_DISPLAY="$PRESENT_DISPLAY" \
   "$OUT/virtual-pointer-click" 400 300 800 600
-if ! wait "$BATCH_PID"; then
-  test -s "$OUT/human-takeover-response.json"
-fi
+sleep 0.1
+STATUS="$(ctl status-json)"
+[[ "$(jq -r .computer_use_held_buttons <<< "$STATUS")" == "1" ]]
+jq -e '.state == "running"' < <(ctl computer-use inspect human-takeover) > /dev/null
+env XDG_RUNTIME_DIR="$PRESENT_RUNTIME_DIR" WAYLAND_DISPLAY="$PRESENT_DISPLAY" \
+  swaymsg -s "$(find "$PRESENT_RUNTIME_DIR" -maxdepth 1 -type s -name 'sway-ipc.*.sock' -print -quit)" \
+  '[title="Brood"] focus' > /dev/null
+env XDG_RUNTIME_DIR="$PRESENT_RUNTIME_DIR" WAYLAND_DISPLAY="$PRESENT_DISPLAY" \
+  "$OUT/virtual-keyboard-key" --none 1
+for _ in $(seq 1 300); do
+  rg -q 'computer-use interaction unlock requested' "$OUT/presentation-client.log" 2> /dev/null && break
+  sleep 0.05
+done
+rg -q 'computer-use interaction unlock requested' "$OUT/presentation-client.log"
+for _ in $(seq 1 300); do
+  rg -q 'computer-use presentation task=human-takeover .*locked=false' \
+    "$OUT/presentation-client.log" 2> /dev/null && break
+  sleep 0.05
+done
+rg -q 'computer-use presentation task=human-takeover .*locked=false' \
+  "$OUT/presentation-client.log"
+env XDG_RUNTIME_DIR="$PRESENT_RUNTIME_DIR" WAYLAND_DISPLAY="$PRESENT_DISPLAY" \
+  grim "$OUT/automation-unlocked.png"
+[[ "$(sha256sum "$OUT/automation-locked.png" | cut -d' ' -f1)" != \
+  "$(sha256sum "$OUT/automation-unlocked.png" | cut -d' ' -f1)" ]]
+env XDG_RUNTIME_DIR="$PRESENT_RUNTIME_DIR" WAYLAND_DISPLAY="$PRESENT_DISPLAY" \
+  "$OUT/virtual-pointer-click" 400 300 800 600
+wait "$BATCH_PID"
 BATCH_PID=""
-jq -e '.results[-1].status == "cancelled" and .results[-1].failure == "cancelled"' \
+jq -e 'all(.results[]; .status == "completed")' \
   "$OUT/human-takeover-response.json" > /dev/null
 ctl computer-use inspect human-takeover > "$OUT/human-task.json"
-jq -e '.state == "paused"' "$OUT/human-task.json" > /dev/null
+jq -e '.state == "running"' "$OUT/human-task.json" > /dev/null
+ctl computer-use stop human-takeover > /dev/null
 for _ in $(seq 1 300); do
   TAKEOVER_RESIZES="$(managed_resize_count)"
   ((TAKEOVER_RESIZES > AUTOMATION_RESIZES)) && break
@@ -979,19 +1027,32 @@ if [[ "${BROOD_COMPUTER_USE_SPEEDCRUNCH:-0}" == "1" ]]; then
   ctl computer-use observe speedcrunch-proof "$INITIAL_EVENT_CURSOR" 0 \
     > "$OUT/speedcrunch-observer-replacement.json"
   jq -e '
-    .task.state == "paused"
+    .task.state == "running"
     and .task.next_sequence == 9
-    and .lease == null
-    and (.events | length) >= 10
+    and .lease != null
+    and (.events | length) >= 8
     and (.events | map(.event.type) | index("approval_requested")) != null
     and (.events | map(.event.type) | index("approval_decided")) != null
-    and (.events | map(.event.type) | index("lease_released")) != null
     and ((.observations | length) >= 2)
     and ((.observations | length) <= 8)
   ' "$OUT/speedcrunch-observer-replacement.json" > /dev/null
 
-  MCP_LEASE="$(ctl computer-use resume speedcrunch-proof 30000)"
-  MCP_GENERATION="$(jq -r .generation <<< "$MCP_LEASE")"
+  env XDG_RUNTIME_DIR="$PRESENT_RUNTIME_DIR" WAYLAND_DISPLAY="$PRESENT_DISPLAY" \
+    "$OUT/virtual-keyboard-key" --none 1
+  for _ in $(seq 1 300); do
+    rg -q 'computer-use presentation task=speedcrunch-proof .*locked=false' \
+      "$OUT/replacement-presentation-client.log" 2> /dev/null && break
+    sleep 0.05
+  done
+  rg -q 'computer-use presentation task=speedcrunch-proof .*locked=false' \
+    "$OUT/replacement-presentation-client.log"
+  env XDG_RUNTIME_DIR="$PRESENT_RUNTIME_DIR" WAYLAND_DISPLAY="$PRESENT_DISPLAY" \
+    grim "$OUT/automation-spectator-unlocked.png"
+  env XDG_RUNTIME_DIR="$PRESENT_RUNTIME_DIR" WAYLAND_DISPLAY="$PRESENT_DISPLAY" \
+    "$OUT/virtual-pointer-click" 400 300 800 600
+  jq -e '.state == "running"' < <(ctl computer-use inspect speedcrunch-proof) > /dev/null
+
+  MCP_GENERATION="$SPEEDCRUNCH_GENERATION"
   MCP_ACTION_ARGUMENTS="$(jq -nc \
     --argjson generation "$MCP_GENERATION" \
     --argjson pane "$SPEEDCRUNCH_PANE" \
@@ -1124,7 +1185,7 @@ cat > "$OUT/proof.md" << EOF
 - stable window identity and capture metrics: metrics.json and each automation.json
 - direct actions: action-response.json, action-state-final.json, and action-observation.png
 - cleanup: stop-cleanup-response.json, key-cleanup-response.json, expiry-cleanup-response.json, and target-cleanup-response.json
-- human takeover: human-takeover-response.json, human-task.json, human-status.json, and presentation-client.log
+- automation interaction: automation-locked.png and automation-unlocked.png prove the lock overlay changes without pane resize; human-takeover-response.json, human-task.json, human-status.json, and presentation-client.log prove locked input suppression, Escape unlock, continued automation, and normal sizing after stop
 - negative live-boundary proofs: stale-lease.err, cross-session.err, and out-of-bounds.err
 EOF
 
@@ -1134,12 +1195,12 @@ if [[ "${BROOD_COMPUTER_USE_SPEEDCRUNCH:-0}" == "1" ]]; then
 - SpeedCrunch calculations: sqrt(2)^10 + 17*23 = 423, sin(pi/6) + cos(pi/3) = 1, and (12345*6789)-987654 = 82822551; corresponding speedcrunch-*.png files and speedcrunch-metrics.json
 - SpeedCrunch isolation: private HOME, XDG_CONFIG_HOME, and XDG_DATA_HOME under speedcrunch-home
 - Phase 3 adapter: Codex-shaped call IDs and action batches in speedcrunch-*.json; server approval checkpoints in speedcrunch-*-approval.json
-- Phase 3 observer continuity: speedcrunch-observer-initial.json, speedcrunch-observer-detached-final.json, speedcrunch-observer-replacement.json, and replacement-presentation-client.log prove the replacement client first received the running task and lease, then primary presentation input paused it without interleaving
+- Phase 3 observer continuity: speedcrunch-observer-initial.json, speedcrunch-observer-detached-final.json, speedcrunch-observer-replacement.json, and replacement-presentation-client.log prove the replacement client received the running task and lease, ignored locked primary input, and explicitly unlocked without ending automation
 - Phase 3 MCP surface: speedcrunch-mcp.jsonl records initialization, tool discovery, a real screenshot action at sequence 9, and the resulting task sequence 10
 - Phase 4 QuickJS/WASM: speedcrunch-script-first.json performs ten ordered SpeedCrunch actions and displays a 1440x900 screenshot while detached; speedcrunch-script-second.json proves persistent globals; speedcrunch-script-metrics.json records isolate and round-trip metrics
 - Phase 4 askUser: speedcrunch-script-ask-observer.json, speedcrunch-script-ask-approved.json, and speedcrunch-script-ask-verify.json prove an observer-visible approval checkpoint resumed without re-running script side effects
 - Phase 4 queued-call teardown: speedcrunch-script-checkpoint-denied-status.json and speedcrunch-script-after-stop-status.json prove denial/lease loss and task stop remove checkpoints with no held input
-- Automation spectator: automation-spectator.png is an upright 800x600 view of the server-owned 1440x900 frame; automation-spectator-action.json and replacement-presentation-client.log prove observation advancement while attached; spectator-server-viewport/automation.json proves presentation did not resize the automation target
+- Automation presentation: automation-spectator.png and automation-spectator-unlocked.png show locked and unlocked 800x600 per-pane views of the server-owned 1440x900 frame; automation-spectator-action.json and replacement-presentation-client.log prove observation advancement while attached; spectator-server-viewport/automation.json proves presentation did not resize the automation target
 - Assembled package: ${PACKAGE:-development binaries}
 EOF
 fi

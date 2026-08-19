@@ -166,7 +166,9 @@ negative proofs for stale and unauthorized handles.
 
 ## Phase 6: Product UX and hardening
 
-- [ ] Add visible automation, approval, pause, takeover, and stop UX.
+- [x] Add per-pane automation state, locked/unlocked input, aspect-fit chrome,
+  automation cursor, blue border, and lock overlay.
+- [ ] Add approval, pause, takeover, and stop UX.
 - [ ] Add audit history and screenshot redaction policy.
 - [ ] Add authentication and authorization for remote adapters.
 - [ ] Add crash recovery and explicit non-recovery semantics for script state.

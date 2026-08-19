@@ -3173,6 +3173,35 @@ const fn is_primary_human_input(input: &InputEvent) -> bool {
     )
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AutomationInputDisposition {
+    Ordinary,
+    Locked,
+    Unlocked,
+}
+
+fn automation_input_disposition(state: &Brood, input: &InputEvent) -> AutomationInputDisposition {
+    let pane = match input {
+        InputEvent::PointerMotion { position }
+        | InputEvent::PointerButton { position, .. }
+        | InputEvent::PointerAxis { position, .. }
+        | InputEvent::PointerWheel { position, .. } => Some(position.pane),
+        InputEvent::KeyboardKey { .. } | InputEvent::KeyboardReset => state
+            .active_window()
+            .as_ref()
+            .and_then(|window| state.window_pane_id(window)),
+        _ => None,
+    };
+    let Some(pane) = pane.filter(|pane| state.computer_use_owns_pane(*pane)) else {
+        return AutomationInputDisposition::Ordinary;
+    };
+    if state.computer_use_pane_is_unlocked(pane) {
+        AutomationInputDisposition::Unlocked
+    } else {
+        AutomationInputDisposition::Locked
+    }
+}
+
 fn drain_fast_path_input(state: &mut Brood) {
     let Some(mut fast_path) = state.dmabuf.fast_path.take() else {
         return;
@@ -3209,15 +3238,26 @@ fn drain_fast_path_input(state: &mut Brood) {
             continue;
         };
         let time = monotonic_time_msec(state);
-        if matches!(&message, ClientMessage::Input(input) if is_primary_human_input(input)) {
-            let now_ms = u64::from(time);
-            if let Some(task) = state.computer_use.handle_human_input(now_ms) {
-                crate::computer_use::cancel_pending_batch(
-                    state,
-                    &task,
-                    "automation paused by human primary input",
-                );
-                publish_computer_use_update = true;
+        if let ClientMessage::Input(input) = &message
+            && is_primary_human_input(input)
+        {
+            match automation_input_disposition(state, input) {
+                AutomationInputDisposition::Locked => {
+                    tracing::debug!("ignored human input to locked automated pane");
+                    continue;
+                }
+                AutomationInputDisposition::Unlocked => {}
+                AutomationInputDisposition::Ordinary => {
+                    let now_ms = u64::from(time);
+                    if let Some(task) = state.computer_use.handle_human_input(now_ms) {
+                        crate::computer_use::cancel_pending_batch(
+                            state,
+                            &task,
+                            "automation paused by human primary input",
+                        );
+                        publish_computer_use_update = true;
+                    }
+                }
             }
         }
         match message {

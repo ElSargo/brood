@@ -239,7 +239,7 @@ int main(int argc, char **argv) {
     }
     ProofState state = {.state_path = argv[1], .pointer_x = 650, .pointer_y = 450};
     GtkApplication *application = gtk_application_new(
-        "org.brood.ComputerUseProof", G_APPLICATION_DEFAULT_FLAGS);
+        "org.brood.ComputerUseProof", G_APPLICATION_NON_UNIQUE);
     g_signal_connect(application, "activate", G_CALLBACK(activate), &state);
     int status = g_application_run(G_APPLICATION(application), 1, argv);
     g_object_unref(application);

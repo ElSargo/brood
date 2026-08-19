@@ -432,6 +432,10 @@ pub enum ComputerUseObserverCommand {
         task: TaskId,
         lease_duration_ms: u64,
     },
+    /// Allow human input to the task's managed windows without ending the task.
+    Unlock {
+        task: TaskId,
+    },
     Stop {
         task: TaskId,
     },

@@ -19,6 +19,7 @@ use brood_computer_use::{
 };
 use brood_wasm::{ComputerUseJsConfig, ComputerUseJsIsolate, ComputerUseJsMetrics};
 use image::{ColorType, ImageEncoder, codecs::png::PngEncoder};
+use num_traits::ToPrimitive;
 use smithay::{
     backend::{
         allocator::Fourcc,
@@ -99,6 +100,8 @@ pub struct AutomationSnapshot {
 #[derive(Default)]
 pub struct AutomationRuntime {
     active_windows: BTreeMap<u64, u64>,
+    cursor_positions: BTreeMap<u64, (u32, u32)>,
+    unlocked_lease_generation: Option<u64>,
     latest: Option<AutomationSnapshot>,
     observations: VecDeque<ComputerObservation>,
     last_capture_at: Option<Instant>,
@@ -128,6 +131,8 @@ impl std::fmt::Debug for AutomationRuntime {
         formatter
             .debug_struct("AutomationRuntime")
             .field("active_windows", &self.active_windows)
+            .field("cursor_positions", &self.cursor_positions)
+            .field("unlocked_lease_generation", &self.unlocked_lease_generation)
             .field("latest", &self.latest)
             .field("observations", &self.observations.len())
             .field("pending_batch", &self.pending_batch.is_some())
@@ -140,6 +145,18 @@ impl std::fmt::Debug for AutomationRuntime {
 }
 
 impl AutomationRuntime {
+    pub(crate) const fn unlock_lease(&mut self, generation: u64) {
+        self.unlocked_lease_generation = Some(generation);
+    }
+
+    pub(crate) fn lease_is_unlocked(&self, generation: u64) -> bool {
+        self.unlocked_lease_generation == Some(generation)
+    }
+
+    pub(crate) fn cursor_position(&self, pane: u64) -> Option<(u32, u32)> {
+        self.cursor_positions.get(&pane).copied()
+    }
+
     pub(crate) fn selected_pane(&self, state: &Brood, session: u64) -> Option<u64> {
         let permitted = |pane| {
             state
@@ -349,6 +366,16 @@ pub fn handle_observer_command(
             if let Some(pane) = lease.windows.iter().next().copied() {
                 activate_window(state, lease.session, pane)?;
             }
+        }
+        ComputerUseObserverCommand::Unlock { task } => {
+            let lease = state
+                .computer_use
+                .lease()
+                .filter(|lease| lease.task == task)
+                .cloned()
+                .ok_or_else(|| "computer-use task does not hold the active lease".to_string())?;
+            state.computer_use_automation.unlock_lease(lease.generation);
+            crate::frame_export::request_redraw(state);
         }
         ComputerUseObserverCommand::Stop { task } => {
             cancel_pending_batch(state, &task, "computer-use task stopped by observer");
@@ -1202,7 +1229,22 @@ fn execute_atomic_action(state: &mut Brood, pane: u64, action: &ComputerAction) 
 }
 
 fn pointer_move(state: &mut Brood, pane: u64, x: f64, y: f64, time: u32) {
+    let cursor_x = x
+        .round()
+        .clamp(0.0, f64::from(AUTOMATION_VIEWPORT_WIDTH.saturating_sub(1)))
+        .to_u32()
+        .unwrap_or_default();
+    let cursor_y = y
+        .round()
+        .clamp(0.0, f64::from(AUTOMATION_VIEWPORT_HEIGHT.saturating_sub(1)))
+        .to_u32()
+        .unwrap_or_default();
+    state
+        .computer_use_automation
+        .cursor_positions
+        .insert(pane, (cursor_x, cursor_y));
     state.forward_pointer_motion_to_pane(pane, Point::<f64, Logical>::from((x, y)), time);
+    crate::frame_export::request_redraw(state);
 }
 
 fn pointer_click(state: &mut Brood, pane: u64, button: PointerButton, time: u32) {
