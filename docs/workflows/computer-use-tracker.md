@@ -15,14 +15,14 @@ work only when there is code and proportionate verification evidence.
 - Worktree: `/home/sargo/projects/brood-computer-use`
 - Branch: `codex/computer-use-plan`
 - Baseline: `147c83eb54a740479b136395e4d88222f9e744a4`
-- Current milestone: Built-in agent integration complete; Phase 5 semantic scripting next
+- Current milestone: Independent built-in agent integration; Phase 5 semantic scripting next
 - Implementation status: Phase 4 is complete. A packaged, capability-empty
   QuickJS/WASM isolate executes persistent scripts through the authoritative
   server action path, including observer-visible approval checkpoints and
   bounded queued-call teardown. The presentation client can spectate changing
   server observations without gaining automation-layout authority. Built-in
-  session agent turns now receive computer use automatically and have completed
-  a real, visually verified SpeedCrunch workload through that path.
+  session agent turns receive computer use automatically. The built-in actor
+  now runs Brood's own headless agent loop rather than wrapping a Codex process.
 
 Checklist meanings:
 
@@ -134,13 +134,16 @@ while adversarial scripts demonstrate every denied capability and limit.
 
 ## Built-in agent integration
 
-- [x] Configure every built-in Codex turn with the required computer-use MCP server.
+- [x] Configure every built-in agent turn with the required computer-use MCP server.
 - [x] Bind the adapter to the pane's surface session and stable agent principal.
 - [x] Forward only the Brood control environment required by the MCP subprocess.
 - [x] Reject cross-session tasks and operations at the adapter and live server boundary.
 - [x] Return observation PNGs as MCP image content instead of JSON byte arrays.
 - [x] Stop adapter-owned tasks on orderly turn teardown and retain daemon lease expiry.
 - [x] Launch requested GUI applications through the bound session and wait for a managed window.
+- [x] Replace the Codex process wrapper with Brood's packaged headless agent loop.
+- [x] Keep conversation state and streamed model/tool events in the existing agent actor.
+- [x] Migrate an existing Codex ChatGPT login once into Brood-owned private OAuth state.
 - [x] Prove the real picker, agent pane, model, MCP, compositor input, and capture path.
 
 Integration gate: a user opens the built-in agent pane normally and asks it to
@@ -233,6 +236,8 @@ design or test workload.
 | 2026-08-18 | Agent integration | working tree | Live presentation shutdown after an empty-session start | Client teardown returned `stop presentation WASM runtime: session actor address is invalid` after the session and observer reached an otherwise idle state | Failed: a queued guest command could lose a validation race with explicit component shutdown and turn orderly presentation teardown into a process error |
 | 2026-08-18 | Agent integration | working tree | Built-in agent automation followed by compositor-driven presentation close | `/tmp/brood-computer-use-builtin-agent-shutdown-b/proof.md`; task `coding-agent-1-computer-2897948-1`; observations 1-2; frames 27-28; `presentation-close.json` reports success; client exited zero after reporting final graphics and input diagnostics; assembled package `/nix/store/r1d1c3994yfffx9y6z5ww22hfpc7h7v6-brood` | Passed: explicit component teardown suppresses only errors produced after shutdown was requested, while live dispatcher errors remain fatal; the real window-close path is clean |
 | 2026-08-18 | Resize authority | working tree | Server-preferred automation size and human takeover | `/tmp/brood-computer-use-size-authority-verified-20260818/proof.md`; changing SHM and DMA-BUF captures; real client log has one normal resize before automation, no additional resize during the held automation drag, a paused observer update at event cursor 29, then a new current-layout resize; `human-status.json` retains an attached presentation with no lease | Passed: a live lease makes the server authoritative independently of screenshot delivery, synchronized presentation resize degrades to scaling without configuring the managed app, and primary human input restores client sizing after the fast-path input drain completes |
+| 2026-08-19 | Agent integration | working tree | Independent built-in agent drives SpeedCrunch from an empty session | `/tmp/brood-independent-agent-h/proof.md`; task `coding-agent-1-computer-4154898-1`; observation sequences 1-2; settle frames 12-13; final 1440x900 observation shows `82822551`; task stopped with lease released | Passed: Brood's packaged headless agent, existing actor UI, direct model stream, session MCP adapter, real compositor input, visual observation, actor-idle transition, and clean presentation close all completed without a Codex process |
+| 2026-08-19 | Agent integration | working tree | Existing Codex ChatGPT OAuth login migration and independent packaged reuse | Five isolated auth/backend tests; live markers `BROOD_OAUTH_OK`, `BROOD_PACKAGED_OAUTH_OK`, and `BROOD_OAUTH_INDEPENDENT_OK`; Brood auth directory/file modes `0700`/`0600`; exact-token scan found zero matches in 418 repository files | Passed: the first live turn copied the existing login outside the repository, the packaged runner used it successfully, and a later turn succeeded with the Codex migration source deliberately unavailable |
 
 ## Immediate next actions
 

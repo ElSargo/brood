@@ -14,6 +14,7 @@ use brood_plugin_sdk::{
     },
     graphics::{TextLayoutCache, drop_resources},
     input::BUTTON_PRIMARY as LEFT_BUTTON,
+    runtime::write_all,
 };
 use serde::{Deserialize, Serialize};
 
@@ -29,7 +30,6 @@ const MAX_IMAGES: usize = 4;
 const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_TOTAL_IMAGE_BYTES: usize = 12 * 1024 * 1024;
 const IMAGE_CHUNK_BYTES: usize = 20 * 1024;
-const COMPUTER_USE_DEVELOPER_INSTRUCTIONS: &str = "You are operating inside a Brood session. For any request to open, start, or launch a graphical application in the session, call brood_computer_use.computer_launch before doing anything else. Never launch a graphical application through a shell command: a shell process is not a Brood-managed application and cannot reliably connect to the session display. Do not claim that an application opened unless computer_launch returned visible=true. Use the brood_computer_use tools for subsequent interaction with session applications.";
 const PROMPT_HEIGHT: f32 = 60.0;
 const IMAGE_TRAY_HEIGHT: f32 = 112.0;
 const IMAGE_TRAY_GAP: f32 = 8.0;
@@ -92,6 +92,30 @@ struct TurnRequest {
     model: String,
     reasoning: String,
     session_id: u64,
+    history: Vec<HistoryTurn>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct HistoryTurn {
+    user: String,
+    assistant: String,
+}
+
+#[derive(Debug, Serialize)]
+struct RunnerImage {
+    path: String,
+    mime_type: String,
+}
+
+#[derive(Debug, Serialize)]
+struct RunnerRequest<'a> {
+    agent: &'a str,
+    prompt: &'a str,
+    model: &'a str,
+    reasoning: &'a str,
+    session_id: u64,
+    history: &'a [HistoryTurn],
+    images: Vec<RunnerImage>,
 }
 
 #[derive(Clone, Debug)]
@@ -153,6 +177,7 @@ struct AgentState {
     incoming_images: BTreeMap<u64, IncomingImage>,
     draft_images: BTreeMap<u64, ImageAttachment>,
     active_images: Vec<ImageAttachment>,
+    history: Vec<HistoryTurn>,
 }
 
 impl AgentState {
@@ -173,6 +198,7 @@ impl AgentState {
             incoming_images: BTreeMap::new(),
             draft_images: BTreeMap::new(),
             active_images: Vec::new(),
+            history: Vec::new(),
         }
     }
 }
@@ -300,7 +326,7 @@ impl Guest for CodingAgentPlugin {
         let request: TurnRequest =
             serde_json::from_slice(&payload).map_err(|error| format!("decode turn: {error}"))?;
         let images = active_worker_images(&request.agent);
-        run_codex_turn(&request, &images).await
+        run_brood_agent_turn(&request, &images).await
     }
 }
 
@@ -383,7 +409,7 @@ fn start_agent_command(id: &str) -> ActorCommand {
         COMPONENT_FILE,
         vec![
             "filesystem:workspace-write".to_string(),
-            "subprocess:codex".to_string(),
+            "subprocess:brood-agent".to_string(),
         ],
     )
 }
@@ -627,6 +653,7 @@ fn handle_agent_message(
                 model: agent.model.clone(),
                 reasoning: agent.reasoning.clone(),
                 session_id: agent.session_id,
+                history: agent.history.clone(),
             };
             let mut commands = agent_commands(
                 agent,
@@ -868,6 +895,9 @@ fn handle_worker_event(event: WorkerEvent) -> Vec<ActorCommand> {
     };
     match event {
         WorkerEvent::Finished(finished) if finished.worker == WORKER_ID => {
+            if let Ok(history) = serde_json::from_slice::<Vec<HistoryTurn>>(&finished.output) {
+                agent.history = history;
+            }
             agent.active_worker = None;
             agent.active_images.clear();
             agent.status = "idle".to_string();
@@ -2074,7 +2104,7 @@ fn one_line(text: &str, maximum: usize) -> String {
     output
 }
 
-async fn run_codex_turn(
+async fn run_brood_agent_turn(
     request: &TurnRequest,
     images: &[ImageAttachment],
 ) -> Result<Vec<u8>, String> {
@@ -2082,34 +2112,20 @@ async fn run_codex_turn(
         &request.agent,
         "status",
         &format!(
-            "Starting Codex · model={} · reasoning={}",
+            "Starting Brood agent · model={} · reasoning={}",
             request.model, request.reasoning
         ),
     );
-    let mut arguments = vec![
-        "exec".to_string(),
-        "--json".to_string(),
-        "--ephemeral".to_string(),
-        "--skip-git-repo-check".to_string(),
-        "--color".to_string(),
-        "never".to_string(),
-        "--sandbox".to_string(),
-        "workspace-write".to_string(),
-        "--config".to_string(),
-        format!("model_reasoning_effort=\"{}\"", request.reasoning),
-    ];
-    arguments.extend(computer_use_config_arguments(request));
-    if request.model != "default" {
-        arguments.push("--model".to_string());
-        arguments.push(request.model.clone());
-    }
     let mut temporary_images = Vec::new();
+    let mut runner_images = Vec::new();
     for image in images {
         let path = temporary_image_path(&request.agent, image);
         match host::worker_replace_file(path.clone(), image.bytes.clone()).await {
             Ok(written) if written == image.bytes.len() as u64 => {
-                arguments.push("--image".to_string());
-                arguments.push(path.clone());
+                runner_images.push(RunnerImage {
+                    path: path.clone(),
+                    mime_type: image.mime_type.clone(),
+                });
                 temporary_images.push(path);
             }
             Ok(written) => {
@@ -2126,60 +2142,31 @@ async fn run_codex_turn(
             }
         }
     }
-    // `--image` accepts one or more values, so terminate option parsing before
-    // the positional prompt or clap will consume it as another image path.
-    arguments.push("--".to_string());
-    arguments.push(request.prompt.clone());
-    let process = match host::subprocess_spawn("codex", &arguments) {
-        Ok(process) => process,
-        Err(direct_error) => {
-            let mut shell_arguments = vec![
-                "-lic".to_string(),
-                "exec codex \"$@\"".to_string(),
-                "brood-codex".to_string(),
-            ];
-            shell_arguments.extend(arguments);
-            match host::subprocess_spawn("bash", &shell_arguments) {
-                Ok(process) => process,
-                Err(shell_error) => {
-                    cleanup_temporary_images(&request.agent, &temporary_images).await;
-                    return Err(format!(
-                        "spawn Codex directly ({direct_error:?}) or through a login shell ({shell_error:?})"
-                    ));
-                }
-            }
-        }
+    let runner_request = RunnerRequest {
+        agent: &request.agent,
+        prompt: &request.prompt,
+        model: &request.model,
+        reasoning: &request.reasoning,
+        session_id: request.session_id,
+        history: &request.history,
+        images: runner_images,
     };
+    let input = serde_json::to_vec(&runner_request)
+        .map_err(|error| format!("encode Brood agent turn: {error}"))?;
+    let process = host::subprocess_spawn("brood-agent", &[])
+        .map_err(|error| format!("spawn Brood agent: {error:?}"))?;
+    if let Err(error) = write_all(process.stdin, &input).await {
+        cleanup_temporary_images(&request.agent, &temporary_images).await;
+        return Err(format!("write Brood agent request: {error}"));
+    }
     let _ = host::stream_close_write(process.stdin);
-    let result = drain_codex_process(&request.agent, &process).await;
+    let result = drain_brood_agent_process(&request.agent, &process).await;
     let _ = host::stream_drop(process.stdin).await;
     let _ = host::stream_drop(process.stdout).await;
     let _ = host::stream_drop(process.stderr).await;
     let _ = host::child_drop(process.child).await;
     cleanup_temporary_images(&request.agent, &temporary_images).await;
     result
-}
-
-fn computer_use_config_arguments(request: &TurnRequest) -> Vec<String> {
-    [
-        format!(
-            "developer_instructions={}",
-            serde_json::to_string(COMPUTER_USE_DEVELOPER_INSTRUCTIONS)
-                .expect("static developer instructions must serialize")
-        ),
-        "mcp_servers.brood_computer_use.command=\"brood-computer-use-mcp\"".to_string(),
-        format!(
-            "mcp_servers.brood_computer_use.args=[\"--session\",\"{}\",\"--principal\",\"{}\"]",
-            request.session_id, request.agent
-        ),
-        "mcp_servers.brood_computer_use.env_vars=[\"BROODD_DBUS_DESTINATION\",\"BROODD_DBUS_ADDRESS\",\"BROOD_SURFACE_SESSION_ID\"]".to_string(),
-        "mcp_servers.brood_computer_use.required=true".to_string(),
-        "mcp_servers.brood_computer_use.default_tools_approval_mode=\"approve\"".to_string(),
-        "mcp_servers.brood_computer_use.tool_timeout_sec=120".to_string(),
-    ]
-    .into_iter()
-    .flat_map(|value| ["--config".to_string(), value])
-    .collect()
 }
 
 fn temporary_image_path(agent: &str, image: &ImageAttachment) -> String {
@@ -2222,7 +2209,10 @@ async fn cleanup_temporary_images(agent: &str, paths: &[String]) {
     }
 }
 
-async fn drain_codex_process(agent: &str, process: &host::ProcessIo) -> Result<Vec<u8>, String> {
+async fn drain_brood_agent_process(
+    agent: &str,
+    process: &host::ProcessIo,
+) -> Result<Vec<u8>, String> {
     let stdout_notification =
         host::stream_notification(process.stdout).map_err(runtime_error("stdout notification"))?;
     let stderr_notification =
@@ -2234,12 +2224,25 @@ async fn drain_codex_process(agent: &str, process: &host::ProcessIo) -> Result<V
     let mut child_generation = 0;
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
+    let mut worker_output = None;
     let mut stdout_eof = false;
     let mut stderr_eof = false;
 
     loop {
-        stdout_eof |= drain_stream_lines(agent, process.stdout, "agent", &mut stdout)?;
-        stderr_eof |= drain_stream_lines(agent, process.stderr, "error", &mut stderr)?;
+        stdout_eof |= drain_agent_stream_lines(
+            agent,
+            process.stdout,
+            "agent",
+            &mut stdout,
+            &mut worker_output,
+        )?;
+        stderr_eof |= drain_agent_stream_lines(
+            agent,
+            process.stderr,
+            "error",
+            &mut stderr,
+            &mut worker_output,
+        )?;
         let status = host::child_status(process.child).map_err(runtime_error("child status"))?;
         if status.0 != host::ChildState::Running && stdout_eof && stderr_eof {
             if !stdout.is_empty() {
@@ -2250,10 +2253,12 @@ async fn drain_codex_process(agent: &str, process: &host::ProcessIo) -> Result<V
             }
             let code = status.1.unwrap_or(-1);
             if status.0 == host::ChildState::Exited && code == 0 {
-                publish_worker_log(agent, "status", "Turn complete");
-                return Ok(Vec::new());
+                return worker_output.ok_or_else(|| {
+                    "Brood agent exited successfully without returning conversation state"
+                        .to_string()
+                });
             }
-            return Err(format!("codex exited with status {code}"));
+            return Err(format!("Brood agent exited with status {code}"));
         }
 
         let stdout_pollable = host::notification_pollable(stdout_notification, stdout_generation)
@@ -2276,25 +2281,29 @@ async fn drain_codex_process(agent: &str, process: &host::ProcessIo) -> Result<V
             Ok(ready) if ready.index == 1 => stderr_generation = ready.generation,
             Ok(ready) => child_generation = ready.generation,
             Err(host::WaitError::Cancelled) => return Err("turn cancelled".to_string()),
-            Err(error) => return Err(format!("wait for codex output: {error:?}")),
+            Err(error) => return Err(format!("wait for Brood agent output: {error:?}")),
         }
     }
 }
 
-fn drain_stream_lines(
+fn drain_agent_stream_lines(
     agent: &str,
     stream: u64,
     fallback_kind: &str,
     pending: &mut Vec<u8>,
+    worker_output: &mut Option<Vec<u8>>,
 ) -> Result<bool, String> {
     loop {
-        match host::stream_read(stream, 8192).map_err(runtime_error("read codex stream"))? {
+        match host::stream_read(stream, 8192).map_err(runtime_error("read Brood agent stream"))? {
             host::StreamReadResult::Data(bytes) => {
                 pending.extend(bytes);
                 while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
                     let line = pending.drain(..=newline).collect::<Vec<_>>();
                     let line = String::from_utf8_lossy(&line);
-                    let (kind, text) = summarize_codex_line(line.trim(), fallback_kind);
+                    let (kind, text, history) = summarize_agent_line(line.trim(), fallback_kind);
+                    if let Some(history) = history {
+                        *worker_output = Some(history);
+                    }
                     if !text.is_empty() {
                         publish_worker_log(agent, kind, &text);
                     }
@@ -2306,12 +2315,10 @@ fn drain_stream_lines(
     }
 }
 
-fn summarize_codex_line(line: &str, fallback_kind: &str) -> (&'static str, String) {
-    if line == "Reading additional input from stdin..."
-        || line.contains("failed to clean up stale arg0 temp dirs")
-    {
-        return ("status", String::new());
-    }
+fn summarize_agent_line(
+    line: &str,
+    fallback_kind: &str,
+) -> (&'static str, String, Option<Vec<u8>>) {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
         return (
             if fallback_kind == "error" {
@@ -2320,6 +2327,7 @@ fn summarize_codex_line(line: &str, fallback_kind: &str) -> (&'static str, Strin
                 "agent"
             },
             one_line(line, 3000),
+            None,
         );
     };
     let event_type = value
@@ -2327,64 +2335,41 @@ fn summarize_codex_line(line: &str, fallback_kind: &str) -> (&'static str, Strin
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
     match event_type {
-        "thread.started" => (
-            "status",
-            format!(
-                "Thread {}",
-                value
-                    .get("thread_id")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("started")
-            ),
-        ),
-        "turn.started" => ("status", "Thinking…".to_string()),
-        "turn.completed" => ("status", "Model turn completed".to_string()),
-        "error" => (
-            "error",
-            value
-                .get("message")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or(line)
-                .to_string(),
-        ),
-        "item.completed" | "item.started" | "item.updated" => {
-            let item = value.get("item").unwrap_or(&value);
-            let item_type = item
-                .get("type")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
-            match item_type {
-                "agent_message" => (
-                    "agent",
-                    item.get("text")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("")
-                        .to_string(),
-                ),
-                "command_execution" => (
-                    "tool",
-                    format!(
-                        "$ {} {}",
-                        item.get("command")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("command"),
-                        item.get("status")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("")
-                    ),
-                ),
-                "file_change" => ("tool", "Applied file changes".to_string()),
-                "mcp_tool_call" => summarize_mcp_tool_call(item),
-                "error" => (
-                    "error",
-                    item.get("message")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("Codex item failed")
-                        .to_string(),
-                ),
-                _ => ("status", one_line(item_type, 3000)),
-            }
+        "assistant" => ("agent", event_text(&value), None),
+        "reasoning" => ("status", event_text(&value), None),
+        "status" => ("status", event_text(&value), None),
+        "tool_start" => {
+            let tool = display_tool_name(&value);
+            ("tool", format!("{tool} in progress"), None)
         }
+        "tool_end" => {
+            let tool = display_tool_name(&value);
+            let text = event_text(&value);
+            let failed = value
+                .get("is_error")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            (
+                if failed { "error" } else { "tool" },
+                format!(
+                    "{tool} {}{}",
+                    if failed { "failed" } else { "completed" },
+                    if text.is_empty() {
+                        String::new()
+                    } else {
+                        format!(": {}", one_line(&text, 1000))
+                    }
+                ),
+                None,
+            )
+        }
+        "result" => (
+            "status",
+            String::new(),
+            value
+                .get("history")
+                .and_then(|history| serde_json::to_vec(history).ok()),
+        ),
         _ => (
             if fallback_kind == "error" {
                 "error"
@@ -2392,68 +2377,31 @@ fn summarize_codex_line(line: &str, fallback_kind: &str) -> (&'static str, Strin
                 "status"
             },
             one_line(line, 3000),
+            None,
         ),
     }
 }
 
-fn summarize_mcp_tool_call(item: &serde_json::Value) -> (&'static str, String) {
-    let server = item
-        .get("server")
+fn event_text(value: &serde_json::Value) -> String {
+    value
+        .get("text")
         .and_then(serde_json::Value::as_str)
-        .unwrap_or("mcp");
-    let tool = item
+        .unwrap_or("")
+        .to_string()
+}
+
+fn display_tool_name(value: &serde_json::Value) -> &str {
+    value
         .get("tool")
         .and_then(serde_json::Value::as_str)
-        .unwrap_or("tool");
-    let label = if server == "brood_computer_use" {
-        tool.to_string()
-    } else {
-        format!("{server}.{tool}")
-    };
-    let status = item
-        .get("status")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("in progress")
-        .replace('_', " ");
-
-    if let Some(error) = item.get("error").filter(|error| !error.is_null()) {
-        let detail = error
-            .get("message")
-            .and_then(serde_json::Value::as_str)
-            .map(ToString::to_string)
-            .unwrap_or_else(|| one_line(&error.to_string(), 1000));
-        return ("error", format!("{label} failed: {detail}"));
-    }
-
-    let result_text = item
-        .get("result")
-        .and_then(|result| result.get("content"))
-        .and_then(serde_json::Value::as_array)
-        .and_then(|content| {
-            content.iter().find_map(|entry| {
-                (entry.get("type").and_then(serde_json::Value::as_str) == Some("text"))
-                    .then(|| entry.get("text").and_then(serde_json::Value::as_str))
-                    .flatten()
-            })
-        });
-    if status == "failed" {
-        return (
-            "error",
-            format!(
-                "{label} failed{}",
-                result_text
-                    .map(|text| format!(": {}", one_line(text, 1000)))
-                    .unwrap_or_default()
-            ),
-        );
-    }
-    if let Some(result_text) = result_text {
-        return (
-            "tool",
-            format!("{label} {status}: {}", one_line(result_text, 1000)),
-        );
-    }
-    ("tool", format!("{label} {status}"))
+        .unwrap_or("tool")
+        .strip_prefix("brood_computer_use__")
+        .unwrap_or_else(|| {
+            value
+                .get("tool")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("tool")
+        })
 }
 
 fn publish_worker_log(agent: &str, kind: &str, text: &str) {
@@ -2538,85 +2486,45 @@ mod tests {
     }
 
     #[test]
-    fn codex_turn_gets_a_required_session_bound_computer_use_server() {
-        let arguments = computer_use_config_arguments(&TurnRequest {
-            agent: "coding-agent-7".to_string(),
-            prompt: "Use the calculator".to_string(),
-            model: "default".to_string(),
-            reasoning: "medium".to_string(),
-            session_id: 42,
-        });
-        assert!(arguments.chunks_exact(2).all(|pair| pair[0] == "--config"));
-        assert!(arguments.iter().any(|argument| {
-            argument.starts_with("developer_instructions=")
-                && argument
-                    .contains("call brood_computer_use.computer_launch before doing anything else")
-                && argument
-                    .contains("Never launch a graphical application through a shell command")
-        }));
-        assert!(arguments.iter().any(|argument| {
-            argument
-                == "mcp_servers.brood_computer_use.args=[\"--session\",\"42\",\"--principal\",\"coding-agent-7\"]"
-        }));
-        assert!(arguments.iter().any(|argument| {
-            argument
-                == "mcp_servers.brood_computer_use.env_vars=[\"BROODD_DBUS_DESTINATION\",\"BROODD_DBUS_ADDRESS\",\"BROOD_SURFACE_SESSION_ID\"]"
-        }));
-        assert!(
-            arguments
-                .iter()
-                .any(|argument| argument == "mcp_servers.brood_computer_use.required=true")
+    fn brood_agent_assistant_events_are_rendered_as_agent_output() {
+        assert_eq!(
+            summarize_agent_line(r#"{"type":"assistant","text":"Done"}"#, "agent"),
+            ("agent", "Done".to_string(), None)
         );
     }
 
     #[test]
-    fn codex_runtime_housekeeping_warning_is_not_shown_as_an_agent_error() {
+    fn brood_agent_computer_tool_events_use_short_names() {
         assert_eq!(
-            summarize_codex_line(
-                "WARNING: failed to clean up stale arg0 temp dirs: Permission denied (os error 13)",
-                "error"
-            ),
-            ("status", String::new())
-        );
-    }
-
-    #[test]
-    fn codex_mcp_launch_events_show_the_tool_and_result() {
-        assert_eq!(
-            summarize_codex_line(
-                r#"{"type":"item.started","item":{"type":"mcp_tool_call","server":"brood_computer_use","tool":"computer_launch","status":"in_progress"}}"#,
+            summarize_agent_line(
+                r#"{"type":"tool_start","tool":"brood_computer_use__computer_launch"}"#,
                 "agent"
             ),
-            (
-                "tool",
-                "computer_launch in progress".to_string()
-            )
+            ("tool", "computer_launch in progress".to_string(), None)
         );
         assert_eq!(
-            summarize_codex_line(
-                r#"{"type":"item.completed","item":{"type":"mcp_tool_call","server":"brood_computer_use","tool":"computer_launch","status":"completed","result":{"content":[{"type":"text","text":"{\"pane\":3,\"visible\":true}"}]}}}"#,
+            summarize_agent_line(
+                r#"{"type":"tool_end","tool":"brood_computer_use__computer_launch","text":"{\"pane\":3,\"visible\":true}","is_error":false}"#,
                 "agent"
             ),
             (
                 "tool",
                 "computer_launch completed: {\"pane\":3,\"visible\":true}".to_string()
+                ,None
             )
         );
     }
 
     #[test]
-    fn codex_mcp_launch_failure_is_shown_as_an_error() {
-        assert_eq!(
-            summarize_codex_line(
-                r#"{"type":"item.completed","item":{"type":"mcp_tool_call","server":"brood_computer_use","tool":"computer_launch","status":"failed","error":{"message":"speedcrunch exited before creating a managed window"}}}"#,
-                "agent"
-            ),
-            (
-                "error",
-                "computer_launch failed: speedcrunch exited before creating a managed window"
-                    .to_string()
-            )
+    fn brood_agent_result_preserves_conversation_history() {
+        let (_, text, history) = summarize_agent_line(
+            r#"{"type":"result","history":[{"user":"hello","assistant":"hi"}]}"#,
+            "agent",
         );
+        assert!(text.is_empty());
+        let history = serde_json::from_slice::<Vec<HistoryTurn>>(&history.unwrap()).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].assistant, "hi");
     }
 
     fn png_bytes(size: usize) -> Vec<u8> {

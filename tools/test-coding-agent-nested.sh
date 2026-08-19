@@ -199,7 +199,7 @@ if [[ -z "$SSH_TARGET" ]]; then
 (
   cd "$WORKSPACE"
   env -u brood_session \
-    PATH="$ROOT/target/debug:$PATH" \
+    PATH="$ROOT/tools:$ROOT/target/debug:$PATH" \
     RUST_LOG="$RUST_LOG" \
     "$ROOT/target/debug/brood-sessiond" \
     --headless \
@@ -301,8 +301,11 @@ backend_ready() {
   if [[ -n "$SSH_TARGET" ]]; then
     rg -q 'backend actor message .*"id":"coding-agent-1"' "$CLIENT_LOG"
   else
-    rg -q "delivered presentation-to-session actor message" "$SERVER_LOG" \
-      && rg -q "coding-agent-1" "$SERVER_LOG"
+    rg -q 'backend actor message .*"id":"coding-agent-1"' "$CLIENT_LOG" \
+      || {
+        rg -q "delivered presentation-to-session actor message" "$SERVER_LOG" \
+          && rg -q "coding-agent-1" "$SERVER_LOG"
+      }
   fi
 }
 
@@ -323,8 +326,7 @@ rg -q "accepted plugin draw packet" "$CLIENT_LOG"
 if [[ -n "$SSH_TARGET" ]]; then
   rg -q 'backend actor message .*"id":"coding-agent-1"' "$CLIENT_LOG"
 else
-  rg -q "delivered presentation-to-session actor message" "$SERVER_LOG"
-  rg -q "coding-agent-1" "$SERVER_LOG"
+  backend_ready
 fi
 
 # Wait for the initial workspace to be committed, then open the picker using
@@ -613,7 +615,7 @@ if [[ -n "$SSH_TARGET" ]]; then
 - target: $SSH_TARGET
 - input: real Wayland clipboard paste and desktop drag/drop
 - transfer: bounded actor messages crossed the SSH backend connection
-- model: Luna-hosted Codex emitted the verified marker $REMOTE_IMAGE_MARKER
+- model: the remote Brood agent emitted the verified marker $REMOTE_IMAGE_MARKER
 - cleanup: temporary image files were removed on Luna
 - captures: agent-images-attached.png and agent-complete.png
 EOF
@@ -668,13 +670,13 @@ PY
   [[ "$(magick identify -format '%wx%h' "$OUT/builtin-agent-final.png")" == "1440x900" ]]
   for _ in $(seq 1 300); do
     if rg -q '"text":"Turn complete"' "$CLIENT_LOG" \
-      && rg -q "component actor worker finished" "$SERVER_LOG"; then
+      && rg -q 'backend actor message .*"agent":"coding-agent-1".*"status":"idle"' "$CLIENT_LOG"; then
       break
     fi
     sleep 0.1
   done
   rg -q '"text":"Turn complete"' "$CLIENT_LOG"
-  rg -q "component actor worker finished" "$SERVER_LOG"
+  rg -q 'backend actor message .*"agent":"coding-agent-1".*"status":"idle"' "$CLIENT_LOG"
   if find "$WORKSPACE" -maxdepth 1 -name '.brood-agent-image-*' -print -quit | rg -q .; then
     echo "ERR coding-agent temporary image was not removed" >&2
     exit 1
@@ -698,7 +700,7 @@ PY
 - settle input sequences: $INPUT_SEQUENCES
 - automation viewport: 1440x900
 - live presentation bounds at capture: 480x686; presentation layout did not control automation geometry
-- workload: the built-in Codex pane used its automatically configured session MCP server to enter (12345*6789)-987654 and visually verified 82822551
+- workload: the independent built-in agent used its automatically configured session MCP server to enter (12345*6789)-987654 and visually verified 82822551
 - input: real Ctrl+Alt+A picker shortcut, pointer selection, prompt typing, and server-side SpeedCrunch keyboard actions
 - captures: builtin-agent-final.png and agent-complete.png
 EOF
@@ -871,9 +873,9 @@ cat > "$OUT/proof.md" <<EOF
 - input: real text and Enter events through a headless Sway presentation
 - UI: Ctrl+Alt+A opened the session agent picker and Enter launched a session-scoped client-realm canvas actor for its selected agent
 - agent: one independently addressed session-realm actor selected through the UI
-- work: a private actor worker launched Codex with workspace-write authority
+- work: a private actor worker launched the headless Brood agent with workspace-write authority
 - result: .brood/agent-actor-proof.txt contains actor-ui-worker-ok
-- image: real compositor clipboard and desktop drag/drop PNGs were attached, transferred to the session actor, interpreted by Codex as $IMAGE_EXPECTED, and removed after the turn
+- image: real compositor clipboard and desktop drag/drop PNGs were attached, transferred to the session actor, interpreted by the Brood agent as $IMAGE_EXPECTED, and removed after the turn
 - inbox: agent completion created a global queue item and clicking it focused the originating agent pane
 - survival: the focused UI accepted a model change after the completed turn
 - captures: agent-idle.png, agent-image-attached.png, agent-images-attached.png, agent-finished-inbox.png, and agent-complete.png
@@ -885,9 +887,9 @@ if [[ -n "$COMPUTER_USE" ]]; then
 # Built-in agent computer-use proof
 
 - input: a real prompt submitted through the built-in session-scoped coding-agent pane
-- binding: Codex received a required stdio MCP server fixed to Brood session 1 and principal coding-agent-1
+- binding: the Brood agent received a required stdio MCP server fixed to Brood session 1 and principal coding-agent-1
 - application: real SpeedCrunch pane $SPEEDCRUNCH_PANE inside that session
-- work: Codex started its own task, observed the application as MCP image content, entered (12345*6789)-987654, visually verified 82822551, and stopped the task
+- work: the Brood agent started its own task, observed the application as MCP image content, entered (12345*6789)-987654, visually verified 82822551, and stopped the task
 - lifecycle: task $COMPUTER_TASK retained at least two changing observations and ended stopped with no lease
 - artifact: builtin-agent-final.png is the final 1440x900 server observation
 - presentation: the same nested client remained attached for live spectator output and returned to the agent UI after stop

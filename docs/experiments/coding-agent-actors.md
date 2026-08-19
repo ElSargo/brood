@@ -110,19 +110,20 @@ notifications wake the actor, which incorporates output into durable actor
 state and publishes bounded updates. Cancellation invalidates the turn
 generation, closes its resources, and ignores stale completions.
 
-The provider adapter is replaceable. A native model SDK, a local model service,
-or a Codex process adapter should all project the same events into the agent
+The provider adapter is replaceable. A native model API, a local model service,
+or another streaming provider must project the same events into the agent
 actor. Provider credentials and outbound network access belong to declared
 capabilities and session configuration; they are not embedded in the UI or
 mailbox protocol.
 
-The Codex adapter starts the capability-allowed executable directly, with a Bash
-login-shell fallback for remote hosts that provide Codex from their normal
-interactive environment. It materializes validated images as uniquely named
-temporary files inside its workspace grant, attaches those files to the initial
-model turn, and removes them after the process exits or is cancelled. The
-temporary file is a provider boundary detail rather than part of the public
-mailbox protocol or durable workspace state.
+The built-in worker starts the capability-allowed `brood-agent` executable and
+sends one bounded JSON turn request over stdin. The headless runner owns the
+model/tool loop and talks to the session-bound computer-use MCP adapter. It
+materializes validated images as uniquely named temporary files inside its
+workspace grant, attaches those files to the initial model turn, and removes
+them after the process exits or is cancelled. The temporary file is a provider
+boundary detail rather than part of the public mailbox protocol or durable
+workspace state.
 
 Tools should become actors when they need independent identity, lifecycle,
 state, subscriptions, or reuse by several agents. A one-turn subprocess or

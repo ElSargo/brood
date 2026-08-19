@@ -228,13 +228,14 @@ task history or observations from the daemon.
 
 ## Built-in agent integration
 
-Every Codex turn launched from a built-in, session-scoped coding-agent pane
-receives a required `brood_computer_use` stdio MCP server automatically. The
+Every turn launched from a built-in, session-scoped coding-agent pane receives
+a required `brood_computer_use` stdio MCP server automatically. The
 pane supplies the current surface-session identity and stable agent identity;
-the adapter injects those values into task creation, forwards only the Brood
-control environment that Codex needs to reach that daemon, and rejects tasks
-or actions that attempt to cross the bound session. Users do not configure an
-MCP server or copy task, lease, or session identifiers into their prompt.
+the independent headless agent starts the adapter with those values, inherits
+only the Brood control environment needed to reach that daemon, and rejects
+tasks or actions that attempt to cross the bound session. Users do not
+configure an MCP server or copy task, lease, or session identifiers into their
+prompt.
 
 The server's MCP initialization instructions explain the observe-act-observe
 workflow and lease sequencing. Observation PNGs are returned as MCP image

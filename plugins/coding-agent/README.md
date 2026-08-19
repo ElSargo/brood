@@ -7,11 +7,12 @@ actor preserves the session switcher while creating separate, session-scoped
 canvas UI actors after a picker selection. Each UI subscribes to its owning
 session's registry and to each selected agent through ordinary actor messages.
 
-Each agent owns its model and reasoning configuration, turn state, subscribers,
-and event log. A private worker runs one Codex turn through the capability-
-scoped subprocess/stream API while the actor dispatcher remains responsive.
-Output is projected back into actor events with a generation-based notification
-and streamed to the presentation actor over the bidirectional realm mailbox.
+Each agent owns its model and reasoning configuration, conversation history,
+turn state, subscribers, and event log. A private worker runs the independent
+headless Brood agent through the capability-scoped subprocess/stream API while
+the actor dispatcher remains responsive. Output is projected back into actor
+events with a generation-based notification and streamed to the presentation
+actor over the bidirectional realm mailbox.
 
 The UI supports:
 
@@ -33,15 +34,17 @@ Every UI's top bar follows the complete session registry, including agents
 created from other UI panes. Closing a UI pane does not stop its session-side
 agents.
 
-Codex turns launched from this pane automatically receive the
-`brood_computer_use` MCP tools bound to the pane's Brood session and agent
-identity. No per-user MCP setup is required. Ask the agent normally, for
-example: `Use SpeedCrunch to calculate (12345*6789)-987654 and verify the
-result visually.` The agent can start a task, inspect screenshots, act through
-the compositor's normal input paths, and stop the task. If the application is
-not open, it can launch it through Brood's hosted-application path and wait for
-its managed window before starting automation. It cannot target the host
-desktop, another Brood session, or client-local plugin panes.
+Turns launched from this pane automatically receive the `brood_computer_use`
+MCP tools bound to the pane's Brood session and agent identity. The agent loop,
+conversation memory, tool execution, and provider stream are Brood-owned; no
+Codex process is involved. No per-user MCP setup is required. Ask the agent
+normally, for example: `Use SpeedCrunch to calculate
+(12345*6789)-987654 and verify the result visually.` The agent can start a
+task, inspect screenshots, act through the compositor's normal input paths,
+and stop the task. If the application is not open, it can launch it through
+Brood's hosted-application path and wait for its managed window before starting
+automation. It cannot target the host desktop, another Brood session, or
+client-local plugin panes.
 
 Attachments are read by the presentation client and transferred as bounded,
 ordered actor messages. The backend never dereferences a client pathname, so
@@ -54,3 +57,18 @@ prompt editor until the turn is submitted or the attachment is removed.
 This is deliberately an actor-system workload rather than a new privileged
 agent subsystem. Editors, diff tools, LSP bridges, automation actors, and other
 agents can use the same mailbox protocol and subscribe to the same agent state.
+
+The headless loop is adapted from the MIT-licensed Open Agent Loops design. It
+keeps only the small model, memory, tool, stop, and event seams. Brood supplies
+the session-scoped tool bridge, provider backend, credential migration, and
+actor event projection; see `agents/brood-agent/THIRD_PARTY_NOTICES.md`.
+
+For model authentication, `OPENAI_API_KEY` selects the public Responses API.
+Otherwise, the first agent turn may import the existing Codex ChatGPT login
+from `~/.codex/auth.json` into `$XDG_CONFIG_HOME/brood/agent-auth.json`, or
+`~/.config/brood/agent-auth.json` when `XDG_CONFIG_HOME` is unset. The
+Brood-owned directory and file are forced to modes `0700` and `0600`;
+subsequent turns use and refresh that copy without modifying Codex's file. Both
+files contain secrets and must stay outside packages, workspaces, logs, and
+version control. Set `BROOD_AGENT_AUTH` to select a different Brood-owned
+credential path.

@@ -189,7 +189,7 @@ fn start_agent(id: &str) -> Command {
         path: CODING_AGENT_COMPONENT_FILE.to_string(),
         capabilities: vec![
             "filesystem:workspace-write".to_string(),
-            "subprocess:codex".to_string(),
+            "subprocess:brood-agent".to_string(),
         ],
         presentation_scope: PresentationScope::Global,
     })

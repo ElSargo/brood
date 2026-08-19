@@ -308,7 +308,7 @@ let
     '';
   };
 
-  runtimeFiles = pkgs.runCommand "brood-runtime-files" { } ''
+  runtimeFiles = pkgs.runCommand "brood-runtime-files" { nativeBuildInputs = [ pkgs.makeWrapper ]; } ''
     mkdir -p "$out"
 
     install -D ${src}/brood.toml "$out/brood.toml"
@@ -351,6 +351,15 @@ let
       ${wasmModules}/runtimes/computer-use-js/target/wasm32-wasip1/release/brood_computer_use_js_runtime.wasm \
       "$out/runtimes/computer-use-js.wasm"
 
+    agent_runtime="$out/share/brood-agent"
+    mkdir -p "$agent_runtime/src"
+    install -m 0644 ${src}/agents/brood-agent/src/agent.mjs "$agent_runtime/src/agent.mjs"
+    install -m 0644 ${src}/agents/brood-agent/src/cli.mjs "$agent_runtime/src/cli.mjs"
+    install -m 0644 ${src}/agents/brood-agent/LICENSE "$agent_runtime/LICENSE"
+    install -m 0644 ${src}/agents/brood-agent/THIRD_PARTY_NOTICES.md "$agent_runtime/THIRD_PARTY_NOTICES.md"
+    makeWrapper ${pkgs.nodejs}/bin/node "$out/bin/brood-agent" \
+      --add-flags "$agent_runtime/src/cli.mjs"
+
     # The editor runtime belongs to the local client package only. Keep it
     # outside wasmModules so consumers of a single backend component (notably
     # the SSH bundle) do not inherit Node or the client-side Neovim runtime.
@@ -369,7 +378,7 @@ let
     ];
     nativeBuildInputs = [ pkgs.makeWrapper ];
     postBuild = ''
-      for program in brood brood-client brood-computer-use-mcp brood-remote brood-sessiond brood-runner-exec brood-runner-nix-develop; do
+      for program in brood brood-agent brood-client brood-computer-use-mcp brood-remote brood-sessiond brood-runner-exec brood-runner-nix-develop; do
         wrapProgram "$out/bin/$program" \
           --prefix PATH : "$out/bin:${appToolPath}" \
           --prefix LD_LIBRARY_PATH : "${nativeLibraryPath}" \
