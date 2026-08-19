@@ -6,6 +6,7 @@ import { createInterface } from "node:readline";
 import { randomUUID } from "node:crypto";
 
 const MAX_STEPS = 32;
+const MAX_MODEL_ATTEMPTS = 4;
 const MAX_TOOL_OUTPUT_BYTES = 1024 * 1024;
 const CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token";
@@ -46,6 +47,14 @@ function functionCalls(output) {
   return output.filter(
     (item) => item?.type === "function_call" && item.call_id && item.name,
   );
+}
+
+function addUsage(total, usage = {}) {
+  total.requests += 1;
+  total.input_tokens += Number(usage.input_tokens) || 0;
+  total.cached_input_tokens += Number(usage.input_tokens_details?.cached_tokens) || 0;
+  total.output_tokens += Number(usage.output_tokens) || 0;
+  total.reasoning_tokens += Number(usage.output_tokens_details?.reasoning_tokens) || 0;
 }
 
 export function parseSsePayloads(text) {
@@ -96,6 +105,71 @@ async function readSse(response) {
     completed.output = output;
   }
   return completed;
+}
+
+function retryableModelResponse(status, text) {
+  return status === 408
+    || status === 429
+    || status >= 500
+    || (status === 400 && text.includes("prompt_cache_retention is not supported"));
+}
+
+function retryDelay(response, attempt, baseMs) {
+  const retryAfter = response.headers.get("retry-after");
+  if (retryAfter) {
+    const seconds = Number(retryAfter);
+    if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+    const date = Date.parse(retryAfter);
+    if (Number.isFinite(date)) return Math.max(0, date - Date.now());
+  }
+  return baseMs * 2 ** (attempt - 1);
+}
+
+async function waitForRetry(milliseconds, signal) {
+  if (milliseconds <= 0) return;
+  await new Promise((resolve, reject) => {
+    const finish = () => {
+      signal?.removeEventListener("abort", abort);
+      resolve();
+    };
+    const timer = setTimeout(finish, milliseconds);
+    const abort = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
+      reject(signal.reason ?? new Error("turn cancelled"));
+    };
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) abort();
+  });
+}
+
+async function requestModel(fetchImpl, backend, body, signal, retryBaseMs) {
+  for (let attempt = 1; attempt <= MAX_MODEL_ATTEMPTS; attempt += 1) {
+    let response;
+    try {
+      response = await fetchImpl(backend.url, {
+        method: "POST",
+        headers: backend.headers,
+        body: JSON.stringify(body),
+        signal,
+      });
+    } catch (error) {
+      if (signal?.aborted || attempt === MAX_MODEL_ATTEMPTS) throw error;
+      emit("status", { text: `Model connection failed; retrying (${attempt}/${MAX_MODEL_ATTEMPTS})` });
+      await waitForRetry(retryBaseMs * 2 ** (attempt - 1), signal);
+      continue;
+    }
+    if (response.ok) return readSse(response);
+    const text = bytePrefix(await response.text(), 4000);
+    if (!retryableModelResponse(response.status, text) || attempt === MAX_MODEL_ATTEMPTS) {
+      throw new Error(`model request failed (${response.status}): ${text}`);
+    }
+    emit("status", {
+      text: `Model request failed (${response.status}); retrying (${attempt}/${MAX_MODEL_ATTEMPTS})`,
+    });
+    await waitForRetry(retryDelay(response, attempt, retryBaseMs), signal);
+  }
+  throw new Error("model request exhausted retries");
 }
 
 function decodeJwtPayload(token) {
@@ -468,6 +542,7 @@ async function imageInput(image) {
 export async function runAgent(request, options = {}) {
   const fetchImpl = options.fetchImpl ?? fetch;
   const signal = options.signal;
+  const modelRetryBaseMs = options.modelRetryBaseMs ?? 500;
   const backend = options.backend ?? (await resolveModelBackend(process.env, fetchImpl));
   const mcp = options.mcp ?? (await new McpClient("brood-computer-use-mcp", [
     "--session",
@@ -489,6 +564,13 @@ export async function runAgent(request, options = {}) {
     });
 
     let finalText = "";
+    const usage = {
+      requests: 0,
+      input_tokens: 0,
+      cached_input_tokens: 0,
+      output_tokens: 0,
+      reasoning_tokens: 0,
+    };
     for (let step = 1; step <= MAX_STEPS; step += 1) {
       if (signal?.aborted) throw new Error("turn cancelled");
       const model = !request.model || request.model === "default" ? "gpt-5.4" : request.model;
@@ -506,16 +588,14 @@ export async function runAgent(request, options = {}) {
         include: ["reasoning.encrypted_content"],
         prompt_cache_key: `${request.agent}-${request.session_id}`,
       };
-      const response = await fetchImpl(backend.url, {
-        method: "POST",
-        headers: backend.headers,
-        body: JSON.stringify(body),
+      const completed = await requestModel(
+        fetchImpl,
+        backend,
+        body,
         signal,
-      });
-      if (!response.ok) {
-        throw new Error(`model request failed (${response.status}): ${bytePrefix(await response.text(), 4000)}`);
-      }
-      const completed = await readSse(response);
+        modelRetryBaseMs,
+      );
+      addUsage(usage, completed.usage);
       const output = completed.output ?? [];
       const reasoning = reasoningFromResponse(output);
       if (reasoning) emit("reasoning", { text: reasoning });
@@ -530,7 +610,7 @@ export async function runAgent(request, options = {}) {
         emit("status", { text: "Turn complete" });
         const history = [...(request.history ?? []), { user: request.prompt, assistant: finalText }]
           .slice(-24);
-        emit("result", { history });
+        emit("result", { history, usage });
         return history;
       }
       for (const call of calls) input.push(await callTool(call, mcp, signal));

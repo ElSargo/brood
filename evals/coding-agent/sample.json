@@ -1,0 +1,29 @@
+{
+  "dataset": "SWE-bench/SWE-bench_Verified",
+  "split": "test",
+  "seed": 20260819,
+  "populations": {
+    "under_one_hour": {
+      "difficulty": ["<15 min fix", "15 min - 1 hour"],
+      "size": 455,
+      "sample_size": 6
+    },
+    "one_to_four_hours": {
+      "difficulty": ["1-4 hours"],
+      "size": 42,
+      "sample_size": 4
+    }
+  },
+  "sample": [
+    "matplotlib__matplotlib-25122",
+    "django__django-17029",
+    "pydata__xarray-3095",
+    "scikit-learn__scikit-learn-10297",
+    "django__django-12419",
+    "django__django-15104",
+    "scikit-learn__scikit-learn-25102",
+    "pylint-dev__pylint-8898",
+    "sphinx-doc__sphinx-9229",
+    "sympy__sympy-16597"
+  ]
+}
