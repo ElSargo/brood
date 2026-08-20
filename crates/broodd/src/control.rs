@@ -3733,6 +3733,18 @@ fn execute_tokens(tokens: &[String], state: &mut Brood) -> Result<String> {
             format!("{}\n", status_json_string(state)?)
         }
         "computer-use" => match args {
+            [subcommand, session] if subcommand == "windows" => {
+                let session = parse_u64(session, "session")?;
+                let windows = crate::computer_use::available_windows(state, session);
+                format!(
+                    "{}\n",
+                    serde_json::to_string(&serde_json::json!({
+                        "protocol_version": brood_computer_use::COMPUTER_USE_PROTOCOL_VERSION,
+                        "session": session,
+                        "windows": windows,
+                    }))?
+                )
+            }
             [subcommand, request] if subcommand == "start-request" => {
                 let request =
                     serde_json::from_str::<brood_computer_use::ComputerUseStartRequest>(request)

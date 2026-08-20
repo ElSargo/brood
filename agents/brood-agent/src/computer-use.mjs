@@ -53,7 +53,11 @@ function functionTool(name, description, parameters) {
 
 export function computerUseTools(session) {
   const tools = [
-    functionTool("computer_launch", `Launch a GUI application inside Brood session ${session} and wait for its managed window`, {
+    functionTool("computer_windows", `List existing GUI windows in Brood session ${session}. Check these windows first and reuse a suitable one before launching another application`, {
+      type: "object",
+      properties: {},
+    }),
+    functionTool("computer_launch", `Launch a GUI application inside Brood session ${session} and wait for its managed window. Call computer_windows first and launch only when no suitable window already exists`, {
       type: "object",
       required: ["command"],
       properties: {
@@ -73,7 +77,7 @@ export function computerUseTools(session) {
         limits: { type: "object" },
       },
     }),
-    functionTool("computer_action", "Execute ordered direct actions and return a causally newer screenshot", {
+    functionTool("computer_action", "Execute ordered direct actions and return a causally newer screenshot. Inspect that screenshot as authoritative evidence and continue correcting the UI until the requested outcome is visibly present", {
       type: "object",
       required: ["protocol_version", "task", "lease_generation", "expected_sequence", "actions"],
       properties: {
@@ -268,6 +272,9 @@ export class NativeComputerUseClient {
   }
 
   async call(name, arguments_ = {}, callId = "computer-call") {
+    if (name === "computer_windows") {
+      return nativeToolResult(await this.command(["computer-use", "windows", String(this.session)]));
+    }
     if (name === "computer_launch") return nativeToolResult(await this.launch(arguments_));
     let command;
     let startedTask;

@@ -123,7 +123,7 @@ impl Adapter {
             },
             |session| {
                 format!(
-                    "These tools control only server-managed applications in Brood session {session}. If the requested application is not already open, call computer_launch before computer_start; it launches through Brood and returns only after a managed window exists. Call computer_start with no session ID, use the returned lease generation and monotonically increasing task sequence for actions or exec_js, observe results, and call computer_stop when finished. The adapter rejects cross-session access; the human presentation is an observer and primary human input pauses automation."
+                    "These tools control only server-managed applications in Brood session {session}. Call computer_windows first and reuse a suitable existing window. If the requested application is not already open, call computer_launch before computer_start; it launches through Brood and returns only after a managed window exists. Call computer_start with no session ID, use the returned lease generation and monotonically increasing task sequence for actions or exec_js, observe results, and call computer_stop when finished. The adapter rejects cross-session access; the human presentation is an observer and primary human input pauses automation."
                 )
             },
         )
@@ -142,6 +142,20 @@ impl Adapter {
         let mut started_task = None;
         if name == "computer_launch" {
             return self.launch(arguments);
+        }
+        if name == "computer_windows" {
+            let session = self
+                .session
+                .context("computer_windows requires a session-bound agent pane")?;
+            let response = request_native_command(
+                &self.native_tool_socket,
+                &[
+                    "computer-use".to_string(),
+                    "windows".to_string(),
+                    session.to_string(),
+                ],
+            )?;
+            return Ok(ToolOutput::from_response(response));
         }
         let command = match name {
             "computer_start" => {
@@ -614,7 +628,7 @@ fn tool_definitions(session: Option<u64>) -> Value {
     let action_schema = action_schema();
     let Value::Array(mut tools) = json!([
         {"name":"computer_start","description":start_description,"inputSchema":{"type":"object","properties":{"task":{"type":"string","description":"Optional unique audit task ID; one is generated when omitted"},"windows":{"type":"array","items":{"type":"integer"},"description":"Optional managed-pane allowlist within this session"},"active_window":{"type":["integer","null"]},"lease_duration_ms":{"type":"integer","minimum":1},"policy":{"type":"object"},"limits":{"type":"object"}}}},
-        {"name":"computer_action","description":"Execute validated ordered direct actions and return a causally newer screenshot observation","inputSchema":{"type":"object","required":["tool_call_id","arguments"],"properties":{"tool_call_id":{"type":"string"},"arguments":{"type":"object","required":["protocol_version","task","lease_generation","expected_sequence","actions"],"properties":{"protocol_version":{"const":1},"task":{"type":"string"},"lease_generation":{"type":"integer"},"expected_sequence":{"type":"integer"},"target_window":{"type":["integer","null"]},"actions":{"type":"array","minItems":1,"items":action_schema},"approval_proof":{"type":["string","null"]}}}}}},
+        {"name":"computer_action","description":"Execute validated ordered direct actions and return a causally newer screenshot observation. Inspect that screenshot as authoritative evidence and continue correcting the UI until the requested outcome is visibly present","inputSchema":{"type":"object","required":["tool_call_id","arguments"],"properties":{"tool_call_id":{"type":"string"},"arguments":{"type":"object","required":["protocol_version","task","lease_generation","expected_sequence","actions"],"properties":{"protocol_version":{"const":1},"task":{"type":"string"},"lease_generation":{"type":"integer"},"expected_sequence":{"type":"integer"},"target_window":{"type":["integer","null"]},"actions":{"type":"array","minItems":1,"items":action_schema},"approval_proof":{"type":["string","null"]}}}}}},
         {"name":"computer_exec_js","description":"Evaluate persistent capability-empty JavaScript; computer helpers use the same validated server action path","inputSchema":{"type":"object","required":["protocol_version","task","lease_generation","expected_sequence","source"],"properties":{"protocol_version":{"const":1},"task":{"type":"string"},"lease_generation":{"type":"integer"},"expected_sequence":{"type":"integer"},"source":{"type":"string"},"approval_proof":{"type":["string","null"]}}}},
         {"name":"computer_observe","description":"Read events, pending approvals, and observations newer than the supplied cursors","inputSchema":{"type":"object","required":["task","event_cursor","observation_sequence"],"properties":{"task":{"type":"string"},"event_cursor":{"type":"integer"},"observation_sequence":{"type":"integer"}}}},
         {"name":"computer_pause","description":"Pause a task and release held input","inputSchema":task_schema()},
@@ -628,7 +642,7 @@ fn tool_definitions(session: Option<u64>) -> Value {
     if let Some(session) = session {
         tools.insert(0, json!({
             "name":"computer_launch",
-            "description":format!("Launch a GUI application inside Brood session {session} and wait for its managed window before starting computer use"),
+            "description":format!("Launch a GUI application inside Brood session {session} and wait for its managed window before starting computer use. Call computer_windows first and launch only when no suitable window already exists"),
             "inputSchema":{
                 "type":"object",
                 "required":["command"],
@@ -638,6 +652,11 @@ fn tool_definitions(session: Option<u64>) -> Value {
                     "window_timeout_ms":{"type":"integer","minimum":1,"maximum":MAX_LAUNCH_TIMEOUT_MS}
                 }
             }
+        }));
+        tools.insert(0, json!({
+            "name":"computer_windows",
+            "description":format!("List existing GUI windows in Brood session {session}. Check these windows first and reuse a suitable one before launching another application"),
+            "inputSchema":{"type":"object","properties":{}}
         }));
     }
     Value::Array(tools)
@@ -718,6 +737,32 @@ mod tests {
             !unbound.as_array().unwrap().iter().any(|tool| {
                 tool.get("name").and_then(Value::as_str) == Some("computer_launch")
             })
+        );
+    }
+
+    #[test]
+    fn window_discovery_is_session_bound_and_recommended_before_launch() {
+        let bound = tool_definitions(Some(7));
+        let windows = bound
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool.get("name").and_then(Value::as_str) == Some("computer_windows"));
+        assert!(windows.is_some_and(|tool| {
+            tool.get("description")
+                .and_then(Value::as_str)
+                .is_some_and(|description| {
+                    description.contains("session 7") && description.contains("first")
+                })
+        }));
+        assert!(
+            !tool_definitions(None)
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| {
+                    tool.get("name").and_then(Value::as_str) == Some("computer_windows")
+                })
         );
     }
 }

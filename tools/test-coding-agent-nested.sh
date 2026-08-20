@@ -8,6 +8,8 @@ SSH_TARGET="${BROOD_CODING_AGENT_SSH_TARGET:-}"
 COMPUTER_USE="${BROOD_CODING_AGENT_COMPUTER_USE:-}"
 CREATE_AGENT_ONLY="${BROOD_CODING_AGENT_CREATE_ONLY:-}"
 REMOTE_IMAGE_MARKER="REMOTE_IMAGE_PROOF: red green"
+FIRST_CU_MARKER="BROOD_BUILTIN_CU_FIRST_OK"
+SECOND_CU_MARKER="BROOD_BUILTIN_CU_SECOND_OK"
 
 if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
   exec dbus-run-session -- "$0" "$@"
@@ -35,6 +37,9 @@ CONFIG="$OUT/brood.toml"
 SWAY_CONFIG="$OUT/sway.conf"
 DBUS_DESTINATION="org.brood.CodingAgentTest.p$$"
 mkdir -p "$PACKAGE" "$WORKSPACE/.brood" "$RUNTIME_DIR"
+if [[ -n "$COMPUTER_USE" ]]; then
+  mkdir -p "$OUT/xdg-config" "$OUT/xdg-data"
+fi
 chmod 700 "$RUNTIME_DIR"
 git -C "$WORKSPACE" init -q
 
@@ -197,9 +202,17 @@ EOF
 
 RUST_LOG="${RUST_LOG:-broodd=info,brood_client=info,smithay=warn,wgpu_core=warn,wgpu_hal=warn}"
 if [[ -z "$SSH_TARGET" ]]; then
+SERVER_PROCESS_ENV=()
+if [[ -n "$COMPUTER_USE" ]]; then
+  SERVER_PROCESS_ENV+=(
+    "XDG_CONFIG_HOME=$OUT/xdg-config"
+    "XDG_DATA_HOME=$OUT/xdg-data"
+  )
+fi
 (
   cd "$WORKSPACE"
   env -u brood_session \
+    "${SERVER_PROCESS_ENV[@]}" \
     PATH="$ROOT/tools:$ROOT/target/debug:$PATH" \
     BROOD_AGENT_REQUIRE_DBUS_FREE="${COMPUTER_USE:+1}" \
     RUST_LOG="$RUST_LOG" \
@@ -455,6 +468,35 @@ focus_agent_prompt() {
   return 1
 }
 
+submit_agent_prompt() {
+  local prompt="$1"
+  local prompt_count_before
+  prompt_count_before="$({ rg -a -c "presentation actor message .*recipient=$AGENT_ID.*\"kind\":\"prompt\"" "$CLIENT_LOG" || true; } | tail -1)"
+  prompt_count_before="${prompt_count_before:-0}"
+  focus_agent_prompt
+  sleep 0.5
+  local offset chunk
+  for ((offset = 0; offset < ${#prompt}; offset += 24)); do
+    chunk="${prompt:offset:24}"
+    env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+      WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+      "$OUT/virtual-keyboard-key" --text "$chunk"
+    sleep 0.03
+  done
+  env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+    WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+    "$OUT/virtual-keyboard-key" --none 28
+  for _ in $(seq 1 300); do
+    local prompt_count
+    prompt_count="$({ rg -a -c "presentation actor message .*recipient=$AGENT_ID.*\"kind\":\"prompt\"" "$CLIENT_LOG" || true; } | tail -1)"
+    prompt_count="${prompt_count:-0}"
+    ((prompt_count > prompt_count_before)) && return 0
+    sleep 0.1
+  done
+  echo "ERR coding-agent prompt was not submitted" >&2
+  return 1
+}
+
 AGENT_ID="coding-agent-1"
 
 capture() {
@@ -623,26 +665,11 @@ fi
 if [[ -n "$SSH_TARGET" ]]; then
   PROMPT="Inspect both attached images. If their solid colors are red and green, reply with exactly this marker and nothing else: $REMOTE_IMAGE_MARKER"
 elif [[ -n "$COMPUTER_USE" ]]; then
-  PROMPT='Open SpeedCrunch and use it to calculate (12345*6789)-987654. Visually verify that the application shows 82822551, leave any automation stopped, and reply with exactly BROOD_BUILTIN_CU_OK only after verification.'
+  PROMPT="Open SpeedCrunch and use it to calculate (12345*6789)-987654. Visually verify that the application shows 82822551, leave any automation stopped, and reply with exactly $FIRST_CU_MARKER only after verification."
 else
   PROMPT='Create .brood/image-proof.txt with red green and .brood/agent-actor-proof.txt with actor-ui-worker-ok'
 fi
-focus_agent_prompt
-sleep 0.5
-env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
-  WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
-  "$OUT/virtual-keyboard-key" --text "$PROMPT"
-env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
-  WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
-  "$OUT/virtual-keyboard-key" --none 28
-
-for _ in $(seq 1 300); do
-  if rg -q "presentation actor message .*recipient=$AGENT_ID.*\"kind\":\"prompt\"" "$CLIENT_LOG"; then
-    break
-  fi
-  sleep 0.1
-done
-rg -q "presentation actor message .*recipient=$AGENT_ID.*\"kind\":\"prompt\"" "$CLIENT_LOG"
+submit_agent_prompt "$PROMPT"
 
 if [[ -n "$SSH_TARGET" ]]; then
   for _ in $(seq 1 180); do
@@ -691,38 +718,59 @@ EOF
   echo "complete=$OUT/agent-complete.png"
   exit 0
 elif [[ -n "$COMPUTER_USE" ]]; then
-  COMPUTER_TASK=""
-  for _ in $(seq 1 1200); do
-    ctl computer-use list > "$OUT/computer-use-tasks.json" || true
-    COMPUTER_TASK="$(
-      jq -r '.[] | select(.principal == "coding-agent-1" and .scope.session == 1 and .state == "stopped" and .next_sequence >= 2) | .id' \
-        "$OUT/computer-use-tasks.json" 2> /dev/null \
-        | tail -1
-    )"
-    if [[ -n "$COMPUTER_TASK" ]] \
-      && rg -q '"log_kind":"agent","text":"BROOD_BUILTIN_CU_OK"' "$CLIENT_LOG"; then
-      break
-    fi
-    kill -0 "$CLIENT_PID" 2> /dev/null || {
-      echo "ERR presentation client exited during the built-in computer-use turn" >&2
-      exit 1
-    }
-    sleep 0.2
-  done
-  [[ -n "$COMPUTER_TASK" ]]
-  rg -q '"log_kind":"agent","text":"BROOD_BUILTIN_CU_OK"' "$CLIENT_LOG"
-  ctl computer-use observe "$COMPUTER_TASK" 0 0 > "$OUT/computer-use-observer.json"
-  jq -e '
-    .task.principal == "coding-agent-1"
-    and .task.scope.session == 1
-    and .task.state == "stopped"
-    and .lease == null
-    and (.observations | length) >= 1
-    and (.events | map(.event.type) | index("batch_committed")) != null
-    and any(.events[]; .event.type == "state_changed" and .event.state == "stopped")
-    and (.events | map(.event.type) | index("lease_released")) != null
-  ' "$OUT/computer-use-observer.json" > /dev/null
-  python3 - "$OUT/computer-use-observer.json" "$OUT/builtin-agent-final.png" <<'PY'
+  wait_for_agent_computer_task() {
+    local marker="$1"
+    local excluded_task="$2"
+    local task_list="$3"
+    local task=""
+    for _ in $(seq 1 1200); do
+      ctl computer-use list > "$task_list" || true
+      task="$(
+        jq -r --arg excluded "$excluded_task" '
+          .[]
+          | select(
+              .principal == "coding-agent-1"
+              and .scope.session == 1
+              and .state == "stopped"
+              and .next_sequence >= 2
+              and ($excluded == "" or .id != $excluded)
+            )
+          | .id
+        ' "$task_list" 2> /dev/null \
+          | tail -1
+      )"
+      if [[ -n "$task" ]] \
+        && rg -a -Fq "\"log_kind\":\"agent\",\"text\":\"$marker\"" "$CLIENT_LOG"; then
+        printf '%s\n' "$task"
+        return 0
+      fi
+      kill -0 "$CLIENT_PID" 2> /dev/null || {
+        echo "ERR presentation client exited during the built-in computer-use turn" >&2
+        return 1
+      }
+      sleep 0.2
+    done
+    echo "ERR timed out waiting for stopped agent computer-use task and marker $marker" >&2
+    return 1
+  }
+
+  wait_for_agent_idle() {
+    for _ in $(seq 1 300); do
+      if { rg -a 'backend actor message .*"agent":"coding-agent-1".*"status":' "$CLIENT_LOG" || true; } \
+        | tail -1 \
+        | rg -q '"status":"idle"'; then
+        return 0
+      fi
+      sleep 0.1
+    done
+    echo "ERR coding-agent did not return to idle" >&2
+    return 1
+  }
+
+  extract_last_observation() {
+    local observer="$1"
+    local image="$2"
+    python3 - "$observer" "$image" <<'PY'
 import json
 import pathlib
 import sys
@@ -733,46 +781,114 @@ if not images or not images[-1]:
     raise SystemExit("built-in agent produced no visual observation")
 pathlib.Path(sys.argv[2]).write_bytes(images[-1])
 PY
-  [[ "$(magick identify -format '%wx%h' "$OUT/builtin-agent-final.png")" == "1440x900" ]]
-  for _ in $(seq 1 300); do
-    if rg -q '"text":"Turn complete"' "$CLIENT_LOG" \
-      && rg -q 'backend actor message .*"agent":"coding-agent-1".*"status":"idle"' "$CLIENT_LOG"; then
-      break
-    fi
-    sleep 0.1
-  done
-  rg -q '"text":"Turn complete"' "$CLIENT_LOG"
-  rg -q 'backend actor message .*"agent":"coding-agent-1".*"status":"idle"' "$CLIENT_LOG"
+    [[ "$(magick identify -format '%wx%h' "$image")" == "1440x900" ]]
+  }
+
+  observe_agent_task() {
+    local task="$1"
+    local observer="$2"
+    local image="$3"
+    ctl computer-use observe "$task" 0 0 > "$observer"
+    jq -e '
+      .task.principal == "coding-agent-1"
+      and .task.scope.session == 1
+      and .task.state == "stopped"
+      and .lease == null
+      and (.observations | length) >= 1
+      and (.events | map(.event.type) | index("batch_committed")) != null
+      and any(.events[]; .event.type == "state_changed" and .event.state == "stopped")
+      and (.events | map(.event.type) | index("lease_released")) != null
+    ' "$observer" > /dev/null
+    extract_last_observation "$observer" "$image"
+  }
+
+  assert_single_speedcrunch_window() {
+    local output="$1"
+    ctl computer-use windows 1 > "$output"
+    jq -e '
+      .session == 1
+      and (
+        [.windows[]
+          | select(
+              ((.application_id // "") | ascii_downcase | contains("speedcrunch"))
+              or ((.title // "") | ascii_downcase | contains("speedcrunch"))
+            )]
+        | length
+      ) == 1
+      and all(.windows[]; ((.title // "") | ascii_downcase | contains("load session") | not))
+    ' "$output" > /dev/null
+  }
+
+  FIRST_COMPUTER_TASK="$(wait_for_agent_computer_task \
+    "$FIRST_CU_MARKER" "" "$OUT/first-computer-use-tasks.json")"
+  observe_agent_task "$FIRST_COMPUTER_TASK" \
+    "$OUT/first-computer-use-observer.json" "$OUT/builtin-agent-first.png"
+  FIRST_SPEEDCRUNCH_PANE="$(jq -r '.observations[-1].active_window' \
+    "$OUT/first-computer-use-observer.json")"
+  [[ "$FIRST_SPEEDCRUNCH_PANE" =~ ^[0-9]+$ ]]
+  assert_single_speedcrunch_window "$OUT/first-computer-windows.json"
+  wait_for_agent_idle
+
+  SECOND_PROMPT="Use the existing SpeedCrunch window from the previous calculation to calculate 25*25. Visually verify that the application shows 625, do not open another application window, leave any automation stopped, and reply with exactly $SECOND_CU_MARKER only after verification."
+  submit_agent_prompt "$SECOND_PROMPT"
+  SECOND_COMPUTER_TASK="$(wait_for_agent_computer_task \
+    "$SECOND_CU_MARKER" "$FIRST_COMPUTER_TASK" "$OUT/second-computer-use-tasks.json")"
+  observe_agent_task "$SECOND_COMPUTER_TASK" \
+    "$OUT/second-computer-use-observer.json" "$OUT/builtin-agent-second.png"
+  SECOND_SPEEDCRUNCH_PANE="$(jq -r '.observations[-1].active_window' \
+    "$OUT/second-computer-use-observer.json")"
+  [[ "$SECOND_SPEEDCRUNCH_PANE" == "$FIRST_SPEEDCRUNCH_PANE" ]]
+  assert_single_speedcrunch_window "$OUT/second-computer-windows.json"
+  wait_for_agent_idle
+
+  python3 - "$OUT/first-computer-use-observer.json" "$OUT/builtin-agent-first-initial.png" \
+    "$OUT/second-computer-use-observer.json" "$OUT/builtin-agent-second-initial.png" <<'PY'
+import json
+import pathlib
+import sys
+
+for observer, image in ((sys.argv[1], sys.argv[2]), (sys.argv[3], sys.argv[4])):
+    payload = json.loads(pathlib.Path(observer).read_text())
+    first = bytes(payload["observations"][0]["png"])
+    if not first:
+        raise SystemExit(f"{observer} has no initial visual observation")
+    pathlib.Path(image).write_bytes(first)
+PY
+  [[ "$(sha256sum "$OUT/builtin-agent-first-initial.png" | cut -d' ' -f1)" \
+    != "$(sha256sum "$OUT/builtin-agent-first.png" | cut -d' ' -f1)" ]]
+  [[ "$(sha256sum "$OUT/builtin-agent-second-initial.png" | cut -d' ' -f1)" \
+    != "$(sha256sum "$OUT/builtin-agent-second.png" | cut -d' ' -f1)" ]]
+  [[ "$(sha256sum "$OUT/builtin-agent-first.png" | cut -d' ' -f1)" \
+    != "$(sha256sum "$OUT/builtin-agent-second.png" | cut -d' ' -f1)" ]]
+
   if find "$WORKSPACE" -maxdepth 1 -name '.brood-agent-image-*' -print -quit | rg -q .; then
     echo "ERR coding-agent temporary image was not removed" >&2
     exit 1
   fi
   capture "$OUT/agent-complete.png"
-  TASK_SEQUENCE="$(jq -r '.task.next_sequence' "$OUT/computer-use-observer.json")"
-  OBSERVATION_SEQUENCES="$(jq -r '[.observations[].sequence] | join(",")' "$OUT/computer-use-observer.json")"
-  FRAME_SEQUENCES="$(jq -r '[.observations[].settle.frame_sequence] | join(",")' "$OUT/computer-use-observer.json")"
-  INPUT_SEQUENCES="$(jq -r '[.observations[].settle.input_sequence] | join(",")' "$OUT/computer-use-observer.json")"
-  SPEEDCRUNCH_PANE="$(jq -r '.observations[-1].active_window' "$OUT/computer-use-observer.json")"
-  [[ "$SPEEDCRUNCH_PANE" =~ ^[0-9]+$ ]]
+  FIRST_TASK_SEQUENCE="$(jq -r '.task.next_sequence' "$OUT/first-computer-use-observer.json")"
+  SECOND_TASK_SEQUENCE="$(jq -r '.task.next_sequence' "$OUT/second-computer-use-observer.json")"
+  FIRST_OBSERVATION_SEQUENCES="$(jq -r '[.observations[].sequence] | join(",")' "$OUT/first-computer-use-observer.json")"
+  SECOND_OBSERVATION_SEQUENCES="$(jq -r '[.observations[].sequence] | join(",")' "$OUT/second-computer-use-observer.json")"
   cat > "$OUT/proof.md" <<EOF
-# Built-in agent computer-use proof
+# Built-in agent sequential computer-use proof
 
-- application: SpeedCrunch, pane $SPEEDCRUNCH_PANE, session 1; launched by the agent from an empty session
+- application: one SpeedCrunch window, pane $FIRST_SPEEDCRUNCH_PANE, session 1; launched by the agent from an empty session and reused for the second turn
 - agent principal: coding-agent-1
-- task: $COMPUTER_TASK, stopped with lease released
-- task next sequence: $TASK_SEQUENCE
-- observation sequences: $OBSERVATION_SEQUENCES
-- settle frame sequences: $FRAME_SEQUENCES
-- settle input sequences: $INPUT_SEQUENCES
+- first task: $FIRST_COMPUTER_TASK, stopped with lease released; sequence $FIRST_TASK_SEQUENCE; observations $FIRST_OBSERVATION_SEQUENCES
+- second task: $SECOND_COMPUTER_TASK, stopped with lease released; sequence $SECOND_TASK_SEQUENCE; observations $SECOND_OBSERVATION_SEQUENCES
 - automation viewport: 1440x900
 - live presentation bounds at capture: 480x686; presentation layout did not control automation geometry
-- workload: the independent built-in agent used native session computer tools to enter (12345*6789)-987654 and visually verified 82822551
+- first workload: the independent built-in agent entered (12345*6789)-987654 and visually verified 82822551
+- second workload: the same agent conversation entered 25*25 in the existing window and visually verified 625
+- regression invariants: each turn visibly changed SpeedCrunch, the two final frames differ, both tasks stopped with their leases released, and exactly one SpeedCrunch window remained with no unexpected dialog
 - input: real Ctrl+Alt+A picker shortcut, pointer selection, prompt typing, and server-side SpeedCrunch keyboard actions
-- captures: builtin-agent-final.png and agent-complete.png
+- captures: builtin-agent-first.png, builtin-agent-second.png, both initial frames, and agent-complete.png
 EOF
-  echo "coding_agent_computer_use=verified task=$COMPUTER_TASK sequences=$OBSERVATION_SEQUENCES frames=$FRAME_SEQUENCES"
+  echo "coding_agent_computer_use=verified first_task=$FIRST_COMPUTER_TASK second_task=$SECOND_COMPUTER_TASK pane=$FIRST_SPEEDCRUNCH_PANE"
   echo "proof=$OUT/proof.md"
-  echo "automation_capture=$OUT/builtin-agent-final.png"
+  echo "first_automation_capture=$OUT/builtin-agent-first.png"
+  echo "second_automation_capture=$OUT/builtin-agent-second.png"
   echo "presentation_capture=$OUT/agent-complete.png"
   SWAY_SOCKET="$(
     find "$RUNTIME_DIR" -maxdepth 1 -type s -name 'sway-ipc.*.sock' | head -1

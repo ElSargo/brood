@@ -235,6 +235,17 @@ for _ in $(seq 1 300); do
   sleep 0.05
 done
 ACTION_PANE="$(jq -r '.windows[] | select(.application_id == "org.brood.ComputerUseProof") | .pane' "$OUT/action-ready/automation.json")"
+EXISTING_WINDOW_PANE="$ACTION_PANE"
+ctl computer-use windows 1 > "$OUT/existing-windows.json"
+jq -e --argjson pane "$ACTION_PANE" '
+  .protocol_version == 1
+  and .session == 1
+  and all(.windows[]; .session == 1)
+  and any(.windows[]; .pane == $pane
+    and .application_id == "org.brood.ComputerUseProof"
+    and .content_width > 0
+    and .content_height > 0)
+' "$OUT/existing-windows.json" > /dev/null
 LEASE="$(ctl computer-use start phase2-proof 1 "$ACTION_PANE" 30000)"
 LEASE_GENERATION="$(jq -r .generation <<< "$LEASE")"
 for _ in $(seq 1 300); do
@@ -1182,6 +1193,7 @@ cat > "$OUT/proof.md" << EOF
 - presentation: detached for capture and direct-action workloads
 - SHM: two changing 1440x900 PNG captures in shm-first and shm-second
 - DMA-BUF: two changing 1440x900 PNG captures in dmabuf-first and dmabuf-second
+- Existing windows: session-scoped discovery found pane $EXISTING_WINDOW_PANE before task start
 - stable window identity and capture metrics: metrics.json and each automation.json
 - direct actions: action-response.json, action-state-final.json, and action-observation.png
 - cleanup: stop-cleanup-response.json, key-cleanup-response.json, expiry-cleanup-response.json, and target-cleanup-response.json

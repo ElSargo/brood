@@ -230,9 +230,12 @@ An optional MCP compatibility surface can expose the same direct-action and
 agent computer use does not depend on it and DBus is not a remote streaming
 protocol.
 
-The built-in agent receives ordinary Responses function tools named
-`computer_launch`, `computer_start`, `computer_action`, `computer_exec_js`, and
-the associated lifecycle operations. Their hidden transport is a private,
+The built-in agent receives ordinary Responses function tools for discovering
+existing windows, launching managed applications, starting tasks, performing
+actions, running persistent scripts, and managing the task lifecycle. Window
+discovery is presented first and returns only windows from the agent pane's
+surface session. Launch guidance directs the agent to reuse a suitable existing
+window before creating another one. Their hidden transport is a private,
 mode-0600 Unix socket created by the owning `brood-sessiond` and inherited only
 by session-scoped children. The socket admits only computer-use, scoped launch,
 and launch-status requests. It has no input, capture, lease, or approval

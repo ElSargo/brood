@@ -120,6 +120,8 @@ test("refreshes an expired imported login into the selected Brood auth file", as
 test("computer actions are native model tools with a hidden host envelope", async () => {
   const definition = computerUseTools(7).find((tool) => tool.name === "computer_action");
   assert.equal(definition.name, "computer_action");
+  assert(definition.description.includes("authoritative evidence"));
+  assert(definition.description.includes("visibly present"));
   assert(definition.parameters.required.includes("task"));
   assert(!definition.parameters.properties.tool_call_id);
 
@@ -142,6 +144,25 @@ test("computer actions are native model tools with a hidden host envelope", asyn
   assert.equal(envelope.tool_call_id, "model-call-7");
   assert.equal(envelope.arguments.target_session, 7);
   assert.equal(envelope.arguments.call_id, "model-call-7");
+});
+
+test("computer window discovery is session scoped and recommended before launch", async () => {
+  const definitions = computerUseTools(7);
+  const windows = definitions.find((tool) => tool.name === "computer_windows");
+  const launch = definitions.find((tool) => tool.name === "computer_launch");
+  assert(windows.description.includes("session 7"));
+  assert(windows.description.includes("first"));
+  assert(launch.description.includes("computer_windows first"));
+
+  const commands = [];
+  const client = new NativeComputerUseClient({ socketPath: "/unused", session: 7, principal: "agent-1" });
+  client.command = async (command) => {
+    commands.push(command);
+    return '{"session":7,"windows":[]}';
+  };
+  const result = await client.call("computer_windows");
+  assert.deepEqual(commands, [["computer-use", "windows", "7"]]);
+  assert.equal(result.text, '{"session":7,"windows":[]}');
 });
 
 test("native computer results extract PNGs from model-visible text", () => {

@@ -511,6 +511,45 @@ pub fn activate_window(state: &mut Brood, session: u64, pane: u64) -> Result<(),
     Ok(())
 }
 
+pub fn available_windows(state: &mut Brood, session: u64) -> Vec<ComputerWindow> {
+    state.refresh_window_state();
+    let active_window = state.computer_use_automation.selected_pane(state, session);
+    state
+        .presentation_window_summaries()
+        .into_iter()
+        .filter(|summary| summary.session == session)
+        .map(|summary| {
+            let window = state.presentation_window_for_pane(summary.pane);
+            let (title, content_width, content_height) = window.as_ref().map_or_else(
+                || (String::new(), 0, 0),
+                |window| {
+                    let geometry = window.geometry();
+                    (
+                        state.window_title(window).unwrap_or_default(),
+                        u32::try_from(geometry.size.w.max(0)).unwrap_or(u32::MAX),
+                        u32::try_from(geometry.size.h.max(0)).unwrap_or(u32::MAX),
+                    )
+                },
+            );
+            ComputerWindow {
+                pane: summary.pane,
+                session: summary.session,
+                application_id: summary.app_id,
+                title,
+                bounds: ComputerRect {
+                    x: 0,
+                    y: 0,
+                    width: content_width.min(AUTOMATION_VIEWPORT_WIDTH),
+                    height: content_height.min(AUTOMATION_VIEWPORT_HEIGHT),
+                },
+                content_width,
+                content_height,
+                active: active_window == Some(summary.pane),
+            }
+        })
+        .collect()
+}
+
 pub fn capture_current(state: &mut Brood) -> Result<(), String> {
     state.refresh_window_state();
     let session = state.active_surface_session().raw();
@@ -1921,7 +1960,8 @@ mod tests {
     fn observation_queue_drops_oldest_and_sequences_monotonically() {
         let mut runtime = AutomationRuntime::default();
         let task = TaskId("queue-proof".to_string());
-        for input_sequence in 1..=4 {
+        let capture_count = u64::try_from(MAX_QUEUED_OBSERVATIONS).unwrap() + 2;
+        for input_sequence in 1..=capture_count {
             runtime.store_capture(snapshot());
             let observation = runtime
                 .observation(&task, input_sequence, true, 75, false)
