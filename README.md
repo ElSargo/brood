@@ -106,14 +106,11 @@ The docs are organized as a wiki-style knowledge base.
 - [Testing](docs/systems/testing.md)
 - [Configuration](docs/systems/configuration.md)
 - [Extension Host](docs/systems/extension-host.md)
-- [Presentation Client Target](docs/systems/presentation-client.md)
-- [Plugin Runtime Target](docs/systems/plugin-runtime.md)
-- [Input And Shortcuts Target](docs/systems/input-shortcuts.md)
-- [Layout Actor Target](docs/systems/layout-actor.md)
-- [Plugin UI Target](docs/systems/plugin-ui.md)
-- [Plugin Graphics Target](docs/systems/plugin-graphics.md)
-- [Future Advanced Plugin Graphics](docs/systems/plugin-advanced-graphics.md)
+- [Design Targets](docs/targets/README.md)
+- [Implementation Progress](docs/progress/README.md)
+- [Design Frictions](docs/frictions/README.md)
 - [CLI Reference Pointers](docs/reference/cli.md)
 - [Decision Records](docs/decisions/README.md)
 
 Historical design notes and older prototypes live under `docs/archive/`.
+Active, unaccepted design explorations live under `docs/experiments/`.

@@ -13,8 +13,8 @@ export names or a complete POSIX emulation.
 
 UI and base canvas rendering belong to [[plugin-ui]] and [[plugin-graphics]].
 Future GPU-style facilities are separated in [[plugin-advanced-graphics]]. Exact
-current ABI details belong to [[extension-host]] and the code-linked
-[[plugin-io-interaction-graph]].
+current ABI details belong to [[../../systems/extension-host]] and the code-linked
+[[../../systems/plugin-io-interaction-graph]].
 
 ## Invariants
 
@@ -393,9 +393,9 @@ mocked resource units. Required coverage includes:
   filesystem mutations;
 - bounded stress and soak runs across many actor generations and workers.
 
-The source-linked interaction map is [[plugin-io-interaction-graph]]. Current
-behavior-test entry points are documented in [[testing]]. Open implementation
-gaps live in the repository `issues.md` rather than in a historical phase plan
+The source-linked interaction map is [[../../systems/plugin-io-interaction-graph]]. Current
+behavior-test entry points are documented in [[../../systems/testing]]. Open implementation
+gaps live in [[../../frictions/structural-lint]] rather than in a historical phase plan
 inside this target specification.
 
 Related:
@@ -404,8 +404,8 @@ Related:
 - [[plugin-ui]]
 - [[plugin-graphics]]
 - [[plugin-advanced-graphics]]
-- [[extension-host]]
+- [[../../systems/extension-host]]
 - [[../concepts/plugin]]
-- [[../concepts/session]]
-- [[../decisions/0006-plugin-actors-and-workers]]
-- [[../reference/wasm-fast-lanes]]
+- [[../../concepts/session]]
+- [[../../decisions/0006-plugin-actors-and-workers]]
+- [[../../reference/wasm-fast-lanes]]

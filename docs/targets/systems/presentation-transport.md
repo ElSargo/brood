@@ -1,5 +1,5 @@
 ---
-status: canonical
+status: target
 type: system
 security-boundary: process-and-network
 runtime-boundary: process-and-network
@@ -263,6 +263,6 @@ not only successful serialization or socket connection.
 
 - [[presentation-client]]
 - [[artifact-distribution]]
-- [[wayland-compositor]]
-- [[testing]]
-- [[../decisions/0007-presentation-transports-and-client-actors]]
+- [[../../systems/wayland-compositor]]
+- [[../../systems/testing]]
+- [[../../decisions/0007-presentation-transports-and-client-actors]]

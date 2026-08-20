@@ -15,6 +15,6 @@ Related:
 
 - [[session]]
 - [[project]]
-- [[plugin]]
+- [[../targets/concepts/plugin]]
 - [[presentation-surface]]
 - [[../systems/runtime]]

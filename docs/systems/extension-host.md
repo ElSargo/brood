@@ -96,8 +96,8 @@ boundary.
 
 ## Target Plugin Host Shape
 
-The durable model is specified once in [[plugin-runtime]], with its resource
-protocol in [[plugin-io-and-resources]]. In short: actors are public fault
+The durable model is specified once in [[../targets/systems/plugin-runtime]], with its resource
+protocol in [[../targets/systems/plugin-io-and-resources]]. In short: actors are public fault
 domains, workers are private shared-memory tasks, policy providers are bounded
 synchronous decisions, and installed plugins are trusted within the enclosing
 session environment. This page only records how the current prototypes map to
@@ -164,12 +164,12 @@ consults it; the WASM global-key policy owns synchronous key decisions.
 
 ## Related Pages
 
-- [[../concepts/plugin]]
+- [[../targets/concepts/plugin]]
 - [[../concepts/wasm-controller]]
-- [[plugin-runtime]]
-- [[plugin-io-and-resources]]
-- [[input-shortcuts]]
-- [[layout-actor]]
-- [[plugin-ui]]
+- [[../targets/systems/plugin-runtime]]
+- [[../targets/systems/plugin-io-and-resources]]
+- [[../targets/systems/input-shortcuts]]
+- [[../targets/systems/layout-actor]]
+- [[../targets/systems/plugin-ui]]
 - [[dbus-control]]
 - [[configuration]]

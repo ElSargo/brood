@@ -13,8 +13,8 @@ should cover:
 - component, layout, styling, and hit-testing code which remained guest-side;
 - places where the SDK was awkward or unexpectedly verbose;
 - any missing canvas, text, input, accessibility, or lifecycle facility;
-- recommended changes to the boundaries in [Plugin UI](../../systems/plugin-ui.md)
-  and [Plugin Graphics](../../systems/plugin-graphics.md).
+- recommended changes to the boundaries in [Plugin UI](../../targets/systems/plugin-ui.md)
+  and [Plugin Graphics](../../targets/systems/plugin-graphics.md).
 
 Be explicit if an implementation appears to require host component knowledge.
 The note should first identify the concrete missing primitive rather than

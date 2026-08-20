@@ -18,7 +18,7 @@ The product model is:
 - A [[concepts/presentation-surface]] is an independent client viewport over the available window catalog.
 - A [[concepts/pane]] is the unit of presentation.
 - A [[concepts/managed-app]] is an external native app tracked by Brood.
-- A [[concepts/plugin]] can extend behavior through addressed actors, private actor-scoped workers, completion-based I/O, WASI resources, policy providers, and publications.
+- A [[targets/concepts/plugin]] can extend behavior through addressed actors, private actor-scoped workers, completion-based I/O, WASI resources, policy providers, and publications.
 - A [[concepts/wasm-controller]] is one plugin role for changing workspace behavior through host APIs.
 
 The Rust workspace contains an authoritative session server and an independent
@@ -27,7 +27,7 @@ session state, hosted applications, durable actors, and DBus bootstrap. The
 client owns presentation actors, recursive layout leases, input policy, and
 WGPU rendering. Local clients use shared-memory protocol lanes plus DMA-BUF or
 copied per-window surfaces; remote clients retain the same client-owned
-viewport over an authenticated carrier. See [[systems/presentation-client]].
+viewport over an authenticated carrier. See [[targets/systems/presentation-client]].
 
 See [[architecture]] for the implementation map.
 
@@ -61,4 +61,4 @@ when isolation is required.
 - [[workflows/test-nested]] if you want to test behavior.
 - [[systems/runtime]] if you want to understand process startup.
 - [[systems/extension-host]] if you want to understand the current WASM and extension surface.
-- [[systems/plugin-runtime]] if you want the target plugin architecture.
+- [[targets/systems/plugin-runtime]] if you want the target plugin architecture.

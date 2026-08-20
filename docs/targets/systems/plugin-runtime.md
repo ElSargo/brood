@@ -69,7 +69,7 @@ Authority is bounded only by the enclosing session environment. A direct local
 session has the full authority of its user. Container and remote sessions add a
 clear environment boundary which defines the available filesystem mounts,
 processes, devices, network, credentials, and host bridges. Plugins within any
-one environment are trusted peers. See [[../concepts/session]].
+one environment are trusted peers. See [[../../concepts/session]].
 
 ## Runtime Shape
 
@@ -422,74 +422,15 @@ workers, outstanding operations, wait registrations, resource counts,
 cancellation, and terminal failures. One actor failure must remain local to
 that actor unless it reveals corruption of a shared host invariant.
 
-## Current Proofs
-
-The Component and Preview 1 runtimes are implementation proofs of this target.
-The Component path demonstrates completion I/O and cooperative workers; the
-Preview 1 path demonstrates ordinary blocking-looking WASI over shared actor
-memory. Their export names and Store layout are not the durable plugin ABI.
-
-The bundled `terminal-session` and `terminal-ui` Components are the real
-terminal product proof. The session guest launches an allowlisted shell
-in a PTY, parses escape sequences with a guest terminal parser, retains grid and
-scrollback state, and publishes coalesced revisions. The presentation guest
-accepts real pane key, text, pointer-scroll, and resize events; negotiates
-application-cursor input; navigates scrollback; renders styled native text runs
-through canvas packets; and can be destroyed and recreated without terminating
-the session-owned shell. The nested proof records shell, ANSI/Unicode, exact
-key bytes, Helix, repeated alternate-screen resize, scrollback, streaming
-output, child exit, resource pressure, mailbox, packet, text churn,
-key-to-present, teardown, and screenshot evidence. The complete product
-boundary and remaining reusable gaps are in [[terminal-plugin]].
-
-`plugins/component-runtime-io` and the runtime-I/O worker in
-`plugins/workspace-file-log` exercise the same bounded stream and pollable
-contract through both backends. Their nested workload preserves separate
-Markdown transcripts containing PATH-selected commands, pipe input and
-transformed output, a nonzero child exit, explicit stdin/stdout PTY checks and
-interactive traffic, a real loopback request/response, and distinct timer wake
-order. The local peer independently records what it received and returned.
-
-`plugins/workspace-file-log` is the user-observable Preview 1 proof. Its module
-declares a bounded shared-memory maximum, then performs a real recursive
-workspace scan and live filesystem watch. Creating, editing, and removing
-files produces corresponding records in
-`.brood/workspace-file-log.log`; the visible file history demonstrates that
-normal actor mailbox, worker, shared-memory, and filesystem behavior remains
-usable inside the ceilings. The nested workload also creates two invalid-UTF-8
-names which lossy conversion would conflate; both real guest logs retain them
-as distinct reversible `%FF` and `%FE` paths.
-
-`plugins/component-workspace-watch` proves the same capability-rooted watch
-model through the Component backend. Its typed WIT resource is an
-actor-generation-owned logical subscription backed by the daemon watcher
-service. The guest SDK wrapper projects its notification into the ordinary
-worker pollable set, and the plugin maintains a live Markdown history at
-`.brood/component-workspace-watch.md`. The nested proof replaces the actor
-generation and observes the old subscription reach zero before the replacement
-is published. It also creates two invalid-UTF-8 Unix filenames which would
-collapse to the same replacement-character text under lossy conversion; the
-artifact shows their distinct native bytes as reversible `\xFF` and `\xFE`
-paths.
-
-Host-owned resource teardown retires a watch and its notification as one
-ownership transition. An actor event already admitted to the reserved lane may
-still carry the retired ID, but it drains as a stale no-op and no longer counts
-as pending. Recursive setup tasks are keyed by watch, reaped after completion,
-and remain inside the watch ceiling if logical teardown races setup. The
-workspace logger's teardown probe repeats real guest watch creation and drop,
-then records a later file mutation through the still-live primary watcher.
-
-Current implementation details and acceptance guidance live in [[extension-host]],
-[[plugin-io-interaction-graph]], and [[../reference/wasm-fast-lanes]].
+Implementation evidence is recorded in [[../../progress/plugin-runtime-proofs]].
 
 Related:
 
 - [[presentation-client]]
 - [[plugin-io-and-resources]]
 - [[../concepts/plugin]]
-- [[../concepts/session]]
-- [[../decisions/0006-plugin-actors-and-workers]]
+- [[../../concepts/session]]
+- [[../../decisions/0006-plugin-actors-and-workers]]
 - [[input-shortcuts]]
 - [[layout-actor]]
 - [[plugin-ui]]

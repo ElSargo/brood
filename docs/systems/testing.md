@@ -153,6 +153,6 @@ available in a pure Nix build sandbox.
 ## Related Pages
 
 - [[../workflows/test-nested]]
-- [[presentation-client]]
-- [[layout-actor]]
+- [[../targets/systems/presentation-client]]
+- [[../targets/systems/layout-actor]]
 - [[wayland-compositor]]

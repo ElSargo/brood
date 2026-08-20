@@ -2,7 +2,7 @@
 
 This archived page records the focused target and current usability shape of the WASM test-harness lane.
 
-Use [Plugin Runtime](../systems/plugin-runtime.md) for the current plugin execution model. Use [WASM Integration](wasm-integration.md) only as historical context for the broader WASM model.
+Use [Plugin Runtime](../targets/systems/plugin-runtime.md) for the current plugin execution model. Use [WASM Integration](wasm-integration.md) only as historical context for the broader WASM model.
 
 The first async test-harness prototype is currently exposed through the `run` CLI. For the exact arguments, see `crates/broodd/src/main.rs`.
 

@@ -1,20 +1,16 @@
-# Structural lint issues
+---
+status: progress
+type: implementation-log
+authority: implementation
+---
 
-These are lint findings that point at design debt rather than a local cleanup.
-The current code carries TODO-backed `allow` annotations so CI can enforce new
-warnings without pretending these areas are already structurally clean.
+# Structural lint progress
 
-## Open
+This log preserves resolved structural lint findings and their implementation
+outcomes. Open design-level mismatches belong in
+[[../frictions/structural-lint]].
 
-- The session picker currently reaches the daemon-scoped worktree manager
-  through the DBus control endpoint. This is an accepted temporary bridge while
-  the actor messaging system only addresses actors in the presentation's bound
-  surface session. Once daemon-realm actor addressing and correlated replies
-  are available, route picker requests and completions through ordinary actor
-  messages. Keep DBus only as an external control adapter over that same actor
-  protocol.
-
-## Resolved
+## Resolved developments
 
 - Core-module actor generations now own their declarations, mailbox identities,
   cancellation signal, and join handles. Replacement builds every actor against
@@ -234,7 +230,7 @@ warnings without pretending these areas are already structurally clean.
   tables. Byte permits follow retained values until dispatch or observation,
   and Preview 1 modules must declare shared-memory maxima within the generation
   ceiling. The target contract is documented in
-  `docs/systems/plugin-runtime.md`. The observable proof is
+  `docs/targets/systems/plugin-runtime.md`. The observable proof is
   `plugins/workspace-file-log`: its acceptance workload performs a real
   workspace scan and records file creation, modification, and removal under the
   bounded runtime.

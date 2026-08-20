@@ -87,5 +87,5 @@ normal runtime path and judge their externally visible output.
 Related:
 
 - [[../systems/extension-host]]
-- [[../systems/plugin-runtime]]
+- [[../targets/systems/plugin-runtime]]
 - [[../reference/wasm-fast-lanes]]

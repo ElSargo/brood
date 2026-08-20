@@ -1,6 +1,6 @@
 # WASM Execution Model
 
-This archived page records an earlier focused target for execution lanes and failure behavior. The current target has been promoted to [Plugin Runtime](../systems/plugin-runtime.md), with related input and layout behavior in [Input And Keyboard Shortcuts](../systems/input-shortcuts.md) and [Layout Actor](../systems/layout-actor.md).
+This archived page records an earlier focused target for execution lanes and failure behavior. The current target has been promoted to [Plugin Runtime](../targets/systems/plugin-runtime.md), with related input and layout behavior in [Input And Keyboard Shortcuts](../targets/systems/input-shortcuts.md) and [Layout Actor](../targets/systems/layout-actor.md).
 
 Use [WASM Integration](wasm-integration.md) only as historical context for the broader app and module model.
 

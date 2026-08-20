@@ -1,6 +1,6 @@
 ---
 status: target
-type: plan
+type: design
 authority: product
 last-reviewed: 2026-08-09
 ---
@@ -899,11 +899,11 @@ Keep the rule that policy providers cannot submit layout.
 
 Update these documents:
 
-- `docs/systems/layout-actor.md`
-- `docs/systems/input-shortcuts.md`
-- `docs/systems/plugin-ui.md`
-- `docs/systems/presentation-client.md`
-- `docs/systems/presentation-transport.md`
+- `docs/targets/systems/layout-actor.md`
+- `docs/targets/systems/input-shortcuts.md`
+- `docs/targets/systems/plugin-ui.md`
+- `docs/targets/systems/presentation-client.md`
+- `docs/targets/systems/presentation-transport.md`
 - `docs/reference/wasm-fast-lanes.md`
 
 ## 22. Verification Plan

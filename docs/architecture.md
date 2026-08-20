@@ -68,7 +68,7 @@ configuration, backend capabilities, cross-runtime actor routing, and
 demand-driven frame streams. Local clients bootstrap through DBus, then use
 bounded shared-memory protocol lanes and DMA-BUF or copied per-window surfaces.
 Remote profiles preserve the same semantic ownership over an authenticated
-carrier. See [[systems/presentation-client]] and
+carrier. See [[targets/systems/presentation-client]] and
 [[decisions/0007-presentation-transports-and-client-actors]].
 
 ## Data Flow
@@ -100,4 +100,4 @@ and pane lifecycle, input/configuration leases, and durable effects. The client
 validates layout leases, final composition, hit testing, local focus, and key
 policy results.
 
-See [[systems/presentation-client]], [[systems/plugin-runtime]], [[systems/input-shortcuts]], [[systems/layout-actor]], [[systems/plugin-ui]], [[systems/plugin-graphics]], [[systems/plugin-advanced-graphics]], and [[systems/extension-host]].
+See [[targets/systems/presentation-client]], [[targets/systems/plugin-runtime]], [[targets/systems/input-shortcuts]], [[targets/systems/layout-actor]], [[targets/systems/plugin-ui]], [[targets/systems/plugin-graphics]], [[targets/systems/plugin-advanced-graphics]], and [[systems/extension-host]].

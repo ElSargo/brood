@@ -33,8 +33,8 @@ The target plugin model keeps the useful synchronous property for decisions
 that must complete before host processing can continue. Policy providers read
 immutable published state and return bounded decision envelopes plus message
 batches; ordinary plugin work stays in actors and workers. See
-[[../systems/plugin-runtime]], [[../systems/input-shortcuts]], and
-[[../systems/layout-actor]].
+[[../targets/systems/plugin-runtime]], [[../targets/systems/input-shortcuts]], and
+[[../targets/systems/layout-actor]].
 
 ## Core-Module Actors
 
@@ -120,7 +120,7 @@ are routed by the same daemon replacement entry point. See `control.rs` and
 Related:
 
 - [[../systems/extension-host]]
-- [[../systems/plugin-runtime]]
-- [[../systems/input-shortcuts]]
-- [[../systems/layout-actor]]
+- [[../targets/systems/plugin-runtime]]
+- [[../targets/systems/input-shortcuts]]
+- [[../targets/systems/layout-actor]]
 - [[../workflows/build-wasm-examples]]

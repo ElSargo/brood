@@ -63,7 +63,7 @@ belong to the client.
 
 ## Related Pages
 
-- [[presentation-client]]
-- [[layout-actor]]
+- [[../targets/systems/presentation-client]]
+- [[../targets/systems/layout-actor]]
 - [[testing]]
 - [[runtime]]

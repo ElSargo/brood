@@ -120,8 +120,8 @@ workspace borders, tabs, drag handles, recovery controls, or presentation menus.
 The actor may request chrome roles and actions, but the client decides their
 placement, style, focus behavior, and composition.
 
-Client chrome is not implemented through the plugin component SDK and cannot be
-overwritten by a full-pane draw packet without a separate presentation role.
+Client chrome is outside the plugin component SDK and cannot be overwritten by
+a full-pane draw packet without a separate presentation role.
 
 ## Accessibility
 
@@ -178,5 +178,5 @@ Related:
 - [[input-shortcuts]]
 - [[terminal-plugin]]
 - [[layout-actor]]
-- [[../concepts/pane]]
-- [[../experiments/session-switcher-ui]]
+- [[../../concepts/pane]]
+- [[../../experiments/session-switcher-ui]]

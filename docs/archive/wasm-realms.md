@@ -2,7 +2,7 @@
 
 This archived page records an earlier target design for WASM realm kinds, binding rules, and cross-realm interaction.
 
-Use [Plugin](../concepts/plugin.md) and [Plugin Runtime](../systems/plugin-runtime.md) for the current target plugin model. Use [WASM Integration](wasm-integration.md) only as historical context for the broader app and module model.
+Use [Plugin](../targets/concepts/plugin.md) and [Plugin Runtime](../targets/systems/plugin-runtime.md) for the current target plugin model. Use [WASM Integration](wasm-integration.md) only as historical context for the broader app and module model.
 
 In this design, a realm is an API and lifetime contract for a WASM module instance. It is not a separate trust boundary and it does not replace the workspace and session object model.
 

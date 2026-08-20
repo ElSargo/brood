@@ -2,13 +2,13 @@
 
 This archived page is a focused target-design note for an earlier WASM API spike.
 
-Use [Plugin Runtime](../systems/plugin-runtime.md), [Input And Keyboard Shortcuts](../systems/input-shortcuts.md), [Layout Actor](../systems/layout-actor.md), and [Plugin UI And Pane Rendering](../systems/plugin-ui.md) for the current target. Use [WASM Integration](wasm-integration.md) only as historical context for the broader app and module model.
+Use [Plugin Runtime](../targets/systems/plugin-runtime.md), [Input And Keyboard Shortcuts](../targets/systems/input-shortcuts.md), [Layout Actor](../targets/systems/layout-actor.md), and [Plugin UI And Pane Rendering](../targets/systems/plugin-ui.md) for the current target. Use [WASM Integration](wasm-integration.md) only as historical context for the broader app and module model.
 
 This note scopes the first WASM API spike to workspace navigation, managed app launch, and keyboard shortcut handling. These are deliberately small because they already exist in the native prototype as focus commands, hosted app spawning, browser launch control, and normal-mode key handling.
 
 The goal is to prove the API boundary before embedding a full app model. WASM should request workspace commands and register command bindings; Brood should execute those requests through the same session process paths used by native input and control commands.
 
-The current execution split is documented in [Plugin Runtime](../systems/plugin-runtime.md): actors provide public isolation and mailbox addressing, actor-scoped workers provide shared-memory concurrency and blocking-looking WASI, and bounded pre-commit policy hooks read immutable published state.
+The current execution split is documented in [Plugin Runtime](../targets/systems/plugin-runtime.md): actors provide public isolation and mailbox addressing, actor-scoped workers provide shared-memory concurrency and blocking-looking WASI, and bounded pre-commit policy hooks read immutable published state.
 
 ## First Prototype Order
 

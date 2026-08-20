@@ -1,6 +1,6 @@
 #![allow(
     clippy::option_if_let_else,
-    reason = "tracked in issues.md: CLI command normalization still uses local option branching"
+    reason = "tracked in docs/frictions/structural-lint.md: CLI command normalization still uses local option branching"
 )]
 // TODO(lint-structure): move CLI/default resolution into typed helpers instead of ad hoc options.
 

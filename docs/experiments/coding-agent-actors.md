@@ -182,8 +182,8 @@ disconnect and reconnect the client, and attach a non-visual actor subscriber.
 
 Related:
 
-- [[../concepts/plugin]]
-- [[../systems/plugin-runtime]]
-- [[../systems/plugin-io-and-resources]]
-- [[../systems/plugin-ui]]
-- [[../systems/plugin-graphics]]
+- [[../targets/concepts/plugin]]
+- [[../targets/systems/plugin-runtime]]
+- [[../targets/systems/plugin-io-and-resources]]
+- [[../targets/systems/plugin-ui]]
+- [[../targets/systems/plugin-graphics]]

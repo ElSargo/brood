@@ -6,11 +6,11 @@ Brood apps are intended to be sandboxed, capability-scoped modules. WASM remains
 
 Use these current pages first:
 
-- [Plugin](../concepts/plugin.md)
-- [Plugin Runtime](../systems/plugin-runtime.md)
-- [Plugin UI And Pane Rendering](../systems/plugin-ui.md)
-- [Input And Keyboard Shortcuts](../systems/input-shortcuts.md)
-- [Layout Actor](../systems/layout-actor.md)
+- [Plugin](../targets/concepts/plugin.md)
+- [Plugin Runtime](../targets/systems/plugin-runtime.md)
+- [Plugin UI And Pane Rendering](../targets/systems/plugin-ui.md)
+- [Input And Keyboard Shortcuts](../targets/systems/input-shortcuts.md)
+- [Layout Actor](../targets/systems/layout-actor.md)
 
 Use the narrower archived WASM pages only for historical focused design notes:
 

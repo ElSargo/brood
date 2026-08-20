@@ -69,7 +69,7 @@ to the enclosing local, containerized, or remote session environment.
   execution contract.
 
 The detailed resource and scheduling contract is specified in
-[[../systems/plugin-io-and-resources]].
+[[../targets/systems/plugin-io-and-resources]].
 
 ## Verification Requirement
 

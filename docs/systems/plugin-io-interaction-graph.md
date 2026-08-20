@@ -118,4 +118,4 @@ caller sends a bounded actor message
 ```
 
 The target contract and lifecycle rules are specified in
-[[plugin-io-and-resources]].
+[[../targets/systems/plugin-io-and-resources]].

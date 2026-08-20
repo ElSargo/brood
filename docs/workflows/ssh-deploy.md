@@ -73,6 +73,6 @@ Exact command options and parser behavior are defined by
 
 Related:
 
-- [[../systems/artifact-distribution]]
-- [[../systems/presentation-transport]]
+- [[../targets/systems/artifact-distribution]]
+- [[../targets/systems/presentation-transport]]
 - [[develop-with-nix]]

@@ -6,7 +6,7 @@
     clippy::option_if_let_else,
     clippy::too_many_arguments,
     clippy::unnecessary_wraps,
-    reason = "tracked in issues.md: DBus waits still cross the compositor actor boundary"
+    reason = "tracked in docs/frictions/structural-lint.md: DBus waits still cross the compositor actor boundary"
 )]
 // TODO(lint-structure): separate the DBus proxy ABI from compositor state dispatch.
 

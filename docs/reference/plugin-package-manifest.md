@@ -1,5 +1,5 @@
 ---
-status: target
+status: current
 type: reference
 authority: implementation
 code-links:
@@ -31,11 +31,11 @@ Package assembly consumes the validated installation order, installs every
 artifact at its placement, and records the manifest and root placement beside
 the artifacts. The Nix build validates Component Model artifacts before this
 assembly step and gives the resulting package tree a content-addressed store
-path. A portable package digest and kind inspection in the assembler remain
-part of the target resolver boundary. Runtime configuration resolves a package
-identity to the declared root. Capability declarations feed the host grant
-policy; they are not ambient permissions or a substitute for runtime
-enforcement.
+path. Runtime configuration resolves a package identity to the declared root.
+Capability declarations feed the host grant policy; they are not ambient
+permissions or a substitute for runtime enforcement. The missing portable
+package digest and assembler kind inspection are tracked as a design friction
+instead of being presented as implemented reference behavior.
 
 The default-client manifest is the first integrated package. Nix assembles its
 root and members under `packages/org.brood.default-client`, and the packaged

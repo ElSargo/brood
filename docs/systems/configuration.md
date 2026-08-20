@@ -116,5 +116,5 @@ entry can acquire viewport placement.
 
 - [[../reference/config-schema]]
 - [[runtime]]
-- [[plugin-runtime]]
+- [[../targets/systems/plugin-runtime]]
 - [[../concepts/session-runner]]

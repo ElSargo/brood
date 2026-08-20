@@ -76,4 +76,4 @@ Related:
 - [[layout-actor]]
 - [[plugin-ui]]
 - [[terminal-plugin]]
-- [[../experiments/coding-agent-actors]]
+- [[../../experiments/coding-agent-actors]]

@@ -61,4 +61,4 @@ Related:
 
 - [[../systems/testing]]
 - [[../systems/wayland-compositor]]
-- [[../systems/terminal-plugin]]
+- [[../targets/systems/terminal-plugin]]

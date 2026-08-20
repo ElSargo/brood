@@ -276,5 +276,5 @@ Related:
 - [[../concepts/plugin]]
 - [[plugin-runtime]]
 - [[layout-actor]]
-- [[extension-host]]
-- [[../reference/wasm-fast-lanes]]
+- [[../../systems/extension-host]]
+- [[../../reference/wasm-fast-lanes]]

@@ -191,4 +191,4 @@ Related:
 - [[plugin-runtime]]
 - [[input-shortcuts]]
 - [[presentation-client]]
-- [[../workflows/ssh-deploy]]
+- [[../../workflows/ssh-deploy]]

@@ -2,7 +2,7 @@
 status: experiment
 type: index
 authority: design
-last-reviewed: 2026-07-01
+last-reviewed: 2026-08-21
 ---
 
 # Experiments
@@ -14,13 +14,13 @@ Rules:
 - Mark current implementation facts explicitly.
 - Prefer links to canonical concepts for shared terminology.
 - Move abandoned experiments to `docs/archive/`.
-- Promote accepted design into canonical or current system pages.
+- Promote accepted designs into `docs/targets/`.
+- Move completed experiment evidence into `docs/progress/`.
+- Record design-level mismatches in `docs/frictions/`.
 
 Active experiments:
 
 - [[coding-agent-actors]] — independently addressed coding agents with a
   separate subscribing presentation UI.
-- [[network-carrier-latency]] — concurrent QUIC stream, QUIC DATAGRAM, and raw
-  UDP latency comparison.
-- [[terminal-latency-spike-profile]] — sequence-correlated remote terminal
-  latency attribution under interactive and burst input.
+- [[session-switcher-ui]] — guest-owned shell UI built from canvas packets,
+  native text, pane input, commands, and actor lifecycle.

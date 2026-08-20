@@ -70,9 +70,9 @@ client into the server process.
 
 ## Related Pages
 
-- [[presentation-client]]
-- [[layout-actor]]
-- [[input-shortcuts]]
+- [[../targets/systems/presentation-client]]
+- [[../targets/systems/layout-actor]]
+- [[../targets/systems/input-shortcuts]]
 - [[configuration]]
 - [[testing]]
 - [[../workflows/run-brood]]

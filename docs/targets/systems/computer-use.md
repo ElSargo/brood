@@ -351,4 +351,4 @@ application-visible state, and screenshots. Unit tests are appropriate for
 schemas, transforms, state machines, and sandbox limits, but they do not replace
 a nested end-to-end proof.
 
-The implementation tracker is [[../workflows/computer-use-tracker]].
+The implementation tracker is [[../../progress/computer-use]].

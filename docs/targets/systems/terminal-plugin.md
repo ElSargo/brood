@@ -97,20 +97,15 @@ resources. It does not stop the session actor or its shell. A replacement
 presentation actor attaches to the existing session actor and receives a
 complete current revision.
 
-The current reconnect bootstrap reconstructs the boot terminal pair only.
-Shortcut-created session actors still survive a presentation disconnect, but
-remain headless after reconnect. Replaying a session-init terminal inventory to
-the replacement client init actor is the remaining lifecycle step; process
-ownership must not be moved into the client to avoid it.
-
-The PTY remains actor-generation-owned today. Replacing the session actor
-therefore tears down its child and streams. Surviving session-actor replacement
-requires the explicitly supervised session-resource promotion described in
-[[plugin-io-and-resources]], not detached processes or host-owned emulation.
+The session publishes its complete terminal inventory to replacement client
+init. Session-resource supervision keeps each PTY and stream alive across actor
+replacement. Reattachment uses the promotion contract in
+[[plugin-io-and-resources]]; it must not move process ownership or terminal
+emulation into the client.
 
 ## Product Gaps And Required General Primitives
 
-The terminal workload exposes these remaining general host gaps:
+The terminal product requires these general host primitives:
 
 - Clipboard access needs a focus- and lease-checked text clipboard capability.
   Selection and copy/paste stay in the guest; the host only bridges the
@@ -124,21 +119,19 @@ The terminal workload exposes these remaining general host gaps:
 - Optional OSC title and bell integration needs constrained pane metadata and
   attention requests. It does not justify exposing native window objects.
 
-The checked-in terminal currently receives committed text but not an IME
-preedit lifecycle, has no clipboard bridge, and launches the configured
-allowlisted `sh`. Those limits materially affect daily terminal use and are the
-next reusable interfaces to close.
-
 ## Acceptance
 
-The built-in Nix-backed nested proof drives a real presentation client and PTY.
-It verifies shell interaction, ANSI styles and Unicode, exact function and
+Acceptance uses the built-in Nix-backed nested proof with a real presentation
+client and PTY. It verifies shell interaction, ANSI styles and Unicode, exact function and
 modified-key bytes, application-cursor negotiation, Helix, alternate-screen
 resize, scrollback navigation, presentation replacement, a real managed Ghostty
 descendant, sustained output, real `Ctrl+Alt+T` creation of a fresh paired
 terminal, child exit, and zero leaked runtime or text resources. It captures
 screenshots and structured latency, mailbox, stream, packet, and text-churn
 metrics.
+
+Implementation evidence is in [[../../progress/terminal-plugin]]. Unresolved
+design-level mismatches are in [[../../frictions/terminal-plugin]].
 
 Related:
 
@@ -148,4 +141,4 @@ Related:
 - [[plugin-graphics]]
 - [[presentation-client]]
 - [[editor-plugin]]
-- [[../workflows/test-nested]]
+- [[../../workflows/test-nested]]

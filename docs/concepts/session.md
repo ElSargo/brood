@@ -57,6 +57,6 @@ Related:
 - [[workspace]]
 - [[project]]
 - [[pane]]
-- [[plugin]]
+- [[../targets/concepts/plugin]]
 - [[session-runner]]
 - [[../systems/runtime]]

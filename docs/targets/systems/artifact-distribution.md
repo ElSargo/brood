@@ -122,7 +122,7 @@ SSH hydration is a bootstrap workflow built on this mechanism:
 
 The copied bootstrap is replaceable infrastructure, not the source of plugin
 authority. Once connected, content-addressed transfer avoids resending cached
-artifacts. The implemented operator workflow is [[../workflows/ssh-deploy]].
+artifacts. The implemented operator workflow is [[../../workflows/ssh-deploy]].
 
 Browser hydration uses the opposite placement: the backend offers approved
 client-realm WASM to a blank browser runtime. Native, browser, SSH, container,
@@ -163,4 +163,4 @@ cover bounds and lane routing but are not sufficient behavior proof.
 - [[presentation-transport]]
 - [[presentation-client]]
 - [[plugin-runtime]]
-- [[extension-host]]
+- [[../../systems/extension-host]]

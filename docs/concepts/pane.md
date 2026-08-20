@@ -22,11 +22,11 @@ The host owns pane chrome, lifecycle, focus integration, and recovery UI. A plug
 
 Related:
 
-- [[plugin]]
+- [[../targets/concepts/plugin]]
 - [[managed-app]]
 - [[presentation-surface]]
-- [[../systems/presentation-client]]
-- [[../systems/plugin-ui]]
-- [[../systems/plugin-graphics]]
-- [[../systems/plugin-advanced-graphics]]
+- [[../targets/systems/presentation-client]]
+- [[../targets/systems/plugin-ui]]
+- [[../targets/systems/plugin-graphics]]
+- [[../targets/systems/plugin-advanced-graphics]]
 - [[../systems/wayland-compositor]]

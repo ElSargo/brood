@@ -9,7 +9,7 @@ last-reviewed: 2026-07-21
 
 This experiment proves that a useful native-feeling plugin interface can be
 built from guest-side SDK components which emit the base canvas packets in
-[[../systems/plugin-graphics]]. It does not define or test a host-rendered
+[[../targets/systems/plugin-graphics]]. It does not define or test a host-rendered
 component tree.
 
 ## Goal
@@ -106,7 +106,7 @@ Actor -> Client: SubmitDrawPacket / RequestFrame / CommandRequest / Status
 ```
 
 The canvas packet is copied and atomically accepted according to
-[[../systems/plugin-graphics]]. Guest component trees and caches remain private
+[[../targets/systems/plugin-graphics]]. Guest component trees and caches remain private
 and may be mutated after submission.
 
 ## SDK Surface Under Test
@@ -201,8 +201,8 @@ protocol.
 
 Related:
 
-- [[../systems/plugin-ui]]
-- [[../systems/plugin-graphics]]
-- [[../systems/plugin-advanced-graphics]]
-- [[../systems/plugin-runtime]]
-- [[../systems/input-shortcuts]]
+- [[../targets/systems/plugin-ui]]
+- [[../targets/systems/plugin-graphics]]
+- [[../targets/systems/plugin-advanced-graphics]]
+- [[../targets/systems/plugin-runtime]]
+- [[../targets/systems/input-shortcuts]]

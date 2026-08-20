@@ -1,4 +1,10 @@
-# Picker actor
+---
+status: current
+type: system
+authority: implementation
+---
+
+# Picker Actor
 
 The presentation realm exposes one reusable actor at the stable local address
 `picker`. It owns a native plugin pane, fuzzy matching, keyboard and pointer
@@ -129,4 +135,4 @@ and selection identity. The nested picker workload builds the real component,
 opens it through the default key policy, sends real text and key input, and
 checks the resulting session activation and presentation metrics.
 
-See also [[layout-actor]], [[plugin-ui]], and [[input-shortcuts]].
+See also [[../targets/systems/layout-actor]], [[../targets/systems/plugin-ui]], and [[../targets/systems/input-shortcuts]].

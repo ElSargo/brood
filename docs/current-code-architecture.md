@@ -57,7 +57,7 @@ messages addressed to either a daemon or session realm; product actors do not
 use DBus to message one another. DMA-BUF is the preferred per-window image
 transport; copied images remain a correctness fallback. Remote endpoints carry
 the same semantic protocol over independent QUIC streams and use encoded
-network-frame resources. See [[systems/presentation-transport]].
+network-frame resources. See [[targets/systems/presentation-transport]].
 
 The client connection registry owns stable backend identities and connection
 generations. Replacing a generation invalidates its pane input routes before a
@@ -153,7 +153,7 @@ The primary graphical proofs are:
 
 - [[architecture]]
 - [[systems/runtime]]
-- [[systems/presentation-client]]
-- [[systems/layout-actor]]
-- [[systems/input-shortcuts]]
+- [[targets/systems/presentation-client]]
+- [[targets/systems/layout-actor]]
+- [[targets/systems/input-shortcuts]]
 - [[systems/testing]]

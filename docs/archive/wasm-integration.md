@@ -1,6 +1,6 @@
 # WASM Integration
 
-This archived page was an earlier WASM design-target document. The current target plugin architecture is documented in [Plugin](../concepts/plugin.md), [Plugin Runtime](../systems/plugin-runtime.md), [Input And Keyboard Shortcuts](../systems/input-shortcuts.md), [Layout Actor](../systems/layout-actor.md), and [Plugin UI And Pane Rendering](../systems/plugin-ui.md).
+This archived page was an earlier WASM design-target document. The current target plugin architecture is documented in [Plugin](../targets/concepts/plugin.md), [Plugin Runtime](../targets/systems/plugin-runtime.md), [Input And Keyboard Shortcuts](../targets/systems/input-shortcuts.md), [Layout Actor](../targets/systems/layout-actor.md), and [Plugin UI And Pane Rendering](../targets/systems/plugin-ui.md).
 
 It describes the intended Brood app and module model as historical context, not a promise that every interface or command described here exists today. Mention current implementation details only when they affect usability.
 
@@ -34,13 +34,13 @@ This means the first useful milestone is not the WASM runtime itself. The first 
 
 The runtime then becomes an adapter over this model. Linux-native `brood` can host the runtime in-process at first, while later backend work can satisfy the same behavior through protocol-facing session processes or backend-specific adapters if needed.
 
-The execution model is now promoted into the target [Plugin Runtime](../systems/plugin-runtime.md). In short, Brood keeps the session process authoritative, uses actors as public mailbox and isolation domains, uses actor-scoped workers for shared-memory concurrency and blocking-looking WASI, and reserves policy providers for bounded pre-commit policy hooks that read immutable published state.
+The execution model is now promoted into the target [Plugin Runtime](../targets/systems/plugin-runtime.md). In short, Brood keeps the session process authoritative, uses actors as public mailbox and isolation domains, uses actor-scoped workers for shared-memory concurrency and blocking-looking WASI, and reserves policy providers for bounded pre-commit policy hooks that read immutable published state.
 
-The layout boundary is now defined in [Layout Actor](../systems/layout-actor.md). In short, the host sends state through an ordinary actor mailbox, the actor returns candidate resolved layout items through its ordinary host outbox, and the native host validates those items and owns rendering, hit testing, focus, input delivery, and fallback behavior.
+The layout boundary is now defined in [Layout Actor](../targets/systems/layout-actor.md). In short, the host sends state through an ordinary actor mailbox, the actor returns candidate resolved layout items through its ordinary host outbox, and the native host validates those items and owns rendering, hit testing, focus, input delivery, and fallback behavior.
 
 The realm binding and lifetime model is recorded in [WASM Realms](wasm-realms.md). In short, modules should target `global`, `session`, or `surface` realms, with mostly shared host APIs plus realm-local convenience bindings and lifetimes.
 
-The current UI experiment is recorded in [Session Switcher UI Experiment](../experiments/session-switcher-ui.md), with the target boundary summarized in [Plugin UI And Pane Rendering](../systems/plugin-ui.md). In short, components are guest SDK functions which emit canvas draw packets; the presentation client validates and renders the canvas without implementing a component ABI.
+The current UI experiment is recorded in [Session Switcher UI Experiment](../experiments/session-switcher-ui.md), with the target boundary summarized in [Plugin UI And Pane Rendering](../targets/systems/plugin-ui.md). In short, components are guest SDK functions which emit canvas draw packets; the presentation client validates and renders the canvas without implementing a component ABI.
 
 The entered session environment model is recorded in [Session Environments](session-environments.md). In short, `brood enter` should bind shells, commands, GUI apps, agents, and optional filesystem/network/DBus isolation layers to one session context.
 
@@ -173,7 +173,7 @@ Examples:
 
 Event delivery should have backpressure and diagnostics. Slow modules should be visible in status output and logs.
 
-Event delivery belongs to the async actor/mailbox lane. Latency-sensitive decisions that must happen before a workspace transaction commits should use the bounded policy provider described in [Plugin Runtime](../systems/plugin-runtime.md).
+Event delivery belongs to the async actor/mailbox lane. Latency-sensitive decisions that must happen before a workspace transaction commits should use the bounded policy provider described in [Plugin Runtime](../targets/systems/plugin-runtime.md).
 
 Realm-local events should be easy:
 

@@ -357,5 +357,5 @@ Related:
 - [[presentation-client]]
 - [[plugin-runtime]]
 - [[plugin-io-and-resources]]
-- [[../concepts/pane]]
+- [[../../concepts/pane]]
 - [[../concepts/plugin]]

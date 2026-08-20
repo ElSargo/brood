@@ -1,5 +1,5 @@
 ---
-status: canonical
+status: target
 type: system
 security-boundary: mixed
 runtime-boundary: process-and-network
@@ -298,17 +298,6 @@ internals.
 
 See [[terminal-plugin]].
 
-### Current ownership limit
-
-The bundled vertical slice survives presentation disconnect and replacement,
-because the PTY belongs to the session-side actor generation. PTY resources are
-not yet promoted to a separately supervised session-scoped owner, so replacing
-or stopping that session actor generation still tears down its shell. Durable
-reattachment across session-actor replacement requires the explicit
-session-resource promotion described in [[plugin-io-and-resources]]; the public
-PTY and snapshot interfaces are shaped so that promotion does not move terminal
-emulation into the host.
-
 ## Rendering
 
 WGPU is the only final presentation renderer. Native and web shells adapt
@@ -378,10 +367,11 @@ The following remain open without changing the ownership model:
 
 ## Related Pages
 
-- [[runtime]]
+- [[../../systems/runtime]]
 - [[layout-actor]]
 - [[input-shortcuts]]
 - [[plugin-runtime]]
 - [[plugin-ui]]
 - [[plugin-graphics]]
-- [[testing]]
+- [[../../systems/testing]]
+- [[../../frictions/terminal-plugin]]

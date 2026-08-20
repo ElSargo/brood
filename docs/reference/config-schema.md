@@ -62,4 +62,4 @@ Related:
 
 - [[../systems/configuration]]
 - [[wasm-fast-lanes]]
-- [[../systems/plugin-runtime]]
+- [[../targets/systems/plugin-runtime]]

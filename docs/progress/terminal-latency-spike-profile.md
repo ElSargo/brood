@@ -1,6 +1,6 @@
 ---
-status: current-evidence
-type: experiment
+status: progress
+type: evidence
 authority: verification
 last-reviewed: 2026-07-28
 ---

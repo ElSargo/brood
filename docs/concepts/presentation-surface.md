@@ -22,7 +22,7 @@ layout may place an available window immediately; the client shows a
 placeholder until that window's frame is mapped. One presentation lease holder
 controls hosted Wayland sizing and primary application input. The session
 server has no in-process presentation endpoint. See
-[[../systems/presentation-client]].
+[[../targets/systems/presentation-client]].
 
 Presentation state is not pane state. A presentation surface may save layout or visibility preferences locally or explicitly coordinate them into session storage, but the pane remains owned by its producer or session state.
 
@@ -32,9 +32,9 @@ Related:
 
 - [[session]]
 - [[pane]]
-- [[../systems/presentation-client]]
-- [[../systems/layout-actor]]
-- [[../systems/input-shortcuts]]
-- [[../systems/plugin-ui]]
+- [[../targets/systems/presentation-client]]
+- [[../targets/systems/layout-actor]]
+- [[../targets/systems/input-shortcuts]]
+- [[../targets/systems/plugin-ui]]
 - [[../systems/runtime]]
 - [[../systems/wayland-compositor]]

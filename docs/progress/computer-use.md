@@ -1,13 +1,13 @@
 ---
-status: target
-type: workflow
+status: progress
+type: implementation-log
 authority: implementation
 last-reviewed: 2026-08-18
 ---
 
 # Computer Use Implementation Tracker
 
-This page tracks delivery of [[../systems/computer-use]]. It records completed
+This page tracks delivery of [[../targets/systems/computer-use]]. It records completed
 work only when there is code and proportionate verification evidence.
 
 ## Project state
@@ -200,7 +200,7 @@ design or test workload.
 
 | Date | Phase | Commit | Real workload | Artifacts and metrics | Result |
 | --- | --- | --- | --- | --- | --- |
-| 2026-08-17 | 0 | working tree | Design and tracker setup | [[../systems/computer-use]] | Plan recorded; implementation not started |
+| 2026-08-17 | 0 | working tree | Design and tracker setup | [[../targets/systems/computer-use]] | Plan recorded; implementation not started |
 | 2026-08-17 | 0 | working tree | Provider-free lifecycle and schema suite | `cargo test -p brood-computer-use`: 6 passed; `cargo clippy -p brood-computer-use --all-targets -- -D warnings`; Nix unavailable | Contract implemented; full `broodd` check blocked by missing host Wayland pkg-config metadata |
 | 2026-08-17 | 0 | working tree | Nix-backed inherited-work verification | `cargo fmt --all -- --check`; 6 contract tests; crate clippy with warnings denied; `cargo check -p broodd` | Passed; previous environment limitation did not reproduce under the flake |
 | 2026-08-17 | 1 | working tree | Detached `weston-simple-shm`, first attempt | `/tmp/brood-computer-use-phase1c`; two 1440x900 PNGs were captured but their hashes matched | Failed: automation did not independently issue frame callbacks, so changing client content stopped |

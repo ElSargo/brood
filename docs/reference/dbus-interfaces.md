@@ -25,4 +25,4 @@ Related:
 
 - [[../systems/dbus-control]]
 - [[../systems/extension-host]]
-- [[../systems/plugin-runtime]]
+- [[../targets/systems/plugin-runtime]]

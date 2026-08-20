@@ -1,3 +1,9 @@
+---
+status: progress
+type: evidence
+authority: verification
+---
+
 # Network Carrier Latency Experiment
 
 This experiment determines whether latency-sensitive remote messages should use

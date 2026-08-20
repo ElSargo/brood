@@ -3,7 +3,25 @@
 
 ## Documentation
 
-Document the target design by default, not the current implementation snapshot.
+Keep target design, implementation history, and design friction separate:
+
+- `docs/targets/` is the authoritative description of the state Brood is
+  working towards. Do not modify a target document as a side effect of
+  implementation work. Change it only when the task intentionally records a
+  new design target or updates an existing target. A mismatch between code and
+  a target is not, by itself, permission to rewrite the target.
+- `docs/progress/` is implementation working memory. Record milestones,
+  verification evidence, failed approaches, temporary constraints, and other
+  developments worth preserving there. Progress notes may be updated during
+  implementation and must not silently redefine a target.
+- `docs/frictions/` records potential oversights, mismatches, unresolved
+  tradeoffs, and recurring friction that require design-level attention. Record
+  the tension and evidence without choosing a new target unless the task also
+  authorizes that design decision.
+
+Document the target design by default when the task is design work. During
+implementation, preserve observations in progress or friction notes instead of
+editing the target to match the code.
 
 Only describe the current state when it materially affects usability, operator workflow, or verification.
 
@@ -15,7 +33,7 @@ Prefer the checked-in Nix flake for builds, checks, and behavior-test commands. 
 
 ## Testing
 
-This repo is in a highly volitile and experimental state. Existing tests are to be questioned rather than trusted. If a test enforces a behavior that goes against the intention of the request, or it is anyway not fit for purpose, modify or remove it.
+This repo is in a highly volatile and experimental state. Existing tests are to be questioned rather than trusted. If a test enforces a behavior that goes against the intention of the request, or it is otherwise not fit for purpose, modify or remove it.
 Bad tests are worse than no tests.
 
 Whenever possible prefer to test the changes with a "real" workload. Open the real app and send real keystrokes, clicks and scrolls and record metrics from the nested client as well as broodd. Use screenshots to verify any graphical changes.

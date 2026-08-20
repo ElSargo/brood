@@ -2,12 +2,14 @@
 status: canonical
 type: index
 authority: documentation
-last-reviewed: 2026-07-24
+last-reviewed: 2026-08-21
 ---
 
 # Brood Knowledge Base
 
-This directory is organized as a wiki-style knowledge base. Pages are grouped by reader intent and marked with `status` frontmatter so current behavior, target design, experiments, and historical notes are not confused.
+This directory is organized by the role a document plays. Target design,
+implementation history, and unresolved design friction are kept in separate
+directories so implementation work does not silently rewrite product goals.
 
 ## Start Here
 
@@ -23,33 +25,14 @@ This directory is organized as a wiki-style knowledge base. Pages are grouped by
 - [[systems/dbus-control]] describes the DBus control surfaces.
 - [[systems/wayland-compositor]] describes the nested Wayland compositor path.
 - [[systems/extension-host]] describes current WASM and extension lanes.
+- [[systems/picker-actor]] describes the implemented reusable picker actor.
 
 ## Target Design
 
-- [[systems/presentation-client]] specifies the independent portable presentation client, session lease, window frame subscriptions, client-side WASM runtime, recursive layout, WGPU renderer, and transports.
-- [[systems/presentation-transport]] defines the transport-neutral protocol,
-  capability-selected local and network carriers, and frame-resource profiles.
-- [[systems/artifact-distribution]] defines symmetric, content-addressed WASM
-  hydration between client and session realms.
-- [[systems/plugin-runtime]] defines plugin trust, actors, actor-scoped workers,
-  policy providers, publications, and session isolation.
-- [[systems/plugin-io-and-resources]] specifies completions, notifications,
-  worker select, external resources, scopes, shutdown, and diagnostics.
-- [[systems/input-shortcuts]] describes host-owned shortcut routing with privileged sync key policy.
-- [[systems/layout-actor]] describes actor-driven layout updates and host-validated resolved layouts.
-- [[systems/picker-actor]] defines the reusable queued fuzzy picker actor and its mailbox protocol.
-- [[systems/plugin-ui]] describes guest-side SDK components, pane input, native chrome, and canvas rendering.
-- [[systems/plugin-graphics]] specifies the base canvas draw-packet, native text, resource, submission, and replay contract.
-- [[systems/plugin-advanced-graphics]] records the separate future protocol direction for user geometry, shaders, pipelines, and other GPU-style facilities.
-- [[systems/terminal-plugin]] defines the bundled first-party terminal product, its guest-owned architecture, and the reusable host gaps exposed by the workload.
-- [[systems/editor-plugin]] defines the client-local Wasm Neovim editor, its
-  remote backend file actor, and its bounded bidirectional actor-message
-  bridge.
-- [[systems/inbox-plugin]] defines the persistent client-global notification
-  queue and click-to-source actor routing.
-- [[systems/computer-use]] defines server-side observation, direct actions,
-  persistent code execution, leases, and semantic automation for applications
-  hosted inside Brood sessions.
+- [[targets/README]] indexes accepted product and architecture targets.
+- Target pages describe the desired state even when implementation is behind.
+- Active proposals remain in [[experiments/README]] until design work accepts
+  them as targets.
 
 ## Core Concepts
 
@@ -59,7 +42,7 @@ This directory is organized as a wiki-style knowledge base. Pages are grouped by
 - [[concepts/presentation-surface]]
 - [[concepts/managed-app]]
 - [[concepts/session-runner]]
-- [[concepts/plugin]]
+- [[targets/concepts/plugin]]
 - [[concepts/wasm-controller]]
 
 ## Workflows
@@ -71,8 +54,12 @@ This directory is organized as a wiki-style knowledge base. Pages are grouped by
 - [[workflows/test-nested]]
 - [[workflows/develop-with-nix]]
 - [[workflows/build-wasm-examples]]
-- [[workflows/computer-use-tracker]] tracks implementation phases, gates,
-  decisions, open items, and verification evidence.
+
+## Working Records
+
+- [[progress/README]] contains implementation milestones and evidence.
+- [[frictions/README]] contains unresolved design-level mismatches and
+  oversights.
 
 ## Reference
 
@@ -81,7 +68,7 @@ This directory is organized as a wiki-style knowledge base. Pages are grouped by
 - [[reference/dbus-interfaces]]
 - [[reference/wasm-fast-lanes]]
 
-## Non-Canonical Areas
+## Other Areas
 
 - [[experiments/README]] contains active design experiments.
 - [[archive/README]] contains historical design notes and older prototypes.
@@ -93,4 +80,6 @@ This directory is organized as a wiki-style knowledge base. Pages are grouped by
 - `current`: describes checked-in implementation behavior.
 - `target`: describes intended direction that may not exist yet.
 - `experiment`: describes active exploration.
+- `progress`: records implementation history or verification evidence.
+- `friction`: records unresolved input for design work.
 - `archive`: historical context, not authoritative for current behavior.
