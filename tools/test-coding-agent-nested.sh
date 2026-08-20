@@ -7,6 +7,7 @@ cd "$ROOT"
 SSH_TARGET="${BROOD_CODING_AGENT_SSH_TARGET:-}"
 COMPUTER_USE="${BROOD_CODING_AGENT_COMPUTER_USE:-}"
 CREATE_AGENT_ONLY="${BROOD_CODING_AGENT_CREATE_ONLY:-}"
+STYLE_ONLY="${BROOD_CODING_AGENT_STYLE_ONLY:-}"
 REMOTE_IMAGE_MARKER="REMOTE_IMAGE_PROOF: red green"
 FIRST_CU_MARKER="BROOD_BUILTIN_CU_FIRST_OK"
 SECOND_CU_MARKER="BROOD_BUILTIN_CU_SECOND_OK"
@@ -36,12 +37,33 @@ CLIENT_LOG="$OUT/client.log"
 CONFIG="$OUT/brood.toml"
 SWAY_CONFIG="$OUT/sway.conf"
 DBUS_DESTINATION="org.brood.CodingAgentTest.p$$"
-mkdir -p "$PACKAGE" "$WORKSPACE/.brood" "$RUNTIME_DIR"
+mkdir -p "$PACKAGE" "$WORKSPACE/.brood" "$RUNTIME_DIR" "$OUT/bin"
 if [[ -n "$COMPUTER_USE" ]]; then
   mkdir -p "$OUT/xdg-config" "$OUT/xdg-data"
 fi
 chmod 700 "$RUNTIME_DIR"
 git -C "$WORKSPACE" init -q
+
+if [[ -n "$STYLE_ONLY" ]]; then
+  cat > "$OUT/bin/brood-agent" <<'EOF'
+#!/usr/bin/env python3
+import json
+import sys
+
+request = json.load(sys.stdin)
+events = [
+    {"type": "reasoning", "text": "Planning a concise visual response"},
+    {"type": "tool_start", "tool": "brood_computer_use__computer_observe"},
+    {"type": "tool_end", "tool": "brood_computer_use__computer_observe", "text": "Captured the active application and verified the requested state.", "is_error": False},
+    {"type": "assistant", "text": "# Agent pane review\n\nThe pane now treats conversation output as a readable document instead of a stream of clipped status lines. Long sentences wrap naturally at the card edge, so narrow panes remain useful without horizontal scrolling.\n\n## What changed\n\n- **Readable chat cards** keep user prompts, agent replies, and errors visually distinct.\n- Tool activity has a dedicated surface with clear progress and completion states.\n- Search highlights matching cards and moves directly between results.\n\n> The conversation stays scrollable while new output arrives; tail following resumes when you return to the bottom.\n\n```rust\nlet verification = PaneQuality::Polished;\nassert!(verification.is_visible());\n```\n\n## Verification notes\n\nThis intentionally long final paragraph exercises proper word wrapping across several visual lines. It also provides enough transcript height to prove wheel scrolling and the draggable scrollbar without relying on a live provider response or timing-sensitive network activity."},
+    {"type": "status", "text": "Visual verification complete"},
+    {"type": "result", "history": [{"user": request.get("prompt", ""), "assistant": "Visual verification complete"}]},
+]
+for event in events:
+    print(json.dumps(event), flush=True)
+EOF
+  chmod +x "$OUT/bin/brood-agent"
+fi
 
 CLIENT_PID=""
 SERVER_PID=""
@@ -156,6 +178,14 @@ cc \
   tools/virtual-keyboard-key.c \
   -o "$OUT/virtual-keyboard-key" \
   "${WAYLAND_BUILD_FLAGS[@]}"
+cc \
+  -std=c11 \
+  -Wall \
+  -Wextra \
+  -Werror \
+  tools/virtual-pointer-input.c \
+  -o "$OUT/virtual-pointer-input" \
+  "${WAYLAND_BUILD_FLAGS[@]}"
 VIRTUAL_POINTER_XML="$(
   pkg-config --variable=pkgdatadir wlr-protocols
 )/unstable/wlr-virtual-pointer-unstable-v1.xml"
@@ -213,7 +243,7 @@ fi
   cd "$WORKSPACE"
   env -u brood_session \
     "${SERVER_PROCESS_ENV[@]}" \
-    PATH="$ROOT/tools:$ROOT/target/debug:$PATH" \
+    PATH="$OUT/bin:$ROOT/tools:$ROOT/target/debug:$PATH" \
     BROOD_AGENT_REQUIRE_DBUS_FREE="${COMPUTER_USE:+1}" \
     RUST_LOG="$RUST_LOG" \
     "$ROOT/target/debug/brood-sessiond" \
@@ -348,7 +378,8 @@ fi
 # the real global shortcut. The rest of this proof continues through real
 # pointer and keyboard input inside the picker and agent UI.
 REQUIRED_LAYOUT_COMMITS=2
-[[ -z "$COMPUTER_USE" && -z "$CREATE_AGENT_ONLY" ]] || REQUIRED_LAYOUT_COMMITS=1
+[[ -z "$COMPUTER_USE" && -z "$CREATE_AGENT_ONLY" && -z "$STYLE_ONLY" ]] \
+  || REQUIRED_LAYOUT_COMMITS=1
 for _ in $(seq 1 300); do
   if [[ "$(rg -a -c 'presented committed layout revision' "$CLIENT_LOG" || true)" -ge "$REQUIRED_LAYOUT_COMMITS" ]]; then
     break
@@ -507,6 +538,112 @@ capture() {
 }
 
 capture "$OUT/agent-idle.png"
+
+if [[ -n "$STYLE_ONLY" ]]; then
+  focus_agent_prompt
+  env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+    WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+    "$OUT/virtual-keyboard-key" --text "Review the agent pane visual desgn"
+  env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+    WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+    "$OUT/virtual-keyboard-key" --none 105
+  env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+    WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+    "$OUT/virtual-keyboard-key" --none 105
+  env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+    WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+    "$OUT/virtual-keyboard-key" --text "i"
+  sleep 0.2
+  capture "$OUT/agent-editor.png"
+  env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+    WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+    "$OUT/virtual-keyboard-key" --none 28
+  for _ in $(seq 1 300); do
+    if rg -q '"text":"Visual verification complete"' "$CLIENT_LOG" \
+      && rg -q '"log_kind":"tool"' "$CLIENT_LOG"; then
+      break
+    fi
+    kill -0 "$CLIENT_PID"
+    sleep 0.1
+  done
+  rg -q '"text":"Visual verification complete"' "$CLIENT_LOG"
+  rg -q '"log_kind":"tool"' "$CLIENT_LOG"
+  rg -q '"prompt":"Review the agent pane visual design"' "$CLIENT_LOG"
+  # Text shaping and glyph upload are asynchronous. Wait for the completed
+  # transcript replacement to reach the renderer before judging its pixels.
+  sleep 1
+  capture "$OUT/agent-markdown.png"
+
+  env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+    WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+    "$OUT/virtual-pointer-input" scroll 240 330 -3 12 1280 720
+  sleep 0.3
+  capture "$OUT/agent-scrolled.png"
+
+  AGENT_WIDTH="$(
+    sed -n \
+      "s/.*accepted plugin draw packet pane=$AGENT_PANE .*gpu_target=\([0-9][0-9]*\)x.*/\1/p" \
+      "$CLIENT_LOG" \
+      | tail -1
+  )"
+  [[ "$AGENT_WIDTH" =~ ^[0-9]+$ ]]
+  click_at "$((AGENT_WIDTH - 60))" 20
+  env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+    WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+    "$OUT/virtual-keyboard-key" --text "verification"
+  sleep 0.3
+  capture "$OUT/agent-search.png"
+  if magick compare -metric RMSE "$OUT/agent-scrolled.png" "$OUT/agent-search.png" null: \
+    2> "$OUT/search-rmse.txt"; then
+    echo "ERR search did not change the rendered pane" >&2
+    exit 1
+  fi
+
+  env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+    WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+    "$OUT/virtual-keyboard-key" --none 1
+  env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+    WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+    "$OUT/virtual-keyboard-key" --none 60
+  for _ in $(seq 1 300); do
+    rg -q 'backend actor message .*"id":"coding-agent-2"' "$CLIENT_LOG" && break
+    sleep 0.1
+  done
+  rg -q 'backend actor message .*"id":"coding-agent-2"' "$CLIENT_LOG"
+  capture "$OUT/agent-tabs-before-drag.png"
+  env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+    WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+    "$OUT/virtual-pointer-input" drag 52 20 244 20 16 1280 720
+  sleep 0.3
+  capture "$OUT/agent-tabs-after-drag.png"
+
+  if magick compare -metric RMSE "$OUT/agent-markdown.png" "$OUT/agent-scrolled.png" null: \
+    2> "$OUT/scroll-rmse.txt"; then
+    echo "ERR scrolling did not change the rendered transcript" >&2
+    exit 1
+  fi
+  if magick compare -metric RMSE "$OUT/agent-tabs-before-drag.png" "$OUT/agent-tabs-after-drag.png" null: \
+    2> "$OUT/tab-drag-rmse.txt"; then
+    echo "ERR dragging did not change the rendered agent tabs" >&2
+    exit 1
+  fi
+  kill -0 "$CLIENT_PID"
+  cat > "$OUT/proof.md" <<EOF
+# Coding agent pane style proof
+
+- input: real Wayland text editing, cursor navigation, shortcut, wheel, and pointer-drag events
+- output: Markdown headings, list, quote, code block, status, and tool events crossed the normal agent stream
+- interaction: transcript scrolling, Ctrl+F search, and tab drag each changed the rendered pane
+- stability: the presentation client remained alive throughout the workload
+- captures: agent-idle.png, agent-editor.png, agent-markdown.png, agent-scrolled.png, agent-search.png, agent-tabs-before-drag.png, and agent-tabs-after-drag.png
+EOF
+  echo "coding_agent_style=verified"
+  echo "proof=$OUT/proof.md"
+  echo "markdown=$OUT/agent-markdown.png"
+  echo "search=$OUT/agent-search.png"
+  echo "tabs=$OUT/agent-tabs-after-drag.png"
+  exit 0
+fi
 
 if [[ -n "$CREATE_AGENT_ONLY" ]]; then
   env XDG_RUNTIME_DIR="$RUNTIME_DIR" \

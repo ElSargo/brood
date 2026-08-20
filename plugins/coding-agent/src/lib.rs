@@ -25,15 +25,21 @@ const INBOX_ID: &str = "inbox";
 const FIRST_AGENT: &str = "coding-agent-1";
 const WORKER_ID: u64 = 1;
 const UPDATE_NOTIFICATION_TOKEN: u64 = 0x434f_4445_5841_4745;
-const MAX_LOG_LINES: usize = 96;
+const MAX_LOG_LINES: usize = 256;
 const MAX_IMAGES: usize = 4;
 const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_TOTAL_IMAGE_BYTES: usize = 12 * 1024 * 1024;
 const IMAGE_CHUNK_BYTES: usize = 20 * 1024;
-const PROMPT_HEIGHT: f32 = 60.0;
+const HEADER_HEIGHT: f32 = 76.0;
+const PROMPT_HEIGHT: f32 = 92.0;
+const TRANSCRIPT_GAP: f32 = 10.0;
+const SCROLLBAR_WIDTH: f32 = 5.0;
+const SCROLLBAR_HIT_WIDTH: f32 = 18.0;
+const SEARCH_HEIGHT: f32 = 42.0;
 const IMAGE_TRAY_HEIGHT: f32 = 112.0;
 const IMAGE_TRAY_GAP: f32 = 8.0;
 const MOD_CTRL: u32 = 1;
+const MOD_SHIFT: u32 = 4;
 const FOCUS_MESSAGE: &[u8] = br#"{"kind":"focus"}"#;
 
 const BG: Color = ashen::BACKGROUND;
@@ -47,6 +53,10 @@ const YELLOW: Color = ashen::WARNING;
 const BLUE: Color = ashen::ACCENT;
 const GREEN: Color = ashen::INFO;
 const RED: Color = ashen::ERROR;
+const STRONG: Color = ashen::TEXT_STRONG;
+const BRIGHT: Color = ashen::TEXT_BRIGHT;
+const SUNKEN: Color = ashen::SURFACE_SUNKEN;
+const ACCENT_MUTED: Color = ashen::ACCENT_MUTED;
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
@@ -225,9 +235,24 @@ impl AgentView {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum UiTarget {
     AgentTab(usize),
+    NewAgent,
+    Search,
     Model,
     Reasoning,
     Send,
+    Prompt,
+}
+
+#[derive(Clone, Debug)]
+struct TabDrag {
+    agent: String,
+    start_x: f32,
+    moved: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ScrollbarDrag {
+    pointer_offset: f32,
 }
 
 struct UiState {
@@ -241,6 +266,21 @@ struct UiState {
     selected: usize,
     preferred_agent: Option<String>,
     prompt: String,
+    prompt_cursor: usize,
+    prompt_selection: Option<(usize, usize)>,
+    pane_focused: bool,
+    transcript_scroll: f32,
+    transcript_content_height: f32,
+    transcript_viewport_height: f32,
+    transcript_follow_tail: bool,
+    scrollbar_drag: Option<ScrollbarDrag>,
+    scrollbar_hovered: bool,
+    search_active: bool,
+    search_query: String,
+    search_cursor: usize,
+    search_match: usize,
+    search_reveal_pending: bool,
+    tab_drag: Option<TabDrag>,
     images: Vec<ImageAttachment>,
     image_previews: BTreeMap<u64, ImagePreview>,
     retired_image_previews: Vec<u64>,
@@ -272,6 +312,21 @@ impl UiState {
             selected: 0,
             preferred_agent: None,
             prompt: String::new(),
+            prompt_cursor: 0,
+            prompt_selection: None,
+            pane_focused: true,
+            transcript_scroll: 0.0,
+            transcript_content_height: 0.0,
+            transcript_viewport_height: 0.0,
+            transcript_follow_tail: true,
+            scrollbar_drag: None,
+            scrollbar_hovered: false,
+            search_active: false,
+            search_query: String::new(),
+            search_cursor: 0,
+            search_match: 0,
+            search_reveal_pending: false,
+            tab_drag: None,
             images: Vec::new(),
             image_previews: BTreeMap::new(),
             retired_image_previews: Vec::new(),
@@ -366,9 +421,7 @@ fn handle_lifecycle(event: LifecycleEvent) -> Vec<ActorCommand> {
         }
         LifecycleEvent::Start(context) if context.instance_id.contains(".coding-agent-") => {
             if let Ok(mut state) = STATE.lock() {
-                *state = RoleState::Agent(AgentState::new(
-                    context.session_id.unwrap_or_default(),
-                ));
+                *state = RoleState::Agent(AgentState::new(context.session_id.unwrap_or_default()));
             }
             vec![ActorCommand::LifecycleComplete(Ok(()))]
         }
@@ -1049,12 +1102,19 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
             ui.height = resized.height.max(360.0);
             ui.hovered = None;
             ui.pressed = None;
+            ui.scrollbar_drag = None;
+            ui.tab_drag = None;
             redraw_ui_for_resize(ui, resized.resize_epoch);
             return Vec::new();
         }
-        PresentationEvent::PaneFocused(focused) if focused.pane == ui.pane && !focused.focused => {
-            ui.hovered = None;
-            ui.pressed = None;
+        PresentationEvent::PaneFocused(focused) if focused.pane == ui.pane => {
+            ui.pane_focused = focused.focused;
+            if !focused.focused {
+                ui.hovered = None;
+                ui.pressed = None;
+                ui.scrollbar_drag = None;
+                ui.tab_drag = None;
+            }
             (Vec::new(), true)
         }
         PresentationEvent::Key(key) if key.pane == ui.pane => {
@@ -1069,7 +1129,18 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
                     | "F6"
                     | "F7"
                     | "Escape"
-            );
+                    | "ArrowLeft"
+                    | "ArrowRight"
+                    | "ArrowUp"
+                    | "ArrowDown"
+                    | "Home"
+                    | "End"
+                    | "Delete"
+                    | "PageUp"
+                    | "PageDown"
+            ) || (key.modifiers & MOD_CTRL != 0
+                && (key.logical_key.eq_ignore_ascii_case("f")
+                    || key.logical_key.eq_ignore_ascii_case("a")));
             (
                 handle_ui_key(ui, &key.logical_key, key.pressed, key.modifiers),
                 should_redraw,
@@ -1083,22 +1154,11 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
             {
                 return Vec::new();
             }
-            let mut commands = Vec::new();
-            for character in text.text.chars() {
-                if matches!(character, '\r' | '\n') {
-                    commands.extend(submit_prompt(ui));
-                } else if !character.is_control() {
-                    ui.prompt.push(character);
-                }
-            }
-            (commands, true)
+            insert_ui_text(ui, &text.text);
+            (Vec::new(), true)
         }
         PresentationEvent::Paste(paste) if paste.pane == ui.pane => {
-            ui.prompt.extend(
-                paste.text.chars().filter(|character| {
-                    !matches!(character, '\r' | '\n') && !character.is_control()
-                }),
-            );
+            insert_ui_text(ui, &paste.text);
             (Vec::new(), true)
         }
         PresentationEvent::Image(image) if image.pane == ui.pane => {
@@ -1117,12 +1177,25 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
         }
         PresentationEvent::PointerMoved(moved) if moved.pane == ui.pane => {
             let hovered = ui_target_at(ui, moved.x, moved.y);
-            let changed = ui.hovered != hovered;
+            let mut changed = ui.hovered != hovered;
             ui.hovered = hovered;
+            if let Some(drag) = ui.scrollbar_drag {
+                changed |= set_scroll_from_pointer(ui, moved.y, drag.pointer_offset);
+            } else if ui.tab_drag.is_some() {
+                changed |= update_tab_drag(ui, moved.x);
+            }
+            let scrollbar_hovered = scrollbar_hit(ui, moved.x, moved.y);
+            changed |= ui.scrollbar_hovered != scrollbar_hovered;
+            ui.scrollbar_hovered = scrollbar_hovered;
             (Vec::new(), changed)
         }
         PresentationEvent::PointerLeft(left) if left.pane == ui.pane => {
-            let changed = ui.hovered.take().is_some() || ui.pressed.take().is_some();
+            let changed = ui.hovered.take().is_some()
+                || ui.pressed.take().is_some()
+                || ui.scrollbar_drag.take().is_some()
+                || ui.tab_drag.take().is_some()
+                || ui.scrollbar_hovered;
+            ui.scrollbar_hovered = false;
             (Vec::new(), changed)
         }
         PresentationEvent::PointerButton(button)
@@ -1130,20 +1203,47 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
         {
             let target = ui_target_at(ui, button.x, button.y);
             if button.pressed {
-                ui.hovered.clone_from(&target);
-                ui.pressed = target;
-                (Vec::new(), true)
-            } else {
-                let pressed = ui.pressed.take();
-                ui.hovered.clone_from(&target);
-                let commands = match (pressed, target) {
-                    (Some(pressed), Some(released)) if pressed == released => {
-                        activate_ui_target(ui, pressed)
+                if begin_scrollbar_drag(ui, button.x, button.y) {
+                    (Vec::new(), true)
+                } else {
+                    ui.hovered.clone_from(&target);
+                    ui.pressed.clone_from(&target);
+                    if let Some(UiTarget::AgentTab(index)) = target
+                        && let Some(agent) = ui.agents.get(index).cloned()
+                    {
+                        ui.tab_drag = Some(TabDrag {
+                            agent,
+                            start_x: button.x,
+                            moved: false,
+                        });
                     }
-                    _ => Vec::new(),
-                };
-                (commands, true)
+                    (Vec::new(), true)
+                }
+            } else {
+                if ui.scrollbar_drag.take().is_some() {
+                    ui.scrollbar_hovered = scrollbar_hit(ui, button.x, button.y);
+                    (Vec::new(), true)
+                } else {
+                    let pressed = ui.pressed.take();
+                    ui.hovered.clone_from(&target);
+                    let tab_was_dragged = ui.tab_drag.take().is_some_and(|drag| drag.moved);
+                    let commands = match (pressed, target, tab_was_dragged) {
+                        (Some(UiTarget::Prompt), Some(UiTarget::Prompt), false) => {
+                            set_prompt_cursor_from_pointer(ui, button.x, button.y);
+                            Vec::new()
+                        }
+                        (Some(pressed), Some(released), false) if pressed == released => {
+                            activate_ui_target(ui, pressed)
+                        }
+                        _ => Vec::new(),
+                    };
+                    (commands, true)
+                }
             }
+        }
+        PresentationEvent::PointerScroll(scroll) if scroll.pane == ui.pane => {
+            let changed = scroll_transcript(ui, -scroll.vertical);
+            (Vec::new(), changed)
         }
         _ => (Vec::new(), false),
     };
@@ -1189,11 +1289,19 @@ fn apply_ui_message(ui: &mut UiState, message: WireMessage) {
                 .preferred_agent
                 .take()
                 .or_else(|| ui.selected_agent().map(str::to_string));
-            ui.agents = message
+            let available = message
                 .agents
                 .iter()
                 .map(|agent| agent.id.clone())
-                .collect();
+                .collect::<Vec<_>>();
+            // A registry refresh reconciles membership without undoing a
+            // presentation-local drag order.
+            ui.agents.retain(|agent| available.contains(agent));
+            for agent in &available {
+                if !ui.agents.contains(agent) {
+                    ui.agents.push(agent.clone());
+                }
+            }
             for agent in &message.agents {
                 let view = ui
                     .views
@@ -1210,6 +1318,7 @@ fn apply_ui_message(ui: &mut UiState, message: WireMessage) {
                 .min(ui.agents.len().saturating_sub(1));
         }
         "agent-state" => {
+            let selected = ui.selected_agent() == Some(message.agent.as_str());
             let view = ui
                 .views
                 .entry(message.agent.clone())
@@ -1230,11 +1339,17 @@ fn apply_ui_message(ui: &mut UiState, message: WireMessage) {
             }
             if !message.text.is_empty() {
                 push_log(view, message.log_kind, message.text);
+                if selected && ui.transcript_follow_tail {
+                    ui.search_reveal_pending = false;
+                }
             }
         }
         "agent-log" => {
             if let Some(view) = ui.views.get_mut(&message.agent) {
                 push_log(view, message.log_kind, message.text);
+                if ui.transcript_follow_tail {
+                    ui.search_reveal_pending = false;
+                }
             }
         }
         _ => {}
@@ -1305,32 +1420,267 @@ fn handle_ui_key(ui: &mut UiState, key: &str, pressed: bool, modifiers: u32) -> 
         }
         return vec![request_clipboard_paste_command(ui.pane)];
     }
+    if modifiers & MOD_CTRL != 0 && key.eq_ignore_ascii_case("f") {
+        if pressed {
+            ui.search_active = true;
+            ui.search_cursor = ui.search_query.len();
+            ui.search_reveal_pending = true;
+            ui.suppressed_text = Some(key.to_string());
+        }
+        return Vec::new();
+    }
+    if modifiers & MOD_CTRL != 0 && key.eq_ignore_ascii_case("a") {
+        if pressed {
+            let length = if ui.search_active {
+                ui.search_query.len()
+            } else {
+                ui.prompt.len()
+            };
+            if ui.search_active {
+                ui.search_cursor = length;
+            } else {
+                ui.prompt_selection = Some((0, length));
+                ui.prompt_cursor = length;
+            }
+            ui.suppressed_text = Some(key.to_string());
+        }
+        return Vec::new();
+    }
     if pressed {
-        if key == "Backspace" {
-            if ui.prompt.is_empty() {
-                if let Some(image) = ui.images.pop() {
+        match key {
+            "Backspace" if ui.search_active => {
+                delete_before_cursor(&mut ui.search_query, &mut ui.search_cursor);
+                ui.search_reveal_pending = true;
+            }
+            "Backspace" => {
+                if !delete_prompt_selection(ui)
+                    && !delete_before_cursor(&mut ui.prompt, &mut ui.prompt_cursor)
+                    && ui.prompt.is_empty()
+                    && let Some(image) = ui.images.pop()
+                {
                     retire_image_preview(ui, image.id);
                 }
-            } else {
-                ui.prompt.pop();
             }
+            "Delete" if ui.search_active => {
+                delete_after_cursor(&mut ui.search_query, ui.search_cursor);
+                ui.search_reveal_pending = true;
+            }
+            "Delete" => {
+                if !delete_prompt_selection(ui) {
+                    delete_after_cursor(&mut ui.prompt, ui.prompt_cursor);
+                }
+            }
+            "ArrowLeft" => move_editor_cursor(ui, false, modifiers & MOD_SHIFT != 0),
+            "ArrowRight" => move_editor_cursor(ui, true, modifiers & MOD_SHIFT != 0),
+            "Home" if ui.search_active => ui.search_cursor = 0,
+            "End" if ui.search_active => ui.search_cursor = ui.search_query.len(),
+            "Home" => set_prompt_cursor(ui, line_start(&ui.prompt, ui.prompt_cursor), false),
+            "End" => set_prompt_cursor(ui, line_end(&ui.prompt, ui.prompt_cursor), false),
+            "ArrowUp" if !ui.search_active => move_prompt_line(ui, false),
+            "ArrowDown" if !ui.search_active => move_prompt_line(ui, true),
+            "PageUp" => {
+                let amount = -ui.transcript_viewport_height * 0.82;
+                scroll_transcript(ui, amount);
+            }
+            "PageDown" => {
+                let amount = ui.transcript_viewport_height * 0.82;
+                scroll_transcript(ui, amount);
+            }
+            _ => {}
         }
         return Vec::new();
     }
     match key {
+        "Enter" | "Return" | "NumpadEnter" if ui.search_active => {
+            cycle_search_match(ui, modifiers & MOD_SHIFT == 0);
+            Vec::new()
+        }
+        "Enter" | "Return" | "NumpadEnter" if modifiers & MOD_SHIFT != 0 => {
+            insert_ui_text(ui, "\n");
+            Vec::new()
+        }
         "Enter" | "Return" | "NumpadEnter" => submit_prompt(ui),
         "Tab" => {
             if !ui.agents.is_empty() {
                 ui.selected = (ui.selected + 1) % ui.agents.len();
+                reset_transcript_view(ui);
             }
             Vec::new()
         }
         "F2" => create_agent(ui).into_iter().collect(),
         "F6" => configure_selected(ui, true).into_iter().collect(),
         "F7" => configure_selected(ui, false).into_iter().collect(),
+        "Escape" if ui.search_active => {
+            ui.search_active = false;
+            Vec::new()
+        }
         "Escape" => cancel_selected(ui).into_iter().collect(),
         _ => Vec::new(),
     }
+}
+
+fn insert_ui_text(ui: &mut UiState, text: &str) {
+    let filtered = text
+        .chars()
+        .filter_map(|character| match character {
+            '\r' => None,
+            '\t' => Some(' '),
+            '\n' => Some('\n'),
+            character if character.is_control() => None,
+            character => Some(character),
+        })
+        .collect::<String>();
+    if filtered.is_empty() {
+        return;
+    }
+    if ui.search_active {
+        ui.search_query.insert_str(ui.search_cursor, &filtered);
+        ui.search_cursor += filtered.len();
+        ui.search_reveal_pending = true;
+        ui.search_match = 0;
+    } else {
+        delete_prompt_selection(ui);
+        ui.prompt.insert_str(ui.prompt_cursor, &filtered);
+        ui.prompt_cursor += filtered.len();
+    }
+}
+
+fn previous_boundary(text: &str, cursor: usize) -> usize {
+    text[..cursor.min(text.len())]
+        .char_indices()
+        .next_back()
+        .map_or(0, |(index, _)| index)
+}
+
+fn next_boundary(text: &str, cursor: usize) -> usize {
+    let cursor = cursor.min(text.len());
+    text[cursor..]
+        .char_indices()
+        .nth(1)
+        .map_or(text.len(), |(offset, _)| cursor + offset)
+}
+
+fn delete_before_cursor(text: &mut String, cursor: &mut usize) -> bool {
+    if *cursor == 0 {
+        return false;
+    }
+    let start = previous_boundary(text, *cursor);
+    text.replace_range(start..*cursor, "");
+    *cursor = start;
+    true
+}
+
+fn delete_after_cursor(text: &mut String, cursor: usize) -> bool {
+    if cursor >= text.len() {
+        return false;
+    }
+    let end = next_boundary(text, cursor);
+    text.replace_range(cursor..end, "");
+    true
+}
+
+fn delete_prompt_selection(ui: &mut UiState) -> bool {
+    let Some((first, second)) = ui.prompt_selection.take() else {
+        return false;
+    };
+    let start = first.min(second).min(ui.prompt.len());
+    let end = first.max(second).min(ui.prompt.len());
+    if start == end {
+        return false;
+    }
+    ui.prompt.replace_range(start..end, "");
+    ui.prompt_cursor = start;
+    true
+}
+
+fn set_prompt_cursor(ui: &mut UiState, cursor: usize, extend: bool) {
+    let cursor = cursor.min(ui.prompt.len());
+    if extend {
+        let anchor = ui
+            .prompt_selection
+            .map_or(ui.prompt_cursor, |selection| selection.0);
+        ui.prompt_selection = Some((anchor, cursor));
+    } else {
+        ui.prompt_selection = None;
+    }
+    ui.prompt_cursor = cursor;
+}
+
+fn move_editor_cursor(ui: &mut UiState, right: bool, extend: bool) {
+    if ui.search_active {
+        ui.search_cursor = if right {
+            next_boundary(&ui.search_query, ui.search_cursor)
+        } else {
+            previous_boundary(&ui.search_query, ui.search_cursor)
+        };
+        return;
+    }
+    let cursor = if right {
+        next_boundary(&ui.prompt, ui.prompt_cursor)
+    } else {
+        previous_boundary(&ui.prompt, ui.prompt_cursor)
+    };
+    set_prompt_cursor(ui, cursor, extend);
+}
+
+fn line_start(text: &str, cursor: usize) -> usize {
+    text[..cursor.min(text.len())]
+        .rfind('\n')
+        .map_or(0, |index| index + 1)
+}
+
+fn line_end(text: &str, cursor: usize) -> usize {
+    let cursor = cursor.min(text.len());
+    text[cursor..]
+        .find('\n')
+        .map_or(text.len(), |offset| cursor + offset)
+}
+
+fn move_prompt_line(ui: &mut UiState, down: bool) {
+    let start = line_start(&ui.prompt, ui.prompt_cursor);
+    let column = ui.prompt[start..ui.prompt_cursor].chars().count();
+    let target_start = if down {
+        let end = line_end(&ui.prompt, ui.prompt_cursor);
+        (end < ui.prompt.len()).then_some(end + 1)
+    } else if start > 0 {
+        Some(line_start(&ui.prompt, start - 1))
+    } else {
+        None
+    };
+    let Some(target_start) = target_start else {
+        return;
+    };
+    let target_end = line_end(&ui.prompt, target_start);
+    let target = ui.prompt[target_start..target_end]
+        .char_indices()
+        .nth(column)
+        .map_or(target_end, |(offset, _)| target_start + offset);
+    set_prompt_cursor(ui, target, false);
+}
+
+fn set_prompt_cursor_from_pointer(ui: &mut UiState, x: f32, y: f32) {
+    ui.search_active = false;
+    ui.prompt_selection = None;
+    let rect = prompt_rect(ui);
+    let editor_width = (rect.width - 122.0).max(120.0);
+    let columns = (editor_width / 7.4).max(16.0) as usize;
+    let lines = wrap_editor_text(&ui.prompt, columns);
+    let current_line = lines
+        .iter()
+        .position(|line| ui.prompt_cursor >= line.start && ui.prompt_cursor <= line.end)
+        .unwrap_or_else(|| lines.len().saturating_sub(1));
+    let first_line = current_line.saturating_sub(1);
+    let row = (((y - (rect.y + 27.0)) / 20.0).floor() as isize).clamp(0, 1) as usize;
+    let Some(line) = lines.get(first_line + row) else {
+        ui.prompt_cursor = ui.prompt.len();
+        return;
+    };
+    let column =
+        (((x - (rect.x + 13.0)) / 7.4).round() as isize).clamp(0, columns as isize) as usize;
+    ui.prompt_cursor = ui.prompt[line.start..line.end]
+        .char_indices()
+        .nth(column)
+        .map_or(line.end, |(offset, _)| line.start + offset);
 }
 
 fn request_clipboard_paste_command(pane: u64) -> ActorCommand {
@@ -1348,6 +1698,12 @@ fn ui_target_at(ui: &UiState, x: f32, y: f32) -> Option<UiTarget> {
             return Some(UiTarget::AgentTab(index));
         }
     }
+    if rect_contains(new_agent_rect(ui.width), x, y) {
+        return Some(UiTarget::NewAgent);
+    }
+    if rect_contains(search_button_rect(ui.width), x, y) {
+        return Some(UiTarget::Search);
+    }
     let (model, reasoning) = toolbar_control_rects(ui.width);
     if ui.selected_agent().is_some() && rect_contains(model, x, y) {
         return Some(UiTarget::Model);
@@ -1358,6 +1714,9 @@ fn ui_target_at(ui: &UiState, x: f32, y: f32) -> Option<UiTarget> {
     if can_submit(ui) && rect_contains(send_button_rect(ui), x, y) {
         return Some(UiTarget::Send);
     }
+    if rect_contains(prompt_rect(ui), x, y) {
+        return Some(UiTarget::Prompt);
+    }
     None
 }
 
@@ -1365,11 +1724,24 @@ fn activate_ui_target(ui: &mut UiState, target: UiTarget) -> Vec<ActorCommand> {
     match target {
         UiTarget::AgentTab(index) if index < ui.agents.len() => {
             ui.selected = index;
+            reset_transcript_view(ui);
+            Vec::new()
+        }
+        UiTarget::NewAgent => create_agent(ui).into_iter().collect(),
+        UiTarget::Search => {
+            ui.search_active = !ui.search_active;
+            ui.search_cursor = ui.search_query.len();
             Vec::new()
         }
         UiTarget::Model => configure_selected(ui, true).into_iter().collect(),
         UiTarget::Reasoning => configure_selected(ui, false).into_iter().collect(),
         UiTarget::Send => submit_prompt(ui),
+        UiTarget::Prompt => {
+            ui.search_active = false;
+            ui.prompt_cursor = ui.prompt.len();
+            ui.prompt_selection = None;
+            Vec::new()
+        }
         UiTarget::AgentTab(_) => Vec::new(),
     }
 }
@@ -1378,30 +1750,225 @@ fn agent_tab_width(ui: &UiState) -> f32 {
     if ui.agents.is_empty() {
         152.0
     } else {
-        ((ui.width - 24.0) / ui.agents.len() as f32).clamp(48.0, 152.0)
+        ((ui.width - 116.0) / ui.agents.len() as f32).clamp(52.0, 144.0)
     }
 }
 
 fn agent_tab_rect(ui: &UiState, index: usize) -> Rect {
     let width = agent_tab_width(ui);
-    Rect::new(12.0 + index as f32 * (width + 4.0), 8.0, width, 28.0)
+    Rect::new(10.0 + index as f32 * (width + 3.0), 7.0, width, 28.0)
 }
 
 fn toolbar_control_rects(width: f32) -> (Rect, Rect) {
-    let content_width = (width - 32.0).max(1.0);
-    let status_width = (content_width * 0.25).clamp(110.0, 190.0);
-    let control_width = ((content_width - status_width - 16.0) * 0.5).clamp(96.0, 250.0);
-    let model = Rect::new(16.0 + status_width + 8.0, 52.0, control_width, 32.0);
-    let reasoning = Rect::new(model.x + model.width + 8.0, 52.0, control_width, 32.0);
+    let control_width = ((width - 198.0) * 0.5).clamp(92.0, 180.0);
+    let reasoning = Rect::new(width - control_width - 10.0, 42.0, control_width, 26.0);
+    let model = Rect::new(reasoning.x - control_width - 6.0, 42.0, control_width, 26.0);
     (model, reasoning)
 }
 
+fn new_agent_rect(width: f32) -> Rect {
+    Rect::new(width - 40.0, 7.0, 30.0, 28.0)
+}
+
+fn search_button_rect(width: f32) -> Rect {
+    Rect::new(width - 76.0, 7.0, 30.0, 28.0)
+}
+
+fn prompt_rect(ui: &UiState) -> Rect {
+    Rect::new(
+        12.0,
+        ui.height - PROMPT_HEIGHT - 12.0,
+        ui.width - 24.0,
+        PROMPT_HEIGHT,
+    )
+}
+
 fn send_button_rect(ui: &UiState) -> Rect {
-    Rect::new(ui.width - 104.0, ui.height - 68.0, 80.0, 38.0)
+    let prompt = prompt_rect(ui);
+    Rect::new(ui.width - 94.0, prompt.y + prompt.height - 38.0, 70.0, 28.0)
 }
 
 fn rect_contains(rect: Rect, x: f32, y: f32) -> bool {
     x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
+}
+
+fn reset_transcript_view(ui: &mut UiState) {
+    ui.transcript_follow_tail = true;
+    ui.transcript_scroll = ui.transcript_content_height;
+    ui.search_match = 0;
+    ui.search_reveal_pending = ui.search_active;
+}
+
+fn max_transcript_scroll(ui: &UiState) -> f32 {
+    (ui.transcript_content_height - ui.transcript_viewport_height).max(0.0)
+}
+
+fn scroll_transcript(ui: &mut UiState, delta: f32) -> bool {
+    if !delta.is_finite() || delta == 0.0 {
+        return false;
+    }
+    let maximum = max_transcript_scroll(ui);
+    let next = (ui.transcript_scroll + delta).clamp(0.0, maximum);
+    if (next - ui.transcript_scroll).abs() < 0.01 {
+        return false;
+    }
+    ui.transcript_scroll = next;
+    ui.transcript_follow_tail = next >= maximum - 1.0;
+    true
+}
+
+fn search_matches(ui: &UiState) -> Vec<usize> {
+    let query = if ui.search_active {
+        ui.search_query.trim().to_lowercase()
+    } else {
+        String::new()
+    };
+    if query.is_empty() {
+        return Vec::new();
+    }
+    ui.selected_agent()
+        .and_then(|agent| ui.views.get(agent))
+        .map(|view| {
+            view.logs
+                .iter()
+                .enumerate()
+                .filter_map(|(index, line)| {
+                    line.text.to_lowercase().contains(&query).then_some(index)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn cycle_search_match(ui: &mut UiState, forward: bool) {
+    let count = search_matches(ui).len();
+    if count == 0 {
+        ui.search_match = 0;
+        return;
+    }
+    ui.search_match = if forward {
+        (ui.search_match + 1) % count
+    } else {
+        (ui.search_match + count - 1) % count
+    };
+    ui.search_reveal_pending = true;
+}
+
+fn transcript_rect(ui: &UiState) -> Rect {
+    let top = HEADER_HEIGHT + TRANSCRIPT_GAP + if ui.search_active { SEARCH_HEIGHT } else { 0.0 };
+    let prompt = prompt_rect(ui);
+    let image_extra = if ui.images.is_empty() {
+        0.0
+    } else {
+        IMAGE_TRAY_HEIGHT + IMAGE_TRAY_GAP
+    };
+    Rect::new(
+        10.0,
+        top,
+        ui.width - 20.0,
+        (prompt.y - top - TRANSCRIPT_GAP - image_extra).max(48.0),
+    )
+}
+
+fn scrollbar_geometry(ui: &UiState) -> Option<(f32, f32, f32, f32)> {
+    let viewport = transcript_rect(ui);
+    if ui.transcript_content_height <= viewport.height + 0.5 {
+        return None;
+    }
+    let track_top = viewport.y + 6.0;
+    let track_height = (viewport.height - 12.0).max(1.0);
+    let thumb_height = (track_height * viewport.height / ui.transcript_content_height)
+        .max(28.0)
+        .min(track_height);
+    let travel = (track_height - thumb_height).max(0.0);
+    let thumb_y = track_top + travel * ui.transcript_scroll / max_transcript_scroll(ui).max(1.0);
+    Some((track_top, track_height, thumb_y, thumb_height))
+}
+
+fn scrollbar_hit(ui: &UiState, x: f32, y: f32) -> bool {
+    let Some((track_top, track_height, _, _)) = scrollbar_geometry(ui) else {
+        return false;
+    };
+    x.is_finite()
+        && y.is_finite()
+        && x >= ui.width - SCROLLBAR_HIT_WIDTH
+        && x <= ui.width
+        && y >= track_top
+        && y <= track_top + track_height
+}
+
+fn begin_scrollbar_drag(ui: &mut UiState, x: f32, y: f32) -> bool {
+    if !scrollbar_hit(ui, x, y) {
+        return false;
+    }
+    let Some((_, _, thumb_y, thumb_height)) = scrollbar_geometry(ui) else {
+        return false;
+    };
+    let pointer_offset = if y >= thumb_y && y <= thumb_y + thumb_height {
+        y - thumb_y
+    } else {
+        thumb_height * 0.5
+    };
+    ui.scrollbar_drag = Some(ScrollbarDrag { pointer_offset });
+    ui.scrollbar_hovered = true;
+    set_scroll_from_pointer(ui, y, pointer_offset);
+    true
+}
+
+fn set_scroll_from_pointer(ui: &mut UiState, pointer_y: f32, pointer_offset: f32) -> bool {
+    if !pointer_y.is_finite() {
+        return false;
+    }
+    let Some((track_top, track_height, _, thumb_height)) = scrollbar_geometry(ui) else {
+        return false;
+    };
+    let travel = (track_height - thumb_height).max(0.0);
+    if travel == 0.0 {
+        return false;
+    }
+    let thumb_y = (pointer_y - pointer_offset).clamp(track_top, track_top + travel);
+    let next = (thumb_y - track_top) / travel * max_transcript_scroll(ui);
+    let changed = (next - ui.transcript_scroll).abs() >= 0.01;
+    ui.transcript_scroll = next;
+    ui.transcript_follow_tail = next >= max_transcript_scroll(ui) - 1.0;
+    changed
+}
+
+fn update_tab_drag(ui: &mut UiState, x: f32) -> bool {
+    let Some(drag) = ui.tab_drag.as_mut() else {
+        return false;
+    };
+    if !x.is_finite() {
+        return false;
+    }
+    if (x - drag.start_x).abs() > 5.0 {
+        drag.moved = true;
+    }
+    if !drag.moved {
+        return false;
+    }
+    let agent = drag.agent.clone();
+    let Some(from) = ui.agents.iter().position(|candidate| candidate == &agent) else {
+        return false;
+    };
+    let selected_agent = ui.selected_agent().map(str::to_string);
+    let width = agent_tab_width(ui) + 3.0;
+    let to = (((x - 10.0) / width).floor() as isize)
+        .clamp(0, ui.agents.len().saturating_sub(1) as isize) as usize;
+    if from == to {
+        return true;
+    }
+    let moved = ui.agents.remove(from);
+    ui.agents.insert(to, moved);
+    ui.selected = selected_agent
+        .and_then(|selected| {
+            ui.agents
+                .iter()
+                .position(|candidate| candidate == &selected)
+        })
+        .unwrap_or(0);
+    ui.pressed = Some(UiTarget::AgentTab(to));
+    true
 }
 
 fn attach_ui_image(
@@ -1563,6 +2130,8 @@ fn submit_prompt(ui: &mut UiState) -> Vec<ActorCommand> {
     } else {
         std::mem::take(&mut ui.prompt)
     };
+    ui.prompt_cursor = 0;
+    ui.prompt_selection = None;
     let images = std::mem::take(&mut ui.images);
     let image_ids = images.iter().map(|image| image.id).collect::<Vec<_>>();
     let mut messages = Vec::new();
@@ -1720,6 +2289,7 @@ fn redraw_ui_for_resize(ui: &mut UiState, resize_epoch: Option<u64>) {
     });
     draw_agent_tabs(ui, &mut text_cache, &mut packet);
     draw_toolbar(ui, &mut text_cache, &mut packet);
+    draw_search(ui, &mut text_cache, &mut packet);
     draw_transcript(ui, &mut text_cache, &mut packet);
     draw_prompt(ui, &mut text_cache, &mut packet);
     let submitted = if let Some(error) = ui.draw_error.take() {
@@ -1742,8 +2312,8 @@ fn redraw_ui_for_resize(ui: &mut UiState, resize_epoch: Option<u64>) {
 
 fn draw_agent_tabs(ui: &mut UiState, text_cache: &mut TextLayoutCache, packet: &mut Packet) {
     packet.push(Command::FillRect {
-        rect: Rect::new(0.0, 0.0, ui.width, 44.0),
-        color: PANEL,
+        rect: Rect::new(0.0, 0.0, ui.width, 40.0),
+        color: SUNKEN,
     });
     let agents = ui.agents.clone();
     for (index, agent) in agents.iter().enumerate() {
@@ -1753,29 +2323,92 @@ fn draw_agent_tabs(ui: &mut UiState, text_cache: &mut TextLayoutCache, packet: &
         let hovered = ui.hovered.as_ref() == Some(&target);
         packet.push(Command::FillRoundedRect {
             rect,
-            radius: 5.0,
+            radius: 4.0,
             color: if pressed {
                 PRESSED
             } else if hovered {
                 HOVER
             } else if index == ui.selected {
-                BLUE
-            } else {
                 PANEL_LIGHT
+            } else {
+                SUNKEN
             },
         });
+        if index == ui.selected {
+            packet.push(Command::FillRoundedRect {
+                rect: Rect::new(
+                    rect.x + 7.0,
+                    rect.y + rect.height - 3.0,
+                    rect.width - 14.0,
+                    3.0,
+                ),
+                radius: 1.5,
+                color: BLUE,
+            });
+        }
         draw_text(
             ui,
             text_cache,
             packet,
             agent,
             rect.x + 7.0,
-            if pressed { 13.0 } else { 12.0 },
-            14.0,
+            if pressed { 12.0 } else { 11.0 },
+            13.0,
             (rect.width - 14.0).max(24.0),
-            FG,
+            if index == ui.selected { BRIGHT } else { FG },
         );
     }
+    draw_header_icon_button(
+        ui,
+        text_cache,
+        packet,
+        UiTarget::Search,
+        search_button_rect(ui.width),
+        "⌕",
+    );
+    draw_header_icon_button(
+        ui,
+        text_cache,
+        packet,
+        UiTarget::NewAgent,
+        new_agent_rect(ui.width),
+        "+",
+    );
+}
+
+fn draw_header_icon_button(
+    ui: &mut UiState,
+    text_cache: &mut TextLayoutCache,
+    packet: &mut Packet,
+    target: UiTarget,
+    rect: Rect,
+    label: &str,
+) {
+    let active = target == UiTarget::Search && ui.search_active;
+    let pressed = ui.pressed.as_ref() == Some(&target);
+    let hovered = ui.hovered.as_ref() == Some(&target);
+    packet.push(Command::FillRoundedRect {
+        rect,
+        radius: 4.0,
+        color: if pressed {
+            PRESSED
+        } else if hovered || active {
+            HOVER
+        } else {
+            SUNKEN
+        },
+    });
+    draw_text(
+        ui,
+        text_cache,
+        packet,
+        label,
+        rect.x + 9.0,
+        rect.y + 5.0,
+        16.0,
+        18.0,
+        if active { BLUE } else { FG },
+    );
 }
 
 fn draw_toolbar(ui: &mut UiState, text_cache: &mut TextLayoutCache, packet: &mut Packet) {
@@ -1799,20 +2432,30 @@ fn draw_toolbar(ui: &mut UiState, text_cache: &mut TextLayoutCache, packet: &mut
             },
         );
     packet.push(Command::FillRect {
-        rect: Rect::new(0.0, 44.0, ui.width, 48.0),
-        color: PANEL_LIGHT,
+        rect: Rect::new(0.0, 40.0, ui.width, 36.0),
+        color: PANEL,
+    });
+    packet.push(Command::FillRect {
+        rect: Rect::new(0.0, HEADER_HEIGHT - 1.0, ui.width, 1.0),
+        color: ashen::SUBTLE,
     });
     let (model_rect, reasoning_rect) = toolbar_control_rects(ui.width);
     draw_text(
         ui,
         text_cache,
         packet,
-        &format!("status  {status}"),
-        16.0,
-        59.0,
-        14.0,
-        (model_rect.x - 32.0).max(80.0),
-        if status == "running" { GREEN } else { FG },
+        &format!("●  {status}"),
+        12.0,
+        49.0,
+        12.0,
+        (model_rect.x - 22.0).max(70.0),
+        if status == "running" {
+            GREEN
+        } else if status.starts_with("failed") {
+            RED
+        } else {
+            MUTED
+        },
     );
     draw_toolbar_button(
         ui,
@@ -1820,7 +2463,7 @@ fn draw_toolbar(ui: &mut UiState, text_cache: &mut TextLayoutCache, packet: &mut
         packet,
         UiTarget::Model,
         model_rect,
-        &format!("Model  {model}"),
+        &format!("{model}  ·  model"),
         BLUE,
     );
     draw_toolbar_button(
@@ -1829,7 +2472,7 @@ fn draw_toolbar(ui: &mut UiState, text_cache: &mut TextLayoutCache, packet: &mut
         packet,
         UiTarget::Reasoning,
         reasoning_rect,
-        &format!("Reasoning  {reasoning}"),
+        &format!("{reasoning}  ·  effort"),
         YELLOW,
     );
 }
@@ -1847,7 +2490,7 @@ fn draw_toolbar_button(
     let hovered = ui.hovered.as_ref() == Some(&target);
     packet.push(Command::FillRoundedRect {
         rect,
-        radius: 5.0,
+        radius: 4.0,
         color: if pressed {
             PRESSED
         } else if hovered {
@@ -1861,9 +2504,9 @@ fn draw_toolbar_button(
         text_cache,
         packet,
         label,
-        rect.x + 9.0,
-        rect.y + if pressed { 8.0 } else { 7.0 },
-        13.0,
+        rect.x + 8.0,
+        rect.y + if pressed { 6.0 } else { 5.0 },
+        11.0,
         rect.width - 18.0,
         if ui.selected_agent().is_some() {
             label_color
@@ -1873,57 +2516,526 @@ fn draw_toolbar_button(
     );
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MarkdownKind {
+    Paragraph,
+    Heading,
+    Bullet,
+    Quote,
+    Code,
+    Rule,
+}
+
+#[derive(Clone, Debug)]
+struct MarkdownBlock {
+    kind: MarkdownKind,
+    text: String,
+}
+
+#[derive(Clone, Debug)]
+struct PreparedBlock {
+    kind: MarkdownKind,
+    text: String,
+    size: f32,
+    color: Color,
+    height: f32,
+}
+
+#[derive(Clone, Debug)]
+struct PreparedCard {
+    log_index: usize,
+    kind: String,
+    blocks: Vec<PreparedBlock>,
+    height: f32,
+    matched: bool,
+}
+
+fn draw_search(ui: &mut UiState, text_cache: &mut TextLayoutCache, packet: &mut Packet) {
+    if !ui.search_active {
+        return;
+    }
+    let rect = Rect::new(
+        10.0,
+        HEADER_HEIGHT + 7.0,
+        ui.width - 20.0,
+        SEARCH_HEIGHT - 8.0,
+    );
+    packet.push(Command::FillRoundedRect {
+        rect,
+        radius: 6.0,
+        color: PANEL,
+    });
+    packet.push(Command::StrokeRoundedRect {
+        rect,
+        radius: 6.0,
+        color: ACCENT_MUTED,
+        width: 1.0,
+    });
+    let matches = search_matches(ui);
+    let query_empty = ui.search_query.is_empty();
+    let query = if query_empty {
+        "Search this conversation".to_string()
+    } else {
+        ui.search_query.clone()
+    };
+    draw_text(
+        ui,
+        text_cache,
+        packet,
+        &query,
+        rect.x + 30.0,
+        rect.y + 8.0,
+        13.0,
+        rect.width - 116.0,
+        if query_empty { MUTED } else { FG },
+    );
+    draw_text(
+        ui,
+        text_cache,
+        packet,
+        "⌕",
+        rect.x + 10.0,
+        rect.y + 7.0,
+        15.0,
+        16.0,
+        BLUE,
+    );
+    let counter = if matches.is_empty() {
+        "0 results".to_string()
+    } else {
+        format!(
+            "{} / {}",
+            ui.search_match.min(matches.len() - 1) + 1,
+            matches.len()
+        )
+    };
+    draw_text(
+        ui,
+        text_cache,
+        packet,
+        &counter,
+        rect.x + rect.width - 78.0,
+        rect.y + 9.0,
+        11.0,
+        66.0,
+        MUTED,
+    );
+    if ui.pane_focused {
+        let prefix = ui.search_query[..ui.search_cursor.min(ui.search_query.len())]
+            .chars()
+            .count() as f32;
+        let cursor_x = (rect.x + 30.0 + prefix * 7.0).min(rect.x + rect.width - 92.0);
+        packet.push(Command::FillRect {
+            rect: Rect::new(cursor_x, rect.y + 8.0, 1.5, 17.0),
+            color: BLUE,
+        });
+    }
+}
+
 fn draw_transcript(ui: &mut UiState, text_cache: &mut TextLayoutCache, packet: &mut Packet) {
     let lines = ui
         .selected_agent()
         .and_then(|agent| ui.views.get(agent))
         .map(|view| view.logs.iter().cloned().collect::<Vec<_>>())
         .unwrap_or_default();
-    let composer_extra = if ui.images.is_empty() {
-        0.0
+    let viewport = transcript_rect(ui);
+    ui.transcript_viewport_height = viewport.height;
+    let query = if ui.search_active {
+        ui.search_query.trim().to_lowercase()
     } else {
-        IMAGE_TRAY_HEIGHT + IMAGE_TRAY_GAP
+        String::new()
     };
-    let available = ((ui.height - 190.0 - composer_extra) / 24.0).max(1.0) as usize;
-    let start = lines.len().saturating_sub(available);
-    let mut y = 108.0;
-    for line in lines.iter().skip(start) {
-        let color = match line.kind.as_str() {
-            "user" => YELLOW,
-            "tool" => BLUE,
-            "error" => RED,
-            "status" => MUTED,
-            _ => FG,
+    let content_width = (viewport.width - 28.0).max(120.0);
+    let mut cards = Vec::new();
+    for (log_index, line) in lines.iter().enumerate() {
+        let blocks = prepare_markdown_blocks(ui, text_cache, line, content_width - 24.0);
+        let height = if line.kind == "status" {
+            30.0
+        } else {
+            (34.0 + blocks.iter().map(|block| block.height + 7.0).sum::<f32>()).max(46.0)
         };
-        let prefix = match line.kind.as_str() {
-            "user" => "you  ",
-            "tool" => "tool ",
-            "error" => "err  ",
-            "status" => "·    ",
-            _ => "agent ",
-        };
-        let visible_characters = ((ui.width - 36.0) / 8.0).max(24.0) as usize;
-        let body_characters = visible_characters
-            .saturating_sub(prefix.chars().count())
-            .clamp(16, 180);
-        let text = format!("{prefix}{}", one_line(&line.text, body_characters));
+        cards.push(PreparedCard {
+            log_index,
+            kind: line.kind.clone(),
+            blocks,
+            height,
+            matched: !query.is_empty() && line.text.to_lowercase().contains(&query),
+        });
+    }
+    let content_height = cards.iter().map(|card| card.height + 10.0).sum::<f32>() + 8.0;
+    ui.transcript_content_height = content_height;
+    let maximum = max_transcript_scroll(ui);
+    if ui.transcript_follow_tail {
+        ui.transcript_scroll = maximum;
+    } else {
+        ui.transcript_scroll = ui.transcript_scroll.min(maximum);
+    }
+    if ui.search_reveal_pending {
+        let matches = cards.iter().filter(|card| card.matched).collect::<Vec<_>>();
+        if let Some(target) = matches.get(ui.search_match.min(matches.len().saturating_sub(1))) {
+            let mut target_y = 8.0;
+            for card in &cards {
+                if card.log_index == target.log_index {
+                    break;
+                }
+                target_y += card.height + 10.0;
+            }
+            ui.transcript_scroll = (target_y - viewport.height * 0.3).clamp(0.0, maximum);
+            ui.transcript_follow_tail = ui.transcript_scroll >= maximum - 1.0;
+        }
+        ui.search_reveal_pending = false;
+    }
+
+    packet.push(Command::Save);
+    packet.push(Command::ClipRect(viewport));
+    let mut content_y = 8.0;
+    for card in &cards {
+        let y = viewport.y + content_y - ui.transcript_scroll;
+        if y + card.height >= viewport.y && y <= viewport.y + viewport.height {
+            draw_transcript_card(
+                ui,
+                text_cache,
+                packet,
+                card,
+                viewport.x + 4.0,
+                y,
+                content_width,
+            );
+        }
+        content_y += card.height + 10.0;
+    }
+    if cards.is_empty() {
+        draw_empty_transcript(ui, text_cache, packet, viewport);
+    }
+    packet.push(Command::Restore);
+    draw_transcript_scrollbar(ui, packet);
+}
+
+fn prepare_markdown_blocks(
+    ui: &mut UiState,
+    text_cache: &mut TextLayoutCache,
+    line: &LogLine,
+    width: f32,
+) -> Vec<PreparedBlock> {
+    let source = if line.kind == "tool" || line.kind == "status" || line.kind == "error" {
+        vec![MarkdownBlock {
+            kind: MarkdownKind::Paragraph,
+            text: line.text.clone(),
+        }]
+    } else {
+        parse_markdown(&line.text)
+    };
+    source
+        .into_iter()
+        .map(|block| {
+            let (size, color) = match block.kind {
+                MarkdownKind::Heading => (16.0, BRIGHT),
+                MarkdownKind::Code => (12.0, ashen::WARNING),
+                MarkdownKind::Quote => (13.0, MUTED),
+                MarkdownKind::Rule => (10.0, ashen::SUBTLE),
+                _ => (
+                    13.5,
+                    if line.kind == "error" {
+                        ashen::ERROR_BRIGHT
+                    } else {
+                        FG
+                    },
+                ),
+            };
+            let inset = if matches!(block.kind, MarkdownKind::Code | MarkdownKind::Quote) {
+                18.0
+            } else {
+                0.0
+            };
+            let height = match text_cache.layout_text(
+                &block.text,
+                size,
+                (width - inset).max(40.0),
+                size * 1.45,
+                color,
+            ) {
+                Ok(layout) => layout.height.max(size * 1.45),
+                Err(error) => {
+                    ui.draw_error
+                        .get_or_insert_with(|| format!("layout transcript: {error}"));
+                    size * 1.45
+                }
+            };
+            PreparedBlock {
+                kind: block.kind,
+                text: block.text,
+                size,
+                color,
+                height,
+            }
+        })
+        .collect()
+}
+
+fn draw_transcript_card(
+    ui: &mut UiState,
+    text_cache: &mut TextLayoutCache,
+    packet: &mut Packet,
+    card: &PreparedCard,
+    x: f32,
+    y: f32,
+    width: f32,
+) {
+    if card.kind == "status" {
         draw_text(
             ui,
             text_cache,
             packet,
-            &text,
-            18.0,
-            y,
-            14.0,
-            (ui.width - 36.0).max(100.0),
-            color,
+            &format!(
+                "·  {}",
+                one_line(
+                    card.blocks.first().map_or("", |block| block.text.as_str()),
+                    160
+                )
+            ),
+            x + 10.0,
+            y + 6.0,
+            11.5,
+            width - 20.0,
+            MUTED,
         );
-        y += 24.0;
+        return;
+    }
+    let (background, accent, label) = match card.kind.as_str() {
+        "user" => (PANEL_LIGHT, YELLOW, "YOU"),
+        "tool" => (SUNKEN, BLUE, "TOOL CALL"),
+        "error" => (Color::rgba(0.25, 0.07, 0.07, 0.64), RED, "ERROR"),
+        _ => (PANEL, MUTED, "AGENT"),
+    };
+    let rect = Rect::new(x, y, width, card.height);
+    packet.push(Command::FillRoundedRect {
+        rect,
+        radius: 7.0,
+        color: background,
+    });
+    packet.push(Command::FillRoundedRect {
+        rect: Rect::new(x, y + 7.0, 3.0, card.height - 14.0),
+        radius: 1.5,
+        color: accent,
+    });
+    if card.matched {
+        packet.push(Command::StrokeRoundedRect {
+            rect,
+            radius: 7.0,
+            color: YELLOW,
+            width: 1.5,
+        });
+    }
+    draw_text(
+        ui,
+        text_cache,
+        packet,
+        label,
+        x + 14.0,
+        y + 9.0,
+        10.0,
+        width - 28.0,
+        accent,
+    );
+    let mut block_y = y + 28.0;
+    for block in &card.blocks {
+        let inset = match block.kind {
+            MarkdownKind::Bullet => 12.0,
+            MarkdownKind::Quote | MarkdownKind::Code => 14.0,
+            _ => 0.0,
+        };
+        if block.kind == MarkdownKind::Code {
+            packet.push(Command::FillRoundedRect {
+                rect: Rect::new(x + 12.0, block_y - 3.0, width - 24.0, block.height + 7.0),
+                radius: 4.0,
+                color: BG,
+            });
+        } else if block.kind == MarkdownKind::Quote {
+            packet.push(Command::FillRect {
+                rect: Rect::new(x + 14.0, block_y, 2.0, block.height),
+                color: ACCENT_MUTED,
+            });
+        }
+        draw_text(
+            ui,
+            text_cache,
+            packet,
+            &block.text,
+            x + 14.0 + inset,
+            block_y,
+            block.size,
+            width - 28.0 - inset,
+            block.color,
+        );
+        block_y += block.height + 7.0;
     }
 }
 
+fn draw_empty_transcript(
+    ui: &mut UiState,
+    text_cache: &mut TextLayoutCache,
+    packet: &mut Packet,
+    viewport: Rect,
+) {
+    draw_text(
+        ui,
+        text_cache,
+        packet,
+        "Start a conversation",
+        viewport.x + 18.0,
+        viewport.y + viewport.height * 0.38,
+        18.0,
+        viewport.width - 36.0,
+        STRONG,
+    );
+    draw_text(
+        ui,
+        text_cache,
+        packet,
+        "Type below, paste an image, or drop one into the pane.",
+        viewport.x + 18.0,
+        viewport.y + viewport.height * 0.38 + 30.0,
+        13.0,
+        viewport.width - 36.0,
+        MUTED,
+    );
+}
+
+fn draw_transcript_scrollbar(ui: &UiState, packet: &mut Packet) {
+    let Some((_, _, thumb_y, thumb_height)) = scrollbar_geometry(ui) else {
+        return;
+    };
+    packet.push(Command::FillRoundedRect {
+        rect: Rect::new(ui.width - 10.0, thumb_y, SCROLLBAR_WIDTH, thumb_height),
+        radius: SCROLLBAR_WIDTH * 0.5,
+        color: Color::rgba(
+            FG.r,
+            FG.g,
+            FG.b,
+            if ui.scrollbar_drag.is_some() {
+                0.82
+            } else if ui.scrollbar_hovered {
+                0.62
+            } else {
+                0.35
+            },
+        ),
+    });
+}
+
+fn parse_markdown(text: &str) -> Vec<MarkdownBlock> {
+    let mut blocks = Vec::new();
+    let mut paragraph = String::new();
+    let mut code = String::new();
+    let mut in_code = false;
+    let flush_paragraph = |blocks: &mut Vec<MarkdownBlock>, paragraph: &mut String| {
+        if !paragraph.trim().is_empty() {
+            blocks.push(MarkdownBlock {
+                kind: MarkdownKind::Paragraph,
+                text: clean_inline_markdown(paragraph.trim()),
+            });
+            paragraph.clear();
+        }
+    };
+    for line in text.replace(" ↵ ", "\n").lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            if in_code {
+                blocks.push(MarkdownBlock {
+                    kind: MarkdownKind::Code,
+                    text: std::mem::take(&mut code),
+                });
+            } else {
+                flush_paragraph(&mut blocks, &mut paragraph);
+            }
+            in_code = !in_code;
+            continue;
+        }
+        if in_code {
+            if !code.is_empty() {
+                code.push('\n');
+            }
+            code.push_str(line);
+            continue;
+        }
+        if trimmed.is_empty() {
+            flush_paragraph(&mut blocks, &mut paragraph);
+        } else if trimmed == "---" || trimmed == "***" {
+            flush_paragraph(&mut blocks, &mut paragraph);
+            blocks.push(MarkdownBlock {
+                kind: MarkdownKind::Rule,
+                text: "────────────────────────".to_string(),
+            });
+        } else if let Some(heading) = trimmed
+            .strip_prefix("### ")
+            .or_else(|| trimmed.strip_prefix("## "))
+            .or_else(|| trimmed.strip_prefix("# "))
+        {
+            flush_paragraph(&mut blocks, &mut paragraph);
+            blocks.push(MarkdownBlock {
+                kind: MarkdownKind::Heading,
+                text: clean_inline_markdown(heading),
+            });
+        } else if let Some(item) = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+            .or_else(|| trimmed.strip_prefix("+ "))
+        {
+            flush_paragraph(&mut blocks, &mut paragraph);
+            blocks.push(MarkdownBlock {
+                kind: MarkdownKind::Bullet,
+                text: format!("•  {}", clean_inline_markdown(item)),
+            });
+        } else if let Some(quote) = trimmed.strip_prefix("> ") {
+            flush_paragraph(&mut blocks, &mut paragraph);
+            blocks.push(MarkdownBlock {
+                kind: MarkdownKind::Quote,
+                text: clean_inline_markdown(quote),
+            });
+        } else {
+            if !paragraph.is_empty() {
+                paragraph.push(' ');
+            }
+            paragraph.push_str(trimmed);
+        }
+    }
+    flush_paragraph(&mut blocks, &mut paragraph);
+    if in_code && !code.is_empty() {
+        blocks.push(MarkdownBlock {
+            kind: MarkdownKind::Code,
+            text: code,
+        });
+    }
+    if blocks.is_empty() {
+        blocks.push(MarkdownBlock {
+            kind: MarkdownKind::Paragraph,
+            text: String::new(),
+        });
+    }
+    blocks
+}
+
+fn clean_inline_markdown(text: &str) -> String {
+    let mut output = text.replace("**", "").replace("__", "").replace('`', "");
+    while let Some(open) = output.find('[') {
+        let Some(middle) = output[open + 1..].find("](").map(|index| open + 1 + index) else {
+            break;
+        };
+        let Some(close) = output[middle + 2..]
+            .find(')')
+            .map(|index| middle + 2 + index)
+        else {
+            break;
+        };
+        let label = output[open + 1..middle].to_string();
+        output.replace_range(open..=close, &format!("{label} ↗"));
+    }
+    output
+}
+
 fn draw_prompt(ui: &mut UiState, text_cache: &mut TextLayoutCache, packet: &mut Packet) {
-    let y = ui.height - PROMPT_HEIGHT - 18.0;
+    let rect = prompt_rect(ui);
+    let y = rect.y;
     if !ui.images.is_empty() {
         draw_image_tray(
             ui,
@@ -1933,20 +3045,92 @@ fn draw_prompt(ui: &mut UiState, text_cache: &mut TextLayoutCache, packet: &mut 
         );
     }
     packet.push(Command::FillRoundedRect {
-        rect: Rect::new(12.0, y, ui.width - 24.0, PROMPT_HEIGHT),
-        radius: 8.0,
+        rect,
+        radius: 9.0,
         color: PANEL,
+    });
+    packet.push(Command::StrokeRoundedRect {
+        rect,
+        radius: 9.0,
+        color: if ui.pane_focused && !ui.search_active {
+            ACCENT_MUTED
+        } else {
+            ashen::SUBTLE
+        },
+        width: 1.0,
     });
     draw_text(
         ui,
         text_cache,
         packet,
-        &format!("> {}", one_line(&ui.prompt, 150)),
-        24.0,
-        y + 12.0,
-        15.0,
-        (ui.width - 150.0).max(100.0),
-        FG,
+        "MESSAGE",
+        rect.x + 12.0,
+        y + 8.0,
+        9.5,
+        80.0,
+        MUTED,
+    );
+    let editor_width = (rect.width - 122.0).max(120.0);
+    let columns = (editor_width / 7.4).max(16.0) as usize;
+    let editor_lines = wrap_editor_text(&ui.prompt, columns);
+    let cursor_line = editor_lines
+        .iter()
+        .position(|line| ui.prompt_cursor >= line.start && ui.prompt_cursor <= line.end)
+        .unwrap_or_else(|| editor_lines.len().saturating_sub(1));
+    let first_line = cursor_line.saturating_sub(1);
+    for (row, line) in editor_lines.iter().skip(first_line).take(2).enumerate() {
+        let text = if ui.prompt.is_empty() && row == 0 {
+            "Ask or instruct the agent…"
+        } else {
+            &line.text
+        };
+        if ui.prompt_selection.is_some() && !ui.prompt.is_empty() {
+            packet.push(Command::FillRoundedRect {
+                rect: Rect::new(
+                    rect.x + 11.0,
+                    y + 25.0 + row as f32 * 20.0,
+                    editor_width,
+                    19.0,
+                ),
+                radius: 3.0,
+                color: ashen::SELECTION,
+            });
+        }
+        draw_text(
+            ui,
+            text_cache,
+            packet,
+            text,
+            rect.x + 13.0,
+            y + 27.0 + row as f32 * 20.0,
+            14.0,
+            editor_width,
+            if ui.prompt.is_empty() { MUTED } else { FG },
+        );
+    }
+    if ui.pane_focused
+        && !ui.search_active
+        && let Some(line) = editor_lines.get(cursor_line)
+    {
+        let cursor = ui.prompt_cursor.clamp(line.start, line.end);
+        let column = ui.prompt[line.start..cursor].chars().count() as f32;
+        let visible_row = cursor_line.saturating_sub(first_line).min(1) as f32;
+        let cursor_x = (rect.x + 13.0 + column * 7.4).min(rect.x + 13.0 + editor_width);
+        packet.push(Command::FillRect {
+            rect: Rect::new(cursor_x, y + 26.0 + visible_row * 20.0, 2.0, 19.0),
+            color: YELLOW,
+        });
+    }
+    draw_text(
+        ui,
+        text_cache,
+        packet,
+        "Shift+Enter newline  ·  Ctrl+F search",
+        rect.x + 13.0,
+        y + rect.height - 17.0,
+        9.5,
+        (rect.width - 112.0).max(80.0),
+        MUTED,
     );
     let send_rect = send_button_rect(ui);
     let send_pressed = ui.pressed.as_ref() == Some(&UiTarget::Send);
@@ -1954,7 +3138,7 @@ fn draw_prompt(ui: &mut UiState, text_cache: &mut TextLayoutCache, packet: &mut 
     let send_enabled = can_submit(ui);
     packet.push(Command::FillRoundedRect {
         rect: send_rect,
-        radius: 7.0,
+        radius: 6.0,
         color: if !send_enabled {
             PANEL_LIGHT
         } else if send_pressed {
@@ -1969,11 +3153,11 @@ fn draw_prompt(ui: &mut UiState, text_cache: &mut TextLayoutCache, packet: &mut 
         ui,
         text_cache,
         packet,
-        if send_enabled { "Send" } else { "Enter" },
-        ui.width - 88.0,
-        send_rect.y + if send_pressed { 11.0 } else { 10.0 },
-        14.0,
-        56.0,
+        if send_enabled { "Send  ↵" } else { "Send" },
+        send_rect.x + 10.0,
+        send_rect.y + if send_pressed { 7.0 } else { 6.0 },
+        11.5,
+        54.0,
         if send_enabled { PANEL } else { MUTED },
     );
     if !ui.error.is_empty() {
@@ -1994,6 +3178,53 @@ fn draw_prompt(ui: &mut UiState, text_cache: &mut TextLayoutCache, packet: &mut 
             RED,
         );
     }
+}
+
+#[derive(Clone, Debug)]
+struct EditorLine {
+    text: String,
+    start: usize,
+    end: usize,
+}
+
+fn wrap_editor_text(text: &str, columns: usize) -> Vec<EditorLine> {
+    if text.is_empty() {
+        return vec![EditorLine {
+            text: String::new(),
+            start: 0,
+            end: 0,
+        }];
+    }
+    let mut lines = Vec::new();
+    let mut start = 0;
+    let mut current = String::new();
+    let mut count = 0;
+    for (index, character) in text.char_indices() {
+        if character == '\n' || count >= columns {
+            lines.push(EditorLine {
+                text: std::mem::take(&mut current),
+                start,
+                end: index,
+            });
+            start = if character == '\n' {
+                index + character.len_utf8()
+            } else {
+                index
+            };
+            count = 0;
+            if character == '\n' {
+                continue;
+            }
+        }
+        current.push(character);
+        count += 1;
+    }
+    lines.push(EditorLine {
+        text: current,
+        start,
+        end: text.len(),
+    });
+    lines
 }
 
 fn draw_image_tray(
@@ -2099,6 +3330,14 @@ fn one_line(text: &str, maximum: usize) -> String {
         .chars()
         .take(maximum)
         .collect::<String>();
+    if text.chars().count() > maximum {
+        output.push('…');
+    }
+    output
+}
+
+fn bounded_text(text: &str, maximum: usize) -> String {
+    let mut output = text.chars().take(maximum).collect::<String>();
     if text.chars().count() > maximum {
         output.push('…');
     }
@@ -2327,7 +3566,7 @@ fn summarize_agent_line(
             } else {
                 "agent"
             },
-            one_line(line, 3000),
+            bounded_text(line, 3000),
             None,
         );
     };
@@ -2377,7 +3616,7 @@ fn summarize_agent_line(
             } else {
                 "status"
             },
-            one_line(line, 3000),
+            bounded_text(line, 3000),
             None,
         ),
     }
@@ -2421,7 +3660,7 @@ fn publish_worker_log(agent: &str, kind: &str, text: &str) {
                 kind: "agent-log".to_string(),
                 agent: agent.to_string(),
                 log_kind: kind.to_string(),
-                text: one_line(text, 3000),
+                text: bounded_text(text, 3000),
                 ..WireMessage::default()
             },
         ));
@@ -2510,8 +3749,8 @@ mod tests {
             ),
             (
                 "tool",
-                "computer_launch completed: {\"pane\":3,\"visible\":true}".to_string()
-                ,None
+                "computer_launch completed: {\"pane\":3,\"visible\":true}".to_string(),
+                None
             )
         );
     }
@@ -2526,6 +3765,72 @@ mod tests {
         let history = serde_json::from_slice::<Vec<HistoryTurn>>(&history.unwrap()).unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].assistant, "hi");
+    }
+
+    #[test]
+    fn editor_inserts_and_deletes_at_unicode_cursor_boundaries() {
+        let mut ui = UiState::new();
+        insert_ui_text(&mut ui, "alpha γ");
+        move_editor_cursor(&mut ui, false, false);
+        insert_ui_text(&mut ui, "beta ");
+        assert_eq!(ui.prompt, "alpha beta γ");
+        assert_eq!(ui.prompt_cursor, "alpha beta ".len());
+        assert!(delete_before_cursor(&mut ui.prompt, &mut ui.prompt_cursor));
+        assert_eq!(ui.prompt, "alpha betaγ");
+    }
+
+    #[test]
+    fn pointer_click_places_editor_cursor_and_ctrl_f_opens_search() {
+        let mut ui = UiState::new();
+        ui.prompt = "alpha beta".to_string();
+        ui.prompt_cursor = ui.prompt.len();
+        let rect = prompt_rect(&ui);
+        set_prompt_cursor_from_pointer(&mut ui, rect.x + 13.0, rect.y + 28.0);
+        assert_eq!(ui.prompt_cursor, 0);
+        handle_ui_key(&mut ui, "f", true, MOD_CTRL);
+        assert!(ui.search_active);
+    }
+
+    #[test]
+    fn markdown_parser_builds_semantic_blocks_without_raw_markers() {
+        let blocks = parse_markdown(
+            "# Result\n\n- **first** item\n\n> note\n\n```rust\nlet value = 4;\n```",
+        );
+        assert_eq!(blocks[0].kind, MarkdownKind::Heading);
+        assert_eq!(blocks[0].text, "Result");
+        assert_eq!(blocks[1].kind, MarkdownKind::Bullet);
+        assert_eq!(blocks[1].text, "•  first item");
+        assert_eq!(blocks[2].kind, MarkdownKind::Quote);
+        assert_eq!(blocks[3].kind, MarkdownKind::Code);
+        assert!(blocks[3].text.contains("let value = 4;"));
+    }
+
+    #[test]
+    fn transcript_scroll_disables_and_restores_tail_following() {
+        let mut ui = UiState::new();
+        ui.transcript_content_height = 900.0;
+        ui.transcript_viewport_height = 300.0;
+        ui.transcript_scroll = 600.0;
+        assert!(scroll_transcript(&mut ui, -120.0));
+        assert!(!ui.transcript_follow_tail);
+        assert!(scroll_transcript(&mut ui, 500.0));
+        assert_eq!(ui.transcript_scroll, 600.0);
+        assert!(ui.transcript_follow_tail);
+    }
+
+    #[test]
+    fn dragging_tabs_preserves_selected_agent_identity() {
+        let mut ui = UiState::new();
+        ui.agents = vec!["one".to_string(), "two".to_string(), "three".to_string()];
+        ui.selected = 1;
+        ui.tab_drag = Some(TabDrag {
+            agent: "one".to_string(),
+            start_x: 20.0,
+            moved: false,
+        });
+        assert!(update_tab_drag(&mut ui, 320.0));
+        assert_eq!(ui.agents, ["two", "three", "one"]);
+        assert_eq!(ui.selected_agent(), Some("two"));
     }
 
     fn png_bytes(size: usize) -> Vec<u8> {

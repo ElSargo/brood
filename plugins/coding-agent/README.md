@@ -16,6 +16,17 @@ actor over the bidirectional realm mailbox.
 
 The UI supports:
 
+- a multiline prompt editor with a visible insertion cursor, Unicode-safe
+  navigation and deletion, `Home`/`End`, selection with `Shift` or `Ctrl+A`,
+  paste, and `Shift+Enter` for a newline;
+- wheel, touchpad, keyboard, and draggable-scrollbar transcript navigation,
+  with tail following that pauses while reading earlier output;
+- `Ctrl+F` conversation search with highlighted results and
+  `Enter`/`Shift+Enter` result navigation;
+- width-aware chat cards with native word wrapping, Markdown headings, lists,
+  quotes, code blocks, and visually distinct tool-call and error cards;
+- compact session-wide agent tabs that can be selected or reordered by drag,
+  plus header controls for search and creating an agent;
 - `Ctrl+Alt+A` globally to fuzzy-pick a running agent in the current session
   and open a UI focused on it; the selected agent is rendered immediately from
   the launch binding while the full registry snapshot reconnects;
