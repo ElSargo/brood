@@ -2,7 +2,7 @@
 status: target
 type: system
 authority: product
-last-reviewed: 2026-08-01
+last-reviewed: 2026-08-21
 ---
 
 # Plugin Runtime
@@ -142,12 +142,15 @@ message validation, and explicit session teardown. Actor names are labels, not
 an ownership convention, and changing the active session never changes an
 existing child's scope.
 
-The default daemon root is the worktree manager. It serializes managed
-worktree acquisition, records occupation, and decides which idle worktrees are
-eligible for cleanup. Its workers perform allow-listed Git operations and
-persist metadata under the managed XDG data root. The host remains responsible
-for validating actor results and attaching or activating surface sessions; it
-does not absorb worktree policy into the session picker.
+The default daemon root is the session storage manager. It serializes session
+volume and managed-worktree acquisition, records occupation, and decides which
+idle resources are eligible for retention or cleanup. Its workers perform
+allow-listed policy operations and persist metadata under the managed XDG data
+root. Native host mechanisms perform validated namespace, mount, reflink,
+export, and removal work. The host remains responsible for validating actor
+results and attaching or activating surface sessions; it does not absorb
+storage policy into the session picker. The complete storage and process
+boundary is specified in [[session-isolation]].
 
 The host retains mechanism and recovery responsibility. It validates identities
 and package-root paths and enforces generation and resource limits. Scheduler
