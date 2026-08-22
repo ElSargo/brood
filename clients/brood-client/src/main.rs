@@ -1503,6 +1503,8 @@ struct CatalogWireSession {
     branch: Option<String>,
     worktree: bool,
     git: bool,
+    #[serde(default)]
+    isolation: brood_protocol::SessionIsolationStatus,
 }
 
 #[derive(Deserialize)]
@@ -1633,6 +1635,7 @@ fn spawn_catalog_updates(
                                     branch: session.branch,
                                     worktree: session.worktree,
                                     git: session.git,
+                                    isolation: session.isolation,
                                 })
                                 .collect::<Vec<_>>();
                             let windows = decoded
@@ -4596,6 +4599,7 @@ impl Application {
                             branch: session.branch.clone(),
                             worktree: session.worktree,
                             git: session.git,
+                            isolation: session.isolation.clone(),
                         })
                         .collect(),
                 })

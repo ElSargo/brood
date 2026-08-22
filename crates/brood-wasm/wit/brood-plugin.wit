@@ -560,6 +560,53 @@ interface actor {
         preview-rgba8: list<u8>,
     }
 
+    enum isolation-profile {
+        isolated,
+        direct,
+    }
+
+    enum session-volume-lifecycle {
+        active,
+        retained,
+        graveyard,
+        purged,
+    }
+
+    record session-volume-status {
+        id: string,
+        lifecycle: session-volume-lifecycle,
+    }
+
+    enum capsule-lifecycle {
+        preparing,
+        ready,
+        stopping,
+        stopped,
+        failed,
+    }
+
+    enum capsule-failure-stage {
+        preparation,
+        runtime,
+        cleanup,
+    }
+
+    record capsule-failure {
+        stage: capsule-failure-stage,
+        message: string,
+    }
+
+    record capsule-status {
+        lifecycle: capsule-lifecycle,
+        failure: option<capsule-failure>,
+    }
+
+    record session-isolation-status {
+        profile: isolation-profile,
+        volume: option<session-volume-status>,
+        capsule: option<capsule-status>,
+    }
+
     record session-summary {
         id: u64,
         name: string,
@@ -572,6 +619,7 @@ interface actor {
         branch: option<string>,
         worktree: bool,
         git: bool,
+        isolation: session-isolation-status,
     }
 
     record session-snapshot {

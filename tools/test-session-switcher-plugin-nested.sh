@@ -35,6 +35,8 @@ DATA_HOME="$OUT/data"
 DBUS_DESTINATION="org.brood.SessionSwitcherTest.p$$"
 OUTPUT_MODE="${BROOD_KEYBINDINGS_TEST_OUTPUT_MODE:-1280x720}"
 EMPTY_STARTUP_ONLY="${BROOD_EMPTY_STARTUP_ONLY:-0}"
+WORKTREE_CREATION_ONLY="${BROOD_WORKTREE_CREATION_ONLY:-0}"
+WORKTREE_FAILURE_ONLY="${BROOD_WORKTREE_FAILURE_ONLY:-0}"
 if [[ ! "$OUTPUT_MODE" =~ ^[1-9][0-9]*x[1-9][0-9]*$ ]]; then
   echo "ERR BROOD_KEYBINDINGS_TEST_OUTPUT_MODE must be WIDTHxHEIGHT" >&2
   exit 2
@@ -475,6 +477,101 @@ PY
 EOF
   echo "empty_startup_plugins=verified"
   echo "proof=$OUT/proof.md"
+  exit 0
+fi
+
+if [[ "$WORKTREE_CREATION_ONLY" == 1 || "$WORKTREE_FAILURE_ONLY" == 1 ]]; then
+  for _ in $(seq 1 200); do
+    if rg -q "accepted leased actor layout .* panes=[1-9][0-9]*" "$CLIENT_LOG" \
+      && rg -q "backend session catalogue backend=1 sessions=2 active=3" "$CLIENT_LOG"; then
+      break
+    fi
+    sleep 0.05
+  done
+  rg -q "accepted leased actor layout .* panes=[1-9][0-9]*" "$CLIENT_LOG"
+  rg -q "backend session catalogue backend=1 sessions=2 active=3" "$CLIENT_LOG"
+  env XDG_RUNTIME_DIR="$RUNTIME_DIR" WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+    grim "$OUT/worktree-first-open.png"
+
+  # Exercise the public header action reported by users, rather than the
+  # project-row shortcut: New -> Worktree -> branch name.
+  env XDG_RUNTIME_DIR="$RUNTIME_DIR" WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+    "$OUT/virtual-pointer-click" 1244 26 1280 720
+  sleep 0.4
+  env XDG_RUNTIME_DIR="$RUNTIME_DIR" WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+    grim "$OUT/worktree-creation-picker.png"
+  env XDG_RUNTIME_DIR="$RUNTIME_DIR" WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+    "$OUT/virtual-pointer-click" 500 185 1280 720
+  sleep 0.3
+  env XDG_RUNTIME_DIR="$RUNTIME_DIR" WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+    grim "$OUT/worktree-branch-prompt.png"
+  if [[ "$WORKTREE_FAILURE_ONLY" == 1 ]]; then
+    env XDG_RUNTIME_DIR="$RUNTIME_DIR" WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+      wtype x -k BackSpace -s 100 bad..branch -s 100 -k Return
+    for _ in $(seq 1 200); do
+      if rg -q 'backend actor message backend=1 realm=Daemon sender=init recipient=session-switcher body=.*"success":false.*"type":"worktree-session-completed"' "$CLIENT_LOG"; then
+        break
+      fi
+      sleep 0.05
+    done
+    rg -q 'backend actor message backend=1 realm=Daemon sender=init recipient=session-switcher body=.*"success":false.*"type":"worktree-session-completed"' "$CLIENT_LOG"
+    sleep 0.2
+    env XDG_RUNTIME_DIR="$RUNTIME_DIR" WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+      grim "$OUT/worktree-failed.png"
+    SESSION_JSON="$(ctl surface-session list-json)"
+    python3 - "$SESSION_JSON" <<'PY'
+import json
+import sys
+
+catalog = json.loads(sys.argv[1])
+assert len(catalog["sessions"]) == 2
+assert all(session["branch"] != "bad..branch" for session in catalog["sessions"])
+PY
+    [[ -s "$OUT/worktree-first-open.png" ]]
+    [[ -s "$OUT/worktree-creation-picker.png" ]]
+    [[ -s "$OUT/worktree-branch-prompt.png" ]]
+    [[ -s "$OUT/worktree-failed.png" ]]
+    echo "session_switcher_worktree_failure=verified"
+    echo "artifacts=$OUT"
+    exit 0
+  fi
+  env XDG_RUNTIME_DIR="$RUNTIME_DIR" WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+    wtype x -k BackSpace -s 100 picker-worktree -s 100 -k Return
+
+  for _ in $(seq 1 200); do
+    if rg -q 'presentation actor message realm=Daemon sender=session-switcher recipient=init body=.*"kind":"create-worktree-session"' "$CLIENT_LOG" \
+      && rg -q 'backend actor message backend=1 realm=Daemon sender=init recipient=session-switcher body=.*"success":true.*"type":"worktree-session-completed"' "$CLIENT_LOG" \
+      && rg -q "presentation shared catalog .*sessions=3 " "$CLIENT_LOG" \
+      && rg -q "backend session catalogue backend=1 sessions=3 active=[1-9][0-9]*" "$CLIENT_LOG"; then
+      break
+    fi
+    sleep 0.05
+  done
+  rg -q 'presentation actor message realm=Daemon sender=session-switcher recipient=init body=.*"kind":"create-worktree-session"' "$CLIENT_LOG"
+  rg -q 'backend actor message backend=1 realm=Daemon sender=init recipient=session-switcher body=.*"success":true.*"type":"worktree-session-completed"' "$CLIENT_LOG"
+  rg -q "presentation shared catalog .*sessions=3 " "$CLIENT_LOG"
+  rg -q "backend session catalogue backend=1 sessions=3 active=[1-9][0-9]*" "$CLIENT_LOG"
+
+  # This is deliberately the first DBus query after submission. The client
+  # must already have received and rendered the async catalogue transition.
+  SESSION_JSON="$(ctl surface-session list-json)"
+  python3 - "$SESSION_JSON" <<'PY'
+import json
+import sys
+
+catalog = json.loads(sys.argv[1])
+created = next(session for session in catalog["sessions"] if session["name"] == "picker-worktree")
+assert created["active"] is True
+assert created["worktree"] is True
+assert created["branch"] == "picker-worktree"
+PY
+  env XDG_RUNTIME_DIR="$RUNTIME_DIR" WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+    grim "$OUT/worktree-created.png"
+  [[ -s "$OUT/worktree-creation-picker.png" ]]
+  [[ -s "$OUT/worktree-branch-prompt.png" ]]
+  [[ -s "$OUT/worktree-created.png" ]]
+  echo "session_switcher_worktree_creation=verified"
+  echo "artifacts=$OUT"
   exit 0
 fi
 
@@ -1116,18 +1213,26 @@ WORKTREE_DAEMON_REQUESTS_BEFORE="$(
 click_at 1260 68
 submit_text picker-worktree
 for _ in $(seq 1 200); do
-  SESSION_JSON="$(ctl surface-session list-json)"
   WORKTREE_DAEMON_REQUESTS_AFTER="$(
     rg -c "delivered presentation-to-daemon actor message" "$SERVER_LOG" || true
   )"
-  if rg -q '"name":"picker-worktree"' <<< "$SESSION_JSON" \
-    && ((WORKTREE_DAEMON_REQUESTS_AFTER > WORKTREE_DAEMON_REQUESTS_BEFORE)); then
+  if ((WORKTREE_DAEMON_REQUESTS_AFTER > WORKTREE_DAEMON_REQUESTS_BEFORE)) \
+    && rg -q "attached managed worktree session" "$SERVER_LOG" \
+    && rg -q "presentation shared catalog .*sessions=3 " "$CLIENT_LOG" \
+    && rg -q "backend session catalogue backend=1 sessions=3 active=[1-9][0-9]*" "$CLIENT_LOG"; then
     break
   fi
   sleep 0.05
 done
-rg -q '"name":"picker-worktree"' <<< "$SESSION_JSON"
 ((WORKTREE_DAEMON_REQUESTS_AFTER > WORKTREE_DAEMON_REQUESTS_BEFORE))
+rg -q "attached managed worktree session" "$SERVER_LOG"
+rg -q "presentation shared catalog .*sessions=3 " "$CLIENT_LOG"
+rg -q "backend session catalogue backend=1 sessions=3 active=[1-9][0-9]*" "$CLIENT_LOG"
+# Query only after the presentation has independently observed the new
+# catalogue. Polling DBus here used to mask missing async catalogue publication
+# because every control request publishes the daemon's latest snapshot.
+SESSION_JSON="$(ctl surface-session list-json)"
+rg -q '"name":"picker-worktree"' <<< "$SESSION_JSON"
 read -r WORKTREE_SESSION_ID WORKTREE_DIRECTORY < <(
   python3 - "$SESSION_JSON" "$PROJECT" "$DATA_HOME" <<'PY'
 import json

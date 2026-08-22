@@ -5,13 +5,15 @@ use brood_plugin_sdk::{
     exports::brood::plugin::actor::{
         Command, Event, Guest, LifecycleEvent, WorkerEvent, WorkerFinished,
     },
-    runtime::{sleep as wait_timer, wait_child, wait_notification},
+    runtime::{sleep as wait_timer, wait_child, wait_notification, write_all},
 };
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Mutex,
 };
+
+mod provision;
 
 const METADATA_BYTES: usize = 4096;
 const MAINTENANCE_INTERVAL_MS: u64 = 60 * 60 * 1000;
@@ -35,6 +37,7 @@ enum HostRequest {
         project_id: String,
         project_name: String,
         source_directory: String,
+        source_worktree: String,
         branch: String,
         target: String,
         metadata_path: String,
@@ -64,6 +67,8 @@ struct WorktreeRecord {
     project_id: String,
     project_name: String,
     source_directory: String,
+    #[serde(default)]
+    source_worktree: String,
     branch: String,
     path: String,
     metadata_path: String,
@@ -322,6 +327,7 @@ fn handle_host_request(sender: &str, bytes: &[u8]) -> Vec<Command> {
             project_id,
             project_name,
             source_directory,
+            source_worktree,
             branch,
             target,
             metadata_path,
@@ -331,6 +337,7 @@ fn handle_host_request(sender: &str, bytes: &[u8]) -> Vec<Command> {
                 project_id,
                 project_name,
                 source_directory,
+                source_worktree,
                 branch,
                 path: target,
                 metadata_path,
@@ -541,68 +548,7 @@ async fn provision_worktree(record: &WorktreeRecord) -> Result<(), String> {
         .into_owned();
     let created_parent = run_command("mkdir", &["-p".to_string(), parent]).await?;
     ensure_success(&created_parent, "create managed worktree directory")?;
-    let checked = run_git(&[
-        "check-ref-format".to_string(),
-        "--branch".to_string(),
-        record.branch.clone(),
-    ])
-    .await?;
-    ensure_success(&checked, "validate Git branch name")?;
-
-    let branch_ref = format!("refs/heads/{}", record.branch);
-    let branch_check = run_git(&[
-        "-C".to_string(),
-        record.source_directory.clone(),
-        "show-ref".to_string(),
-        "--verify".to_string(),
-        "--quiet".to_string(),
-        branch_ref,
-    ])
-    .await?;
-    let mut arguments = vec![
-        "-C".to_string(),
-        record.source_directory.clone(),
-        "worktree".to_string(),
-        "add".to_string(),
-    ];
-    if branch_check.status == 0 {
-        arguments.push(record.path.clone());
-        arguments.push(record.branch.clone());
-    } else {
-        arguments.extend([
-            "-b".to_string(),
-            record.branch.clone(),
-            record.path.clone(),
-            "HEAD".to_string(),
-        ]);
-    }
-    let created = run_git(&arguments).await?;
-    if created.status != 0 {
-        let existing_branch = run_git(&[
-            "-C".to_string(),
-            record.path.clone(),
-            "branch".to_string(),
-            "--show-current".to_string(),
-        ])
-        .await?;
-        let existing_project = run_git(&[
-            "-C".to_string(),
-            record.path.clone(),
-            "rev-parse".to_string(),
-            "--path-format=absolute".to_string(),
-            "--git-common-dir".to_string(),
-        ])
-        .await?;
-        let existing_branch = String::from_utf8_lossy(&existing_branch.stdout)
-            .trim()
-            .to_string();
-        let existing_project = String::from_utf8_lossy(&existing_project.stdout)
-            .trim()
-            .to_string();
-        if existing_branch != record.branch || existing_project != record.project_id {
-            return Err(command_error(&created, "create managed Git worktree"));
-        }
-    }
+    provision::provision(&provision::HostProvisionRunner, record).await?;
     persist_record(record).await
 }
 
@@ -767,8 +713,21 @@ async fn run_git(arguments: &[String]) -> Result<GitOutput, String> {
 }
 
 async fn run_command(command: &str, arguments: &[String]) -> Result<GitOutput, String> {
+    run_command_with_input(command, arguments, None).await
+}
+
+async fn run_command_with_input(
+    command: &str,
+    arguments: &[String],
+    input: Option<&[u8]>,
+) -> Result<GitOutput, String> {
     let process = host::subprocess_spawn(command, arguments)
         .map_err(|error| format!("spawn {command}: {error:?}"))?;
+    if let Some(input) = input {
+        write_all(process.stdin, input)
+            .await
+            .map_err(|error| format!("write {command} stdin: {error}"))?;
+    }
     host::stream_close_write(process.stdin)
         .map_err(|error| format!("close {command} stdin: {error:?}"))?;
     let stdout = read_to_eof(process.stdout).await?;

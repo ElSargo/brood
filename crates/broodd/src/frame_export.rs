@@ -88,6 +88,7 @@ struct CatalogSession {
     branch: Option<String>,
     worktree: bool,
     git: bool,
+    isolation: brood_protocol::SessionIsolationStatus,
 }
 
 #[derive(serde::Serialize)]
@@ -277,6 +278,7 @@ pub fn publish_catalog_snapshot(state: &mut Brood) -> std::result::Result<(), Fr
                 branch: session.branch,
                 worktree: session.worktree,
                 git: session.git,
+                isolation: session.isolation,
             })
             .collect(),
         windows: state

@@ -77,6 +77,7 @@ const EXTENSION_INTERFACE: &str = "org.brood.Extension";
 const PLUGIN_INTERFACE: &str = "org.brood.Plugin";
 const AGENT_INTERFACE: &str = "org.brood.Agent";
 const CONTROL_REPLY_TIMEOUT: Duration = Duration::from_secs(15);
+const WORKTREE_REPLY_TIMEOUT: Duration = Duration::from_secs(120);
 const NATIVE_TOOL_REPLY_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_NATIVE_TOOL_REQUEST_BYTES: u64 = 1024 * 1024;
 
@@ -584,13 +585,15 @@ impl SessionDbus {
         source_session: u64,
         branch: String,
     ) -> fdo::Result<u64> {
-        request_state(&self.sender, |response| {
-            DbusStateRequest::CreateManagedWorktreeSession {
+        request_state_with_timeout(
+            &self.sender,
+            |response| DbusStateRequest::CreateManagedWorktreeSession {
                 source_session,
                 branch,
                 response,
-            }
-        })
+            },
+            WORKTREE_REPLY_TIMEOUT,
+        )
         .await
     }
 
@@ -1097,13 +1100,21 @@ fn request_state<T>(
     sender: &channel::Sender<DbusStateRequest>,
     build: impl FnOnce(DbusResponse<T>) -> DbusStateRequest,
 ) -> impl Future<Output = fdo::Result<T>> {
+    request_state_with_timeout(sender, build, CONTROL_REPLY_TIMEOUT)
+}
+
+fn request_state_with_timeout<T>(
+    sender: &channel::Sender<DbusStateRequest>,
+    build: impl FnOnce(DbusResponse<T>) -> DbusStateRequest,
+    timeout: Duration,
+) -> impl Future<Output = fdo::Result<T>> {
     let (response_tx, response_rx) = tokio::sync::oneshot::channel();
     let send_result = sender.send(build(response_tx));
     async move {
         send_result.map_err(|err| {
             fdo::Error::Failed(format!("Brood session loop is not running: {err}"))
         })?;
-        tokio::time::timeout(CONTROL_REPLY_TIMEOUT, response_rx)
+        tokio::time::timeout(timeout, response_rx)
             .await
             .map_err(|err| {
                 fdo::Error::Failed(format!(

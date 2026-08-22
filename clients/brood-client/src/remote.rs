@@ -772,6 +772,7 @@ fn handle_reliable_message(
                     branch: session.branch,
                     worktree: session.worktree,
                     git: session.git,
+                    isolation: session.isolation,
                 })
                 .collect();
             let windows = catalog

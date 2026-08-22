@@ -46,7 +46,7 @@ use crate::lifecycle::wait_for_lifecycle_reply;
 use crate::lifecycle::{PluginLifecycleEvent, PluginStartReason, PluginStopReason};
 use crate::presentation::{
     FontIntent, FontStyle, FontWeight, PresentationError, PresentationEvent, PresentationHost,
-    SessionCommandRequest, SessionEvent, SessionOperation, TextLayoutOptions,
+    SessionCommandRequest, SessionEvent, SessionOperation, SessionSummary, TextLayoutOptions,
 };
 use crate::resource_limits::{
     GenerationByteBudget, GenerationBytePermit, GenerationStoreLimits, WasmResourceLimits,
@@ -3253,19 +3253,7 @@ fn component_session_to_guest(event: SessionEvent) -> GuestEvent {
             sessions: snapshot
                 .sessions
                 .into_iter()
-                .map(|session| abi::SessionSummary {
-                    id: session.id,
-                    name: session.name,
-                    active: session.active,
-                    windows: session.windows,
-                    working_directory: session.working_directory,
-                    project_id: session.project_id,
-                    project_name: session.project_name,
-                    project_directory: session.project_directory,
-                    branch: session.branch,
-                    worktree: session.worktree,
-                    git: session.git,
-                })
+                .map(component_session_summary_to_guest)
                 .collect(),
         }),
         SessionEvent::CommandCompleted(completion) => {
@@ -3280,6 +3268,64 @@ fn component_session_to_guest(event: SessionEvent) -> GuestEvent {
         }
     };
     abi::Event::Session(event)
+}
+
+fn component_session_summary_to_guest(
+    session: SessionSummary,
+) -> bindings::exports::brood::plugin::actor::SessionSummary {
+    use bindings::exports::brood::plugin::actor as abi;
+    use brood_protocol::{
+        CapsuleFailureStage, CapsuleLifecycle, IsolationProfile, SessionVolumeLifecycle,
+    };
+
+    abi::SessionSummary {
+        id: session.id,
+        name: session.name,
+        active: session.active,
+        windows: session.windows,
+        working_directory: session.working_directory,
+        project_id: session.project_id,
+        project_name: session.project_name,
+        project_directory: session.project_directory,
+        branch: session.branch,
+        worktree: session.worktree,
+        git: session.git,
+        isolation: abi::SessionIsolationStatus {
+            profile: match session.isolation.profile {
+                IsolationProfile::Isolated => abi::IsolationProfile::Isolated,
+                IsolationProfile::Direct => abi::IsolationProfile::Direct,
+            },
+            volume: session
+                .isolation
+                .volume
+                .map(|volume| abi::SessionVolumeStatus {
+                    id: volume.id.to_string(),
+                    lifecycle: match volume.lifecycle {
+                        SessionVolumeLifecycle::Active => abi::SessionVolumeLifecycle::Active,
+                        SessionVolumeLifecycle::Retained => abi::SessionVolumeLifecycle::Retained,
+                        SessionVolumeLifecycle::Graveyard => abi::SessionVolumeLifecycle::Graveyard,
+                        SessionVolumeLifecycle::Purged => abi::SessionVolumeLifecycle::Purged,
+                    },
+                }),
+            capsule: session.isolation.capsule.map(|capsule| abi::CapsuleStatus {
+                lifecycle: match capsule.lifecycle {
+                    CapsuleLifecycle::Preparing => abi::CapsuleLifecycle::Preparing,
+                    CapsuleLifecycle::Ready => abi::CapsuleLifecycle::Ready,
+                    CapsuleLifecycle::Stopping => abi::CapsuleLifecycle::Stopping,
+                    CapsuleLifecycle::Stopped => abi::CapsuleLifecycle::Stopped,
+                    CapsuleLifecycle::Failed => abi::CapsuleLifecycle::Failed,
+                },
+                failure: capsule.failure.map(|failure| abi::CapsuleFailure {
+                    stage: match failure.stage {
+                        CapsuleFailureStage::Preparation => abi::CapsuleFailureStage::Preparation,
+                        CapsuleFailureStage::Runtime => abi::CapsuleFailureStage::Runtime,
+                        CapsuleFailureStage::Cleanup => abi::CapsuleFailureStage::Cleanup,
+                    },
+                    message: failure.message,
+                }),
+            }),
+        },
+    }
 }
 
 fn component_session_command_from_guest(

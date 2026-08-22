@@ -926,7 +926,13 @@ fn validate_catalog(catalog: &brood_protocol::CatalogSnapshot) -> Result<()> {
                 && session
                     .branch
                     .as_ref()
-                    .is_none_or(|branch| branch.len() <= 1_024),
+                    .is_none_or(|branch| branch.len() <= 1_024)
+                && session
+                    .isolation
+                    .capsule
+                    .as_ref()
+                    .and_then(|capsule| capsule.failure.as_ref())
+                    .is_none_or(|failure| failure.message.len() <= 1_024),
             "network catalog session metadata is oversized"
         );
     }

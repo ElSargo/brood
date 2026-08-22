@@ -155,8 +155,8 @@ let
   brooddArtifacts = craneLib.buildDepsOnly (
     craneBaseArgs
     // {
-      cargoBuildExtraArgs = "-p broodd -p brood-client -p brood-remote --bins";
-      cargoCheckExtraArgs = "-p broodd -p brood-client -p brood-remote --all-targets";
+      cargoBuildExtraArgs = "-p broodd -p brood-capsuled -p brood-client -p brood-remote --bins";
+      cargoCheckExtraArgs = "-p broodd -p brood-capsuled -p brood-client -p brood-remote --all-targets";
     }
   );
 
@@ -164,7 +164,7 @@ let
     craneBaseArgs
     // {
       cargoArtifacts = brooddArtifacts;
-      cargoBuildExtraArgs = "-p broodd -p brood-client -p brood-remote --bins";
+      cargoBuildExtraArgs = "-p broodd -p brood-capsuled -p brood-client -p brood-remote --bins";
       doCheck = false;
     }
   );
@@ -379,7 +379,7 @@ let
     ];
     nativeBuildInputs = [ pkgs.makeWrapper ];
     postBuild = ''
-      for program in brood brood-agent brood-client brood-computer-use-mcp brood-remote brood-sessiond brood-runner-exec brood-runner-nix-develop; do
+      for program in brood brood-agent brood-capsuled brood-client brood-computer-use-mcp brood-remote brood-sessiond brood-runner-exec brood-runner-nix-develop; do
         wrapProgram "$out/bin/$program" \
           --prefix PATH : "$out/bin:${appToolPath}" \
           --prefix LD_LIBRARY_PATH : "${nativeLibraryPath}" \
@@ -417,7 +417,7 @@ let
           "$out/lib" \
           "$out/libexec" \
           "$out/plugins/worktree-manager/target/wasm32-unknown-unknown/release"
-        for program in brood brood-remote brood-sessiond brood-runner-exec; do
+        for program in brood brood-capsuled brood-remote brood-sessiond brood-runner-exec; do
           cp ${broodd}/bin/"$program" "$out/bin/$program"
           chmod u+w "$out/bin/$program"
           patchelf \
@@ -487,7 +487,7 @@ let
           "$out/share/glvnd/egl_vendor.d" \
           "$out/share/X11"
 
-        for program in brood brood-remote brood-sessiond brood-runner-exec; do
+        for program in brood brood-capsuled brood-remote brood-sessiond brood-runner-exec; do
           cp ${broodd}/bin/"$program" "$out/bin/$program"
           chmod u+w "$out/bin/$program"
         done

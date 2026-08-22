@@ -30,7 +30,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
-use brood_protocol::BackendActorRealm;
+use brood_protocol::{BackendActorRealm, SessionIsolationStatus};
 #[cfg(feature = "shm-fallback")]
 use smithay::wayland::shm::ShmState;
 use smithay::{
@@ -296,6 +296,8 @@ pub struct SurfaceSessionSummary {
     pub branch: Option<String>,
     pub worktree: bool,
     pub git: bool,
+    #[serde(default)]
+    pub isolation: SessionIsolationStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1574,6 +1576,11 @@ impl Brood {
                     self.plugin_actor_failures = self.plugin_actor_failures.saturating_add(1);
                     self.plugin_actor_last_status = Some(format!("{actor_name}:dispatcher_failed"));
                     warn!(actor = %actor_name, error = %message, "component actor dispatcher failed");
+                    if actor_name == BACKEND_INIT_ACTOR_ID {
+                        self.fail_pending_managed_worktrees(&format!(
+                            "worktree backend stopped unexpectedly: {message}"
+                        ));
+                    }
                     if let Some((session, child_id)) = self.realm_init_child_owner(&actor_name) {
                         self.send_realm_init_child_event(
                             session,
@@ -1611,6 +1618,11 @@ impl Brood {
                 brood_wasm::ComponentActorEvent::Stopped => {
                     self.plugin_actor_last_status = Some(format!("{actor_name}:stopped"));
                     info!(actor = %actor_name, "component actor stopped");
+                    if actor_name == BACKEND_INIT_ACTOR_ID {
+                        self.fail_pending_managed_worktrees(
+                            "worktree backend stopped before creation completed",
+                        );
+                    }
                     if let Some((session, child_id)) = self.realm_init_child_owner(&actor_name) {
                         self.send_realm_init_child_event(
                             session,
@@ -2845,6 +2857,11 @@ impl Brood {
                 branch: project.and_then(|project| project.branch.clone()),
                 worktree: project.is_some_and(|project| project.is_worktree),
                 git: project.is_some_and(|project| project.is_git),
+                isolation: self
+                    .sessions
+                    .isolation_status(session)
+                    .cloned()
+                    .unwrap_or_default(),
             }
         })
     }
@@ -4239,10 +4256,13 @@ impl Brood {
             ConfiguredPluginResources::default(),
             brood_wasm::RuntimeIoCapabilities {
                 commands: vec![
+                    "cp".to_string(),
                     "find".to_string(),
                     "git".to_string(),
                     "mkdir".to_string(),
                     "rm".to_string(),
+                    "stat".to_string(),
+                    "test".to_string(),
                 ],
                 ..brood_wasm::RuntimeIoCapabilities::default()
             },
@@ -4348,6 +4368,7 @@ impl Brood {
                 "project_id": project.id,
                 "project_name": project.name,
                 "source_directory": project.source_directory,
+                "source_worktree": project.working_tree,
                 "branch": branch,
                 "target": target,
                 "metadata_path": metadata_path,
@@ -4494,17 +4515,24 @@ impl Brood {
                     .working_directory(*session)
                     .is_some_and(|directory| directory == path)
             });
-            let session = if let Some(session) = existing {
-                self.switch_to_surface_session(session);
-                session
+            let (session, catalogue_changed) = if let Some(session) = existing {
+                (session, self.switch_to_surface_session(session))
             } else {
                 let session = self.create_and_attach_named_surface_session_in_directory(
                     Some(pending.branch.clone()),
                     path.to_path_buf(),
                 )?;
                 self.remember_directory_surface_session(path.to_path_buf(), session, true);
-                session
+                (session, true)
             };
+            // Worktree provisioning completes asynchronously, outside the
+            // DBus request path that normally publishes session mutations.
+            // Publish before delivering the actor completion so the client can
+            // import and render the newly active session without requiring an
+            // unrelated control request or window commit to flush the state.
+            if catalogue_changed {
+                crate::frame_export::request_redraw(self);
+            }
             let attached = serde_json::to_vec(&serde_json::json!({
                 "kind": "attached",
                 "request": request,
@@ -4535,6 +4563,14 @@ impl Brood {
             return;
         };
         self.complete_managed_worktree_response(pending.response, Err(message.to_string()));
+    }
+
+    fn fail_pending_managed_worktrees(&mut self, message: &str) {
+        let pending = std::mem::take(&mut self.pending_managed_worktrees);
+        for (request, pending) in pending {
+            warn!(request, error = %message, "managed worktree request did not complete");
+            self.complete_managed_worktree_response(pending.response, Err(message.to_string()));
+        }
     }
 
     fn complete_managed_worktree_response(

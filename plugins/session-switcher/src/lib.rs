@@ -16,8 +16,8 @@ use brood_plugin_sdk::{
     input::{BUTTON_PRIMARY as LEFT_BUTTON, BUTTON_SECONDARY as RIGHT_BUTTON},
     layout::{
         Axis, DelegateLayoutRest, DividerItem, InputZone, ItemKind, LayoutFragment, LayoutItem,
-        LayoutRest, Lease, ResolvedLayout, SetPointerPolicy, SetResolvedLayout,
-        SubmitLayoutRegion, SubmitSynchronizedLayout, Transform,
+        LayoutRest, Lease, ResolvedLayout, SetPointerPolicy, SetResolvedLayout, SubmitLayoutRegion,
+        SubmitSynchronizedLayout, Transform,
     },
     text::truncate_to_width,
 };
@@ -656,6 +656,11 @@ impl SwitcherState {
                 .find(|group| group.backend == session.backend && group.id == session.project_id)
             {
                 group.sessions.push(index);
+                // Session snapshots and backend catalogues can arrive in a
+                // different order. Git is a project capability, so one stale
+                // or incomplete session row must not hide the worktree action
+                // for every other checkout of the project.
+                group.git |= session.git;
                 let source_is_worktree = self
                     .sessions
                     .iter()
@@ -1191,7 +1196,14 @@ fn apply_backend_sessions(
         .map(|backend| (backend.backend.0, backend.label.clone()))
         .collect();
     state.backends.sort_by_key(|(backend, _)| *backend);
-    state.sessions = backends
+    let current_backend = state.backend_id;
+    let current_sessions = state
+        .sessions
+        .iter()
+        .filter(|session| session.backend == current_backend)
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut catalogue_sessions = backends
         .into_iter()
         .flat_map(|backend| {
             backend
@@ -1215,7 +1227,21 @@ fn apply_backend_sessions(
                     git: session.git,
                 })
         })
-        .collect();
+        .collect::<Vec<_>>();
+    // The global catalogue is discovered asynchronously and can initially
+    // contain an empty row for the active backend even though that backend's
+    // live session snapshot has already arrived. Preserve that newer snapshot
+    // until the catalogue has real rows to replace it. A genuine empty state
+    // still arrives through `apply_snapshot`, which removes the sessions.
+    if current_backend != 0
+        && !current_sessions.is_empty()
+        && !catalogue_sessions
+            .iter()
+            .any(|session| session.backend == current_backend)
+    {
+        catalogue_sessions.extend(current_sessions);
+    }
+    state.sessions = catalogue_sessions;
     state
         .sessions
         .sort_by_key(|session| (session.backend, session.id));
@@ -1298,27 +1324,52 @@ fn handle_daemon_message(sender: &str, bytes: &[u8]) -> Vec<ActorCommand> {
     let Ok(mut state) = STATE.lock() else {
         return Vec::new();
     };
-    if state.pending == Some(completion.request) {
-        state.pending = None;
+    let backend = backend_from_sender(sender).unwrap_or(state.backend_id);
+    apply_worktree_completion(
+        &mut state,
+        backend,
+        completion.request,
+        completion.success,
+        completion.session,
+        completion.message.as_str(),
+    );
+    redraw_or_record_error(&mut state);
+    Vec::new()
+}
+
+fn apply_worktree_completion(
+    state: &mut SwitcherState,
+    backend: u64,
+    request: u64,
+    success: bool,
+    session: Option<u64>,
+    message: &str,
+) {
+    if state.pending != Some(request) {
+        return;
     }
-    state.error = !completion.success;
-    if completion.success {
-        let backend = backend_from_sender(sender).unwrap_or(state.backend_id);
-        if let Some(session) = completion.session {
-            state.selected = state
-                .sessions
-                .iter()
-                .find(|candidate| candidate.backend == backend && candidate.id == session)
-                .map(|candidate| (candidate.backend, candidate.id));
+    state.pending = None;
+    state.error = !success;
+    if success {
+        if let Some(session) = session {
+            // The completion and catalogue use independent bounded lanes. Keep
+            // the authoritative identity even when completion wins the race;
+            // the following catalogue update will retain this selection once
+            // it adds the row.
+            state.backend_id = backend;
+            state.session_id = session;
+            state.selected = Some((backend, session));
         }
         state.status = "Created worktree session".to_string();
         state.query.clear();
         state.mode = EditMode::Search;
     } else {
-        state.status = completion.message.as_str().to_string();
+        state.status = if message.trim().is_empty() {
+            "Worktree creation failed: the backend returned no error details".to_string()
+        } else {
+            format!("Worktree creation failed: {}", message.trim())
+        };
     }
-    redraw_or_record_error(&mut state);
-    Vec::new()
 }
 
 fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
@@ -1455,8 +1506,7 @@ fn handle_layout_message(bytes: &[u8]) -> Vec<ActorCommand> {
         };
         return apply_layout_transaction_notification(&mut state, &notification);
     }
-    if let Ok((message, consumed)) =
-        serde_json_core::from_slice::<LayoutRegionResizeMessage>(bytes)
+    if let Ok((message, consumed)) = serde_json_core::from_slice::<LayoutRegionResizeMessage>(bytes)
         && consumed == bytes.len()
         && message.message_type.as_str() == "layout-region-resized"
     {
@@ -1579,10 +1629,10 @@ fn publish_layout_region_response(
         fragment: &publication.fragment,
         focus,
     })
-        .ok()
-        .map(ActorCommand::SendHostMessage)
-        .into_iter()
-        .collect()
+    .ok()
+    .map(ActorCommand::SendHostMessage)
+    .into_iter()
+    .collect()
 }
 
 fn layout_region_failure_command(
@@ -2497,8 +2547,18 @@ fn handle_picker_layout_message(bytes: &[u8]) -> Vec<ActorCommand> {
     }
     state.picker_pane = Some(message.pane);
     state.picker_visible = message.visible;
+    let editing_in_switcher = matches!(
+        state.mode,
+        EditMode::Rename(..)
+            | EditMode::CreateWorktree(..)
+            | EditMode::ConnectRemote
+            | EditMode::CreateLocalContainer
+            | EditMode::CreateRemoteContainer
+    );
     let focus = if message.visible {
         Some(message.pane)
+    } else if editing_in_switcher {
+        Some(state.pane)
     } else {
         state
             .workspace_focus
@@ -2552,20 +2612,22 @@ fn handle_picker_selection(bytes: &[u8]) -> Vec<ActorCommand> {
         state.backend_picker = None;
         state.awaiting_backend_catalogue = false;
     }
-    if let Some(session) = message.result.value.session {
-        let backend = message.result.value.backend.unwrap_or_default();
-        let request = state.next_request();
-        return vec![backend_session_command(
-            request,
-            backend,
-            "activate",
-            Some(session),
-            None,
-            None,
-        )];
-    }
     if let Some(action) = message.result.value.action {
         match action.as_str() {
+            "create-worktree" => {
+                let Some(backend) = message.result.value.backend else {
+                    return Vec::new();
+                };
+                let Some(source_session) = message.result.value.session else {
+                    return Vec::new();
+                };
+                if !begin_worktree_for_source(&mut state, backend, source_session) {
+                    state.error = true;
+                    state.status = "The selected Git project is no longer available".to_string();
+                }
+                redraw_or_record_error(&mut state);
+                return Vec::new();
+            }
             "choose-directory" => {
                 if let Some(backend) = message.result.value.backend {
                     return open_directory_picker(&mut state, backend);
@@ -2623,6 +2685,18 @@ fn handle_picker_selection(bytes: &[u8]) -> Vec<ActorCommand> {
             }
             _ => {}
         }
+    }
+    if let Some(session) = message.result.value.session {
+        let backend = message.result.value.backend.unwrap_or_default();
+        let request = state.next_request();
+        return vec![backend_session_command(
+            request,
+            backend,
+            "activate",
+            Some(session),
+            None,
+            None,
+        )];
     }
     let Some(agent) = message.result.value.agent else {
         return Vec::new();
@@ -2691,6 +2765,28 @@ fn open_session_picker(state: &mut SwitcherState) -> Vec<ActorCommand> {
 
 fn creation_backend_items(state: &SwitcherState) -> Vec<SessionPickerItem> {
     let mut picker_items = Vec::new();
+    for project in state
+        .project_groups()
+        .into_iter()
+        .filter(|project| project.git)
+    {
+        let source = state.sessions.iter().find(|session| {
+            session.backend == project.backend && session.id == project.source_session
+        });
+        let source_label = source
+            .and_then(|session| session.branch.as_deref())
+            .unwrap_or("the current checkout");
+        picker_items.push(SessionPickerItem {
+            label: format!("Worktree · {}", project.name),
+            detail: format!("Create a new branch from {source_label}"),
+            value: SessionPickerValueWire {
+                backend: Some(project.backend),
+                session: Some(project.source_session),
+                action: Some("create-worktree".to_string()),
+                directory: None,
+            },
+        });
+    }
     for (backend, backend_label) in &state.backends {
         let label = if backend_label.is_empty() {
             format!("Backend {backend}")
@@ -2764,8 +2860,8 @@ fn creation_backend_picker_command(
     let request = SessionPickerRequest {
         message_type: "picker-create",
         request: loading.then_some(BACKEND_PICKER_REQUEST),
-        title: "Choose backend",
-        placeholder: "Fuzzy-match a backend or create a connection…",
+        title: "Create session",
+        placeholder: "Choose a worktree, directory, or backend…",
         items: creation_backend_items(state),
         loading,
         loading_label: if loading {
@@ -3190,12 +3286,7 @@ fn divider_zone(id: u64, center: f64, width: f64, content_size: f64) -> InputZon
     let zone_width = (16.0 / width).clamp(0.005, 0.05);
     InputZone {
         id,
-        transform: Transform::new(
-            center - zone_width * 0.5,
-            -1.0,
-            zone_width,
-            content_size,
-        ),
+        transform: Transform::new(center - zone_width * 0.5, -1.0, zone_width, content_size),
         z: 80,
         event_mask: DIVIDER_EVENT_MASK,
         cursor: "col-resize",
@@ -3579,18 +3670,10 @@ fn publish_synchronized_layout_attempt(
         f64::from(context.size.w.max(1)),
     );
     let inbox_width = state.inbox_pane.map_or(0.0, |pane| {
-        layout.pane_extent(
-            pane,
-            Axis::Horizontal,
-            f64::from(context.size.w.max(1)),
-        )
+        layout.pane_extent(pane, Axis::Horizontal, f64::from(context.size.w.max(1)))
     });
     let status_height = state.status_bar_pane.map_or(0.0, |pane| {
-        layout.pane_extent(
-            pane,
-            Axis::Vertical,
-            f64::from(context.size.height.max(1)),
-        )
+        layout.pane_extent(pane, Axis::Vertical, f64::from(context.size.height.max(1)))
     });
 
     let Some(request_id) = state.next_layout_request.checked_add(1) else {
@@ -3666,7 +3749,7 @@ fn switcher_target_at(state: &SwitcherState, x: f32, y: f32) -> Option<SwitcherT
     });
     let item = item.cloned()?;
     if let ListItem::Project(project) = item {
-        if x >= state.width - 48.0 && project.git {
+        if x >= state.width - 56.0 && project.git {
             Some(SwitcherTarget::ProjectWorktree(project.backend, project.id))
         } else {
             Some(SwitcherTarget::ProjectToggle(project.backend, project.id))
@@ -3827,6 +3910,7 @@ fn submit(state: &mut SwitcherState) -> Vec<ActorCommand> {
             return Vec::new();
         }
         let request = state.next_request();
+        state.status = format!("Creating and reflinking {branch}…");
         let Ok(body) = serde_json::to_vec(&WorktreeSessionRequest {
             kind: "create-worktree-session",
             request,
@@ -3980,6 +4064,19 @@ fn begin_worktree(state: &mut SwitcherState, project: &ProjectGroup) {
     state.query.clear();
     state.status = format!("New branch in {}: Enter to create", project.name);
     state.error = false;
+}
+
+fn begin_worktree_for_source(state: &mut SwitcherState, backend: u64, source_session: u64) -> bool {
+    let project = state
+        .project_groups()
+        .into_iter()
+        .find(|project| project.backend == backend && project.source_session == source_session);
+    if let Some(project) = project {
+        begin_worktree(state, &project);
+        true
+    } else {
+        false
+    }
 }
 
 fn move_selection(state: &mut SwitcherState, delta: isize) {
@@ -4300,7 +4397,7 @@ fn redraw_with_cache(
                     let worktree_hovered = state.hovered.as_ref() == Some(&worktree_target);
                     if worktree_pressed || worktree_hovered {
                         packet.push(Command::FillRoundedRect {
-                            rect: Rect::new(state.width - 44.0, y + 4.0, 32.0, 26.0),
+                            rect: Rect::new(state.width - 52.0, y + 4.0, 40.0, 26.0),
                             radius: 4.0,
                             color: if worktree_pressed { PRESSED } else { HOVER },
                         });
@@ -4309,12 +4406,12 @@ fn redraw_with_cache(
                         state,
                         &mut packet,
                         cache,
-                        "+",
-                        16.0,
+                        "+WT",
+                        11.0,
                         YELLOW,
-                        state.width - 36.0,
-                        y + 5.0,
-                        20.0,
+                        state.width - 48.0,
+                        y + 8.0,
+                        34.0,
                     )?;
                 }
             }
@@ -4485,7 +4582,7 @@ struct HeaderGeometry {
 fn header_geometry(width: f32) -> HeaderGeometry {
     let compact_button = width < 260.0;
     let narrow_title = width < 220.0;
-    let button_width = if compact_button { 32.0 } else { 42.0 };
+    let button_width = if compact_button { 32.0 } else { 50.0 };
     let button_x = (width - SIDE_MARGIN - button_width).max(SIDE_MARGIN);
     let input_x = if narrow_title { 36.0 } else { 94.0 };
     let input_width = (button_x - input_x - 8.0).max(1.0);
@@ -4519,16 +4616,7 @@ fn add_text(
     max_width: f32,
 ) -> Result<(), String> {
     cache
-        .draw_text_clipped(
-            packet,
-            text,
-            size,
-            max_width,
-            size + 4.0,
-            color,
-            x,
-            y,
-        )
+        .draw_text_clipped(packet, text, size, max_width, size + 4.0, color, x, y)
         .map_err(|error| format!("layout session switcher text: {error}"))?;
     Ok(())
 }
@@ -4538,19 +4626,20 @@ bindings::export!(SessionSwitcher with_types_in bindings);
 #[cfg(test)]
 mod tests {
     use brood_plugin_sdk::exports::brood::plugin::actor::{PresentationScope, PresentationSession};
-    use brood_protocol::backend_catalogue::BackendCatalogueEntry;
+    use brood_protocol::backend_catalogue::{BackendCatalogueEntry, BackendSessionEntry};
 
     use super::{
         ActorCommand, EditMode, LayoutContext, LayoutLeaseToken, LayoutRegionResizeMessage,
-        LayoutStateSize, ResizePaintPlan, SwitcherState, actor_realm,
+        LayoutStateSize, ResizePaintPlan, SwitcherState, ViewSession, actor_realm,
         apply_backend_sessions, apply_layout_pointer_message,
-        apply_layout_transaction_notification, authenticated_neovim_client,
+        apply_layout_transaction_notification, apply_worktree_completion,
+        authenticated_neovim_client, begin_worktree_for_source, creation_backend_items,
         ensure_default_terminal_ui, header_geometry, neovim_client_realm, neovim_ui_id,
-        open_creation_backend_picker, publish_layout, publish_synchronized_layout,
-        publish_layout_region_response, request_creation_backend_picker, request_editor,
-        resize_paint_plan, sender_actor_is, shell_layout_state, shell_requested_focus, start_neovim_client,
-        submit, toggle_diff, truncate_to_width, update_creation_backend_picker,
-        valid_editor_actor_target,
+        open_creation_backend_picker, publish_layout, publish_layout_region_response,
+        publish_synchronized_layout, request_creation_backend_picker, request_editor,
+        resize_paint_plan, sender_actor_is, shell_layout_state, shell_requested_focus,
+        start_neovim_client, submit, toggle_diff, truncate_to_width,
+        update_creation_backend_picker, valid_editor_actor_target,
     };
 
     fn host_command<'a>(commands: &'a [ActorCommand], message_type: &str) -> &'a [u8] {
@@ -4663,12 +4752,8 @@ mod tests {
 
         for sidebar_visible in [false, true] {
             state.sidebar_visible = sidebar_visible;
-            let commands = publish_synchronized_layout(
-                &mut state,
-                Some(workspace),
-                "sidebar",
-                None,
-            );
+            let commands =
+                publish_synchronized_layout(&mut state, Some(workspace), "sidebar", None);
             let value: serde_json::Value =
                 serde_json::from_slice(host_command(&commands, "submit-synchronized-layout"))
                     .expect("valid toggle layout JSON");
@@ -4726,7 +4811,10 @@ mod tests {
             presented_panes: visible_panes.clone(),
             visible_panes,
             focused_pane: Some(6),
-            size: LayoutStateSize { w: 800, height: 600 },
+            size: LayoutStateSize {
+                w: 800,
+                height: 600,
+            },
             rest: true,
         });
         let bytes = br#"{"type":"layout-region-resized","resize_epoch":{"id":31,"lease":1,"lease_generation":1,"base_layout_revision":3,"target_layout_revision":4},"lease":{"id":4,"generation":2},"size":{"w":1200,"h":700},"scale":1.5}"#;
@@ -4741,7 +4829,10 @@ mod tests {
         let body = host_command(&commands, "submit-layout-region");
         let response: serde_json::Value = serde_json::from_slice(body).unwrap();
         assert_eq!(response["resize_epoch"]["id"], 31);
-        assert_eq!(response["lease"], serde_json::json!({"id": 4, "generation": 2}));
+        assert_eq!(
+            response["lease"],
+            serde_json::json!({"id": 4, "generation": 2})
+        );
         assert_eq!(response["inventory_revision"], 9);
         assert!(response["fragment"]["rest"].is_object());
         let restored = state.layout.as_ref().unwrap().size;
@@ -5672,6 +5763,192 @@ mod tests {
                 .iter()
                 .any(|item| item["label"] == "Local" && item["value"]["action"] == "create-local")
         }));
+    }
+
+    #[test]
+    fn new_session_picker_offers_worktree_and_enters_branch_mode() {
+        let mut state = SwitcherState::new();
+        state.backends.push((7, "Local".to_string()));
+        state.sessions.push(ViewSession {
+            backend: 7,
+            id: 3,
+            name: "brood".to_string(),
+            active: true,
+            windows: 1,
+            working_directory: Some("/work/brood".to_string()),
+            project_id: "/work/brood/.git".to_string(),
+            project_name: "brood".to_string(),
+            branch: Some("main".to_string()),
+            worktree: false,
+            git: true,
+        });
+
+        let commands = open_creation_backend_picker(&mut state);
+        let [ActorCommand::SendLocalMessage(message)] = commands.as_slice() else {
+            panic!("creation picker did not open");
+        };
+        let value: serde_json::Value =
+            serde_json::from_slice(&message.body).unwrap_or(serde_json::Value::Null);
+        assert_eq!(value["title"], "Create session");
+        assert_eq!(value["items"][0]["label"], "Worktree · brood");
+        assert_eq!(value["items"][0]["detail"], "Create a new branch from main");
+        assert_eq!(value["items"][0]["value"]["action"], "create-worktree");
+        assert_eq!(value["items"][0]["value"]["backend"], 7);
+        assert_eq!(value["items"][0]["value"]["session"], 3);
+
+        assert!(begin_worktree_for_source(&mut state, 7, 3));
+        assert!(state.mode == EditMode::CreateWorktree(7, 3));
+        assert_eq!(state.status, "New branch in brood: Enter to create");
+    }
+
+    #[test]
+    fn project_git_capability_is_independent_of_session_order() {
+        let mut state = SwitcherState::new();
+        for (id, git) in [(3, false), (4, true)] {
+            state.sessions.push(ViewSession {
+                backend: 7,
+                id,
+                name: format!("brood-{id}"),
+                active: id == 3,
+                windows: 1,
+                working_directory: Some(format!("/work/brood-{id}")),
+                project_id: "/work/brood/.git".to_string(),
+                project_name: "brood".to_string(),
+                branch: Some("main".to_string()),
+                worktree: id == 4,
+                git,
+            });
+        }
+
+        let groups = state.project_groups();
+        assert_eq!(groups.len(), 1);
+        assert!(groups[0].git);
+        assert!(creation_backend_items(&state)
+            .iter()
+            .any(|item| item.value.action.as_deref() == Some("create-worktree")));
+    }
+
+    #[test]
+    fn empty_initial_catalogue_preserves_the_live_backend_snapshot() {
+        let mut state = SwitcherState::new();
+        state.backend_id = 7;
+        state.session_id = 3;
+        state.sessions.push(ViewSession {
+            backend: 7,
+            id: 3,
+            name: "brood".to_string(),
+            active: true,
+            windows: 1,
+            working_directory: Some("/work/brood".to_string()),
+            project_id: "/work/brood/.git".to_string(),
+            project_name: "brood".to_string(),
+            branch: Some("main".to_string()),
+            worktree: false,
+            git: true,
+        });
+
+        apply_backend_sessions(
+            &mut state,
+            true,
+            false,
+            false,
+            vec![BackendCatalogueEntry {
+                backend: brood_protocol::BackendId(7),
+                label: "Local".to_string(),
+                sessions: Vec::new(),
+            }],
+        );
+
+        assert_eq!(state.sessions.len(), 1);
+        assert_eq!(state.sessions[0].id, 3);
+        assert!(creation_backend_items(&state)
+            .iter()
+            .any(|item| item.value.action.as_deref() == Some("create-worktree")));
+
+        apply_backend_sessions(
+            &mut state,
+            true,
+            false,
+            false,
+            vec![BackendCatalogueEntry {
+                backend: brood_protocol::BackendId(7),
+                label: "Local".to_string(),
+                sessions: vec![BackendSessionEntry {
+                    id: 8,
+                    name: "replacement".to_string(),
+                    active: true,
+                    windows: 0,
+                    working_directory: Some("/work/replacement".to_string()),
+                    project_id: "/work/replacement/.git".to_string(),
+                    project_name: "replacement".to_string(),
+                    branch: Some("main".to_string()),
+                    worktree: false,
+                    git: true,
+                    isolation: brood_protocol::SessionIsolationStatus::default(),
+                }],
+            }],
+        );
+        assert_eq!(state.sessions.len(), 1);
+        assert_eq!(state.sessions[0].id, 8);
+    }
+
+    #[test]
+    fn worktree_completion_keeps_new_identity_until_catalogue_arrives() {
+        let mut state = SwitcherState::new();
+        state.backend_id = 1;
+        state.session_id = 3;
+        state.pending = Some(17);
+
+        apply_worktree_completion(&mut state, 1, 17, true, Some(9), "");
+
+        assert_eq!(state.backend_id, 1);
+        assert_eq!(state.session_id, 9);
+        assert_eq!(state.selected, Some((1, 9)));
+        assert_eq!(state.pending, None);
+
+        state.sessions.push(ViewSession {
+            backend: 1,
+            id: 9,
+            name: "new-worktree".to_string(),
+            active: true,
+            windows: 0,
+            working_directory: Some("/worktrees/new-worktree".to_string()),
+            project_id: "/source/.git".to_string(),
+            project_name: "source".to_string(),
+            branch: Some("new-worktree".to_string()),
+            worktree: true,
+            git: true,
+        });
+        state.ensure_selection();
+
+        assert_eq!(state.selected, Some((1, 9)));
+        assert_eq!(state.selected_session().map(|session| session.id), Some(9));
+    }
+
+    #[test]
+    fn worktree_failure_clears_progress_and_reports_a_specific_error() {
+        let mut state = SwitcherState::new();
+        state.pending = Some(17);
+        state.mode = EditMode::CreateWorktree(1, 3);
+        state.query = "new-branch".to_string();
+
+        apply_worktree_completion(&mut state, 1, 17, false, None, "branch already exists");
+
+        assert_eq!(state.pending, None);
+        assert!(state.error);
+        assert_eq!(
+            state.status,
+            "Worktree creation failed: branch already exists"
+        );
+        assert!(state.mode == EditMode::CreateWorktree(1, 3));
+        assert_eq!(state.query, "new-branch");
+
+        state.pending = Some(18);
+        apply_worktree_completion(&mut state, 1, 18, false, None, "");
+        assert_eq!(
+            state.status,
+            "Worktree creation failed: the backend returned no error details"
+        );
     }
 
     #[test]

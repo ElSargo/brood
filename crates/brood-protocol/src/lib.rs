@@ -6,11 +6,13 @@
 
 pub mod backend_catalogue;
 
-use serde::{Deserialize, Serialize};
+use std::{fmt, str::FromStr};
+
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use thiserror::Error;
 
 /// Current semantic presentation protocol version.
-pub const PRESENTATION_PROTOCOL_VERSION: u32 = 22;
+pub const PRESENTATION_PROTOCOL_VERSION: u32 = 23;
 
 /// Number of fixed scale units in one logical output unit.
 pub const FRACTIONAL_SCALE_DENOMINATOR: u32 = 120;
@@ -31,6 +33,168 @@ pub const MAX_NETWORK_FRAME_BYTES: u64 = 64 * 1024 * 1024;
 /// state, even when a connection currently carries only one backend.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct BackendId(pub u64);
+
+/// Execution boundary selected for one session.
+///
+/// `Direct` preserves the historical host-native process model. Callers must
+/// never interpret it as a degraded isolated session.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum IsolationProfile {
+    Isolated,
+    #[default]
+    Direct,
+}
+
+/// Stable identity of one persistent session volume.
+///
+/// The daemon generates this 128-bit value independently from its ephemeral
+/// numeric session identifiers. Its wire representation is 32 hexadecimal
+/// digits so JSON consumers never lose precision.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SessionVolumeId([u8; 16]);
+
+impl SessionVolumeId {
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
+}
+
+impl fmt::Display for SessionVolumeId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+/// A serialized session-volume identity was not exactly 128 bits of hex.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+#[error("session volume identity must contain exactly 32 hexadecimal digits")]
+pub struct InvalidSessionVolumeId;
+
+impl FromStr for SessionVolumeId {
+    type Err = InvalidSessionVolumeId;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.len() != 32 {
+            return Err(InvalidSessionVolumeId);
+        }
+        let mut decoded = [0_u8; 16];
+        let mut nibbles = value.bytes().map(hex_nibble);
+        for byte in &mut decoded {
+            let high = nibbles.next().ok_or(InvalidSessionVolumeId)??;
+            let low = nibbles.next().ok_or(InvalidSessionVolumeId)??;
+            *byte = (high << 4) | low;
+        }
+        if nibbles.next().is_some() {
+            return Err(InvalidSessionVolumeId);
+        }
+        Ok(Self(decoded))
+    }
+}
+
+const fn hex_nibble(byte: u8) -> Result<u8, InvalidSessionVolumeId> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(InvalidSessionVolumeId),
+    }
+}
+
+impl Serialize for SessionVolumeId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for SessionVolumeId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let encoded = String::deserialize(deserializer)?;
+        encoded.parse().map_err(de::Error::custom)
+    }
+}
+
+/// Persistent storage lifecycle independent from a live daemon session ID.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SessionVolumeLifecycle {
+    #[default]
+    Active,
+    Retained,
+    Graveyard,
+    Purged,
+}
+
+/// Public status of one persistent session volume.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SessionVolumeStatus {
+    pub id: SessionVolumeId,
+    #[serde(default)]
+    pub lifecycle: SessionVolumeLifecycle,
+}
+
+/// Lifecycle of the native process boundary for an isolated session.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CapsuleLifecycle {
+    Preparing,
+    Ready,
+    Stopping,
+    #[default]
+    Stopped,
+    Failed,
+}
+
+/// Stage at which capsule setup or teardown failed.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CapsuleFailureStage {
+    Preparation,
+    Runtime,
+    Cleanup,
+}
+
+/// Structured capsule failure retained for status and recovery diagnostics.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CapsuleFailure {
+    pub stage: CapsuleFailureStage,
+    pub message: String,
+}
+
+/// Latest lifecycle and failure state of an isolated session capsule.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CapsuleStatus {
+    #[serde(default)]
+    pub lifecycle: CapsuleLifecycle,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<CapsuleFailure>,
+}
+
+/// Isolation and persistent-volume status attached to a live session.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SessionIsolationStatus {
+    #[serde(default)]
+    pub profile: IsolationProfile,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume: Option<SessionVolumeStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capsule: Option<CapsuleStatus>,
+}
 
 /// Version of the content-addressed artifact manifest contract.
 pub const ARTIFACT_ABI_VERSION: u32 = 1;
@@ -339,6 +503,8 @@ pub struct CatalogSession {
     pub branch: Option<String>,
     pub worktree: bool,
     pub git: bool,
+    #[serde(default)]
+    pub isolation: SessionIsolationStatus,
 }
 
 /// One managed window in a catalog snapshot.
@@ -813,11 +979,13 @@ pub enum ServerMessage {
 mod tests {
     use super::{
         ARTIFACT_ABI_VERSION, ArtifactKind, ArtifactManifest, ArtifactMessage, ArtifactRealm,
-        ArtifactValidationError, AutomationCursor, AutomationInteractionState, CarrierKind,
-        EndpointCapabilities, FrameTransportKind, InputEvent, MAX_ARTIFACT_CHUNK_BYTES,
+        ArtifactValidationError, AutomationCursor, AutomationInteractionState, CapsuleFailure,
+        CapsuleFailureStage, CapsuleLifecycle, CapsuleStatus, CarrierKind, EndpointCapabilities,
+        FrameTransportKind, InputEvent, IsolationProfile, MAX_ARTIFACT_CHUNK_BYTES,
         ManagedResizeRejectionReason, ManagedResizeStatus, ManagedResizeStatusResult,
         ManagedWindowAutomationState, ManagedWindowSizeAuthority, NegotiationError,
-        PRESENTATION_PROTOCOL_VERSION, ServerMessage, TransportProfile, WindowFrame,
+        PRESENTATION_PROTOCOL_VERSION, ServerMessage, SessionIsolationStatus, SessionVolumeId,
+        SessionVolumeLifecycle, SessionVolumeStatus, TransportProfile, WindowFrame,
         negotiate_profile,
     };
 
@@ -860,13 +1028,81 @@ mod tests {
 
     #[test]
     fn version_mismatch_is_rejected() {
-        assert_eq!(PRESENTATION_PROTOCOL_VERSION, 22);
+        assert_eq!(PRESENTATION_PROTOCOL_VERSION, 23);
         let client = EndpointCapabilities::local_server(true);
         let mut server = client.clone();
-        server.protocol_version = 21;
+        server.protocol_version = 22;
         assert_eq!(
             negotiate_profile(&client, &server),
             Err(NegotiationError::ProtocolVersion)
+        );
+    }
+
+    #[test]
+    fn volume_identity_uses_lossless_fixed_width_hex() {
+        let identity = SessionVolumeId::from_bytes([
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
+        ]);
+        let encoded = serde_json::to_string(&identity);
+        assert!(matches!(
+            encoded.as_deref(),
+            Ok("\"00112233445566778899aabbccddeeff\"")
+        ));
+        assert_eq!(
+            encoded
+                .ok()
+                .and_then(|json| serde_json::from_str(&json).ok()),
+            Some(identity)
+        );
+        assert!(serde_json::from_str::<SessionVolumeId>("\"short\"").is_err());
+    }
+
+    #[test]
+    fn older_catalog_sessions_default_to_direct_without_runtime_status() {
+        let legacy = br#"{
+            "id":1,
+            "name":"shell",
+            "active":true,
+            "windows":0,
+            "working_directory":"/workspace",
+            "project_id":"project",
+            "project_name":"Project",
+            "project_directory":"/workspace",
+            "branch":"main",
+            "worktree":false,
+            "git":true
+        }"#;
+        let decoded = serde_json::from_slice::<super::CatalogSession>(legacy);
+        assert!(matches!(
+            decoded,
+            Ok(super::CatalogSession { isolation, .. })
+                if isolation == SessionIsolationStatus::default()
+        ));
+    }
+
+    #[test]
+    fn isolation_status_round_trips_stable_volume_and_structured_failure() {
+        let status = SessionIsolationStatus {
+            profile: IsolationProfile::Isolated,
+            volume: Some(SessionVolumeStatus {
+                id: SessionVolumeId::from_bytes([0x5a; 16]),
+                lifecycle: SessionVolumeLifecycle::Retained,
+            }),
+            capsule: Some(CapsuleStatus {
+                lifecycle: CapsuleLifecycle::Failed,
+                failure: Some(CapsuleFailure {
+                    stage: CapsuleFailureStage::Cleanup,
+                    message: "remove runtime socket".to_string(),
+                }),
+            }),
+        };
+        let encoded = serde_json::to_vec(&status);
+        assert_eq!(
+            encoded
+                .ok()
+                .and_then(|json| serde_json::from_slice(&json).ok()),
+            Some(status)
         );
     }
 

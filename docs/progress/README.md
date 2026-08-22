@@ -21,6 +21,7 @@ interpret evidence.
 - [[computer-use]]
 - [[network-carrier-latency]]
 - [[plugin-runtime-proofs]]
+- [[session-isolation]]
 - [[terminal-latency-spike-profile]]
 - [[terminal-plugin]]
 - [[structural-lint]]

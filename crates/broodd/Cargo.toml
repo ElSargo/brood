@@ -58,6 +58,9 @@ wayland-protocols.workspace = true
 wayland-protocols-wlr.workspace = true
 zbus.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [lints.rust]
 warnings = { level = "deny", priority = -1 }
 unsafe_code = "allow"

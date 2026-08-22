@@ -24,6 +24,7 @@ mod runtime;
 mod session_bus;
 mod session_bus_state;
 mod session_runner;
+pub mod session_volume;
 pub(crate) mod state;
 pub(crate) mod state_services;
 mod wasm_test;

@@ -100,11 +100,13 @@ let
   '';
 
   appTools = [
+    pkgs.bubblewrap
     pkgs.coreutils
     pkgs.findutils
     pkgs.foot
     pkgs.git
     pkgs.nodejs
+    pkgs.passt
     pkgs.ripgrep
     sessionSwitcherPython
     pkgs.util-linux
@@ -140,6 +142,7 @@ let
   wasi32Binutils = wasi32Cc.bintools;
 
   smokeTools = [
+    pkgs.bubblewrap
     dbusDaemonForDev
     pkgs.dbus
     pkgs.foot
@@ -151,6 +154,7 @@ let
     pkgs.mesa-demos
     pkgs.nix
     pkgs.procps
+    pkgs.passt
     pkgs.sway
     pkgs.speedcrunch
     pkgs.vulkan-tools

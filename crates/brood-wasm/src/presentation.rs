@@ -211,6 +211,7 @@ pub struct SessionSummary {
     pub branch: Option<String>,
     pub worktree: bool,
     pub git: bool,
+    pub isolation: brood_protocol::SessionIsolationStatus,
 }
 
 /// Latest-state session catalogue delivered by the presentation client.

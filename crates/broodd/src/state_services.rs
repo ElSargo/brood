@@ -5,6 +5,7 @@ use std::{
 };
 
 use brood_cli::project::{ProjectContext, discover_project};
+use brood_protocol::SessionIsolationStatus;
 use brood_wasm::{TestHarnessCleanupResult, TestHarnessCompletion, TestHarnessRuntime};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 
@@ -27,6 +28,7 @@ pub struct SurfaceSessionService {
     names: BTreeMap<SurfaceSessionId, String>,
     working_directories: BTreeMap<SurfaceSessionId, PathBuf>,
     projects: BTreeMap<SurfaceSessionId, ProjectContext>,
+    isolation: BTreeMap<SurfaceSessionId, SessionIsolationStatus>,
     directory_sessions: BTreeMap<PathBuf, Vec<SurfaceSessionId>>,
     directory_defaults: BTreeMap<PathBuf, SurfaceSessionId>,
     surface_assignments: Vec<(WlSurface, SurfaceSessionId)>,
@@ -71,6 +73,7 @@ impl SurfaceSessionService {
             names: std::iter::once((initial, initial_name)).collect(),
             working_directories: std::iter::once((initial, initial_directory)).collect(),
             projects: std::iter::once((initial, initial_project)).collect(),
+            isolation: std::iter::once((initial, SessionIsolationStatus::default())).collect(),
             directory_sessions: BTreeMap::new(),
             directory_defaults: BTreeMap::new(),
             surface_assignments: Vec::new(),
@@ -122,6 +125,7 @@ impl SurfaceSessionService {
         self.names.clear();
         self.working_directories.clear();
         self.projects.clear();
+        self.isolation.clear();
         self.directory_sessions.clear();
         self.directory_defaults.clear();
         Ok(())
@@ -142,6 +146,8 @@ impl SurfaceSessionService {
         self.names.insert(session, name);
         self.working_directories.insert(session, directory);
         self.projects.insert(session, project);
+        self.isolation
+            .insert(session, SessionIsolationStatus::default());
         self.activate_created(session);
         Ok(session)
     }
@@ -212,6 +218,7 @@ impl SurfaceSessionService {
         self.names.remove(&session);
         self.working_directories.remove(&session);
         self.projects.remove(&session);
+        self.isolation.remove(&session);
         self.interaction_order
             .retain(|existing| *existing != session);
         self.directory_sessions.retain(|_, assigned| {
@@ -258,6 +265,13 @@ impl SurfaceSessionService {
 
     pub(crate) fn name(&self, session: SurfaceSessionId) -> Option<&str> {
         self.names.get(&session).map(String::as_str)
+    }
+
+    pub(crate) fn isolation_status(
+        &self,
+        session: SurfaceSessionId,
+    ) -> Option<&SessionIsolationStatus> {
+        self.isolation.get(&session)
     }
 
     pub(crate) fn working_directory(&self, session: SurfaceSessionId) -> Option<&Path> {

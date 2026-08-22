@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::BackendId;
+use crate::{BackendId, SessionIsolationStatus};
 
 /// Current version of the bundled backend catalogue actor protocol.
 pub const BACKEND_CATALOGUE_PROTOCOL_VERSION: u32 = 1;
@@ -27,6 +27,7 @@ pub const MAX_BACKEND_CATALOGUE_PATH_BYTES: usize = 4_096;
 pub const MAX_BACKEND_CATALOGUE_PROJECT_ID_BYTES: usize = 512;
 pub const MAX_BACKEND_CATALOGUE_BRANCH_BYTES: usize = 1_024;
 pub const MAX_BACKEND_CONNECTION_ERROR_BYTES: usize = 1_024;
+pub const MAX_BACKEND_CAPSULE_FAILURE_BYTES: usize = 1_024;
 
 /// One backend and its latest session catalogue.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -49,6 +50,8 @@ pub struct BackendSessionEntry {
     pub branch: Option<String>,
     pub worktree: bool,
     pub git: bool,
+    #[serde(default)]
+    pub isolation: SessionIsolationStatus,
 }
 
 /// Client-host notifications consumed by the bundled session switcher.
@@ -170,6 +173,18 @@ impl BackendCatalogueMessage {
                                 BackendCatalogueTextField::Branch,
                             )?;
                         }
+                        if let Some(failure) = session
+                            .isolation
+                            .capsule
+                            .as_ref()
+                            .and_then(|capsule| capsule.failure.as_ref())
+                        {
+                            validate_text(
+                                &failure.message,
+                                MAX_BACKEND_CAPSULE_FAILURE_BYTES,
+                                BackendCatalogueTextField::CapsuleFailure,
+                            )?;
+                        }
                     }
                 }
                 Ok(())
@@ -202,6 +217,7 @@ pub enum BackendCatalogueTextField {
     ProjectName,
     Branch,
     ConnectionError,
+    CapsuleFailure,
 }
 
 /// Invalid bundled backend catalogue message.
@@ -226,7 +242,7 @@ mod tests {
         BACKEND_CATALOGUE_PROTOCOL_VERSION, BackendCatalogueEntry, BackendCatalogueMessage,
         BackendCatalogueValidationError, BackendSessionEntry, MAX_BACKEND_CATALOGUE_NAME_BYTES,
     };
-    use crate::BackendId;
+    use crate::{BackendId, SessionIsolationStatus};
 
     fn session() -> BackendSessionEntry {
         BackendSessionEntry {
@@ -240,6 +256,7 @@ mod tests {
             branch: Some("main".to_string()),
             worktree: false,
             git: true,
+            isolation: SessionIsolationStatus::default(),
         }
     }
 
@@ -273,6 +290,27 @@ mod tests {
                 can_create_container: false,
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn older_session_entries_default_to_direct_without_volume_or_capsule() {
+        let json = r#"{
+            "id":7,
+            "name":"shell",
+            "active":true,
+            "windows":2,
+            "working_directory":"/workspace",
+            "project_id":"project",
+            "project_name":"Project",
+            "branch":"main",
+            "worktree":false,
+            "git":true
+        }"#;
+        let decoded = serde_json::from_str::<BackendSessionEntry>(json);
+        assert!(matches!(
+            decoded,
+            Ok(BackendSessionEntry { isolation, .. }) if isolation == SessionIsolationStatus::default()
         ));
     }
 
