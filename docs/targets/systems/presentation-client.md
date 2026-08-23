@@ -127,9 +127,10 @@ views consume the qualified global catalogue explicitly.
 
 ## Connection And Lease Lifecycle
 
-DBus is the local discovery, authentication, descriptor broker, and public
-control surface. A
-successful handshake creates a fresh connection generation, immutable
+The private local IPC socket is the discovery, authentication, control, and
+descriptor broker for Brood-owned same-machine endpoints. D-Bus is only the
+public message and control surface for external applications. A successful
+private handshake creates a fresh connection generation, immutable
 negotiated capabilities, bounded protocol lanes, and optional presentation
 lease. Product actors use addressed mailbox traffic over those lanes to reach
 daemon and session actors rather than calling the local DBus control API.
@@ -160,8 +161,10 @@ Snapshots are revisioned; a delta gap forces resynchronization.
 Inventory invalidation is event driven. Periodic snapshot comparison is only a
 recovery mechanism and must never determine user-visible interaction latency.
 Local clients receive atomic catalog snapshots through a dedicated
-server-to-client shared-memory lane with eventfd wakeups. DBus remains the
-descriptor bootstrap and asynchronous command path, not the catalog transport.
+server-to-client shared-memory lane with eventfd wakeups. Correlated control and
+session operations use their own bounded shared-memory request/response lanes;
+descriptor bootstrap uses the private packet socket. Neither path enters the
+public D-Bus dispatcher.
 
 Client-realm Component actors wake the native presentation loop when an
 observer event is admitted, and the loop drains those events before sleeping

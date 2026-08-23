@@ -28,9 +28,8 @@ use brood_cli::{
     ClientArgs,
     control::{
         ControlTarget, DmabufFrame, PresentationWindowSummary, ServerLaunch, SharedMemoryFrame,
-        activate_surface_session, close_surface_session, connect_or_spawn, create_surface_session,
-        dmabuf_resource, open_presentation_fast_path, rename_surface_session, request_dbus_command,
-        resolve_control_target, shared_memory_resource,
+        connect_or_spawn, dmabuf_resource, open_presentation_fast_path, resolve_control_target,
+        shared_memory_resource,
     },
 };
 use brood_computer_use::{
@@ -46,8 +45,8 @@ use brood_layout::{
 };
 use brood_protocol::{
     ArtifactManifest, ArtifactRealm, AutomationInteractionState, BackendActorRealm, BackendId,
-    ClientLifecycle, ClientMessage, FrameTransportKind, InputEvent, ManagedWindowAutomationState,
-    ManagedWindowSizeAuthority, PanePosition,
+    BackendOperation, ClientLifecycle, ClientMessage, FrameTransportKind, InputEvent,
+    ManagedWindowAutomationState, ManagedWindowSizeAuthority, PanePosition,
     backend_catalogue::{
         BACKEND_CATALOGUE_ACTOR_ID, BACKEND_CATALOGUE_CLIENT_SENDER, BackendCatalogueEntry,
         BackendCatalogueMessage, BackendSessionEntry,
@@ -750,7 +749,16 @@ fn main() -> Result<()> {
             command_lanes.insert(
                 backend,
                 Box::new(BackendCommandLane::Local(LocalBackendCommandLane::start(
-                    target,
+                    brood_ipc::BackendMessageProducer::map(
+                        fast_path.backend_request_fd.as_fd(),
+                        fast_path.generation,
+                    )?,
+                    brood_ipc::EventNotifier::from_owned_fd(fast_path.backend_request_notify_fd),
+                    brood_ipc::BackendMessageConsumer::map(
+                        fast_path.backend_response_fd.as_fd(),
+                        fast_path.generation,
+                    )?,
+                    brood_ipc::EventNotifier::from_owned_fd(fast_path.backend_response_notify_fd),
                     event_loop.create_proxy(),
                 )?)),
             );
@@ -885,7 +893,16 @@ fn main() -> Result<()> {
             lanes: BTreeMap::from([(
                 backend,
                 Box::new(BackendCommandLane::Local(LocalBackendCommandLane::start(
-                    target,
+                    brood_ipc::BackendMessageProducer::map(
+                        fast_path.backend_request_fd.as_fd(),
+                        fast_path.generation,
+                    )?,
+                    brood_ipc::EventNotifier::from_owned_fd(fast_path.backend_request_notify_fd),
+                    brood_ipc::BackendMessageConsumer::map(
+                        fast_path.backend_response_fd.as_fd(),
+                        fast_path.generation,
+                    )?,
+                    brood_ipc::EventNotifier::from_owned_fd(fast_path.backend_response_notify_fd),
                     event_loop.create_proxy(),
                 )?)),
             )]),
@@ -1740,7 +1757,7 @@ fn spawn_frame_updates(
                             };
                             let resource_id = frame.resource;
                             let resource = if resources.insert(resource_id) {
-                                match dmabuf_resource(&target, resource_id) {
+                                match dmabuf_resource(&target, resource_id, generation) {
                                     Ok(resource) => Some(FrameResource::Dmabuf(resource)),
                                     Err(error) => {
                                         let _send_result =
@@ -2388,6 +2405,114 @@ enum BackendRequest {
     Session(actor_runtime::SessionCommandEnvelope),
 }
 
+#[derive(Clone)]
+enum LocalBackendContext {
+    Control {
+        description: String,
+    },
+    Session {
+        actor_id: String,
+        request: SessionCommandRequest,
+    },
+}
+
+fn local_backend_operation(request: BackendRequest) -> (BackendOperation, LocalBackendContext) {
+    match request {
+        BackendRequest::Control(command) => (
+            BackendOperation::Control { argv: command.argv },
+            LocalBackendContext::Control {
+                description: command.description,
+            },
+        ),
+        BackendRequest::Session(command) => {
+            let operation = match command.request.operation {
+                SessionOperation::Refresh => brood_protocol::SessionOperation::Refresh,
+                SessionOperation::Activate => brood_protocol::SessionOperation::Activate,
+                SessionOperation::Create => brood_protocol::SessionOperation::Create,
+                SessionOperation::Rename => brood_protocol::SessionOperation::Rename,
+                SessionOperation::Close => brood_protocol::SessionOperation::Close,
+            };
+            (
+                BackendOperation::Session {
+                    operation,
+                    session: command.request.session,
+                    name: command.request.name.clone(),
+                    directory: command.request.directory.clone(),
+                },
+                LocalBackendContext::Session {
+                    actor_id: command.actor_id,
+                    request: command.request,
+                },
+            )
+        }
+    }
+}
+
+fn local_backend_failure(context: LocalBackendContext, message: String) -> ClientEvent {
+    match context {
+        LocalBackendContext::Control { description } => ClientEvent::BackendCommandCompleted {
+            description,
+            result: Err(message),
+        },
+        LocalBackendContext::Session { actor_id, request } => {
+            ClientEvent::SessionCommandCompleted {
+                actor_id,
+                completion: SessionCommandCompletion {
+                    backend_id: request.backend_id,
+                    request: request.request,
+                    operation: request.operation,
+                    success: false,
+                    session: request.session,
+                    message,
+                },
+            }
+        }
+    }
+}
+
+fn local_backend_completion(
+    context: LocalBackendContext,
+    response: brood_protocol::BackendResponse,
+) -> ClientEvent {
+    use brood_protocol::BackendResponseValue;
+    match context {
+        LocalBackendContext::Control { description } => {
+            let result = response.result.and_then(|value| match value {
+                BackendResponseValue::Control(output) => Ok(output),
+                BackendResponseValue::Session(_) => {
+                    Err("backend returned a session value for a control request".to_string())
+                }
+            });
+            ClientEvent::BackendCommandCompleted {
+                description,
+                result,
+            }
+        }
+        LocalBackendContext::Session { actor_id, request } => {
+            let (success, session, message) = match response.result {
+                Ok(BackendResponseValue::Session(session)) => (true, session, String::new()),
+                Ok(BackendResponseValue::Control(_)) => (
+                    false,
+                    None,
+                    "backend returned a control value for a session request".to_string(),
+                ),
+                Err(message) => (false, request.session, message),
+            };
+            ClientEvent::SessionCommandCompleted {
+                actor_id,
+                completion: SessionCommandCompletion {
+                    backend_id: request.backend_id,
+                    request: request.request,
+                    operation: request.operation,
+                    success,
+                    session,
+                    message,
+                },
+            }
+        }
+    }
+}
+
 struct BackendCommand {
     description: String,
     argv: Vec<String>,
@@ -2395,40 +2520,90 @@ struct BackendCommand {
 
 impl LocalBackendCommandLane {
     fn start(
-        target: ControlTarget,
+        mut requests: brood_ipc::BackendMessageProducer,
+        request_notifications: brood_ipc::EventNotifier,
+        mut responses: brood_ipc::BackendMessageConsumer,
+        response_notifications: brood_ipc::EventNotifier,
         proxy: winit::event_loop::EventLoopProxy<ClientEvent>,
     ) -> Result<Self> {
         let (sender, receiver) = mpsc::sync_channel::<BackendRequest>(32);
         let worker = thread::Builder::new()
             .name("brood-backend-commands".to_string())
             .spawn(move || {
+                let mut next_request = 1_u64;
                 while let Ok(request) = receiver.recv() {
-                    match request {
-                        BackendRequest::Control(command) => {
-                            let result = request_dbus_command(&target, &command.argv, false)
-                                .map_err(|error| format!("{error:#}"));
-                            if proxy
-                                .send_event(ClientEvent::BackendCommandCompleted {
-                                    description: command.description,
-                                    result,
-                                })
-                                .is_err()
-                            {
+                    let id = next_request;
+                    next_request = next_request.wrapping_add(1);
+                    let (operation, context) = local_backend_operation(request);
+                    let value =
+                        brood_ipc::BackendMessageValue::Request(brood_protocol::BackendRequest {
+                            id,
+                            operation,
+                        });
+                    if let Err(error) = requests.try_send(&value) {
+                        let _send_result = proxy.send_event(local_backend_failure(
+                            context,
+                            format!("send backend IPC request: {error}"),
+                        ));
+                        return;
+                    }
+                    if request_notifications.notify().is_err() {
+                        let _send_result = proxy.send_event(local_backend_failure(
+                            context,
+                            "notify backend IPC request failed".to_string(),
+                        ));
+                        return;
+                    }
+                    let response = loop {
+                        if response_notifications.wait().is_err() {
+                            let _send_result = proxy.send_event(local_backend_failure(
+                                context,
+                                "wait for backend IPC response failed".to_string(),
+                            ));
+                            return;
+                        }
+                        let Some(message) = responses.try_recv() else {
+                            continue;
+                        };
+                        match message {
+                            Ok(message) => match message.value {
+                                brood_ipc::BackendMessageValue::Response(response)
+                                    if response.id == id =>
+                                {
+                                    break response;
+                                }
+                                brood_ipc::BackendMessageValue::Response(response) => {
+                                    let _send_result = proxy.send_event(local_backend_failure(
+                                        context,
+                                        format!(
+                                            "backend IPC response ID mismatch: expected {id}, received {}",
+                                            response.id
+                                        ),
+                                    ));
+                                    return;
+                                }
+                                brood_ipc::BackendMessageValue::Request(_) => {
+                                    let _send_result = proxy.send_event(local_backend_failure(
+                                        context,
+                                        "backend request reached the response lane".to_string(),
+                                    ));
+                                    return;
+                                }
+                            },
+                            Err(error) => {
+                                let _send_result = proxy.send_event(local_backend_failure(
+                                    context,
+                                    format!("decode backend IPC response: {error}"),
+                                ));
                                 return;
                             }
                         }
-                        BackendRequest::Session(command) => {
-                            let completion = execute_session_command(&target, command.request);
-                            if proxy
-                                .send_event(ClientEvent::SessionCommandCompleted {
-                                    actor_id: command.actor_id,
-                                    completion,
-                                })
-                                .is_err()
-                            {
-                                return;
-                            }
-                        }
+                    };
+                    if proxy
+                        .send_event(local_backend_completion(context, response))
+                        .is_err()
+                    {
+                        return;
                     }
                 }
             })
@@ -2656,84 +2831,6 @@ impl BackendCommandLane {
         if let Self::Multi { default, .. } = self {
             *default = Some(backend);
         }
-    }
-}
-
-fn execute_session_command(
-    target: &ControlTarget,
-    request: SessionCommandRequest,
-) -> SessionCommandCompletion {
-    let request_id = request.request;
-    let backend_id = request.backend_id;
-    let operation = request.operation;
-    let session = request.session;
-    let name = request.name;
-    let result = match operation {
-        SessionOperation::Refresh => Ok(None),
-        SessionOperation::Activate => session
-            .context("activate request is missing a session ID")
-            .and_then(|session| {
-                activate_surface_session(target, session).and_then(|changed| {
-                    anyhow::ensure!(changed, "session {session} is unavailable");
-                    Ok(Some(session))
-                })
-            }),
-        SessionOperation::Create => (|| -> Result<Option<u64>> {
-            if let Some(directory) = request.directory {
-                let mut argv = vec![
-                    "surface-session".to_string(),
-                    "dir-new".to_string(),
-                    directory,
-                    "default".to_string(),
-                ];
-                if let Some(name) = name {
-                    argv.push(name);
-                }
-                let response = request_dbus_command(target, &argv, false)?;
-                let active = response
-                    .split_whitespace()
-                    .find_map(|part| part.strip_prefix("active=")?.parse().ok())
-                    .context("directory session creation returned no active session")?;
-                Ok(Some(active))
-            } else {
-                create_surface_session(target, name.unwrap_or_default()).map(Some)
-            }
-        })(),
-        SessionOperation::Rename => session
-            .context("rename request is missing a session ID")
-            .and_then(|session| {
-                let name = name.context("rename request is missing a name")?;
-                rename_surface_session(target, session, name).and_then(|changed| {
-                    anyhow::ensure!(changed, "session {session} was not renamed");
-                    Ok(Some(session))
-                })
-            }),
-        SessionOperation::Close => session
-            .context("close request is missing a session ID")
-            .and_then(|session| {
-                close_surface_session(target, session).and_then(|changed| {
-                    anyhow::ensure!(changed, "session {session} was not closed");
-                    Ok(Some(session))
-                })
-            }),
-    };
-    match result {
-        Ok(session) => SessionCommandCompletion {
-            backend_id,
-            request: request_id,
-            operation,
-            success: true,
-            session,
-            message: String::new(),
-        },
-        Err(error) => SessionCommandCompletion {
-            backend_id,
-            request: request_id,
-            operation,
-            success: false,
-            session,
-            message: format!("{error:#}"),
-        },
     }
 }
 
@@ -4283,7 +4380,16 @@ impl Application {
             .insert_local(
                 backend,
                 LocalBackendCommandLane::start(
-                    target,
+                    brood_ipc::BackendMessageProducer::map(
+                        fast_path.backend_request_fd.as_fd(),
+                        fast_path.generation,
+                    )?,
+                    brood_ipc::EventNotifier::from_owned_fd(fast_path.backend_request_notify_fd),
+                    brood_ipc::BackendMessageConsumer::map(
+                        fast_path.backend_response_fd.as_fd(),
+                        fast_path.generation,
+                    )?,
+                    brood_ipc::EventNotifier::from_owned_fd(fast_path.backend_response_notify_fd),
                     self.event_proxy
                         .clone()
                         .context("event loop proxy is unavailable")?,

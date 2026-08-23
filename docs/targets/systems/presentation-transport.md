@@ -5,10 +5,12 @@ security-boundary: process-and-network
 runtime-boundary: process-and-network
 wire-format: not-frozen
 authority: product
-last-reviewed: 2026-08-09
+last-reviewed: 2026-08-23
 code-links:
   - crates/brood-protocol/src/lib.rs
   - crates/brood-ipc/src/local_protocol.rs
+  - crates/brood-ipc/src/local_control.rs
+  - crates/brood-ipc/src/backend_message.rs
   - crates/brood-ipc/src/shared_image.rs
   - crates/brood-transport/src/network.rs
   - crates/brood-transport/src/artifact.rs
@@ -115,15 +117,24 @@ invalidates every old lease, resource, mapping, and in-flight operation.
 
 ## Local Carrier
 
-DBus discovers and authenticates the local session server and brokers sealed
-memory and event descriptors. Steady-state messages use bounded shared-memory
-records with event notifications. Local records are a codec for
-`brood-protocol` messages rather than a second protocol definition.
+An internal, mode-`0600` Unix `SOCK_SEQPACKET` endpoint discovers the local
+session server, validates the protocol version, and brokers sealed memory,
+event, DMA-BUF, and shared-image descriptors with `SCM_RIGHTS`. D-Bus is not a
+presentation carrier or bootstrap path. It remains a public control API for
+external applications.
 
-Descriptor values never appear as raw integers in shared memory. DBus registers
-a generation-scoped external resource first; records then refer to its stable
-resource ID. Owner loss and mapping validation provide local peer-liveness and
-stale-generation rejection.
+Steady-state messages use bounded shared-memory records with eventfd
+notifications. Critical input, latest state, actor messages, catalogs, frames,
+and correlated backend request/response traffic have independent mappings.
+Local records are codecs for `brood-protocol` messages rather than a second
+protocol definition. Presentation steady-state control and session operations
+never fall back to the packet broker or to D-Bus.
+
+Descriptor values never appear as raw integers in shared memory. The private
+broker transfers a generation-scoped resource descriptor after its stable
+resource ID appears in a frame record. Generation checks, filesystem
+permissions, owner loss, and mapping validation reject stale or
+unrelated access.
 
 ## Local Frames
 

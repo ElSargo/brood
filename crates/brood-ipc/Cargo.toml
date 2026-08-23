@@ -9,7 +9,13 @@ clap.workspace = true
 libc.workspace = true
 memmap2.workspace = true
 brood-protocol.workspace = true
+postcard.workspace = true
+rustix.workspace = true
+serde.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints.rust]
 warnings = { level = "deny", priority = -1 }

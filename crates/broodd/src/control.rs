@@ -16,7 +16,7 @@ use std::{
     ffi::OsString,
     future::Future,
     io::Write,
-    os::fd::AsFd,
+    os::fd::{AsFd, OwnedFd},
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, Stdio},
@@ -24,12 +24,13 @@ use std::{
         atomic::{AtomicU64, Ordering},
         mpsc,
     },
+    thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail, ensure};
 pub use brood_cli::control::{
-    ControlTarget, request_dbus_command, resolve_control_target, session_marker_value,
+    ControlTarget, request_internal_command, resolve_control_target, session_marker_value,
 };
 use brood_protocol::{ClientLifecycle, ClientMessage, InputEvent};
 use smithay::{
@@ -102,22 +103,6 @@ type DbusDmabufFrame = (
     bool,
     zvariant::OwnedFd,
 );
-type DbusFastPath = (
-    u64,
-    u64,
-    u32,
-    zvariant::OwnedFd,
-    zvariant::OwnedFd,
-    zvariant::OwnedFd,
-    zvariant::OwnedFd,
-    zvariant::OwnedFd,
-    zvariant::OwnedFd,
-    zvariant::OwnedFd,
-    zvariant::OwnedFd,
-    zvariant::OwnedFd,
-    zvariant::OwnedFd,
-);
-type DbusSharedMemoryFrame = (String, zvariant::OwnedFd);
 type DbusAgent = (
     String,
     String,
@@ -146,9 +131,6 @@ type PluginMailboxListResponse = DbusResponse<Vec<DbusPluginMailbox>>;
 type AgentListResponse = DbusResponse<Vec<DbusAgent>>;
 type OptionalControlResponse = DbusResponse<Option<String>>;
 type DmabufFrameResponse = DbusResponse<DbusDmabufFrame>;
-type FastPathResponse = DbusResponse<DbusFastPath>;
-type SharedMemoryFrameResponse = DbusResponse<DbusSharedMemoryFrame>;
-type RealmArtifactRequestListResponse = DbusResponse<Vec<(u64, String)>>;
 
 enum DbusStateRequest {
     ControlCommand {
@@ -159,33 +141,8 @@ enum DbusStateRequest {
     CurrentStatus {
         response: ControlResponse,
     },
-    InstallSessionInitArtifact {
-        path: String,
-        response: BoolResponse,
-    },
-    TakeRealmArtifactRequests {
-        response: RealmArtifactRequestListResponse,
-    },
-    CompleteRealmArtifactRequest {
-        request: u64,
-        success: bool,
-        message: String,
-        response: BoolResponse,
-    },
     LatestDmabufFrame {
         response: DmabufFrameResponse,
-    },
-    OpenPresentationFastPath {
-        frame_transports: Vec<u32>,
-        response: FastPathResponse,
-    },
-    DmabufResource {
-        resource_id: u64,
-        response: DmabufFrameResponse,
-    },
-    SharedMemoryResource {
-        resource_id: u64,
-        response: SharedMemoryFrameResponse,
     },
     ListSurfaceSessions {
         response: SessionListResponse,
@@ -367,6 +324,16 @@ enum DbusStateRequest {
     },
 }
 
+struct LocalStateReply {
+    value: brood_ipc::LocalControlValue,
+    descriptors: Vec<OwnedFd>,
+}
+
+struct LocalStateRequest {
+    request: brood_ipc::LocalControlRequest,
+    response: tokio::sync::oneshot::Sender<std::result::Result<LocalStateReply, String>>,
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct NativeToolRequest {
     command: Vec<String>,
@@ -382,9 +349,9 @@ struct NativeToolResponse<'a> {
     error: Option<&'a str>,
 }
 
-struct NativeToolSocketGuard(PathBuf);
+struct SocketPathGuard(PathBuf);
 
-impl Drop for NativeToolSocketGuard {
+impl Drop for SocketPathGuard {
     fn drop(&mut self) {
         let _result = std::fs::remove_file(&self.0);
     }
@@ -441,71 +408,9 @@ impl ControlDbus {
         .await
     }
 
-    async fn install_session_init_artifact(&self, path: String) -> fdo::Result<bool> {
-        request_state(&self.sender, |response| {
-            DbusStateRequest::InstallSessionInitArtifact { path, response }
-        })
-        .await
-    }
-
-    async fn take_realm_artifact_requests(&self) -> fdo::Result<Vec<(u64, String)>> {
-        request_state(&self.sender, |response| {
-            DbusStateRequest::TakeRealmArtifactRequests { response }
-        })
-        .await
-    }
-
-    async fn complete_realm_artifact_request(
-        &self,
-        request: u64,
-        success: bool,
-        message: String,
-    ) -> fdo::Result<bool> {
-        request_state(&self.sender, |response| {
-            DbusStateRequest::CompleteRealmArtifactRequest {
-                request,
-                success,
-                message,
-                response,
-            }
-        })
-        .await
-    }
-
     async fn latest_dmabuf_frame(&self) -> fdo::Result<DbusDmabufFrame> {
         request_state(&self.sender, |response| {
             DbusStateRequest::LatestDmabufFrame { response }
-        })
-        .await
-    }
-
-    async fn open_presentation_fast_path(
-        &self,
-        frame_transports: Vec<u32>,
-    ) -> fdo::Result<DbusFastPath> {
-        request_state(&self.sender, |response| {
-            DbusStateRequest::OpenPresentationFastPath {
-                frame_transports,
-                response,
-            }
-        })
-        .await
-    }
-
-    async fn dmabuf_resource(&self, resource_id: u64) -> fdo::Result<DbusDmabufFrame> {
-        request_state(&self.sender, |response| DbusStateRequest::DmabufResource {
-            resource_id,
-            response,
-        })
-        .await
-    }
-
-    async fn shared_memory_resource(&self, resource_id: u64) -> fdo::Result<DbusSharedMemoryFrame> {
-        request_state(&self.sender, |response| {
-            DbusStateRequest::SharedMemoryResource {
-                resource_id,
-                response,
-            }
         })
         .await
     }
@@ -1134,22 +1039,6 @@ fn header_sender(header: &Header<'_>) -> String {
         .map_or_else(|| "unknown".to_string(), ToString::to_string)
 }
 
-#[proxy(
-    interface = "org.brood.Session.Control",
-    default_path = "/org/brood/Session"
-)]
-trait BroodControl {
-    fn command(&self, argv: Vec<String>, json: bool) -> zbus::Result<String>;
-    fn install_session_init_artifact(&self, path: String) -> zbus::Result<bool>;
-    fn take_realm_artifact_requests(&self) -> zbus::Result<Vec<(u64, String)>>;
-    fn complete_realm_artifact_request(
-        &self,
-        request: u64,
-        success: bool,
-        message: String,
-    ) -> zbus::Result<bool>;
-}
-
 #[proxy(interface = "org.brood.Manager", default_path = "/org/brood/Manager")]
 trait BroodManager {
     fn list_sessions(&self) -> zbus::Result<Vec<DbusSurfaceSession>>;
@@ -1281,7 +1170,19 @@ pub fn listen(
         })
         .map_err(|err| anyhow::anyhow!("insert DBus control request channel: {err:?}"))?;
 
+    let (local_sender, local_receiver) = channel::channel::<LocalStateRequest>();
+    event_loop
+        .handle()
+        .insert_source(local_receiver, |event, (), state| {
+            let Event::Msg(request) = event else {
+                return;
+            };
+            execute_local_state_request(request, state);
+        })
+        .map_err(|err| anyhow::anyhow!("insert private IPC request channel: {err:?}"))?;
+
     start_dbus_service(target.clone(), sender.clone(), runtime.clone())?;
+    start_local_control_service(&target, local_sender)?;
     let native_tool_socket = start_native_tool_service(sender, runtime)?;
 
     info!(
@@ -1330,7 +1231,7 @@ fn start_native_tool_service(
     };
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
         .with_context(|| format!("secure native agent tool socket {}", path.display()))?;
-    let guard = NativeToolSocketGuard(path.clone());
+    let guard = SocketPathGuard(path.clone());
     let task = runtime.spawn(async move {
         let _guard = guard;
         loop {
@@ -1352,6 +1253,107 @@ fn start_native_tool_service(
     });
     drop(task);
     Ok(path)
+}
+
+fn start_local_control_service(
+    target: &ControlTarget,
+    sender: channel::Sender<LocalStateRequest>,
+) -> Result<()> {
+    type Transport = brood_ipc::PacketTransport<
+        { brood_ipc::LOCAL_CONTROL_MAX_BYTES },
+        { brood_ipc::LOCAL_CONTROL_MAX_FDS },
+    >;
+    let path = target.local_ipc_path();
+    let parent = path.parent().context("private IPC socket has no parent")?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("create private IPC directory {}", parent.display()))?;
+    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("secure private IPC directory {}", parent.display()))?;
+    if path.exists() {
+        std::fs::remove_file(&path)
+            .with_context(|| format!("remove stale private IPC socket {}", path.display()))?;
+    }
+    let listener = Transport::bind_path(&path, 16)
+        .with_context(|| format!("bind private IPC socket {}", path.display()))?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("secure private IPC socket {}", path.display()))?;
+    let guard = SocketPathGuard(path.clone());
+    thread::Builder::new()
+        .name("brood-private-ipc".to_string())
+        .spawn(move || {
+            let _guard = guard;
+            loop {
+                let connection = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) => {
+                        warn!(%error, "private IPC accept failed");
+                        break;
+                    }
+                };
+                let sender = sender.clone();
+                if let Err(error) = thread::Builder::new()
+                    .name("brood-private-ipc-client".to_string())
+                    .spawn(move || {
+                        if let Err(error) = serve_local_control_connection(connection, sender) {
+                            warn!(%error, "private IPC request failed");
+                        }
+                    })
+                {
+                    warn!(%error, "spawn private IPC client failed");
+                }
+            }
+        })
+        .context("spawn private IPC listener")?;
+    info!(path = %path.display(), "private local IPC listening");
+    Ok(())
+}
+
+fn serve_local_control_connection(
+    connection: brood_ipc::PacketTransport<
+        { brood_ipc::LOCAL_CONTROL_MAX_BYTES },
+        { brood_ipc::LOCAL_CONTROL_MAX_FDS },
+    >,
+    sender: channel::Sender<LocalStateRequest>,
+) -> Result<()> {
+    loop {
+        let request = match connection.receive::<brood_ipc::LocalControlRequest>() {
+            Ok(request) => request,
+            Err(brood_ipc::PacketTransportError::PeerClosed) => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        ensure!(
+            request.descriptors.is_empty(),
+            "private IPC requests must not include descriptors"
+        );
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        sender
+            .send(LocalStateRequest {
+                request: request.message,
+                response: response_tx,
+            })
+            .map_err(|error| anyhow::anyhow!("send private IPC state request: {error:?}"))?;
+        let reply = response_rx
+            .blocking_recv()
+            .context("private IPC state response dropped")?;
+        match reply {
+            Ok(reply) => {
+                let descriptors = reply
+                    .descriptors
+                    .iter()
+                    .map(AsFd::as_fd)
+                    .collect::<Vec<_>>();
+                connection.send(
+                    &brood_ipc::LocalControlResponse {
+                        result: Ok(reply.value),
+                    },
+                    &descriptors,
+                )?;
+            }
+            Err(error) => {
+                connection.send(&brood_ipc::LocalControlResponse { result: Err(error) }, &[])?
+            }
+        }
+    }
 }
 
 async fn serve_native_tool_connection(
@@ -1442,7 +1444,7 @@ pub fn send(args: CtlArgs) -> Result<()> {
         args.command,
         args.json,
     )?;
-    let response = request_dbus_command(target, &command, args.json)?;
+    let response = request_internal_command(target, &command, args.json)?;
     print!("{response}");
     Ok(())
 }
@@ -1459,7 +1461,7 @@ pub fn plug(args: PlugArgs) -> Result<()> {
         command.push(instance_id);
     }
     command.push(path.display().to_string());
-    let response = request_dbus_command(&context.target, &command, false)?;
+    let response = request_internal_command(&context.target, &command, false)?;
     ensure_ok_response(&response)?;
     print!("{response}");
     Ok(())
@@ -1640,7 +1642,7 @@ pub fn hide(args: HideArgs) -> Result<()> {
     switch_surface_session(target, resolution.session_id)?;
 
     if status.presentation == "Attached" {
-        let response = request_dbus_command(target, &["close-frontend".to_string()], false)?;
+        let response = request_internal_command(target, &["close-frontend".to_string()], false)?;
         ensure_ok_response(&response)?;
     }
     Ok(())
@@ -1746,7 +1748,7 @@ const fn missing_directory_surface_session_action(
 }
 
 fn switch_surface_session(target: &ControlTarget, session_id: u64) -> Result<()> {
-    let response = request_dbus_command(
+    let response = request_internal_command(
         target,
         &[
             "surface-session".to_string(),
@@ -1759,7 +1761,7 @@ fn switch_surface_session(target: &ControlTarget, session_id: u64) -> Result<()>
 }
 
 fn restore_last_focused_surface_session(target: &ControlTarget) -> Result<()> {
-    let response = request_dbus_command(
+    let response = request_internal_command(
         target,
         &["surface-session".to_string(), "last-focused".to_string()],
         false,
@@ -1817,7 +1819,7 @@ fn create_directory_surface_session(
     set_default: bool,
 ) -> Result<u64> {
     let command = surface_session_dir_new_command(directory, name, set_default);
-    let response = request_dbus_command(target, &command, false)?;
+    let response = request_internal_command(target, &command, false)?;
     ensure_ok_response(&response)?;
     let value = session_marker_value(response.trim(), "active")
         .context("surface-session dir-new response missing active marker")?;
@@ -1849,12 +1851,12 @@ fn surface_session_dir_new_command(
 }
 
 fn status_snapshot(target: &ControlTarget) -> Result<EnterStatusSnapshot> {
-    let response = request_dbus_command(target, &[String::from("status-json")], false)?;
+    let response = request_internal_command(target, &[String::from("status-json")], false)?;
     serde_json::from_str(response.trim()).context("decode Brood status-json")
 }
 
 fn resolve_surface_session(target: &ControlTarget, query: &str) -> Result<u64> {
-    let response = request_dbus_command(
+    let response = request_internal_command(
         target,
         &[
             "surface-session".to_string(),
@@ -1871,7 +1873,7 @@ fn resolve_directory_surface_session(
     target: &ControlTarget,
     directory: &Path,
 ) -> Result<Option<u64>> {
-    let response = request_dbus_command(
+    let response = request_internal_command(
         target,
         &[
             "surface-session".to_string(),
@@ -1889,7 +1891,7 @@ fn remember_directory_surface_session(
     session_id: u64,
     set_default: bool,
 ) -> Result<()> {
-    let response = request_dbus_command(
+    let response = request_internal_command(
         target,
         &[
             "surface-session".to_string(),
@@ -2008,7 +2010,7 @@ pub fn switch(args: SwitchArgs) -> Result<()> {
 
     let selected_session = match outcome {
         SessionSwitchOutcome::Existing(selected) => {
-            let response = request_dbus_command(
+            let response = request_internal_command(
                 target,
                 &[
                     "surface-session".to_string(),
@@ -2240,7 +2242,7 @@ fn typed_connection(target: &ControlTarget) -> Result<zbus::blocking::Connection
 }
 
 fn request_presentation_window_focus(target: &ControlTarget) -> Result<()> {
-    let response = request_dbus_command(target, &["focus-presentation".to_string()], false)?;
+    let response = request_internal_command(target, &["focus-presentation".to_string()], false)?;
     ensure_ok_response(&response)
 }
 
@@ -2528,7 +2530,7 @@ pub fn execute_json_command(input: &str, state: &mut Brood) -> Result<String> {
     execute_tokens(&tokens, state)
 }
 
-fn execute_dbus_request(command: Vec<String>, json: bool, state: &mut Brood) -> Result<String> {
+fn execute_control_request(command: Vec<String>, json: bool, state: &mut Brood) -> Result<String> {
     let tokens = if json {
         let encoded = command.join(" ");
         parse_command_tokens(encoded.trim())?
@@ -2597,7 +2599,7 @@ fn execute_state_request(request: DbusStateRequest, state: &mut Brood) {
                             })
                     }
                     _ => {
-                        send_response(response, execute_dbus_request(command, json, state));
+                        send_response(response, execute_control_request(command, json, state));
                         return;
                     }
                 };
@@ -2608,50 +2610,15 @@ fn execute_state_request(request: DbusStateRequest, state: &mut Brood) {
                     Err(error) => send_response(response, Err(anyhow::anyhow!(error))),
                 }
             } else {
-                send_response(response, execute_dbus_request(command, json, state));
+                send_response(response, execute_control_request(command, json, state));
             }
         }
         DbusStateRequest::CurrentStatus { response } => {
             send_response(response, status_json_string(state));
         }
-        DbusStateRequest::InstallSessionInitArtifact { path, response } => {
-            let result = state
-                .install_remote_session_init_actor(Path::new(&path))
-                .map(|()| true);
-            send_response(response, result);
-        }
-        DbusStateRequest::TakeRealmArtifactRequests { response } => {
-            send_response(response, Ok(state.take_realm_artifact_requests()));
-        }
-        DbusStateRequest::CompleteRealmArtifactRequest {
-            request,
-            success,
-            message,
-            response,
-        } => send_response(
-            response,
-            Ok(state.complete_realm_artifact_request(request, success, message)),
-        ),
         DbusStateRequest::LatestDmabufFrame { response } => {
             send_response(response, latest_dmabuf_frame(state));
         }
-        DbusStateRequest::OpenPresentationFastPath {
-            frame_transports,
-            response,
-        } => {
-            send_response(
-                response,
-                open_presentation_fast_path(state, frame_transports),
-            );
-        }
-        DbusStateRequest::DmabufResource {
-            resource_id,
-            response,
-        } => send_response(response, dmabuf_resource(state, resource_id)),
-        DbusStateRequest::SharedMemoryResource {
-            resource_id,
-            response,
-        } => send_response(response, shared_memory_resource(state, resource_id)),
         DbusStateRequest::ListSurfaceSessions { response } => {
             let result = execute_session_command(state, SessionCommand::List)
                 .and_then(SessionCommandResult::into_sessions)
@@ -2968,6 +2935,130 @@ fn execute_state_request(request: DbusStateRequest, state: &mut Brood) {
     }
 }
 
+fn execute_local_state_request(request: LocalStateRequest, state: &mut Brood) {
+    let result =
+        handle_local_state_request(request.request, state).map_err(|error| error.to_string());
+    let _ = request.response.send(result);
+}
+
+fn handle_local_state_request(
+    request: brood_ipc::LocalControlRequest,
+    state: &mut Brood,
+) -> Result<LocalStateReply> {
+    use brood_ipc::{LocalControlRequest, LocalControlValue, LocalDmabufResource};
+
+    let reply = match request {
+        LocalControlRequest::Handshake { protocol_version } => {
+            ensure!(
+                protocol_version == brood_protocol::PRESENTATION_PROTOCOL_VERSION,
+                "presentation protocol mismatch: client={protocol_version}, server={}",
+                brood_protocol::PRESENTATION_PROTOCOL_VERSION
+            );
+            LocalStateReply {
+                value: LocalControlValue::Handshake {
+                    protocol_version,
+                    server_pid: std::process::id(),
+                },
+                descriptors: Vec::new(),
+            }
+        }
+        LocalControlRequest::Control { argv, json } => LocalStateReply {
+            value: LocalControlValue::Control(execute_control_request(argv, json, state)?),
+            descriptors: Vec::new(),
+        },
+        LocalControlRequest::OpenPresentation { frame_transports } => {
+            let opened = open_presentation_fast_path(state, frame_transports)?;
+            LocalStateReply {
+                value: LocalControlValue::Presentation {
+                    generation: opened.generation,
+                    active_session: opened.active_session,
+                    frame_transport: opened.frame_transport,
+                },
+                descriptors: opened.descriptors,
+            }
+        }
+        LocalControlRequest::DmabufResource {
+            generation,
+            resource,
+        } => {
+            ensure_fast_path_generation(state, generation)?;
+            let (
+                sequence,
+                app_id,
+                width,
+                height,
+                fourcc,
+                color_space,
+                modifier,
+                stride,
+                offset,
+                y_inverted,
+                fd,
+            ) = dmabuf_resource(state, resource)?;
+            LocalStateReply {
+                value: LocalControlValue::DmabufResource(LocalDmabufResource {
+                    sequence,
+                    app_id,
+                    width,
+                    height,
+                    fourcc,
+                    color_space,
+                    modifier,
+                    stride,
+                    offset,
+                    y_inverted,
+                }),
+                descriptors: vec![fd.into()],
+            }
+        }
+        LocalControlRequest::SharedMemoryResource {
+            generation,
+            resource,
+        } => {
+            ensure_fast_path_generation(state, generation)?;
+            let (app_id, fd) = shared_memory_resource(state, resource)?;
+            LocalStateReply {
+                value: LocalControlValue::SharedMemoryResource { app_id },
+                descriptors: vec![fd],
+            }
+        }
+        LocalControlRequest::InstallSessionInitArtifact { path } => {
+            state.install_remote_session_init_actor(Path::new(&path))?;
+            LocalStateReply {
+                value: LocalControlValue::Bool(true),
+                descriptors: Vec::new(),
+            }
+        }
+        LocalControlRequest::TakeRealmArtifactRequests => LocalStateReply {
+            value: LocalControlValue::RealmArtifactRequests(state.take_realm_artifact_requests()),
+            descriptors: Vec::new(),
+        },
+        LocalControlRequest::CompleteRealmArtifactRequest {
+            request,
+            success,
+            message,
+        } => LocalStateReply {
+            value: LocalControlValue::Bool(
+                state.complete_realm_artifact_request(request, success, message),
+            ),
+            descriptors: Vec::new(),
+        },
+    };
+    Ok(reply)
+}
+
+fn ensure_fast_path_generation(state: &Brood, generation: u64) -> Result<()> {
+    ensure!(
+        state
+            .dmabuf
+            .fast_path
+            .as_ref()
+            .is_some_and(|fast_path| fast_path.generation == generation),
+        "presentation generation {generation} is stale"
+    );
+    Ok(())
+}
+
 fn send_response<T>(response: DbusResponse<T>, result: Result<T>) {
     let response_result = result.map_err(|err| err.to_string());
     if let Err(err) = &response_result {
@@ -2978,16 +3069,18 @@ fn send_response<T>(response: DbusResponse<T>, result: Result<T>) {
 
 static FAST_PATH_GENERATION: AtomicU64 = AtomicU64::new(1);
 
+struct OpenedPresentationFastPath {
+    generation: u64,
+    active_session: u64,
+    frame_transport: brood_protocol::FrameTransportKind,
+    descriptors: Vec<OwnedFd>,
+}
+
 fn open_presentation_fast_path(
     state: &mut Brood,
-    frame_transports: Vec<u32>,
-) -> Result<DbusFastPath> {
+    client_frames: Vec<brood_protocol::FrameTransportKind>,
+) -> Result<OpenedPresentationFastPath> {
     let generation = FAST_PATH_GENERATION.fetch_add(1, Ordering::Relaxed);
-    let client_frames = frame_transports
-        .into_iter()
-        .map(brood_protocol::FrameTransportKind::try_from)
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .context("decode client frame transport capabilities")?;
     let client_capabilities = brood_protocol::EndpointCapabilities {
         protocol_version: brood_protocol::PRESENTATION_PROTOCOL_VERSION,
         carriers: vec![brood_protocol::CarrierKind::LocalSharedMemory],
@@ -3013,11 +3106,15 @@ fn open_presentation_fast_path(
     let catalog_file = brood_ipc::CriticalLaneFile::create(generation)?;
     let actor_message_file = brood_ipc::ActorMessageLaneFile::create(generation)?;
     let presentation_message_file = brood_ipc::ActorMessageLaneFile::create(generation)?;
+    let backend_request_file = brood_ipc::BackendMessageLaneFile::create(generation)?;
+    let backend_response_file = brood_ipc::BackendMessageLaneFile::create(generation)?;
     let input_notifications = brood_ipc::EventNotifier::create()?;
     let frame_notifications = brood_ipc::EventNotifier::create()?;
     let catalog_notifications = brood_ipc::EventNotifier::create()?;
     let actor_message_notifications = brood_ipc::EventNotifier::create()?;
     let presentation_message_notifications = brood_ipc::EventNotifier::create()?;
+    let backend_request_notifications = brood_ipc::EventNotifier::create()?;
+    let backend_response_notifications = brood_ipc::EventNotifier::create()?;
     let input_fd = input_file.as_fd().try_clone_to_owned()?;
     let input_notify_fd = input_notifications.as_fd().try_clone_to_owned()?;
     let frame_fd = frame_file.as_fd().try_clone_to_owned()?;
@@ -3030,6 +3127,12 @@ fn open_presentation_fast_path(
     let presentation_message_notify_fd = presentation_message_notifications
         .as_fd()
         .try_clone_to_owned()?;
+    let backend_request_fd = backend_request_file.as_fd().try_clone_to_owned()?;
+    let backend_request_notify_fd = backend_request_notifications.as_fd().try_clone_to_owned()?;
+    let backend_response_fd = backend_response_file.as_fd().try_clone_to_owned()?;
+    let backend_response_notify_fd = backend_response_notifications
+        .as_fd()
+        .try_clone_to_owned()?;
     let input = brood_ipc::CriticalConsumer::map(input_file.as_fd(), generation)?;
     let frames = brood_ipc::CriticalProducer::map(frame_file.as_fd(), generation)?;
     let catalog = brood_ipc::CriticalProducer::map(catalog_file.as_fd(), generation)?;
@@ -3037,6 +3140,10 @@ fn open_presentation_fast_path(
         brood_ipc::ActorMessageConsumer::map(actor_message_file.as_fd(), generation)?;
     let presentation_messages =
         brood_ipc::ActorMessageProducer::map(presentation_message_file.as_fd(), generation)?;
+    let backend_requests =
+        brood_ipc::BackendMessageConsumer::map(backend_request_file.as_fd(), generation)?;
+    let backend_responses =
+        brood_ipc::BackendMessageProducer::map(backend_response_file.as_fd(), generation)?;
     let fast_path = crate::state::PresentationFastPath {
         generation,
         profile,
@@ -3045,13 +3152,17 @@ fn open_presentation_fast_path(
         catalog,
         actor_messages,
         presentation_messages,
+        backend_requests,
+        backend_responses,
         frame_notifications,
         catalog_notifications,
         catalog_revision: 0,
         last_catalog_payload: Vec::new(),
         presentation_message_notifications,
+        backend_response_notifications,
         presentation_message_sequence: 0,
         deferred_presentation_messages: std::collections::VecDeque::new(),
+        deferred_backend_responses: std::collections::VecDeque::new(),
         deferred_managed_resize_statuses: std::collections::VecDeque::new(),
         resources: std::collections::HashMap::new(),
         buffers: std::collections::HashMap::new(),
@@ -3096,21 +3207,40 @@ fn open_presentation_fast_path(
             },
         )
         .map_err(|error| anyhow::anyhow!("install actor-message notification: {error}"))?;
-    Ok((
+    state
+        .loop_handle
+        .insert_source(
+            Generic::new(backend_request_notifications, Interest::READ, Mode::Level),
+            |_, notifications, state| {
+                if let Err(error) = notifications.drain() {
+                    warn!(?error, "drain backend-request notification failed");
+                }
+                drain_fast_path_backend_requests(state);
+                Ok(PostAction::Continue)
+            },
+        )
+        .map_err(|error| anyhow::anyhow!("install backend-request notification: {error}"))?;
+    Ok(OpenedPresentationFastPath {
         generation,
         active_session,
-        profile.frames.into(),
-        input_fd.into(),
-        input_notify_fd.into(),
-        frame_fd.into(),
-        frame_notify_fd.into(),
-        catalog_fd.into(),
-        catalog_notify_fd.into(),
-        actor_message_fd.into(),
-        actor_message_notify_fd.into(),
-        presentation_message_fd.into(),
-        presentation_message_notify_fd.into(),
-    ))
+        frame_transport: profile.frames,
+        descriptors: vec![
+            input_fd,
+            input_notify_fd,
+            frame_fd,
+            frame_notify_fd,
+            catalog_fd,
+            catalog_notify_fd,
+            actor_message_fd,
+            actor_message_notify_fd,
+            presentation_message_fd,
+            presentation_message_notify_fd,
+            backend_request_fd,
+            backend_request_notify_fd,
+            backend_response_fd,
+            backend_response_notify_fd,
+        ],
+    })
 }
 
 fn drain_fast_path_actor_messages(state: &mut Brood) {
@@ -3169,6 +3299,150 @@ fn drain_fast_path_actor_messages(state: &mut Brood) {
             (Err(error), _) => warn!(error = %error, "rejected malformed actor-message realm"),
             (_, Err(error)) => warn!(error = %error, "rejected malformed actor-message record"),
         }
+    }
+}
+
+fn drain_fast_path_backend_requests(state: &mut Brood) {
+    let Some(mut fast_path) = state.dmabuf.fast_path.take() else {
+        return;
+    };
+    let mut requests = Vec::new();
+    while let Some(message) = fast_path.backend_requests.try_recv() {
+        match message {
+            Ok(message) => match message.value {
+                brood_ipc::BackendMessageValue::Request(request) => requests.push(request),
+                brood_ipc::BackendMessageValue::Response(_) => {
+                    warn!("backend response reached the request lane");
+                }
+            },
+            Err(error) => warn!(%error, "rejected malformed backend request"),
+        }
+    }
+    state.dmabuf.fast_path = Some(fast_path);
+
+    for request in requests {
+        let response = execute_fast_path_backend_request(state, request);
+        let Some(fast_path) = state.dmabuf.fast_path.as_mut() else {
+            return;
+        };
+        fast_path.deferred_backend_responses.push_back(response);
+        flush_fast_path_backend_responses(fast_path);
+    }
+    if let Err(error) = crate::frame_export::publish_catalog_snapshot(state) {
+        warn!(?error, "publish catalog after backend IPC request failed");
+    }
+    if let Err(error) = state.display_handle.flush_clients() {
+        warn!(?error, "flush clients after backend IPC request failed");
+    }
+}
+
+fn flush_fast_path_backend_responses(fast_path: &mut crate::state::PresentationFastPath) {
+    let mut sent = false;
+    while let Some(response) = fast_path.deferred_backend_responses.pop_front() {
+        match fast_path
+            .backend_responses
+            .try_send(&brood_ipc::BackendMessageValue::Response(response.clone()))
+        {
+            Ok(()) => sent = true,
+            Err(brood_ipc::BackendMessageLaneError::Full) => {
+                fast_path.deferred_backend_responses.push_front(response);
+                break;
+            }
+            Err(error) => warn!(%error, request = response.id, "encode backend response failed"),
+        }
+    }
+    if sent && let Err(error) = fast_path.backend_response_notifications.notify() {
+        warn!(%error, "notify backend response failed");
+    }
+}
+
+fn execute_fast_path_backend_request(
+    state: &mut Brood,
+    request: brood_protocol::BackendRequest,
+) -> brood_protocol::BackendResponse {
+    use brood_protocol::{BackendOperation, BackendResponseValue, SessionOperation};
+
+    let id = request.id;
+    let result = match request.operation {
+        BackendOperation::Control { argv } => {
+            execute_control_request(argv, false, state).map(BackendResponseValue::Control)
+        }
+        BackendOperation::Session {
+            operation,
+            session,
+            name,
+            directory,
+        } => (|| -> Result<BackendResponseValue> {
+            let value = match operation {
+                SessionOperation::Refresh => None,
+                SessionOperation::Activate => {
+                    let session = SurfaceSessionId::from_raw(
+                        session.context("activate request is missing a session ID")?,
+                    );
+                    let transition =
+                        execute_session_command(state, SessionCommand::Activate { session })?
+                            .into_transition()?;
+                    ensure!(
+                        transition.target_exists,
+                        "session {} is unavailable",
+                        session.raw()
+                    );
+                    Some(session.raw())
+                }
+                SessionOperation::Create => {
+                    if let Some(directory) = directory {
+                        let mut argv = vec![
+                            "surface-session".to_string(),
+                            "dir-new".to_string(),
+                            directory,
+                            "default".to_string(),
+                        ];
+                        if let Some(name) = name {
+                            argv.push(name);
+                        }
+                        let response = execute_control_request(argv, false, state)?;
+                        Some(
+                            response
+                                .split_whitespace()
+                                .find_map(|part| part.strip_prefix("active=")?.parse().ok())
+                                .context("directory session creation returned no active session")?,
+                        )
+                    } else {
+                        Some(
+                            execute_session_command(state, SessionCommand::Create { name })?
+                                .into_created()?
+                                .raw(),
+                        )
+                    }
+                }
+                SessionOperation::Rename => {
+                    let session = SurfaceSessionId::from_raw(
+                        session.context("rename request is missing a session ID")?,
+                    );
+                    let name = name.context("rename request is missing a name")?;
+                    ensure!(
+                        execute_session_command(state, SessionCommand::Rename { session, name })?
+                            .into_renamed()?,
+                        "session {} was not renamed",
+                        session.raw()
+                    );
+                    Some(session.raw())
+                }
+                SessionOperation::Close => {
+                    let session = SurfaceSessionId::from_raw(
+                        session.context("close request is missing a session ID")?,
+                    );
+                    execute_session_command(state, SessionCommand::Close { session })?
+                        .into_closed()?;
+                    Some(session.raw())
+                }
+            };
+            Ok(BackendResponseValue::Session(value))
+        })(),
+    };
+    brood_protocol::BackendResponse {
+        id,
+        result: result.map_err(|error| format!("{error:#}")),
     }
 }
 
@@ -3522,7 +3796,7 @@ fn dmabuf_resource(state: &mut Brood, resource_id: u64) -> Result<DbusDmabufFram
     dmabuf_frame_tuple(&dmabuf, resource_id, app_id)
 }
 
-fn shared_memory_resource(state: &mut Brood, resource_id: u64) -> Result<DbusSharedMemoryFrame> {
+fn shared_memory_resource(state: &mut Brood, resource_id: u64) -> Result<(String, OwnedFd)> {
     let fast_path = state
         .dmabuf
         .fast_path
@@ -3536,7 +3810,7 @@ fn shared_memory_resource(state: &mut Brood, resource_id: u64) -> Result<DbusSha
         .as_fd()
         .try_clone_to_owned()
         .context("duplicate shared-memory image descriptor")?;
-    Ok((app_id.clone(), fd.into()))
+    Ok((app_id.clone(), fd))
 }
 
 fn dmabuf_frame_tuple(
@@ -4182,7 +4456,7 @@ fn execute_tokens(tokens: &[String], state: &mut Brood) -> Result<String> {
                 bail!("usage: nested-inner <command...>");
             }
             let target = ControlTarget::new(destination.to_string(), address.map(str::to_string));
-            request_dbus_command(&target, args, false)?
+            request_internal_command(&target, args, false)?
         }
         "debug" => match args {
             [subcommand, dir] if subcommand == "dump" => {
@@ -4894,7 +5168,7 @@ impl DirectorySurfaceSessionList {
 }
 
 fn request_surface_session_list(target: &ControlTarget) -> Result<SurfaceSessionList> {
-    let response = request_dbus_command(
+    let response = request_internal_command(
         target,
         &["surface-session".to_string(), "list-json".to_string()],
         false,
@@ -4906,7 +5180,7 @@ fn request_directory_surface_session_list(
     target: &ControlTarget,
     directory: &Path,
 ) -> Result<DirectorySurfaceSessionList> {
-    let response = request_dbus_command(
+    let response = request_internal_command(
         target,
         &[
             "surface-session".to_string(),

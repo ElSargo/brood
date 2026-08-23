@@ -12,18 +12,15 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use brood_cli::control::{
-    ControlTarget, SharedMemoryFrame, activate_surface_session, close_surface_session,
-    complete_realm_artifact_request, create_surface_session, handshake,
-    install_session_init_artifact, open_presentation_fast_path, rename_surface_session,
-    request_dbus_command, resolve_control_target, shared_memory_resource,
-    take_realm_artifact_requests,
+    ControlTarget, SharedMemoryFrame, complete_realm_artifact_request, handshake,
+    install_session_init_artifact, open_presentation_fast_path, request_internal_command,
+    resolve_control_target, shared_memory_resource, take_realm_artifact_requests,
 };
 use brood_protocol::{
     ActorMessage, ArtifactDigest, ArtifactMessage, ArtifactRealm, BackendActorRealm,
     BackendOperation, BackendRequest, BackendResponse, BackendResponseValue, CatalogSession,
     CatalogSnapshot, CatalogWindow, ClientLifecycle, ClientMessage, EndpointCapabilities,
-    FrameResourceRef, FrameScene, FrameTransportKind, InputEvent, Lane, ServerMessage,
-    SessionOperation, WindowFrame,
+    FrameResourceRef, FrameScene, FrameTransportKind, InputEvent, Lane, ServerMessage, WindowFrame,
 };
 use brood_transport::{
     ArtifactExchange, ArtifactExchangeEvent, ArtifactOffer, ArtifactTransfer, NetworkFramePacket,
@@ -597,6 +594,24 @@ async fn relay(
     )?;
     let actor_notifications =
         brood_ipc::EventNotifier::from_owned_fd(fast_path.actor_message_notify_fd);
+    let backend_requests = brood_ipc::BackendMessageProducer::map(
+        fast_path.backend_request_fd.as_fd(),
+        fast_path.generation,
+    )?;
+    let backend_request_notifications =
+        brood_ipc::EventNotifier::from_owned_fd(fast_path.backend_request_notify_fd);
+    let backend_responses = brood_ipc::BackendMessageConsumer::map(
+        fast_path.backend_response_fd.as_fd(),
+        fast_path.generation,
+    )?;
+    let backend_response_notifications =
+        brood_ipc::EventNotifier::from_owned_fd(fast_path.backend_response_notify_fd);
+    let backend_commands = spawn_local_backend_bridge(
+        backend_requests,
+        backend_request_notifications,
+        backend_responses,
+        backend_response_notifications,
+    )?;
     let (local_critical_input_tx, local_critical_input_rx) = mpsc::channel(LOCAL_INPUT_CAPACITY);
     let (local_latest_input_tx, local_latest_input_rx) = tokio::sync::watch::channel(None);
     let (local_actor_tx, local_actor_rx) = mpsc::channel(LOCAL_ACTOR_CAPACITY);
@@ -728,11 +743,15 @@ async fn relay(
             .await
             .context("daemon actor network receiver stopped")
     });
-    let reliable_target = target.clone();
     transport_tasks.spawn(async move {
-        receive_reliable_input(reliable_receive, reliable_target, outbound, frame_resources)
-            .await
-            .context("reliable network receiver stopped")
+        receive_reliable_input(
+            reliable_receive,
+            backend_commands,
+            outbound,
+            frame_resources,
+        )
+        .await
+        .context("reliable network receiver stopped")
     });
     let mut artifact_task = tokio::spawn(exchange_session_artifacts(
         bulk_send,
@@ -1068,7 +1087,7 @@ async fn install_session_artifact(
     let id = artifact.manifest.id.clone();
     let path = artifact.path.clone();
     let response = tokio::task::spawn_blocking(move || {
-        request_dbus_command(
+        request_internal_command(
             &install_target,
             &[
                 "plug".to_string(),
@@ -1208,21 +1227,88 @@ async fn receive_actor_input(
     }
 }
 
+struct LocalBackendCommand {
+    request: BackendRequest,
+    response: oneshot::Sender<Result<BackendResponse, String>>,
+}
+
+fn spawn_local_backend_bridge(
+    mut requests: brood_ipc::BackendMessageProducer,
+    request_notifications: brood_ipc::EventNotifier,
+    mut responses: brood_ipc::BackendMessageConsumer,
+    response_notifications: brood_ipc::EventNotifier,
+) -> Result<mpsc::Sender<LocalBackendCommand>> {
+    let (sender, mut receiver) = mpsc::channel::<LocalBackendCommand>(RELIABLE_EGRESS_CAPACITY);
+    std::thread::Builder::new()
+        .name("brood-relay-backend-ipc".to_string())
+        .spawn(move || {
+            while let Some(command) = receiver.blocking_recv() {
+                let id = command.request.id;
+                let value = brood_ipc::BackendMessageValue::Request(command.request);
+                let result = (|| -> Result<BackendResponse, String> {
+                    requests
+                        .try_send(&value)
+                        .map_err(|error| format!("send backend IPC request: {error}"))?;
+                    request_notifications
+                        .notify()
+                        .map_err(|error| format!("notify backend IPC request: {error}"))?;
+                    loop {
+                        response_notifications
+                            .wait()
+                            .map_err(|error| format!("wait for backend IPC response: {error}"))?;
+                        let Some(message) = responses.try_recv() else {
+                            continue;
+                        };
+                        let message = message
+                            .map_err(|error| format!("decode backend IPC response: {error}"))?;
+                        match message.value {
+                            brood_ipc::BackendMessageValue::Response(response)
+                                if response.id == id =>
+                            {
+                                return Ok(response);
+                            }
+                            brood_ipc::BackendMessageValue::Response(response) => {
+                                return Err(format!(
+                                    "backend IPC response ID mismatch: expected {id}, received {}",
+                                    response.id
+                                ));
+                            }
+                            brood_ipc::BackendMessageValue::Request(_) => {
+                                return Err("backend request reached the response lane".to_string());
+                            }
+                        }
+                    }
+                })();
+                if command.response.send(result).is_err() {
+                    return;
+                }
+            }
+        })
+        .context("spawn relay backend IPC bridge")?;
+    Ok(sender)
+}
+
 async fn receive_reliable_input(
     mut lane: brood_transport::NetworkReceiveLane,
-    target: ControlTarget,
+    backend_commands: mpsc::Sender<LocalBackendCommand>,
     outbound: Outbound,
     frame_resources: SharedFrameResources,
 ) -> Result<()> {
     loop {
         match lane.receive_client_message().await? {
             ClientMessage::BackendRequest(request) => {
-                let request_target = target.clone();
-                let response = tokio::task::spawn_blocking(move || {
-                    execute_backend_request(&request_target, request)
-                })
-                .await
-                .context("join remote backend request")?;
+                let (response_tx, response_rx) = oneshot::channel();
+                backend_commands
+                    .send(LocalBackendCommand {
+                        request,
+                        response: response_tx,
+                    })
+                    .await
+                    .map_err(|_error| anyhow!("local backend IPC bridge stopped"))?;
+                let response = response_rx
+                    .await
+                    .context("local backend IPC bridge dropped its response")?
+                    .map_err(anyhow::Error::msg)?;
                 outbound
                     .reliable
                     .send(ServerMessage::BackendResponse(response))
@@ -1241,84 +1327,6 @@ async fn receive_reliable_input(
             | ClientMessage::Artifact(_) => {
                 bail!("critical client message reached the reliable lane");
             }
-        }
-    }
-}
-
-fn execute_backend_request(target: &ControlTarget, request: BackendRequest) -> BackendResponse {
-    let result = match request.operation {
-        BackendOperation::Control { argv } => request_dbus_command(target, &argv, false)
-            .map(BackendResponseValue::Control)
-            .map_err(|error| format!("{error:#}")),
-        BackendOperation::Session {
-            operation,
-            session,
-            name,
-            directory,
-        } => execute_session_operation(target, operation, session, name, directory)
-            .map(BackendResponseValue::Session)
-            .map_err(|error| format!("{error:#}")),
-    };
-    BackendResponse {
-        id: request.id,
-        result,
-    }
-}
-
-fn execute_session_operation(
-    target: &ControlTarget,
-    operation: SessionOperation,
-    session: Option<u64>,
-    name: Option<String>,
-    directory: Option<String>,
-) -> Result<Option<u64>> {
-    match operation {
-        SessionOperation::Refresh => Ok(None),
-        SessionOperation::Activate => {
-            let session = session.context("activate request is missing a session ID")?;
-            ensure!(
-                activate_surface_session(target, session)?,
-                "session {session} is unavailable"
-            );
-            Ok(Some(session))
-        }
-        SessionOperation::Create => {
-            if let Some(directory) = directory {
-                let mut argv = vec![
-                    "surface-session".to_string(),
-                    "dir-new".to_string(),
-                    directory,
-                    "default".to_string(),
-                ];
-                if let Some(name) = name {
-                    argv.push(name);
-                }
-                let response = request_dbus_command(target, &argv, false)?;
-                let active = response
-                    .split_whitespace()
-                    .find_map(|part| part.strip_prefix("active=")?.parse().ok())
-                    .context("remote directory session creation returned no active session")?;
-                Ok(Some(active))
-            } else {
-                create_surface_session(target, name.unwrap_or_default()).map(Some)
-            }
-        }
-        SessionOperation::Rename => {
-            let session = session.context("rename request is missing a session ID")?;
-            let name = name.context("rename request is missing a name")?;
-            ensure!(
-                rename_surface_session(target, session, name)?,
-                "session {session} was not renamed"
-            );
-            Ok(Some(session))
-        }
-        SessionOperation::Close => {
-            let session = session.context("close request is missing a session ID")?;
-            ensure!(
-                close_surface_session(target, session)?,
-                "session {session} was not closed"
-            );
-            Ok(Some(session))
         }
     }
 }
@@ -1966,7 +1974,11 @@ async fn probe(
         .await?;
 
     let catalog = loop {
-        if let ServerMessage::Catalog(catalog) = reliable_receive.receive_server_message().await? {
+        if let ServerMessage::Catalog(catalog) = reliable_receive
+            .receive_server_message()
+            .await
+            .context("receive initial remote catalog")?
+        {
             break catalog;
         }
     };
@@ -1979,8 +1991,10 @@ async fn probe(
         }))
         .await?;
     let backend_response = loop {
-        if let ServerMessage::BackendResponse(response) =
-            reliable_receive.receive_server_message().await?
+        if let ServerMessage::BackendResponse(response) = reliable_receive
+            .receive_server_message()
+            .await
+            .context("receive remote backend response")?
             && response.id == 1
         {
             break response;

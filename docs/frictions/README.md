@@ -27,3 +27,4 @@ When design work resolves a friction, update the applicable page in
 - [[structural-lint]]
 - [[package-resolution]]
 - [[terminal-plugin]]
+- [[ui-concurrency]]

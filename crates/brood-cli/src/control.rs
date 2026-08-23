@@ -1,4 +1,6 @@
 use std::{
+    cell::RefCell,
+    collections::BTreeMap,
     env,
     fs::{self, OpenOptions},
     os::fd::{AsFd, OwnedFd},
@@ -26,6 +28,16 @@ pub use brood_protocol::PRESENTATION_PROTOCOL_VERSION;
 const SERVER_START_ATTEMPTS: usize = 180;
 const SERVER_START_INTERVAL: Duration = Duration::from_millis(100);
 
+type LocalTransport = brood_ipc::PacketTransport<
+    { brood_ipc::LOCAL_CONTROL_MAX_BYTES },
+    { brood_ipc::LOCAL_CONTROL_MAX_FDS },
+>;
+
+thread_local! {
+    static LOCAL_CONNECTIONS: RefCell<BTreeMap<PathBuf, LocalTransport>> =
+        const { RefCell::new(BTreeMap::new()) };
+}
+
 type DbusDmabufFrame = (
     u64,
     String,
@@ -41,22 +53,6 @@ type DbusDmabufFrame = (
 );
 type DbusSurfaceSession = (u64, String, bool, u64);
 type DbusPresentationWindow = (u64, u64, String);
-type DbusFastPath = (
-    u64,
-    u64,
-    u32,
-    zbus::zvariant::OwnedFd,
-    zbus::zvariant::OwnedFd,
-    zbus::zvariant::OwnedFd,
-    zbus::zvariant::OwnedFd,
-    zbus::zvariant::OwnedFd,
-    zbus::zvariant::OwnedFd,
-    zbus::zvariant::OwnedFd,
-    zbus::zvariant::OwnedFd,
-    zbus::zvariant::OwnedFd,
-    zbus::zvariant::OwnedFd,
-);
-type DbusSharedMemoryFrame = (String, zbus::zvariant::OwnedFd);
 
 #[proxy(
     interface = "org.brood.Session.Control",
@@ -64,19 +60,7 @@ type DbusSharedMemoryFrame = (String, zbus::zvariant::OwnedFd);
 )]
 trait BroodControl {
     fn command(&self, argv: Vec<String>, json: bool) -> zbus::Result<String>;
-    fn install_session_init_artifact(&self, path: String) -> zbus::Result<bool>;
-    fn take_realm_artifact_requests(&self) -> zbus::Result<Vec<(u64, String)>>;
-    fn complete_realm_artifact_request(
-        &self,
-        request: u64,
-        success: bool,
-        message: String,
-    ) -> zbus::Result<bool>;
     fn latest_dmabuf_frame(&self) -> zbus::Result<DbusDmabufFrame>;
-    fn open_presentation_fast_path(&self, frame_transports: Vec<u32>)
-    -> zbus::Result<DbusFastPath>;
-    fn dmabuf_resource(&self, resource_id: u64) -> zbus::Result<DbusDmabufFrame>;
-    fn shared_memory_resource(&self, resource_id: u64) -> zbus::Result<DbusSharedMemoryFrame>;
 }
 
 #[proxy(interface = "org.brood.Session", default_path = "/org/brood/Session")]
@@ -126,6 +110,37 @@ impl ControlTarget {
         }
     }
 
+    /// Private socket used only by Brood-owned local clients.
+    #[must_use]
+    pub fn local_ipc_path(&self) -> PathBuf {
+        let effective_address = self
+            .address
+            .as_deref()
+            .map(str::to_string)
+            .or_else(|| env::var(BROODD_DBUS_ADDRESS_ENV).ok())
+            .or_else(|| env::var("DBUS_SESSION_BUS_ADDRESS").ok())
+            .unwrap_or_default();
+        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+        for byte in self
+            .destination
+            .bytes()
+            .chain([0])
+            .chain(effective_address.as_str().bytes())
+        {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x100_0000_01b3);
+        }
+        let bus_runtime = effective_address.split(',').find_map(|field| {
+            let path = field.strip_prefix("unix:path=")?;
+            Path::new(path).parent().map(Path::to_path_buf)
+        });
+        bus_runtime
+            .or_else(|| env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from))
+            .unwrap_or_else(env::temp_dir)
+            .join("brood")
+            .join(format!("presentation-{hash:016x}.sock"))
+    }
+
     #[must_use]
     pub fn session_marker(&self) -> String {
         self.session_marker_with_session(None)
@@ -167,6 +182,10 @@ pub struct PresentationFastPath {
     pub actor_message_notify_fd: OwnedFd,
     pub presentation_message_fd: OwnedFd,
     pub presentation_message_notify_fd: OwnedFd,
+    pub backend_request_fd: OwnedFd,
+    pub backend_request_notify_fd: OwnedFd,
+    pub backend_response_fd: OwnedFd,
+    pub backend_response_notify_fd: OwnedFd,
 }
 
 #[derive(Debug)]
@@ -260,23 +279,55 @@ pub fn request_dbus_command(
         .with_context(|| format!("call Brood DBus control command on {}", target.destination))
 }
 
+/// Execute a Brood-internal control operation without entering the public D-Bus API.
+pub fn request_internal_command(
+    target: &ControlTarget,
+    command: &[String],
+    json: bool,
+) -> Result<String> {
+    if json {
+        let encoded = command.join(" ");
+        let _: Vec<String> =
+            serde_json::from_str(&encoded).context("validate JSON control argv")?;
+    }
+    match local_request(
+        target,
+        &brood_ipc::LocalControlRequest::Control {
+            argv: command.to_vec(),
+            json,
+        },
+    )?
+    .message
+    {
+        brood_ipc::LocalControlValue::Control(output) => Ok(output),
+        _ => bail!("private IPC returned the wrong control response"),
+    }
+}
+
 pub fn install_session_init_artifact(target: &ControlTarget, path: &Path) -> Result<bool> {
-    let connection = connection(target)?;
-    presentation_proxy(&connection, target)?
-        .install_session_init_artifact(path.display().to_string())
-        .with_context(|| {
-            format!(
-                "install remote session init artifact on {}",
-                target.destination
-            )
-        })
+    match local_request(
+        target,
+        &brood_ipc::LocalControlRequest::InstallSessionInitArtifact {
+            path: path.display().to_string(),
+        },
+    )?
+    .message
+    {
+        brood_ipc::LocalControlValue::Bool(installed) => Ok(installed),
+        _ => bail!("private IPC returned the wrong artifact-install response"),
+    }
 }
 
 pub fn take_realm_artifact_requests(target: &ControlTarget) -> Result<Vec<(u64, String)>> {
-    let connection = connection(target)?;
-    presentation_proxy(&connection, target)?
-        .take_realm_artifact_requests()
-        .with_context(|| format!("take realm artifact requests from {}", target.destination))
+    match local_request(
+        target,
+        &brood_ipc::LocalControlRequest::TakeRealmArtifactRequests,
+    )?
+    .message
+    {
+        brood_ipc::LocalControlValue::RealmArtifactRequests(requests) => Ok(requests),
+        _ => bail!("private IPC returned the wrong artifact-request response"),
+    }
 }
 
 pub fn complete_realm_artifact_request(
@@ -285,15 +336,19 @@ pub fn complete_realm_artifact_request(
     success: bool,
     message: String,
 ) -> Result<bool> {
-    let connection = connection(target)?;
-    presentation_proxy(&connection, target)?
-        .complete_realm_artifact_request(request, success, message)
-        .with_context(|| {
-            format!(
-                "complete realm artifact request {request} on {}",
-                target.destination
-            )
-        })
+    match local_request(
+        target,
+        &brood_ipc::LocalControlRequest::CompleteRealmArtifactRequest {
+            request,
+            success,
+            message,
+        },
+    )?
+    .message
+    {
+        brood_ipc::LocalControlValue::Bool(completed) => Ok(completed),
+        _ => bail!("private IPC returned the wrong artifact-completion response"),
+    }
 }
 
 fn session_proxy<'a>(
@@ -383,43 +438,30 @@ pub fn close_surface_session(target: &ControlTarget, id: u64) -> Result<bool> {
         .with_context(|| format!("close Brood surface session {id}"))
 }
 
-fn presentation_proxy<'a>(
-    connection: &'a zbus::blocking::Connection,
-    target: &'a ControlTarget,
-) -> Result<BroodControlProxyBlocking<'a>> {
-    BroodControlProxyBlocking::builder(connection)
-        .destination(target.destination.as_str())?
-        .path(CONTROL_OBJECT_PATH)?
-        .interface(CONTROL_INTERFACE)?
-        .build()
-        .context("build Brood presentation proxy")
-}
-
 pub fn open_presentation_fast_path(
     target: &ControlTarget,
     frame_transports: &[brood_protocol::FrameTransportKind],
 ) -> Result<PresentationFastPath> {
-    let connection = connection(target)?;
-    let (
+    let response = local_request(
+        target,
+        &brood_ipc::LocalControlRequest::OpenPresentation {
+            frame_transports: frame_transports.to_vec(),
+        },
+    )?;
+    let brood_ipc::LocalControlValue::Presentation {
         generation,
         active_session,
-        selected_frame_transport,
-        input_fd,
-        input_notify_fd,
-        frame_fd,
-        frame_notify_fd,
-        catalog_fd,
-        catalog_notify_fd,
-        actor_message_fd,
-        actor_message_notify_fd,
-        presentation_message_fd,
-        presentation_message_notify_fd,
-    ) = presentation_proxy(&connection, target)?
-        .open_presentation_fast_path(frame_transports.iter().copied().map(u32::from).collect())
-        .context("open local presentation fast path")?;
-    let frames = selected_frame_transport
-        .try_into()
-        .context("decode selected local frame transport")?;
+        frame_transport: frames,
+    } = response.message
+    else {
+        bail!("private IPC returned the wrong presentation response");
+    };
+    let mut descriptors = response.descriptors.into_iter();
+    let mut next = || {
+        descriptors
+            .next()
+            .context("presentation response omitted a descriptor")
+    };
     Ok(PresentationFastPath {
         generation,
         active_session,
@@ -427,16 +469,20 @@ pub fn open_presentation_fast_path(
             carrier: brood_protocol::CarrierKind::LocalSharedMemory,
             frames,
         },
-        input_fd: input_fd.into(),
-        input_notify_fd: input_notify_fd.into(),
-        frame_fd: frame_fd.into(),
-        frame_notify_fd: frame_notify_fd.into(),
-        catalog_fd: catalog_fd.into(),
-        catalog_notify_fd: catalog_notify_fd.into(),
-        actor_message_fd: actor_message_fd.into(),
-        actor_message_notify_fd: actor_message_notify_fd.into(),
-        presentation_message_fd: presentation_message_fd.into(),
-        presentation_message_notify_fd: presentation_message_notify_fd.into(),
+        input_fd: next()?,
+        input_notify_fd: next()?,
+        frame_fd: next()?,
+        frame_notify_fd: next()?,
+        catalog_fd: next()?,
+        catalog_notify_fd: next()?,
+        actor_message_fd: next()?,
+        actor_message_notify_fd: next()?,
+        presentation_message_fd: next()?,
+        presentation_message_notify_fd: next()?,
+        backend_request_fd: next()?,
+        backend_request_notify_fd: next()?,
+        backend_response_fd: next()?,
+        backend_response_notify_fd: next()?,
     })
 }
 
@@ -445,11 +491,24 @@ pub fn shared_memory_resource(
     resource_id: u64,
     generation: u64,
 ) -> Result<SharedMemoryFrame> {
-    let connection = connection(target)?;
-    let (app_id, fd) = presentation_proxy(&connection, target)?
-        .shared_memory_resource(resource_id)
-        .with_context(|| format!("request shared-memory frame resource {resource_id}"))?;
-    let fd: OwnedFd = fd.into();
+    let response = local_request(
+        target,
+        &brood_ipc::LocalControlRequest::SharedMemoryResource {
+            generation,
+            resource: resource_id,
+        },
+    )?;
+    let brood_ipc::LocalControlValue::SharedMemoryResource { app_id } = response.message else {
+        bail!("private IPC returned the wrong shared-memory response");
+    };
+    let mut descriptors = response.descriptors.into_iter();
+    let fd = descriptors
+        .next()
+        .context("shared-memory response omitted its descriptor")?;
+    ensure!(
+        descriptors.next().is_none(),
+        "shared-memory response included extra descriptors"
+    );
     let image = brood_ipc::SharedImageConsumer::map(fd.as_fd(), generation)
         .context("map shared-memory frame resource")?;
     Ok(SharedMemoryFrame { app_id, image })
@@ -495,58 +554,69 @@ pub fn latest_dmabuf_frame(target: &ControlTarget) -> Result<DmabufFrame> {
     })
 }
 
-pub fn dmabuf_resource(target: &ControlTarget, resource_id: u64) -> Result<DmabufFrame> {
-    let connection = connection(target)?;
-    let (
-        sequence,
-        app_id,
-        width,
-        height,
-        fourcc,
-        color_space,
-        modifier,
-        stride,
-        offset,
-        y_inverted,
-        fd,
-    ) = presentation_proxy(&connection, target)?
-        .dmabuf_resource(resource_id)
-        .with_context(|| format!("fetch DMA-BUF resource {resource_id}"))?;
+pub fn dmabuf_resource(
+    target: &ControlTarget,
+    resource_id: u64,
+    generation: u64,
+) -> Result<DmabufFrame> {
+    let response = local_request(
+        target,
+        &brood_ipc::LocalControlRequest::DmabufResource {
+            generation,
+            resource: resource_id,
+        },
+    )?;
+    let brood_ipc::LocalControlValue::DmabufResource(resource) = response.message else {
+        bail!("private IPC returned the wrong DMA-BUF response");
+    };
+    let mut descriptors = response.descriptors.into_iter();
+    let fd = descriptors
+        .next()
+        .context("DMA-BUF response omitted its descriptor")?;
+    ensure!(
+        descriptors.next().is_none(),
+        "DMA-BUF response included extra descriptors"
+    );
     Ok(DmabufFrame {
-        sequence,
-        app_id,
-        width,
-        height,
-        fourcc,
-        color_space: color_space
+        sequence: resource.sequence,
+        app_id: resource.app_id,
+        width: resource.width,
+        height: resource.height,
+        fourcc: resource.fourcc,
+        color_space: resource
+            .color_space
             .try_into()
             .context("decode DMA-BUF resource color space")?,
-        modifier,
-        stride,
-        offset,
-        y_inverted,
-        fd: fd.into(),
+        modifier: resource.modifier,
+        stride: resource.stride,
+        offset: resource.offset,
+        y_inverted: resource.y_inverted,
+        fd,
     })
 }
 
 pub fn handshake(target: &ControlTarget) -> Result<Handshake> {
-    let response = request_dbus_command(
+    let response = local_request(
         target,
-        &[
-            "handshake".to_string(),
-            PRESENTATION_PROTOCOL_VERSION.to_string(),
-        ],
-        false,
+        &brood_ipc::LocalControlRequest::Handshake {
+            protocol_version: PRESENTATION_PROTOCOL_VERSION,
+        },
     )?;
-    let handshake: Handshake =
-        serde_json::from_str(response.trim()).context("decode presentation handshake")?;
+    let brood_ipc::LocalControlValue::Handshake {
+        protocol_version,
+        server_pid,
+    } = response.message
+    else {
+        bail!("private IPC returned the wrong handshake response");
+    };
     ensure!(
-        handshake.protocol_version == PRESENTATION_PROTOCOL_VERSION,
-        "presentation protocol mismatch: client={}, server={}",
-        PRESENTATION_PROTOCOL_VERSION,
-        handshake.protocol_version
+        response.descriptors.is_empty(),
+        "handshake returned descriptors"
     );
-    Ok(handshake)
+    Ok(Handshake {
+        protocol_version,
+        server_pid,
+    })
 }
 
 pub fn launch_client() -> Result<ExitStatus> {
@@ -614,6 +684,39 @@ fn connection(target: &ControlTarget) -> Result<zbus::blocking::Connection> {
     }
 }
 
+fn local_request(
+    target: &ControlTarget,
+    request: &brood_ipc::LocalControlRequest,
+) -> Result<brood_ipc::ReceivedPacket<brood_ipc::LocalControlValue>> {
+    let path = target.local_ipc_path();
+    LOCAL_CONNECTIONS.with(|connections| {
+        let mut connections = connections.borrow_mut();
+        if !connections.contains_key(&path) {
+            let transport = LocalTransport::connect_path(&path)
+                .with_context(|| format!("connect private Brood IPC at {}", path.display()))?;
+            transport.set_send_timeout(Some(Duration::from_secs(15)))?;
+            transport.set_receive_timeout(Some(Duration::from_secs(15)))?;
+            connections.insert(path.clone(), transport);
+        }
+        let transport = connections
+            .get(&path)
+            .context("private Brood IPC connection disappeared")?;
+        let result = (|| {
+            transport.send(&request, &[])?;
+            let response = transport.receive::<brood_ipc::LocalControlResponse>()?;
+            let message = response.message.result.map_err(anyhow::Error::msg)?;
+            Ok(brood_ipc::ReceivedPacket {
+                message,
+                descriptors: response.descriptors,
+            })
+        })();
+        if result.is_err() {
+            connections.remove(&path);
+        }
+        result
+    })
+}
+
 fn spawn_server(target: &ControlTarget, launch: &ServerLaunch) -> Result<(PathBuf, Child)> {
     let log_dir = server_log_dir();
     fs::create_dir_all(&log_dir).with_context(|| format!("create {}", log_dir.display()))?;
@@ -674,4 +777,31 @@ pub fn session_marker_value(marker: &str, key: &str) -> Option<String> {
             .filter(|value| !value.is_empty())
             .map(ToString::to_string)
     })
+}
+
+#[cfg(test)]
+mod control_tests {
+    use std::path::Path;
+
+    use super::ControlTarget;
+
+    #[test]
+    fn explicit_bus_address_stabilizes_private_ipc_discovery() {
+        let target = ControlTarget::new(
+            "org.brood.Test".to_string(),
+            Some("unix:path=/tmp/brood-test-bus/bus,guid=1234".to_string()),
+        );
+        let same_target = target.clone();
+        let other_target = ControlTarget::new(
+            "org.brood.Other".to_string(),
+            Some("unix:path=/tmp/brood-test-bus/bus,guid=1234".to_string()),
+        );
+
+        assert_eq!(
+            target.local_ipc_path().parent(),
+            Some(Path::new("/tmp/brood-test-bus/brood"))
+        );
+        assert_eq!(target.local_ipc_path(), same_target.local_ipc_path());
+        assert_ne!(target.local_ipc_path(), other_target.local_ipc_path());
+    }
 }

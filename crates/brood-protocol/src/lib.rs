@@ -12,7 +12,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use thiserror::Error;
 
 /// Current semantic presentation protocol version.
-pub const PRESENTATION_PROTOCOL_VERSION: u32 = 23;
+pub const PRESENTATION_PROTOCOL_VERSION: u32 = 24;
 
 /// Number of fixed scale units in one logical output unit.
 pub const FRACTIONAL_SCALE_DENOMINATOR: u32 = 120;
@@ -181,7 +181,7 @@ pub struct CapsuleFailure {
 pub struct CapsuleStatus {
     #[serde(default)]
     pub lifecycle: CapsuleLifecycle,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub failure: Option<CapsuleFailure>,
 }
 
@@ -190,9 +190,9 @@ pub struct CapsuleStatus {
 pub struct SessionIsolationStatus {
     #[serde(default)]
     pub profile: IsolationProfile,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub volume: Option<SessionVolumeStatus>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub capsule: Option<CapsuleStatus>,
 }
 
@@ -520,8 +520,7 @@ pub struct CatalogWindow {
 }
 
 /// Which endpoint chooses a managed application's configured logical size.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "owner", rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ManagedWindowSizeAuthority {
     /// The presentation client chooses a size from its human layout.
     #[default]
@@ -533,9 +532,96 @@ pub enum ManagedWindowSizeAuthority {
     },
 }
 
+// Preserve the named JSON contract while giving non-self-describing carriers
+// a positional enum that Postcard can decode.
+#[derive(Deserialize, Serialize)]
+#[serde(tag = "owner", rename_all = "snake_case")]
+enum HumanManagedWindowSizeAuthority {
+    Presentation,
+    ServerPreferred {
+        logical_width: u32,
+        logical_height: u32,
+    },
+}
+
+#[derive(Deserialize, Serialize)]
+enum BinaryManagedWindowSizeAuthority {
+    Presentation,
+    ServerPreferred {
+        logical_width: u32,
+        logical_height: u32,
+    },
+}
+
+impl Serialize for ManagedWindowSizeAuthority {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let (human, binary) = match *self {
+            Self::Presentation => (
+                HumanManagedWindowSizeAuthority::Presentation,
+                BinaryManagedWindowSizeAuthority::Presentation,
+            ),
+            Self::ServerPreferred {
+                logical_width,
+                logical_height,
+            } => (
+                HumanManagedWindowSizeAuthority::ServerPreferred {
+                    logical_width,
+                    logical_height,
+                },
+                BinaryManagedWindowSizeAuthority::ServerPreferred {
+                    logical_width,
+                    logical_height,
+                },
+            ),
+        };
+        if serializer.is_human_readable() {
+            human.serialize(serializer)
+        } else {
+            binary.serialize(serializer)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ManagedWindowSizeAuthority {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        if deserializer.is_human_readable() {
+            Ok(
+                match HumanManagedWindowSizeAuthority::deserialize(deserializer)? {
+                    HumanManagedWindowSizeAuthority::Presentation => Self::Presentation,
+                    HumanManagedWindowSizeAuthority::ServerPreferred {
+                        logical_width,
+                        logical_height,
+                    } => Self::ServerPreferred {
+                        logical_width,
+                        logical_height,
+                    },
+                },
+            )
+        } else {
+            Ok(
+                match BinaryManagedWindowSizeAuthority::deserialize(deserializer)? {
+                    BinaryManagedWindowSizeAuthority::Presentation => Self::Presentation,
+                    BinaryManagedWindowSizeAuthority::ServerPreferred {
+                        logical_width,
+                        logical_height,
+                    } => Self::ServerPreferred {
+                        logical_width,
+                        logical_height,
+                    },
+                },
+            )
+        }
+    }
+}
+
 /// Human-presentation state for a server-managed window under automation.
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum ManagedWindowAutomationState {
     /// The window is under ordinary human control.
     #[default]
@@ -546,6 +632,126 @@ pub enum ManagedWindowAutomationState {
         interaction: AutomationInteractionState,
         cursor: Option<AutomationCursor>,
     },
+}
+
+// The human-readable catalog is externally consumed. Its tagged map shape is
+// deliberately separate from the compact binary enum used on network lanes.
+#[derive(Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum HumanManagedWindowAutomationState {
+    Normal,
+    Automated {
+        task: String,
+        interaction: AutomationInteractionState,
+        cursor: Option<AutomationCursor>,
+    },
+}
+
+#[derive(Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum HumanManagedWindowAutomationStateRef<'a> {
+    Normal,
+    Automated {
+        task: &'a str,
+        interaction: AutomationInteractionState,
+        cursor: Option<AutomationCursor>,
+    },
+}
+
+#[derive(Deserialize)]
+enum BinaryManagedWindowAutomationState {
+    Normal,
+    Automated {
+        task: String,
+        interaction: AutomationInteractionState,
+        cursor: Option<AutomationCursor>,
+    },
+}
+
+#[derive(Serialize)]
+enum BinaryManagedWindowAutomationStateRef<'a> {
+    Normal,
+    Automated {
+        task: &'a str,
+        interaction: AutomationInteractionState,
+        cursor: Option<AutomationCursor>,
+    },
+}
+
+impl Serialize for ManagedWindowAutomationState {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if serializer.is_human_readable() {
+            match self {
+                Self::Normal => HumanManagedWindowAutomationStateRef::Normal.serialize(serializer),
+                Self::Automated {
+                    task,
+                    interaction,
+                    cursor,
+                } => HumanManagedWindowAutomationStateRef::Automated {
+                    task,
+                    interaction: *interaction,
+                    cursor: *cursor,
+                }
+                .serialize(serializer),
+            }
+        } else {
+            match self {
+                Self::Normal => BinaryManagedWindowAutomationStateRef::Normal.serialize(serializer),
+                Self::Automated {
+                    task,
+                    interaction,
+                    cursor,
+                } => BinaryManagedWindowAutomationStateRef::Automated {
+                    task,
+                    interaction: *interaction,
+                    cursor: *cursor,
+                }
+                .serialize(serializer),
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ManagedWindowAutomationState {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        if deserializer.is_human_readable() {
+            Ok(
+                match HumanManagedWindowAutomationState::deserialize(deserializer)? {
+                    HumanManagedWindowAutomationState::Normal => Self::Normal,
+                    HumanManagedWindowAutomationState::Automated {
+                        task,
+                        interaction,
+                        cursor,
+                    } => Self::Automated {
+                        task,
+                        interaction,
+                        cursor,
+                    },
+                },
+            )
+        } else {
+            Ok(
+                match BinaryManagedWindowAutomationState::deserialize(deserializer)? {
+                    BinaryManagedWindowAutomationState::Normal => Self::Normal,
+                    BinaryManagedWindowAutomationState::Automated {
+                        task,
+                        interaction,
+                        cursor,
+                    } => Self::Automated {
+                        task,
+                        interaction,
+                        cursor,
+                    },
+                },
+            )
+        }
+    }
 }
 
 /// Whether human input may reach an automated managed window.
@@ -1028,10 +1234,10 @@ mod tests {
 
     #[test]
     fn version_mismatch_is_rejected() {
-        assert_eq!(PRESENTATION_PROTOCOL_VERSION, 23);
+        assert_eq!(PRESENTATION_PROTOCOL_VERSION, 24);
         let client = EndpointCapabilities::local_server(true);
         let mut server = client.clone();
-        server.protocol_version = 22;
+        server.protocol_version = 23;
         assert_eq!(
             negotiate_profile(&client, &server),
             Err(NegotiationError::ProtocolVersion)

@@ -8,21 +8,33 @@
 #![cfg(target_os = "linux")]
 
 mod actor_message;
+mod backend_message;
+mod local_control;
 mod local_protocol;
+mod packet;
 mod shared_image;
 
 pub use actor_message::{
     ACTOR_MESSAGE_BODY_CAPACITY, ActorMessageConsumer, ActorMessageLaneError, ActorMessageLaneFile,
     ActorMessageProducer, ActorMessageRecord,
 };
+pub use backend_message::{
+    BackendMessageConsumer, BackendMessageLaneError, BackendMessageLaneFile,
+    BackendMessageProducer, BackendMessageReceived, BackendMessageValue,
+};
 pub use brood_protocol::{
     FrameColorSpace, FramePixelFormat, UnsupportedFrameColorSpace, UnsupportedFramePixelFormat,
+};
+pub use local_control::{
+    LOCAL_CONTROL_MAX_BYTES, LOCAL_CONTROL_MAX_FDS, LocalControlRequest, LocalControlResponse,
+    LocalControlValue, LocalDmabufResource,
 };
 pub use local_protocol::{
     LocalProtocolError, LocalWindowFrame, decode_client_record,
     decode_managed_resize_status_record, decode_window_frame_record, encode_client_record,
     encode_managed_resize_status_record, encode_window_frame_record, is_coalescible_client_record,
 };
+pub use packet::{PacketTransport, PacketTransportError, ReceivedPacket};
 pub use shared_image::{
     SharedImageConsumer, SharedImageError, SharedImageMetadata, SharedImageProducer,
 };

@@ -7003,13 +7003,17 @@ pub struct PresentationFastPath {
     pub catalog: brood_ipc::CriticalProducer,
     pub actor_messages: brood_ipc::ActorMessageConsumer,
     pub presentation_messages: brood_ipc::ActorMessageProducer,
+    pub backend_requests: brood_ipc::BackendMessageConsumer,
+    pub backend_responses: brood_ipc::BackendMessageProducer,
     pub frame_notifications: brood_ipc::EventNotifier,
     pub catalog_notifications: brood_ipc::EventNotifier,
     pub catalog_revision: u64,
     pub last_catalog_payload: Vec<u8>,
     pub presentation_message_notifications: brood_ipc::EventNotifier,
+    pub backend_response_notifications: brood_ipc::EventNotifier,
     pub presentation_message_sequence: u64,
     pub deferred_presentation_messages: VecDeque<Box<brood_ipc::ActorMessageRecord>>,
+    pub deferred_backend_responses: VecDeque<brood_protocol::BackendResponse>,
     /// Lossless control records waiting for capacity in the shared frame
     /// ring. Resize acknowledgements are ordered and never coalesced.
     pub deferred_managed_resize_statuses: VecDeque<brood_ipc::CriticalRecord>,

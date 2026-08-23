@@ -1197,11 +1197,13 @@ mod tests {
 
     use brood_protocol::{
         ARTIFACT_ABI_VERSION, ActorMessage, ArtifactKind, ArtifactManifest, ArtifactMessage,
-        ArtifactRealm, BackendActorRealm, BackendOperation, BackendRequest, BackendResponse,
-        BackendResponseValue, ClientMessage, EndpointCapabilities, FrameColorSpace,
-        FramePixelFormat, FrameResourceRef, FrameScene, InputEvent, Lane, MAX_ACTOR_MESSAGE_BYTES,
-        MAX_ARTIFACT_CHUNK_BYTES, ManagedResizeStatus, ManagedResizeStatusResult, PanePosition,
-        ServerMessage, WindowFrame,
+        ArtifactRealm, BackendActorRealm, BackendId, BackendOperation, BackendRequest,
+        BackendResponse, BackendResponseValue, CatalogSession, CatalogSnapshot, CatalogWindow,
+        ClientMessage, EndpointCapabilities, FrameColorSpace, FramePixelFormat, FrameResourceRef,
+        FrameScene, InputEvent, Lane, MAX_ACTOR_MESSAGE_BYTES, MAX_ARTIFACT_CHUNK_BYTES,
+        ManagedResizeStatus, ManagedResizeStatusResult, ManagedWindowAutomationState,
+        ManagedWindowSizeAuthority, PanePosition, ServerMessage, SessionIsolationStatus,
+        WindowFrame,
     };
     use quinn::Endpoint;
     use rcgen::{CertifiedKey, generate_simple_self_signed};
@@ -1270,6 +1272,41 @@ mod tests {
             body: vec![0; MAX_ACTOR_MESSAGE_BYTES as usize + 1],
         });
         assert!(validate_client_message(&message).is_err());
+    }
+
+    #[test]
+    fn catalog_with_absent_isolation_details_round_trips_on_the_binary_carrier() {
+        let message = ServerMessage::Catalog(CatalogSnapshot {
+            backend: BackendId(1),
+            revision: 2,
+            active_session: 3,
+            sessions: vec![CatalogSession {
+                id: 3,
+                name: "session".to_string(),
+                active: true,
+                windows: 1,
+                working_directory: Some("/workspace".to_string()),
+                project_id: "project".to_string(),
+                project_name: "Project".to_string(),
+                project_directory: "/workspace".to_string(),
+                branch: None,
+                worktree: false,
+                git: true,
+                isolation: SessionIsolationStatus::default(),
+            }],
+            windows: vec![CatalogWindow {
+                pane: 4,
+                session: 3,
+                app_id: "terminal".to_string(),
+                size_authority: ManagedWindowSizeAuthority::Presentation,
+                automation: ManagedWindowAutomationState::default(),
+            }],
+        });
+        let encoded = postcard::to_stdvec(&message)
+            .unwrap_or_else(|error| unreachable!("encode catalog: {error}"));
+        let decoded = postcard::from_bytes::<ServerMessage>(&encoded)
+            .unwrap_or_else(|error| unreachable!("decode catalog: {error}"));
+        assert_eq!(decoded, message);
     }
 
     #[test]
