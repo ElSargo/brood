@@ -1,0 +1,5 @@
+accepted synchronized layout actor=session-switcher request=3 interaction=0 event_sequence=7 native_resize_revision=3 epoch=3 base_revision=5 target_revision=6 region_final=0/1 pane_ready=0/4 wait=4 affected=4 mode=ScaleThenAtomic actor_generation=2 focus=9 recovered_regions=[] wait_for_panes=[9,10,11,15] target_rects=[]
+resize-present interaction=0 event_sequence=7 epoch=3 divider_x=350 phase=projected wait_ready=0/4 staged_count=1 degraded=false
+synchronized layout ready actor=session-switcher request=3 interaction=0 event_sequence=7 epoch=4 target_revision=6 region_final=1/1 pane_ready=4/4 recovered_regions=[] recovered_count=0 recovered_managed={} recovered_managed_content={} missing=[] degraded=false duration_us=112164
+resize-present interaction=0 event_sequence=7 epoch=3 divider_x=350 phase=promoted wait_ready=4/4 staged_count=0 degraded=false
+completed synchronized layout actor=session-switcher request=3 interaction=0 event_sequence=7 native_resize_revision=3 epoch=3 target_revision=6 region_final=1/1 pane_ready=4/4 recovered_regions=[] recovered_count=0 recovered_managed={} recovered_managed_content={} missing=[] duration_us=113216

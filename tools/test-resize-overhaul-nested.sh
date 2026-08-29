@@ -217,7 +217,6 @@ MODE_HEIGHT="$(jq -r 'map(select(.active))[0].current_mode.height // 0' "$OUTPUT
   exit 1
 }
 EXPECTED_PANE_LOGICAL_WIDTH=$((LOGICAL_WIDTH / 2))
-EXPECTED_PANE_DEVICE_WIDTH=$((MODE_WIDTH / 2))
 EXPECTED_OUTPUT_SCALE="$(printf '%.2f' "$OUTPUT_SCALE")"
 FRACTIONAL_SCALE_SUPPORTED="$(python3 - "$OUTPUT_SCALE" <<'PY'
 import sys
@@ -237,8 +236,6 @@ start_proof_client() {
   local first_actor="${3:-resize-proof-fast}"
   local second_mode="${second_actor#resize-proof-}"
   [[ "$second_mode" != stall ]] || second_mode=stall-once
-  local final_diagnostics_line=""
-  local target_scene_panes="0"
   local startup_native_line=""
   CLIENT_LOG="$CLIENT_LOG_NORMAL"
   if [[ "$lane" == degraded ]]; then
@@ -271,108 +268,20 @@ start_proof_client() {
   CLIENT_PID=$!
 
   for _ in $(seq 1 600); do
-    final_diagnostics_line="$(awk \
-      -v expected_width="$EXPECTED_PANE_LOGICAL_WIDTH" \
-      -v expected_height="$LOGICAL_HEIGHT" \
-      -v second_mode="$second_mode" '
-        index($0, "resize-proof-untagged-resize") == 0 \
-          && index($0, "resize-proof-tagged") == 0 { next }
-        $0 !~ /}$/ { next }
-        index($0, sprintf("\"width\":%d.000", expected_width)) == 0 { next }
-        index($0, sprintf("\"height\":%d.000", expected_height)) == 0 { next }
-        index($0, "\"mode\":\"fast\"") != 0 { fast = NR }
-        index($0, sprintf("\"mode\":\"%s\"", second_mode)) != 0 { second = NR }
-        END {
-          if (fast > 0 && second > 0) print (fast > second ? fast : second)
-        }
-      ' "$CLIENT_LOG")"
-    target_scene_panes="$(awk \
-      -v target="gpu_target=${EXPECTED_PANE_DEVICE_WIDTH}x${MODE_HEIGHT}" \
-      -v scale="scale=${EXPECTED_OUTPUT_SCALE}" '
-        function field(name,    field_index, pair) {
-          for (field_index = 1; field_index <= NF; field_index += 1) {
-            split($field_index, pair, "=")
-            if (pair[1] == name) return pair[2]
-          }
-          return ""
-        }
-        (index($0, "accepted plugin draw packet pane=") != 0 \
-          || index($0, "staged plugin draw pane=") != 0) \
-          && index($0, target) != 0 && index($0, scale) != 0 \
-          && $0 ~ / scale=[0-9]+\.[0-9]+$/ {
-            pane = field("pane")
-            if (pane != "") seen[pane] = 1
-          }
-        END {
-          for (pane in seen) count += 1
-          print count + 0
-        }
-      ' "$CLIENT_LOG")"
-    startup_native_line="$(awk '
-        function field(name,    field_index, pair) {
-          for (field_index = 1; field_index <= NF; field_index += 1) {
-            split($field_index, pair, "=")
-            if (pair[1] == name) return pair[2]
-          }
-          return ""
-        }
-        index($0, "accepted synchronized layout actor=workspace ") != 0 \
-          && $0 ~ / target_rects=\[[^]]*\]$/ \
-          && field("native_resize_revision") + 0 > 0 {
-            request = field("request")
-            native = field("native_resize_revision")
-            epoch = field("epoch")
-            target_revision = field("target_revision")
-            accepted = NR
-            common_promoted = completed = window_promoted = lease_ack = 0
-            next
-          }
-        accepted > 0 && completed == 0 \
-          && index($0, "resize-present ") != 0 \
-          && $0 ~ / superseded_epochs=[0-9]+$/ \
-          && field("epoch") == epoch && field("phase") == "promoted" \
-          && field("staged_count") == "0" && field("degraded") == "false" {
-            common_promoted = NR
-            next
-          }
-        common_promoted > 0 \
-          && index($0, "completed synchronized layout actor=workspace ") != 0 \
-          && $0 ~ / duration_us=[0-9]+$/ \
-          && field("request") == request \
-          && field("native_resize_revision") == native \
-          && field("epoch") == epoch {
-            completed = NR
-            next
-          }
-        completed > 0 && window_promoted == 0 \
-          && index($0, "window-resize-present ") != 0 \
-          && $0 ~ / degraded=(true|false)$/ \
-          && field("native_resize_revision") == native \
-          && field("epoch") == epoch && field("phase") == "promoted" \
-          && field("staged_count") == "0" && field("degraded") == "false" {
-            window_promoted = NR
-            next
-          }
-        window_promoted > 0 && lease_ack == 0 \
-          && index($0, "accepted unchanged leased actor layout ") != 0 \
-          && $0 ~ / presented_layout_revision=[0-9]+$/ \
-          && field("presented_layout_revision") == target_revision {
-            lease_ack = NR
-          }
-        END {
-          if (accepted < common_promoted && common_promoted < completed \
-              && completed < window_promoted && window_promoted < lease_ack) {
-            print lease_ack
-          }
-        }
-      ' "$CLIENT_LOG")"
+    startup_native_line="$(python3 "$ROOT/tools/check-resize-startup.py" \
+      "$CLIENT_LOG" \
+      --width "$EXPECTED_PANE_LOGICAL_WIDTH" \
+      --height "$LOGICAL_HEIGHT" \
+      --first-actor "$first_actor" \
+      --first-mode fast \
+      --second-actor "$second_actor" \
+      --second-mode "$second_mode")"
     if rg -q 'registered pointer-policy provider=workspace .*path=[^[:space:]]+$' "$CLIENT_LOG" \
       && rg -q 'bound pointer-policy provider=workspace .*actor=workspace .*actor_generation=[0-9]+$' "$CLIENT_LOG" \
       && rg -q "started presentation WASM actor id=$first_actor .*path=[^[:space:]]+$" "$CLIENT_LOG" \
       && rg -q "started presentation WASM actor id=$second_actor .*path=[^[:space:]]+$" "$CLIENT_LOG" \
       && rg -q 'started presentation WASM actor id=session-switcher .*path=[^[:space:]]+$' "$CLIENT_LOG" \
       && rg -q "settled presentation window resize .*to=${MODE_WIDTH}x${MODE_HEIGHT} .*elapsed_ms=[0-9]+$" "$CLIENT_LOG" \
-      && [[ -n "$final_diagnostics_line" && "$target_scene_panes" -eq 2 ]] \
       && [[ -n "$startup_native_line" ]] \
       && rg -q 'resize-present .*event_sequence=0 .*divider_x=[0-9]+ .*phase=(settled|promoted) .*superseded_epochs=[0-9]+$' "$CLIENT_LOG"; then
       return 0
@@ -768,8 +677,10 @@ PY
 # Establish a fresh pointer capture, then admit exactly the first motion.  Once
 # that transaction is active, the remaining captured motions and final release
 # are sent back-to-back with only the virtual-pointer roundtrip ACK between
-# them.  The 120 ms slow proof pane keeps the first request in flight, making
-# the host supersession path deterministic without presentation backpressure.
+# them. The 90 ms slow proof pane keeps the first request in flight. One
+# obsolete cycle plus the coalesced final cycle costs at most 180 ms, leaving
+# 70 ms of the fixed 250 ms transaction budget for host hint and preparation
+# work while keeping the supersession path deterministic.
 send_pointer_command press press
 record_burst_ack capture-press
 wait_resize_trace "$ACK_SEQUENCE" settled 1

@@ -287,6 +287,22 @@ metric_value() {
   last_metric "$log" | jq -r ".$key // 0"
 }
 
+terminal_snapshot_ack_value() {
+  local log="$1"
+  sed -n \
+    's/.*sender=terminal-session recipient=terminal-ui .*terminal_input_sequence=\([0-9][0-9]*\).*/\1/p' \
+    "$log" \
+    | tail -1
+}
+
+terminal_input_backlog_value() {
+  local log="$1"
+  sed -n \
+    's/.*terminal input drain pending_plugin_inputs=\([0-9][0-9]*\).*/\1/p' \
+    "$log" \
+    | tail -1
+}
+
 type_line() {
   local input="$1"
   local ascii_chunk="" character code index
@@ -316,7 +332,8 @@ ctrl_alt_i() {
 
 focus_terminal() {
   local log="$1"
-  local baseline next quiet_previous quiet_samples terminal_pane
+  local baseline focus_baseline focus_count focused last_focused next pointer_baseline pointer_count
+  local quiet_previous quiet_samples terminal_pane
   terminal_pane="$(
     sed -n \
       's/.*started presentation WASM actor id=terminal-ui .* pane=\([0-9][0-9]*\) .*/\1/p' \
@@ -338,11 +355,28 @@ focus_terminal() {
         quiet_samples=0
       fi
     done
-    baseline="$(metric_value "$log" pty_bytes)"
     # The terminal is the composed workspace surface on the left. Use real
     # pointer input to focus that visible pane; Ctrl+J cycles the declared pane
     # catalogue and may legitimately defer on a currently hidden plugin pane.
+    focus_baseline="$({ rg -a -c "focused local plugin pane=$terminal_pane" "$log" || true; })"
+    pointer_baseline="$({ rg -a -c "presentation pointer button target=Plugin \\{ pane: $terminal_pane, .* pressed=true" "$log" || true; })"
     wayland_env "$OUT/virtual-pointer-input" click 240 360 1280 720
+    focused=0
+    for _ in $(seq 1 60); do
+      focus_count="$({ rg -a -c "focused local plugin pane=$terminal_pane" "$log" || true; })"
+      pointer_count="$({ rg -a -c "presentation pointer button target=Plugin \\{ pane: $terminal_pane, .* pressed=true" "$log" || true; })"
+      last_focused="$(sed -n 's/.*focused local plugin pane=\([0-9][0-9]*\).*/\1/p' "$log" | tail -1)"
+      if ((focus_count > focus_baseline)) \
+        || { ((pointer_count > pointer_baseline)) && [[ "$last_focused" == "$terminal_pane" ]]; }; then
+        focused=1
+        break
+      fi
+      sleep 0.05
+    done
+    if ((focused == 0)); then
+      continue
+    fi
+    baseline="$(metric_value "$log" pty_bytes)"
     type_line "echo __TERMINAL_FOCUS_${attempt}__"
     for _ in $(seq 1 60); do
       next="$(metric_value "$log" pty_bytes)"
@@ -461,19 +495,29 @@ INBOX_PANE="$(
 INBOX_REVEAL_BASELINE="$(
   rg -a -c 'sent key-policy actor message actor=inbox' "$CLIENT1_LOG" || true
 )"
+INBOX_FRAME_BASELINE="$(
+  rg -a -c 'render scheduling actor-frame promoted actor=inbox ' "$CLIENT1_LOG" || true
+)"
 ctrl_alt_i
 for _ in $(seq 1 100); do
   INBOX_REVEAL_COUNT="$(
     rg -a -c 'sent key-policy actor message actor=inbox' "$CLIENT1_LOG" || true
   )"
+  INBOX_FRAME_COUNT="$(
+    rg -a -c 'render scheduling actor-frame promoted actor=inbox ' "$CLIENT1_LOG" || true
+  )"
   if ((INBOX_REVEAL_COUNT > INBOX_REVEAL_BASELINE)) \
-    && rg -a -q "staged plugin draw pane=$INBOX_PANE .* gpu_target=320x686 " "$CLIENT1_LOG"; then
+    && ((INBOX_FRAME_COUNT > INBOX_FRAME_BASELINE)) \
+    && rg -a -q "accepted synchronized layout actor=session-switcher .* target_rects=.*${INBOX_PANE}:960:0:320:686" "$CLIENT1_LOG" \
+    && rg -a -q 'synchronized layout ready actor=session-switcher .* missing=\[\] degraded=false ' "$CLIENT1_LOG"; then
     break
   fi
   sleep 0.05
 done
 ((INBOX_REVEAL_COUNT > INBOX_REVEAL_BASELINE))
-rg -a -q "staged plugin draw pane=$INBOX_PANE .* gpu_target=320x686 " "$CLIENT1_LOG"
+((INBOX_FRAME_COUNT > INBOX_FRAME_BASELINE))
+rg -a -q "accepted synchronized layout actor=session-switcher .* target_rects=.*${INBOX_PANE}:960:0:320:686" "$CLIENT1_LOG"
+rg -a -q 'synchronized layout ready actor=session-switcher .* missing=\[\] degraded=false ' "$CLIENT1_LOG"
 INBOX_CLICK_X=$((1280 - 320 / 2))
 wayland_env "$OUT/virtual-pointer-input" click "$INBOX_CLICK_X" 100 1280 720
 for _ in $(seq 1 100); do
@@ -653,14 +697,22 @@ jq -e '
 start_client "$CLIENT2_LOG"
 wait_for_terminal_render "$CLIENT2_LOG"
 focus_terminal "$CLIENT2_LOG"
-RECONNECT_BASELINE="$(metric_value "$CLIENT2_LOG" pty_bytes)"
-type_line 'echo __SESSION_SHELL_SURVIVED_PRESENTATION_RECONNECT__'
+RECONNECT_MARKER="$OUT/session-shell-survived-presentation-reconnect.txt"
+RECONNECT_FRAME_BASELINE="$(
+  rg -a -c 'render scheduling actor-frame promoted actor=terminal-ui ' "$CLIENT2_LOG" || true
+)"
+type_line "printf '%s\\n' '__SESSION_SHELL_SURVIVED_PRESENTATION_RECONNECT__' > '$RECONNECT_MARKER'; printf '%s\\n' '__SESSION_SHELL_SURVIVED_PRESENTATION_RECONNECT__'"
 for _ in $(seq 1 200); do
-  RECONNECT_BYTES="$(metric_value "$CLIENT2_LOG" pty_bytes)"
-  ((RECONNECT_BYTES > RECONNECT_BASELINE)) && break
+  RECONNECT_FRAME_COUNT="$(
+    rg -a -c 'render scheduling actor-frame promoted actor=terminal-ui ' "$CLIENT2_LOG" || true
+  )"
+  if [[ -s "$RECONNECT_MARKER" ]] && ((RECONNECT_FRAME_COUNT > RECONNECT_FRAME_BASELINE)); then
+    break
+  fi
   sleep 0.05
 done
-((RECONNECT_BYTES > RECONNECT_BASELINE))
+rg -qx '__SESSION_SHELL_SURVIVED_PRESENTATION_RECONNECT__' "$RECONNECT_MARKER"
+((RECONNECT_FRAME_COUNT > RECONNECT_FRAME_BASELINE))
 capture "$OUT/terminal-reconnected.png"
 
 COLOR_ENV_FILE="$OUT/terminal-color-env.txt"
@@ -681,7 +733,13 @@ rg -q '/brood-inprocess-dbus-[^/]+-surface-[0-9]+/bus$' <<< "$CHILD_DBUS_ADDRESS
 
 GHOSTTY_BASELINE="$(ctl status-json | jq -r .total_windows)"
 GHOSTTY_PID_FILE="$OUT/ghostty-child.pid"
-type_line "env -u LD_LIBRARY_PATH ghostty --config-file=/dev/null --class=brood-terminal-ghostty-proof -e sleep 30 > '$OUT/ghostty-child.log' 2>&1 & printf '%s\n' \"\$!\" > '$GHOSTTY_PID_FILE'"
+GHOSTTY_CONFIG_HOME="$OUT/ghostty-config"
+mkdir -p "$GHOSTTY_CONFIG_HOME"
+# Ghostty loads its default config files before additional --config-file
+# entries, so /dev/null does not isolate this proof from the operator's
+# shaders or process policy. Use an empty config root and a valid GTK
+# application ID so the nested managed-window workload is deterministic.
+type_line "env -u LD_LIBRARY_PATH XDG_CONFIG_HOME='$GHOSTTY_CONFIG_HOME' GDK_BACKEND=wayland GTK_A11Y=none ghostty --class=org.brood.TerminalGhosttyProof -e sleep 30 > '$OUT/ghostty-child.log' 2>&1 & printf '%s\n' \"\$!\" > '$GHOSTTY_PID_FILE'"
 for _ in $(seq 1 100); do
   [[ -s "$GHOSTTY_PID_FILE" ]] && break
   sleep 0.05
@@ -695,6 +753,7 @@ for _ in $(seq 1 300); do
   ((GHOSTTY_WINDOWS > GHOSTTY_BASELINE)) && break
   sleep 0.05
 done
+printf '%s\n' "$GHOSTTY_STATUS" > "$OUT/status-ghostty-managed.json"
 ((GHOSTTY_WINDOWS > GHOSTTY_BASELINE))
 capture "$OUT/terminal-ghostty-managed.png"
 kill "$GHOSTTY_PID"
@@ -804,6 +863,7 @@ else
   ((MOUSE_SCROLL_BYTES > MOUSE_SCROLL_BASELINE))
   capture "$OUT/terminal-helix-mouse-scroll.png"
   wayland_env "$OUT/virtual-keyboard-key" --none 88
+SCROLL_INPUT_SEQUENCE_BASELINE="$(metric_value "$SCROLL_LOG" input_sequence)"
 # Saturate the terminal above refresh rate so input/compositor phase alignment
 # cannot create artificial missed frames. Presentation should remain display
 # limited while the terminal pipeline continues producing well above 60 Hz.
@@ -821,31 +881,93 @@ for _ in $(seq 1 200); do
   sleep 0.05
 done
 [[ -n "$HELIX_SCROLL_METRIC" ]]
+if [[ "$WESTON_DIRECT" != 1 ]]; then
+  # --repeat marshals 720 press requests and one final release. The client
+  # records every admitted press and records the independently delivered Text
+  # event; terminal-ui emits exactly one protocol command per non-empty Text.
+  [[ "$(jq -r .input_events <<< "$HELIX_SCROLL_METRIC")" == 720 ]]
+  SCROLL_TEXT_EVENTS="$(jq -r .text_events <<< "$HELIX_SCROLL_METRIC")"
+  [[ "$SCROLL_TEXT_EVENTS" == 720 ]]
+  EXPECTED_SCROLL_INPUT_SEQUENCE=$((SCROLL_INPUT_SEQUENCE_BASELINE + SCROLL_TEXT_EVENTS))
+  INPUT_DRAIN_STARTED_MS="$(date +%s%3N)"
+  for _ in $(seq 1 200); do
+    DRAINED_INPUT_SEQUENCE="$(terminal_snapshot_ack_value "$SCROLL_LOG")"
+    DRAINED_INPUT_SEQUENCE="${DRAINED_INPUT_SEQUENCE:-0}"
+    DRAINED_INPUT_BACKLOG="$(terminal_input_backlog_value "$SCROLL_LOG")"
+    DRAINED_INPUT_BACKLOG="${DRAINED_INPUT_BACKLOG:-720}"
+    if ((DRAINED_INPUT_SEQUENCE >= EXPECTED_SCROLL_INPUT_SEQUENCE \
+      && DRAINED_INPUT_BACKLOG == 0)); then
+      break
+    fi
+    sleep 0.05
+  done
+  INPUT_DRAIN_MS=$(( $(date +%s%3N) - INPUT_DRAIN_STARTED_MS ))
+  ((DRAINED_INPUT_SEQUENCE == EXPECTED_SCROLL_INPUT_SEQUENCE))
+  ((DRAINED_INPUT_BACKLOG == 0))
+  printf 'terminal_scroll_input_drain_ms=%s input_sequence=%s expected=%s pending_plugin_inputs=%s\n' \
+    "$INPUT_DRAIN_MS" "$DRAINED_INPUT_SEQUENCE" "$EXPECTED_SCROLL_INPUT_SEQUENCE" \
+    "$DRAINED_INPUT_BACKLOG"
+fi
+# The focused scroll-only lane has no later lifecycle work. Detach cleanly
+# before asserting its captured measurement so scheduler diagnostics survive a
+# failed cadence gate instead of being lost to trap-time process termination.
+if [[ "${BROOD_TERMINAL_SCROLL_ONLY:-0}" == 1 ]]; then
+  close_frontend
+  if [[ "$WESTON_DIRECT" != 1 ]]; then
+    SCROLL_RUNTIME_DIAGNOSTICS="$(
+      sed -n 's/^render scheduling diagnostics //p' "$SCROLL_LOG" | tail -1
+    )"
+    [[ -n "$SCROLL_RUNTIME_DIAGNOSTICS" ]]
+    jq -e '
+      .reliable_transition_drops == 0
+      and .actor_failures == 0
+      and .pending_actor_events == 0
+      and .pending_plugin_inputs == 0
+    ' <<< "$SCROLL_RUNTIME_DIAGNOSTICS" > /dev/null
+  fi
+fi
 # The headless compositor has host-scheduler jitter, so keep a narrow tolerance
 # on actual presents while requiring nearly every 240 Hz Helix update to arrive.
 if [[ "$WESTON_DIRECT" == 1 ]]; then
   MIN_SCENES=650
   MIN_SCENE_FPS_MILLI=220000
+  MAX_SCENE_FPS_MILLI=1000000
   MIN_FRAMES=500
   MIN_FPS_MILLI=170000
   MAX_P95_INTERVAL_US=7000
 else
-  MIN_SCENES=350
-  MIN_SCENE_FPS_MILLI=115000
+  MIN_SCENES=175
+  MIN_SCENE_FPS_MILLI=57000
+  MAX_SCENE_FPS_MILLI=70000
   MIN_FRAMES=175
   MIN_FPS_MILLI=57000
   MAX_P95_INTERVAL_US=25000
 fi
 jq -e \
+  --argjson weston_direct "$WESTON_DIRECT" \
   --argjson min_scenes "$MIN_SCENES" \
   --argjson min_scene_fps "$MIN_SCENE_FPS_MILLI" \
+  --argjson max_scene_fps "$MAX_SCENE_FPS_MILLI" \
   --argjson min_frames "$MIN_FRAMES" \
   --argjson min_fps "$MIN_FPS_MILLI" \
   --argjson max_p95 "$MAX_P95_INTERVAL_US" \
   '
-  (.input_events == 0 or (.input_events == 720 and .input_fps_milli >= 235000))
+  (if $weston_direct == 1 then
+     .input_events == 0
+   else
+     .input_events == 720
+     and .text_events == 720
+     and .input_fps_milli >= 235000
+     and .scenes == .frames
+     and (.presentation_batch_counts | length) == 17
+     and ([range(1; 17) as $size |
+       .presentation_batch_counts[$size] * $size] | add) == .presentation_events
+     and ([.presentation_batch_counts[1:17][]] | add) == .presentation_turns
+     and ([.presentation_batch_counts[2:17][]] | add) > 0
+   end)
   and .scenes >= $min_scenes
   and .scene_fps_milli >= $min_scene_fps
+  and .scene_fps_milli <= $max_scene_fps
   and .frames >= $min_frames
   and .fps_milli >= $min_fps
   and .p95_interval_us <= $max_p95
@@ -1120,6 +1242,18 @@ printf '%s\n' "$STATUS_SPAWNED" > "$OUT/status-shortcut-shell-live.json"
 printf '%s\n' "$STATUS_FINAL_EXIT" > "$OUT/status-shortcut-shell-exited.json"
 
 close_frontend
+if [[ "$WESTON_DIRECT" != 1 ]]; then
+  FINAL_RUNTIME_DIAGNOSTICS="$(
+    sed -n 's/^render scheduling diagnostics //p' "$CLIENT2_LOG" | tail -1
+  )"
+  [[ -n "$FINAL_RUNTIME_DIAGNOSTICS" ]]
+  jq -e '
+    .reliable_transition_drops == 0
+    and .actor_failures == 0
+    and .pending_actor_events == 0
+    and .pending_plugin_inputs == 0
+  ' <<< "$FINAL_RUNTIME_DIAGNOSTICS" > /dev/null
+fi
 GRAPHICS_METRIC="$(
   sed -n 's/^plugin graphics diagnostics //p' "$CLIENT2_LOG" | tail -1
 )"

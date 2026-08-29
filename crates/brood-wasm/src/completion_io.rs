@@ -294,10 +294,11 @@ impl CompletionIo {
     }
 }
 
-/// Start one owned completion supervisor.
-pub(crate) fn start_completion_io(
+/// Start one owned completion supervisor on an explicit I/O executor.
+pub(crate) fn start_completion_io_on(
     generation: u64,
     config: &CompletionIoConfig,
+    runtime: &tokio::runtime::Handle,
 ) -> Result<(
     CompletionIo,
     mpsc::Receiver<ActorCompletion>,
@@ -346,7 +347,7 @@ pub(crate) fn start_completion_io(
     let io = CompletionIo {
         inner: Arc::clone(&inner),
     };
-    let task = tokio::spawn(run_completion_io_supervisor(
+    let task = runtime.spawn(run_completion_io_supervisor(
         root,
         writable,
         inner,

@@ -52,10 +52,7 @@ enum KeybindingsMessage {
     #[serde(rename = "picker-created")]
     PickerCreated { picker: u64 },
     #[serde(rename = "picker-selected")]
-    PickerSelected {
-        picker: u64,
-        result: PickerResult,
-    },
+    PickerSelected { picker: u64, result: PickerResult },
     #[serde(rename = "picker-cancelled")]
     PickerCancelled { picker: u64 },
     #[serde(rename = "picker-error")]
@@ -223,11 +220,7 @@ impl Guest for KeybindingsActor {
     }
 }
 
-fn handle_message(
-    state: &mut KeybindingsState,
-    sender: &str,
-    bytes: &[u8],
-) -> Vec<ActorCommand> {
+fn handle_message(state: &mut KeybindingsState, sender: &str, bytes: &[u8]) -> Vec<ActorCommand> {
     let Ok(message) = serde_json::from_slice::<KeybindingsMessage>(bytes) else {
         return Vec::new();
     };
@@ -409,6 +402,15 @@ fn handle_presentation(
                 Vec::new()
             }
         }
+        PresentationEvent::RenderHint(hint) => {
+            if let Err(error) =
+                brood_plugin_sdk::graphics::render_with_hint(&hint, || redraw(state, None))
+            {
+                state.error = true;
+                state.status = error;
+            }
+            Vec::new()
+        }
         _ => Vec::new(),
     }
 }
@@ -573,7 +575,12 @@ fn redraw_for_resize_or_record_error(state: &mut KeybindingsState, resize_epoch:
     if state.pane == 0 {
         return;
     }
-    if let Err(error) = redraw(state, resize_epoch) {
+    let result = if brood_plugin_sdk::graphics::render_is_active() {
+        redraw(state, resize_epoch)
+    } else {
+        brood_plugin_sdk::graphics::request_render_for_resize(state.pane, resize_epoch)
+    };
+    if let Err(error) = result {
         state.error = true;
         state.status = error;
     }
@@ -687,7 +694,7 @@ fn redraw(state: &mut KeybindingsState, resize_epoch: Option<u64>) -> Result<(),
         panel.width - SIDE_MARGIN * 2.0,
     )?;
 
-    frame.submit(resize_epoch, &packet, &mut state.text_resources)?;
+    frame.queue(resize_epoch, &packet, &mut state.text_resources)?;
     Ok(())
 }
 
@@ -704,16 +711,7 @@ fn add_text(
     max_width: f32,
 ) -> Result<(), String> {
     frame
-        .draw_text_clipped(
-            packet,
-            text,
-            size,
-            max_width,
-            size + 4.0,
-            color,
-            x,
-            y,
-        )
+        .draw_text_clipped(packet, text, size, max_width, size + 4.0, color, x, y)
         .map_err(|error| format!("layout keybinding text: {error}"))?;
     Ok(())
 }
@@ -746,7 +744,12 @@ mod tests {
             PICKER_ACTOR_ID,
             br#"{"type":"picker-selected","picker":7,"result":{"label":"Open session picker","value":{"action":"sessions.picker"}},"index":4}"#,
         );
-        assert_eq!(state.capture, ACTIONS.iter().position(|action| action.id == "sessions.picker"));
+        assert_eq!(
+            state.capture,
+            ACTIONS
+                .iter()
+                .position(|action| action.id == "sessions.picker")
+        );
         assert!(state.visible);
         assert!(commands.is_empty());
     }

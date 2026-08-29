@@ -1,3 +1,9 @@
+#![allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    reason = "wire assertions deliberately fail fast"
+)]
+
 use brood_wasm::{
     CursorRole, DividerAxis, DividerRole, InputBehavior, InteractionZone, LayoutDivider,
     LayoutItemId, LayoutItemKind, LocalPoint, LocalTransform, PointerEventMask, ResolvedLayout,

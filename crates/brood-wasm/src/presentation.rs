@@ -5,7 +5,11 @@ use std::{error::Error, fmt};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PresentationError {
     Unavailable,
+    ActorStopped,
     InvalidPane,
+    InvalidToken,
+    DuplicatePane,
+    StaleResizeEpoch,
     InvalidArgument,
     LimitReached,
     InvalidPacket,
@@ -18,7 +22,11 @@ impl fmt::Display for PresentationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::Unavailable => "presentation service is unavailable",
+            Self::ActorStopped => "presentation actor is stopped",
             Self::InvalidPane => "presentation pane is invalid",
+            Self::InvalidToken => "render token is invalid",
+            Self::DuplicatePane => "actor frame contains a duplicate pane",
+            Self::StaleResizeEpoch => "synchronized resize epoch is stale",
             Self::InvalidArgument => "presentation argument is invalid",
             Self::LimitReached => "presentation limit reached",
             Self::InvalidPacket => "draw packet is invalid",
@@ -30,6 +38,29 @@ impl fmt::Display for PresentationError {
 }
 
 impl Error for PresentationError {}
+
+/// Opaque identity for one actor-scoped render opportunity.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct RenderToken(pub u64);
+
+/// One changed pane in an atomic actor-frame batch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActorFrameDraw {
+    pub pane: u64,
+    pub resize_epoch: Option<u64>,
+    pub state_watermark: Option<u64>,
+    pub packet: Vec<u8>,
+}
+
+/// Host-timed opportunity delivered after all events through its watermark.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RenderHint {
+    pub token: RenderToken,
+    pub target_presentation_time_ns: u64,
+    pub submission_deadline_ns: u64,
+    pub relevant_panes: Vec<u64>,
+    pub event_watermark: u64,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FontIntent {
@@ -76,22 +107,24 @@ pub struct TextLayoutResult {
 
 /// Client-supplied presentation capability installed into one actor Store.
 pub trait PresentationHost: fmt::Debug + Send + Sync + 'static {
-    fn submit_draw_packet(
-        &self,
-        actor_generation: u64,
-        pane: u64,
-        packet: Vec<u8>,
-    ) -> Result<u64, PresentationError>;
-
-    fn submit_tagged_draw_packet(
-        &self,
-        _actor_generation: u64,
-        _pane: u64,
-        _resize_epoch: u64,
-        _packet: Vec<u8>,
-    ) -> Result<u64, PresentationError> {
+    fn request_render(&self, _actor_generation: u64) -> Result<(), PresentationError> {
         Err(PresentationError::Unavailable)
     }
+
+    fn set_render_subscription(
+        &self,
+        _actor_generation: u64,
+        _enabled: bool,
+    ) -> Result<(), PresentationError> {
+        Err(PresentationError::Unavailable)
+    }
+
+    fn finish_actor_frame(
+        &self,
+        actor_generation: u64,
+        token: RenderToken,
+        draws: Vec<ActorFrameDraw>,
+    ) -> Result<u64, PresentationError>;
 
     fn reuse_pane_content(
         &self,
@@ -195,6 +228,7 @@ pub enum PresentationEvent {
         preview_height: u32,
         preview_rgba8: Vec<u8>,
     },
+    RenderHint(RenderHint),
 }
 
 /// One backend surface session as observed by a presentation-local actor.

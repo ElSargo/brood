@@ -141,7 +141,7 @@ impl Adapter {
         let mut stopped_task = None;
         let mut started_task = None;
         if name == "computer_launch" {
-            return self.launch(arguments);
+            return self.launch(&arguments);
         }
         if name == "computer_windows" {
             let session = self
@@ -168,7 +168,7 @@ impl Adapter {
                 ]
             }
             "computer_action" => {
-                let arguments = self.scoped_action(arguments)?;
+                let arguments = self.scoped_action(&arguments)?;
                 vec![
                     "computer-use".to_string(),
                     "mcp-call".to_string(),
@@ -247,11 +247,11 @@ impl Adapter {
         Ok(ToolOutput::from_response(response))
     }
 
-    fn launch(&self, arguments: Value) -> Result<ToolOutput> {
+    fn launch(&self, arguments: &Value) -> Result<ToolOutput> {
         let session = self
             .session
             .context("computer_launch requires a session-bound agent pane")?;
-        let command = string_argument(&arguments, "command")?;
+        let command = string_argument(arguments, "command")?;
         ensure!(
             !command.trim().is_empty() && command.len() <= 256,
             "launch command must contain 1 to 256 bytes"
@@ -385,8 +385,7 @@ impl Adapter {
         let task = object
             .get("task")
             .and_then(Value::as_str)
-            .map(ToString::to_string)
-            .unwrap_or_else(|| self.generated_task_id());
+            .map_or_else(|| self.generated_task_id(), ToString::to_string);
         let request = json!({
             "protocol_version": COMPUTER_USE_PROTOCOL_VERSION,
             "task": task,
@@ -422,7 +421,7 @@ impl Adapter {
         task
     }
 
-    fn scoped_action(&self, arguments: Value) -> Result<Value> {
+    fn scoped_action(&self, arguments: &Value) -> Result<Value> {
         let mut envelope = arguments
             .as_object()
             .cloned()
@@ -619,6 +618,12 @@ fn integer_argument(arguments: &Value, name: &str) -> Result<String> {
 }
 
 fn tool_definitions(session: Option<u64>) -> Value {
+    macro_rules! json_values {
+        ($($value:tt),* $(,)?) => {
+            vec![$(json!($value)),*]
+        };
+    }
+
     let start_description = session.map_or_else(
         || "Start a scoped server-side computer-use task".to_string(),
         |session| {
@@ -626,7 +631,7 @@ fn tool_definitions(session: Option<u64>) -> Value {
         },
     );
     let action_schema = action_schema();
-    let Value::Array(mut tools) = json!([
+    let mut tools = json_values![
         {"name":"computer_start","description":start_description,"inputSchema":{"type":"object","properties":{"task":{"type":"string","description":"Optional unique audit task ID; one is generated when omitted"},"windows":{"type":"array","items":{"type":"integer"},"description":"Optional managed-pane allowlist within this session"},"active_window":{"type":["integer","null"]},"lease_duration_ms":{"type":"integer","minimum":1},"policy":{"type":"object"},"limits":{"type":"object"}}}},
         {"name":"computer_action","description":"Execute validated ordered direct actions and return a causally newer screenshot observation. Inspect that screenshot as authoritative evidence and continue correcting the UI until the requested outcome is visibly present","inputSchema":{"type":"object","required":["tool_call_id","arguments"],"properties":{"tool_call_id":{"type":"string"},"arguments":{"type":"object","required":["protocol_version","task","lease_generation","expected_sequence","actions"],"properties":{"protocol_version":{"const":1},"task":{"type":"string"},"lease_generation":{"type":"integer"},"expected_sequence":{"type":"integer"},"target_window":{"type":["integer","null"]},"actions":{"type":"array","minItems":1,"items":action_schema},"approval_proof":{"type":["string","null"]}}}}}},
         {"name":"computer_exec_js","description":"Evaluate persistent capability-empty JavaScript; computer helpers use the same validated server action path","inputSchema":{"type":"object","required":["protocol_version","task","lease_generation","expected_sequence","source"],"properties":{"protocol_version":{"const":1},"task":{"type":"string"},"lease_generation":{"type":"integer"},"expected_sequence":{"type":"integer"},"source":{"type":"string"},"approval_proof":{"type":["string","null"]}}}},
@@ -636,9 +641,7 @@ fn tool_definitions(session: Option<u64>) -> Value {
         {"name":"computer_renew","description":"Renew the current lease before it expires","inputSchema":{"type":"object","required":["task","lease_generation","lease_duration_ms"],"properties":{"task":{"type":"string"},"lease_generation":{"type":"integer"},"lease_duration_ms":{"type":"integer","minimum":1}}}},
         {"name":"computer_stop","description":"Stop a task, release input, and destroy its script isolate","inputSchema":task_schema()},
         {"name":"computer_approve","description":"Approve or deny a pending checkpoint owned by this task","inputSchema":{"type":"object","required":["task","request_id","decision"],"properties":{"task":{"type":"string"},"request_id":{"type":"string"},"decision":{"enum":["approve","deny"]}}}}
-    ]) else {
-        unreachable!("tool definitions are a JSON array")
-    };
+    ];
     if let Some(session) = session {
         tools.insert(0, json!({
             "name":"computer_launch",
@@ -689,6 +692,12 @@ fn action_schema() -> Value {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::indexing_slicing,
+        clippy::unwrap_used,
+        reason = "MCP adapter fixtures assert the exact JSON-array and image-vector shapes they construct"
+    )]
+
     use super::*;
 
     #[test]

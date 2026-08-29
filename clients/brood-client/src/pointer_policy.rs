@@ -204,6 +204,10 @@ impl ClientPointerPolicy {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "pointer-policy fixtures stop immediately when their required temporary module cannot be built"
+)]
 mod tests {
     use super::*;
 

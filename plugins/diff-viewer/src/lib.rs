@@ -385,6 +385,14 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
             redraw_or_record_error(&mut state);
             command.into_iter().collect()
         }
+        PresentationEvent::RenderHint(hint) => {
+            if let Err(error) =
+                brood_plugin_sdk::graphics::render_with_hint(&hint, || redraw(&mut state, None))
+            {
+                state.error = Some(error);
+            }
+            Vec::new()
+        }
         _ => Vec::new(),
     }
 }
@@ -428,7 +436,12 @@ fn redraw_for_resize_or_record_error(state: &mut ViewerState, resize_epoch: Opti
     if state.pane == 0 {
         return;
     }
-    if let Err(error) = redraw(state, resize_epoch) {
+    let result = if brood_plugin_sdk::graphics::render_is_active() {
+        redraw(state, resize_epoch)
+    } else {
+        brood_plugin_sdk::graphics::request_render_for_resize(state.pane, resize_epoch)
+    };
+    if let Err(error) = result {
         state.error = Some(error);
     }
 }
@@ -640,7 +653,7 @@ fn redraw_with_cache(
         state.width - 28.0,
     )?;
 
-    text_cache.submit(resize_epoch, &packet)?;
+    text_cache.queue(resize_epoch, &packet)?;
     Ok(())
 }
 

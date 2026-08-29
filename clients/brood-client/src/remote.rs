@@ -1436,6 +1436,10 @@ impl RemoteBackendCommandLane {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "bounded-lane tests stop immediately when a required send or receive does not occur"
+)]
 mod tests {
     use brood_protocol::{BackendActorRealm, BackendId, ClientMessage, InputEvent, PanePosition};
 

@@ -1,3 +1,8 @@
+#![allow(
+    clippy::expect_used,
+    reason = "a failed setup or an unexpected result must fail this test"
+)]
+
 use std::{fs, path::Path};
 
 use brood_wasm::{
@@ -31,7 +36,7 @@ fn write_provider(body: &str, initial_pages: u32, tables: &str) -> (TempDir, std
     (directory, path)
 }
 
-fn query() -> PointerPolicyQuery {
+const fn query() -> PointerPolicyQuery {
     PointerPolicyQuery {
         interaction: None,
         event_sequence: 1,

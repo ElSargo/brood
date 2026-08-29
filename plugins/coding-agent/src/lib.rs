@@ -1245,6 +1245,15 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
             let changed = scroll_transcript(ui, -scroll.vertical);
             (Vec::new(), changed)
         }
+        PresentationEvent::RenderHint(hint) => {
+            if let Err(error) = brood_plugin_sdk::graphics::render_with_hint(&hint, || {
+                redraw_ui_for_resize(ui, None);
+                Ok(())
+            }) {
+                ui.error = error;
+            }
+            return Vec::new();
+        }
         _ => (Vec::new(), false),
     };
     if should_redraw {
@@ -2275,6 +2284,14 @@ fn redraw_ui_for_resize(ui: &mut UiState, resize_epoch: Option<u64>) {
     if ui.pane == 0 {
         return;
     }
+    if !brood_plugin_sdk::graphics::render_is_active() {
+        if let Err(error) =
+            brood_plugin_sdk::graphics::request_render_for_resize(ui.pane, resize_epoch)
+        {
+            ui.error = error;
+        }
+        return;
+    }
     let mut text_cache = ui
         .text_cache
         .take()
@@ -2296,7 +2313,7 @@ fn redraw_ui_for_resize(ui: &mut UiState, resize_epoch: Option<u64>) {
         text_cache.abort_frame();
         Err(error)
     } else {
-        text_cache.submit(resize_epoch, &packet).map(|_| ())
+        text_cache.queue(resize_epoch, &packet).map(|_| ())
     };
     match submitted {
         Ok(()) => {

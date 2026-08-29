@@ -5,8 +5,8 @@ wit_bindgen::generate!({
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use exports::brood::plugin::actor::{Command, Event, Guest, WorkerRequest};
 use brood::plugin::host;
+use exports::brood::plugin::actor::{Command, Event, Guest, WorkerRequest};
 
 static INPUT_NOTIFICATION: AtomicU64 = AtomicU64::new(0);
 static RESULT_NOTIFICATION: AtomicU64 = AtomicU64::new(0);
@@ -58,6 +58,12 @@ impl Guest for ExampleActor {
                 vec![Command::SpawnWorker(WorkerRequest {
                     worker: 1,
                     payload: b"input.txt".to_vec(),
+                })]
+            }
+            Event::Mailbox(message) if message.body == b"spawn-spin-worker" => {
+                vec![Command::SpawnWorker(WorkerRequest {
+                    worker: 900,
+                    payload: b"__spin__".to_vec(),
                 })]
             }
             Event::Mailbox(message) if message.body == b"completion-read" => {
@@ -145,18 +151,12 @@ impl Guest for ExampleActor {
         }
         if payload == b"__notification_wait__" {
             let input = INPUT_NOTIFICATION.load(Ordering::Acquire);
-            let pollable = host::notification_pollable(
-                input,
-                INPUT_GENERATION.load(Ordering::Acquire),
-            )
-            .map_err(|error| format!("create notification pollable: {error:?}"))?;
-            let ready = host::worker_wait_any(
-                vec![pollable],
-                Some(1_000),
-                host::WaitMode::Fair,
-            )
-            .await
-            .map_err(|error| format!("wait for notification: {error:?}"))?;
+            let pollable =
+                host::notification_pollable(input, INPUT_GENERATION.load(Ordering::Acquire))
+                    .map_err(|error| format!("create notification pollable: {error:?}"))?;
+            let ready = host::worker_wait_any(vec![pollable], Some(1_000), host::WaitMode::Fair)
+                .await
+                .map_err(|error| format!("wait for notification: {error:?}"))?;
             host::pollable_drop(pollable)
                 .map_err(|error| format!("drop notification pollable: {error:?}"))?;
             if ready.pollable != pollable || ready.generation == 0 {
@@ -175,17 +175,10 @@ impl Guest for ExampleActor {
             return Ok(vec![u8::try_from(value).unwrap_or_default()]);
         }
         if payload == b"__notification_cancel_wait__" {
-            let pollable = host::notification_pollable(
-                CANCEL_NOTIFICATION.load(Ordering::Acquire),
-                0,
-            )
-            .map_err(|error| format!("create cancellation pollable: {error:?}"))?;
-            let result = host::worker_wait_any(
-                vec![pollable],
-                None,
-                host::WaitMode::Biased,
-            )
-            .await;
+            let pollable =
+                host::notification_pollable(CANCEL_NOTIFICATION.load(Ordering::Acquire), 0)
+                    .map_err(|error| format!("create cancellation pollable: {error:?}"))?;
+            let result = host::worker_wait_any(vec![pollable], None, host::WaitMode::Biased).await;
             let _dropped = host::pollable_drop(pollable);
             return Err(format!("cancelled notification wait resumed: {result:?}"));
         }
@@ -232,9 +225,8 @@ fn parse_rube_message(bytes: &[u8]) -> Option<(u64, u64, u64, u64)> {
 }
 
 fn rube_mix(input: u64, transition: u64, generation: u64) -> u64 {
-    let mut value = input
-        ^ transition.wrapping_mul(0x9e37_79b9_7f4a_7c15)
-        ^ generation.rotate_left(17);
+    let mut value =
+        input ^ transition.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ generation.rotate_left(17);
     value ^= value >> 30;
     value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
     value ^= value >> 27;

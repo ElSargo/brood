@@ -31,7 +31,7 @@ mod bindings {
 use crate::actor_kernel::{ActorRuntimeKernel, allocate_generation};
 use crate::completion_io::{
     ActorCompletion, ActorCompletionKind, CompletionIo, CompletionIoConfig, CompletionIoError,
-    FilesystemGrant, OperationId, start_completion_io as start_shared_completion_io,
+    FilesystemGrant, OperationId, start_completion_io_on as start_shared_completion_io_on,
 };
 use crate::coordination::{
     ActorWatchResult, CoordinationConfig, CoordinationHub, NotificationError, NotificationId,
@@ -45,8 +45,9 @@ use crate::filesystem_watch::{
 use crate::lifecycle::wait_for_lifecycle_reply;
 use crate::lifecycle::{PluginLifecycleEvent, PluginStartReason, PluginStopReason};
 use crate::presentation::{
-    FontIntent, FontStyle, FontWeight, PresentationError, PresentationEvent, PresentationHost,
-    SessionCommandRequest, SessionEvent, SessionOperation, SessionSummary, TextLayoutOptions,
+    ActorFrameDraw, FontIntent, FontStyle, FontWeight, PresentationError, PresentationEvent,
+    PresentationHost, RenderHint, RenderToken, SessionCommandRequest, SessionEvent,
+    SessionOperation, SessionSummary, TextLayoutOptions,
 };
 use crate::resource_limits::{
     GenerationByteBudget, GenerationBytePermit, GenerationStoreLimits, WasmResourceLimits,
@@ -120,6 +121,13 @@ pub enum ComponentAppEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ComponentActorEvent {
     DispatcherReturned,
+    /// One serialized presentation turn has returned from guest code. Hosts
+    /// advance causal reduction only from this terminal observer record.
+    PresentationTurnReturned {
+        event_watermark: Option<u64>,
+        render_token: Option<RenderToken>,
+        presentation_events: u8,
+    },
     DispatcherFailed {
         message: String,
     },
@@ -198,6 +206,15 @@ pub enum PresentationScope {
 pub enum ComponentActorSendError<T> {
     Full(T),
     Closed(T),
+    InvariantViolation,
+}
+
+#[derive(Debug)]
+pub enum ComponentActorPresentationEnvelopeSendError {
+    Full(Vec<(PresentationEvent, Option<u64>)>),
+    Closed(Vec<(PresentationEvent, Option<u64>)>),
+    InvalidSize(Vec<(PresentationEvent, Option<u64>)>),
+    InvariantViolation,
 }
 
 impl<T> std::fmt::Display for ComponentActorSendError<T> {
@@ -205,11 +222,29 @@ impl<T> std::fmt::Display for ComponentActorSendError<T> {
         formatter.write_str(match self {
             Self::Full(_) => "component actor command queue is full",
             Self::Closed(_) => "component actor command queue is closed",
+            Self::InvariantViolation => {
+                "component actor command queue returned a different command"
+            }
         })
     }
 }
 
 impl<T: std::fmt::Debug> std::error::Error for ComponentActorSendError<T> {}
+
+impl std::fmt::Display for ComponentActorPresentationEnvelopeSendError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Full(_) => "component actor command queue is full",
+            Self::Closed(_) => "component actor command queue is closed",
+            Self::InvalidSize(_) => "presentation envelope must contain 1 to 16 events",
+            Self::InvariantViolation => {
+                "component actor command queue returned a non-presentation command"
+            }
+        })
+    }
+}
+
+impl std::error::Error for ComponentActorPresentationEnvelopeSendError {}
 
 impl PresentationScope {
     #[must_use]
@@ -335,6 +370,10 @@ pub struct ComponentActorConfig {
     pub max_wait_set: usize,
     /// Generation-owned process, PTY, socket, stream, and timer policy.
     pub runtime_io: RuntimeIoConfig,
+    /// Executor for subprocess, stream, timer, and filesystem I/O. Hosts which
+    /// run actor dispatch on a dedicated runtime set this to their general I/O
+    /// runtime so guest services cannot contend with interactive actor turns.
+    pub io_runtime: Option<tokio::runtime::Handle>,
     /// Presentation-local canvas, resource, and native text capability.
     pub presentation: Option<Arc<dyn PresentationHost>>,
     /// Admit realm child lifecycle commands. Hosts set this only for the one
@@ -385,6 +424,7 @@ impl Default for ComponentActorConfig {
             max_pollables: 256,
             max_wait_set: 64,
             runtime_io: RuntimeIoConfig::default(),
+            io_runtime: None,
             presentation: None,
             actor_management: false,
             app_management: false,
@@ -420,18 +460,20 @@ fn validate_capability_path(path: &Path) -> std::result::Result<PathBuf, Complet
 fn start_completion_io(
     generation: u64,
     config: &ComponentActorConfig,
+    runtime: &tokio::runtime::Handle,
 ) -> Result<(
     CompletionIo,
     mpsc::Receiver<ActorCompletion>,
     JoinHandle<()>,
 )> {
-    start_shared_completion_io(
+    start_shared_completion_io_on(
         generation,
         &CompletionIoConfig {
             filesystem: config.filesystem.clone(),
             max_outstanding: config.max_outstanding_io,
             max_completion_bytes: config.max_completion_bytes,
         },
+        runtime,
     )
 }
 
@@ -726,40 +768,55 @@ impl WorkerCancellationToken {
 }
 
 impl bindings::brood::plugin::host::Host for ActorStore {
-    fn graphics_submit_draw_packet(
+    fn render_request(
         &mut self,
-        pane: u64,
-        packet: Vec<u8>,
-    ) -> wasmtime::Result<std::result::Result<u64, bindings::brood::plugin::host::GraphicsError>>
+    ) -> wasmtime::Result<std::result::Result<(), bindings::brood::plugin::host::RenderInterestError>>
     {
         Ok(self
             .presentation
             .as_ref()
             .ok_or(PresentationError::Unavailable)
-            .and_then(|presentation| {
-                presentation.submit_draw_packet(self.actor_generation, pane, packet)
-            })
-            .map_err(map_component_presentation_error))
+            .and_then(|presentation| presentation.request_render(self.actor_generation))
+            .map_err(map_component_render_interest_error))
     }
 
-    fn graphics_submit_tagged_draw_packet(
+    fn render_set_subscription(
         &mut self,
-        pane: u64,
-        resize_epoch: u64,
-        packet: Vec<u8>,
-    ) -> wasmtime::Result<std::result::Result<u64, bindings::brood::plugin::host::GraphicsError>>
+        enabled: bool,
+    ) -> wasmtime::Result<std::result::Result<(), bindings::brood::plugin::host::RenderInterestError>>
     {
         Ok(self
             .presentation
             .as_ref()
             .ok_or(PresentationError::Unavailable)
             .and_then(|presentation| {
-                presentation.submit_tagged_draw_packet(
-                    self.actor_generation,
-                    pane,
-                    resize_epoch,
-                    packet,
-                )
+                presentation.set_render_subscription(self.actor_generation, enabled)
+            })
+            .map_err(map_component_render_interest_error))
+    }
+
+    fn graphics_finish_actor_frame(
+        &mut self,
+        token: bindings::brood::plugin::host::RenderToken,
+        draws: Vec<bindings::brood::plugin::host::ActorFrameDraw>,
+    ) -> wasmtime::Result<std::result::Result<u64, bindings::brood::plugin::host::GraphicsError>>
+    {
+        let token = RenderToken(token.opaque);
+        let draws = draws
+            .into_iter()
+            .map(|draw| ActorFrameDraw {
+                pane: draw.pane,
+                resize_epoch: draw.resize_epoch,
+                state_watermark: draw.state_watermark,
+                packet: draw.packet,
+            })
+            .collect();
+        Ok(self
+            .presentation
+            .as_ref()
+            .ok_or(PresentationError::Unavailable)
+            .and_then(|presentation| {
+                presentation.finish_actor_frame(self.actor_generation, token, draws)
             })
             .map_err(map_component_presentation_error))
     }
@@ -1934,13 +1991,36 @@ const fn map_component_presentation_error(
 ) -> bindings::brood::plugin::host::GraphicsError {
     use bindings::brood::plugin::host::GraphicsError as AbiError;
     match error {
-        PresentationError::Unavailable => AbiError::Unavailable,
+        PresentationError::Unavailable | PresentationError::ActorStopped => AbiError::Unavailable,
         PresentationError::InvalidPane => AbiError::InvalidPane,
+        PresentationError::InvalidToken => AbiError::InvalidToken,
+        PresentationError::DuplicatePane => AbiError::DuplicatePane,
+        PresentationError::StaleResizeEpoch => AbiError::StaleResizeEpoch,
         PresentationError::InvalidArgument => AbiError::InvalidArgument,
         PresentationError::LimitReached => AbiError::LimitReached,
         PresentationError::InvalidPacket => AbiError::InvalidPacket,
         PresentationError::InvalidResource => AbiError::InvalidResource,
         PresentationError::ResourceInUse => AbiError::ResourceInUse,
+        PresentationError::HostFailure => AbiError::HostFailure,
+    }
+}
+
+const fn map_component_render_interest_error(
+    error: PresentationError,
+) -> bindings::brood::plugin::host::RenderInterestError {
+    use bindings::brood::plugin::host::RenderInterestError as AbiError;
+    match error {
+        PresentationError::Unavailable => AbiError::Unavailable,
+        PresentationError::ActorStopped => AbiError::ActorStopped,
+        PresentationError::InvalidArgument
+        | PresentationError::InvalidPane
+        | PresentationError::InvalidToken
+        | PresentationError::DuplicatePane
+        | PresentationError::StaleResizeEpoch
+        | PresentationError::InvalidPacket
+        | PresentationError::InvalidResource
+        | PresentationError::ResourceInUse
+        | PresentationError::LimitReached => AbiError::InvalidArgument,
         PresentationError::HostFailure => AbiError::HostFailure,
     }
 }
@@ -1975,7 +2055,9 @@ enum RuntimeCommand {
     },
     Child(ComponentChildEvent),
     App(ComponentAppEvent),
-    Presentation(PresentationEvent),
+    Presentation {
+        events: Vec<(PresentationEvent, Option<u64>)>,
+    },
     Session(SessionEvent),
     Shutdown,
 }
@@ -2012,10 +2094,7 @@ impl ComponentActor {
             config.command_capacity > 0,
             "command capacity must be non-zero"
         );
-        ensure!(
-            config.presentation_backlog > 0,
-            "presentation backlog must be non-zero"
-        );
+        validate_presentation_backlog(config.presentation_backlog)?;
         ensure!(
             config.mailbox_backlog > 0,
             "mailbox backlog must be non-zero"
@@ -2068,9 +2147,17 @@ impl ComponentActor {
             config.max_filesystem_watch_events,
         )
         .map_err(|error| anyhow::anyhow!("create component filesystem watch hub: {error}"))?;
-        let runtime_io =
-            RuntimeIoHub::new(generation, config.runtime_io.clone(), coordination.clone())
-                .map_err(|error| anyhow::anyhow!("create component runtime I/O hub: {error}"))?;
+        let io_runtime = config
+            .io_runtime
+            .clone()
+            .unwrap_or_else(tokio::runtime::Handle::current);
+        let runtime_io = RuntimeIoHub::new_on(
+            generation,
+            config.runtime_io.clone(),
+            coordination.clone(),
+            io_runtime.clone(),
+        )
+        .map_err(|error| anyhow::anyhow!("create component runtime I/O hub: {error}"))?;
         let kernel = ActorRuntimeKernel::new(
             generation,
             coordination.clone(),
@@ -2090,7 +2177,8 @@ impl ComponentActor {
         let worker_filesystem = open_worker_filesystem(&config)?;
         // Start owned background work only after all fallible static loading
         // and capability setup has succeeded.
-        let (completion_io, io_completion_rx, io_task) = start_completion_io(generation, &config)?;
+        let (completion_io, io_completion_rx, io_task) =
+            start_completion_io(generation, &config, &io_runtime)?;
         let (command_tx, command_rx) = mpsc::channel(config.command_capacity);
         let mailbox_slots = Arc::new(Semaphore::new(config.mailbox_backlog));
         let mailbox_capacity = config.mailbox_backlog;
@@ -2249,7 +2337,67 @@ impl ComponentActor {
         &self,
         event: PresentationEvent,
     ) -> std::result::Result<(), ComponentActorSendError<PresentationEvent>> {
-        try_send_typed(&self.commands, event, RuntimeCommand::Presentation)
+        let event_watermark = match &event {
+            PresentationEvent::RenderHint(hint) => Some(hint.event_watermark),
+            _ => None,
+        };
+        self.try_send_presentation_event_with_watermark(event, event_watermark)
+    }
+
+    /// Deliver a presentation event together with its host admission identity.
+    pub fn try_send_presentation_event_with_watermark(
+        &self,
+        event: PresentationEvent,
+        event_watermark: Option<u64>,
+    ) -> std::result::Result<(), ComponentActorSendError<PresentationEvent>> {
+        match self.try_send_presentation_events(vec![(event, event_watermark)]) {
+            Ok(()) => Ok(()),
+            Err(ComponentActorPresentationEnvelopeSendError::Full(mut events)) => {
+                match events.pop() {
+                    Some((event, _watermark)) => Err(ComponentActorSendError::Full(event)),
+                    None => Err(ComponentActorSendError::InvariantViolation),
+                }
+            }
+            Err(ComponentActorPresentationEnvelopeSendError::Closed(mut events)) => {
+                match events.pop() {
+                    Some((event, _watermark)) => Err(ComponentActorSendError::Closed(event)),
+                    None => Err(ComponentActorSendError::InvariantViolation),
+                }
+            }
+            Err(
+                ComponentActorPresentationEnvelopeSendError::InvalidSize(_)
+                | ComponentActorPresentationEnvelopeSendError::InvariantViolation,
+            ) => Err(ComponentActorSendError::InvariantViolation),
+        }
+    }
+
+    /// Deliver one bounded FIFO presentation envelope without blocking.
+    pub fn try_send_presentation_events(
+        &self,
+        events: Vec<(PresentationEvent, Option<u64>)>,
+    ) -> std::result::Result<(), ComponentActorPresentationEnvelopeSendError> {
+        Self::try_send_presentation_envelope(&self.commands, events)
+    }
+
+    fn try_send_presentation_envelope(
+        commands: &mpsc::Sender<RuntimeCommand>,
+        events: Vec<(PresentationEvent, Option<u64>)>,
+    ) -> std::result::Result<(), ComponentActorPresentationEnvelopeSendError> {
+        if events.is_empty() || events.len() > MAX_PRESENTATION_BATCH_EVENTS {
+            return Err(ComponentActorPresentationEnvelopeSendError::InvalidSize(
+                events,
+            ));
+        }
+        match commands.try_send(RuntimeCommand::Presentation { events }) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(RuntimeCommand::Presentation { events })) => {
+                Err(ComponentActorPresentationEnvelopeSendError::Full(events))
+            }
+            Err(mpsc::error::TrySendError::Closed(RuntimeCommand::Presentation { events })) => {
+                Err(ComponentActorPresentationEnvelopeSendError::Closed(events))
+            }
+            Err(_) => Err(ComponentActorPresentationEnvelopeSendError::InvariantViolation),
+        }
     }
 
     /// Deliver one typed session snapshot or command completion without
@@ -2335,6 +2483,13 @@ impl ComponentActor {
         Some(event)
     }
 
+    /// Return the observer events already queued for the host without
+    /// consuming them. Hosts use this after a bounded drain to distinguish a
+    /// fully drained turn from one which must be resumed by a later callback.
+    pub fn pending_event_count(&self) -> usize {
+        self.events.len()
+    }
+
     /// Observe the completion lane independently of normal mailbox traffic.
     pub async fn recv_completion(&mut self) -> Option<ActorCompletion> {
         self.completions.recv().await
@@ -2381,6 +2536,14 @@ impl ComponentActor {
         io_result?;
         Ok(())
     }
+}
+
+fn validate_presentation_backlog(capacity: usize) -> Result<()> {
+    ensure!(
+        capacity >= MAX_PRESENTATION_BATCH_EVENTS,
+        "presentation backlog must reserve at least {MAX_PRESENTATION_BATCH_EVENTS} events"
+    );
+    Ok(())
 }
 
 fn increment_saturating(counter: &AtomicU64) {
@@ -2497,7 +2660,10 @@ type GuestEvent = bindings::exports::brood::plugin::actor::Event;
 type GuestCommand = bindings::exports::brood::plugin::actor::Command;
 
 enum GuestCallOutcome {
-    Dispatch(wasmtime::Result<Vec<GuestCommand>>),
+    Dispatch {
+        result: wasmtime::Result<Vec<GuestCommand>>,
+        context: DispatchContext,
+    },
     Worker {
         worker: WorkerId,
         result: wasmtime::Result<std::result::Result<Vec<u8>, String>>,
@@ -2509,6 +2675,28 @@ type GuestCallFuture<'a> = Pin<Box<dyn Future<Output = GuestCallOutcome> + Send 
 struct QueuedGuestEvent {
     event: GuestEvent,
     _byte_permit: Option<GenerationBytePermit>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct DispatchContext {
+    event_watermark: Option<u64>,
+    render_token: Option<RenderToken>,
+    presentation_events: u8,
+}
+
+struct QueuedPresentationEvent {
+    event: PresentationEvent,
+    context: DispatchContext,
+}
+
+const MAX_PRESENTATION_BATCH_EVENTS: usize = 16;
+const DEFAULT_PRESENTATION_BATCH_EVENTS: usize = 1;
+
+fn normalize_presentation_batch_limit(requested: u8) -> usize {
+    usize::from(requested).clamp(
+        DEFAULT_PRESENTATION_BATCH_EVENTS,
+        MAX_PRESENTATION_BATCH_EVENTS,
+    )
 }
 
 async fn run_component_actor(
@@ -2605,6 +2793,7 @@ async fn run_component_event_loop(
     let mut cancelled_workers = HashSet::new();
     let mut pending_lifecycle: Option<oneshot::Sender<std::result::Result<(), String>>> = None;
     let mut dispatch_lane = 0_usize;
+    let mut presentation_batch_limit = DEFAULT_PRESENTATION_BATCH_EVENTS;
 
     loop {
         if component_dispatch_can_start(dispatcher_busy, event_observer) {
@@ -2615,10 +2804,11 @@ async fn run_component_event_loop(
                 &mut system_queue,
                 &mut presentation_queue,
                 &mut mailbox_queue,
+                presentation_batch_limit,
                 accessor,
                 event_observer,
             )?;
-            if let Some((event, mailbox_permit, byte_permit)) = event {
+            if let Some((event, mailbox_permit, byte_permit, context)) = event {
                 dispatcher_busy = true;
                 let call = accessor
                     .with(|mut access| dispatch.start_call_concurrent(&mut access, (event,)))?;
@@ -2632,7 +2822,7 @@ async fn run_component_event_loop(
                             .finish_call_concurrent(accessor, call)
                             .await
                             .map(|(commands,)| commands);
-                        GuestCallOutcome::Dispatch(result)
+                        GuestCallOutcome::Dispatch { result, context }
                     }
                     .boxed(),
                 );
@@ -2657,7 +2847,10 @@ async fn run_component_event_loop(
                 drop(permits);
             }
             command = commands.recv(), if event_observer.has_ordinary_capacity(1)
-                && presentation_queue.len() < config.presentation_backlog
+                && presentation_command_lane_has_capacity(
+                    presentation_queue.len(),
+                    config.presentation_backlog,
+                )
                 && system_queue.len() < component_system_capacity(config)
                 && mailbox_queue.len() < config.mailbox_backlog => match command {
                 Some(RuntimeCommand::Mailbox { sender, body, permit, byte_permit }) => {
@@ -2718,12 +2911,15 @@ async fn run_component_event_loop(
                         component_app_to_guest(event),
                     );
                 }
-                Some(RuntimeCommand::Presentation(event)) => {
-                    enqueue_presentation_dispatch(
-                        &mut presentation_queue,
-                        config.presentation_backlog,
-                        event,
-                    );
+                Some(RuntimeCommand::Presentation { events }) => {
+                    for (event, event_watermark) in events {
+                        enqueue_presentation_dispatch_with_watermark(
+                            &mut presentation_queue,
+                            config.presentation_backlog,
+                            event,
+                            event_watermark,
+                        );
+                    }
                 }
                 Some(RuntimeCommand::Session(event)) => {
                     enqueue_dispatch(
@@ -2755,15 +2951,26 @@ async fn run_component_event_loop(
                     <= component_system_capacity(config) => {
                 let Some(outcome) = outcome else { continue; };
                 match outcome {
-                    GuestCallOutcome::Dispatch(result) => {
+                    GuestCallOutcome::Dispatch { result, context } => {
                         dispatcher_busy = false;
                         match result {
                             Ok(returned) => {
-                                let _ = event_observer.try_send(ComponentActorEvent::DispatcherReturned);
                                 ensure!(
                                     returned.len() <= config.command_capacity,
                                     "actor dispatcher returned too many commands"
                                 );
+                                let completed = if context.event_watermark.is_some()
+                                    || context.render_token.is_some()
+                                {
+                                    ComponentActorEvent::PresentationTurnReturned {
+                                        event_watermark: context.event_watermark,
+                                        render_token: context.render_token,
+                                        presentation_events: context.presentation_events,
+                                    }
+                                } else {
+                                    ComponentActorEvent::DispatcherReturned
+                                };
+                                let _ = event_observer.try_send(completed);
                                 for command in returned {
                                     match command {
                                         abi::Command::SpawnWorker(request) => {
@@ -2937,6 +3144,9 @@ async fn run_component_event_loop(
                                                     payload,
                                                 })
                                                 .context("component host message request queue is full")?;
+                                        }
+                                        abi::Command::SetPresentationBatchLimit(limit) => {
+                                            presentation_batch_limit = normalize_presentation_batch_limit(limit);
                                         }
                                         abi::Command::Stop => return Ok(()),
                                     }
@@ -3136,7 +3346,14 @@ fn component_lifecycle_to_guest(event: PluginLifecycleEvent) -> GuestEvent {
 
 fn component_presentation_to_guest(event: PresentationEvent) -> GuestEvent {
     use bindings::exports::brood::plugin::actor as abi;
-    let event = match event {
+    abi::Event::Presentation(component_presentation_to_guest_event(event))
+}
+
+fn component_presentation_to_guest_event(
+    event: PresentationEvent,
+) -> bindings::exports::brood::plugin::actor::PresentationEvent {
+    use bindings::exports::brood::plugin::actor as abi;
+    match event {
         PresentationEvent::PaneCreated {
             pane,
             width,
@@ -3238,8 +3455,20 @@ fn component_presentation_to_guest(event: PresentationEvent) -> GuestEvent {
             preview_height,
             preview_rgba8,
         }),
-    };
-    abi::Event::Presentation(event)
+        PresentationEvent::RenderHint(RenderHint {
+            token,
+            target_presentation_time_ns,
+            submission_deadline_ns,
+            relevant_panes,
+            event_watermark,
+        }) => abi::PresentationEvent::RenderHint(abi::RenderHint {
+            token: abi::RenderToken { opaque: token.0 },
+            target_presentation_time_ns,
+            submission_deadline_ns,
+            relevant_panes,
+            event_watermark,
+        }),
+    }
 }
 
 fn component_session_to_guest(event: SessionEvent) -> GuestEvent {
@@ -3420,8 +3649,9 @@ fn pop_component_dispatch(
     completion_queue: &mut VecDeque<QueuedGuestEvent>,
     notification_queue: &mut VecDeque<NotificationId>,
     system_queue: &mut VecDeque<QueuedGuestEvent>,
-    presentation_queue: &mut VecDeque<PresentationEvent>,
+    presentation_queue: &mut VecDeque<QueuedPresentationEvent>,
     mailbox_queue: &mut VecDeque<(GuestEvent, OwnedSemaphorePermit, GenerationBytePermit)>,
+    presentation_batch_limit: usize,
     accessor: &wasmtime::component::Accessor<ActorStore>,
     event_observer: &ComponentActorEventObserver,
 ) -> Result<
@@ -3429,6 +3659,7 @@ fn pop_component_dispatch(
         GuestEvent,
         Option<OwnedSemaphorePermit>,
         Option<GenerationBytePermit>,
+        DispatchContext,
     )>,
 > {
     use bindings::exports::brood::plugin::actor as abi;
@@ -3439,7 +3670,7 @@ fn pop_component_dispatch(
         let event = match lane {
             0 => completion_queue
                 .pop_front()
-                .map(|queued| (queued.event, None, None)),
+                .map(|queued| (queued.event, None, None, DispatchContext::default())),
             1 => {
                 let mut selected = None;
                 while let Some(notification) = notification_queue.pop_front() {
@@ -3462,6 +3693,7 @@ fn pop_component_dispatch(
                         }),
                         None,
                         None,
+                        DispatchContext::default(),
                     ));
                     break;
                 }
@@ -3469,14 +3701,19 @@ fn pop_component_dispatch(
             }
             2 => system_queue
                 .pop_front()
-                .map(|queued| (queued.event, None, None)),
-            3 => presentation_queue
-                .pop_front()
-                .map(component_presentation_to_guest)
-                .map(|event| (event, None, None)),
+                .map(|queued| (queued.event, None, None, DispatchContext::default())),
+            3 => pop_presentation_dispatch(presentation_queue, presentation_batch_limit)?
+                .map(|(event, context)| (event, None, None, context)),
             _ => mailbox_queue
                 .pop_front()
-                .map(|(event, permit, byte_permit)| (event, Some(permit), Some(byte_permit))),
+                .map(|(event, permit, byte_permit)| {
+                    (
+                        event,
+                        Some(permit),
+                        Some(byte_permit),
+                        DispatchContext::default(),
+                    )
+                }),
         };
         if event.is_some() {
             return Ok(event);
@@ -3485,29 +3722,138 @@ fn pop_component_dispatch(
     Ok(None)
 }
 
+fn pop_presentation_dispatch(
+    queue: &mut VecDeque<QueuedPresentationEvent>,
+    batch_limit: usize,
+) -> Result<Option<(GuestEvent, DispatchContext)>> {
+    use bindings::exports::brood::plugin::actor as abi;
+
+    let Some(first) = queue.pop_front() else {
+        return Ok(None);
+    };
+    if batch_limit <= 1 || presentation_event_is_batch_boundary(&first.event) {
+        return Ok(Some((
+            component_presentation_to_guest(first.event),
+            first.context,
+        )));
+    }
+    let mut events = vec![first.event];
+    let mut context = first.context;
+    while events.len() < batch_limit.min(MAX_PRESENTATION_BATCH_EVENTS) {
+        if queue
+            .front()
+            .is_none_or(|queued| presentation_event_is_batch_boundary(&queued.event))
+        {
+            break;
+        }
+        let Some(queued) = queue.pop_front() else {
+            anyhow::bail!("presentation queue changed between inspection and removal");
+        };
+        context.event_watermark = match (context.event_watermark, queued.context.event_watermark) {
+            (Some(left), Some(right)) => Some(left.max(right)),
+            (left, right) => left.or(right),
+        };
+        events.push(queued.event);
+    }
+    context.presentation_events = u8::try_from(events.len())
+        .map_err(|_| anyhow::anyhow!("presentation batch length does not fit the guest ABI"))?;
+    let event = if events.len() == 1 {
+        let Some(event) = events.pop() else {
+            anyhow::bail!("singleton presentation batch lost its event");
+        };
+        component_presentation_to_guest(event)
+    } else {
+        abi::Event::PresentationBatch(
+            events
+                .into_iter()
+                .map(component_presentation_to_guest_event)
+                .collect(),
+        )
+    };
+    Ok(Some((event, context)))
+}
+
+const fn presentation_event_is_batch_boundary(event: &PresentationEvent) -> bool {
+    matches!(
+        event,
+        PresentationEvent::RenderHint(_)
+            | PresentationEvent::Paste { .. }
+            | PresentationEvent::Image { .. }
+    )
+}
+
+const fn presentation_command_lane_has_capacity(queue_len: usize, capacity: usize) -> bool {
+    // RuntimeCommand is a shared lane, so its next variant cannot be inspected
+    // before receive. Reserve the largest legal presentation envelope. The
+    // sender retains an unreceived envelope in its bounded command channel,
+    // preserving FIFO without letting a 16-event envelope expand past the
+    // reliable presentation queue's hard cap.
+    queue_len.saturating_add(MAX_PRESENTATION_BATCH_EVENTS) <= capacity
+}
+
+#[cfg(test)]
 fn enqueue_presentation_dispatch(
-    queue: &mut VecDeque<PresentationEvent>,
+    queue: &mut VecDeque<QueuedPresentationEvent>,
     capacity: usize,
     event: PresentationEvent,
 ) {
-    match &event {
+    enqueue_presentation_dispatch_with_watermark(queue, capacity, event, None);
+}
+
+fn enqueue_presentation_dispatch_with_watermark(
+    queue: &mut VecDeque<QueuedPresentationEvent>,
+    capacity: usize,
+    event: PresentationEvent,
+    event_watermark: Option<u64>,
+) {
+    let render_token = match &event {
+        PresentationEvent::RenderHint(hint) => Some(hint.token),
+        _ => None,
+    };
+    let queued_event = QueuedPresentationEvent {
+        event,
+        context: DispatchContext {
+            event_watermark,
+            render_token,
+            presentation_events: 1,
+        },
+    };
+    match &queued_event.event {
         PresentationEvent::PointerMoved { pane, .. } => {
             if let Some(queued) = queue.back_mut()
-                && matches!(queued, PresentationEvent::PointerMoved { pane: queued_pane, .. } if *queued_pane == *pane)
+                && matches!(&queued.event, PresentationEvent::PointerMoved { pane: queued_pane, .. } if *queued_pane == *pane)
             {
-                *queued = event;
+                queued.context.event_watermark = match (
+                    queued.context.event_watermark,
+                    queued_event.context.event_watermark,
+                ) {
+                    (Some(left), Some(right)) => Some(left.max(right)),
+                    (left, right) => left.or(right),
+                };
+                let context = queued.context;
+                *queued = queued_event;
+                queued.context = context;
                 return;
             }
             if queue.len() < capacity {
-                queue.push_back(event);
+                queue.push_back(queued_event);
             }
             return;
         }
         PresentationEvent::PaneResized { pane, .. } => {
             if let Some(queued) = queue.back_mut()
-                && matches!(queued, PresentationEvent::PaneResized { pane: queued_pane, .. } if *queued_pane == *pane)
+                && matches!(&queued.event, PresentationEvent::PaneResized { pane: queued_pane, .. } if *queued_pane == *pane)
             {
-                *queued = event;
+                queued.context.event_watermark = match (
+                    queued.context.event_watermark,
+                    queued_event.context.event_watermark,
+                ) {
+                    (Some(left), Some(right)) => Some(left.max(right)),
+                    (left, right) => left.or(right),
+                };
+                let context = queued.context;
+                *queued = queued_event;
+                queued.context = context;
                 return;
             }
         }
@@ -3519,17 +3865,22 @@ fn enqueue_presentation_dispatch(
         | PresentationEvent::Key { .. }
         | PresentationEvent::Text { .. }
         | PresentationEvent::Paste { .. }
-        | PresentationEvent::Image { .. } => {}
+        | PresentationEvent::Image { .. }
+        | PresentationEvent::RenderHint(_) => {}
     }
 
     if queue.len() >= capacity
         && let Some(index) = queue
             .iter()
-            .position(|queued| matches!(queued, PresentationEvent::PointerMoved { .. }))
+            .position(|queued| matches!(queued.event, PresentationEvent::PointerMoved { .. }))
     {
         queue.remove(index);
     }
-    queue.push_back(event);
+    assert!(
+        queue.len() < capacity,
+        "reliable presentation event exceeded reserved queue capacity"
+    );
+    queue.push_back(queued_event);
 }
 
 fn enqueue_dispatch(
@@ -3750,12 +4101,15 @@ mod tests {
         let (sender, _receiver) = mpsc::channel(1);
         assert!(
             sender
-                .try_send(RuntimeCommand::Presentation(
-                    PresentationEvent::PaneFocused {
-                        pane: 1,
-                        focused: true,
-                    },
-                ))
+                .try_send(RuntimeCommand::Presentation {
+                    events: vec![(
+                        PresentationEvent::PaneFocused {
+                            pane: 1,
+                            focused: true,
+                        },
+                        Some(1),
+                    )],
+                })
                 .is_ok()
         );
         let pending = PresentationEvent::Key {
@@ -3766,15 +4120,57 @@ mod tests {
             repeat: false,
             modifiers: 0,
         };
-        let error = try_send_typed(&sender, pending, RuntimeCommand::Presentation);
+        let error = sender.try_send(RuntimeCommand::Presentation {
+            events: vec![(pending, Some(2))],
+        });
+        let returned_events = match &error {
+            Err(mpsc::error::TrySendError::Full(RuntimeCommand::Presentation { events })) => {
+                Some(events.as_slice())
+            }
+            _ => None,
+        };
         assert!(matches!(
-            error,
-            Err(ComponentActorSendError::Full(PresentationEvent::Key {
-                physical_key: 42,
-                ..
-            }))
+            returned_events,
+            Some([(
+                PresentationEvent::Key {
+                    physical_key: 42,
+                    ..
+                },
+                Some(2)
+            )])
         ));
+        drop(error);
         assert_eq!(sender.capacity(), 0);
+    }
+
+    #[test]
+    fn presentation_envelope_rejects_oversize_transactionally() {
+        let (sender, mut receiver) = mpsc::channel(2);
+        let make_events = |count: u64| {
+            (0..count)
+                .map(|index| {
+                    (
+                        PresentationEvent::Text {
+                            pane: 7,
+                            text: index.to_string(),
+                        },
+                        Some(index),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert!(matches!(
+            ComponentActor::try_send_presentation_envelope(&sender, make_events(17)),
+            Err(ComponentActorPresentationEnvelopeSendError::InvalidSize(events))
+                if events.len() == 17
+        ));
+        assert!(receiver.try_recv().is_err());
+        assert!(ComponentActor::try_send_presentation_envelope(&sender, make_events(16)).is_ok());
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(RuntimeCommand::Presentation { events }) if events.len() == 16
+        ));
     }
 
     #[test]
@@ -3784,7 +4180,10 @@ mod tests {
             if queue.len() == 8 {
                 assert!(matches!(
                     queue.pop_front(),
-                    Some(PresentationEvent::Key { .. })
+                    Some(QueuedPresentationEvent {
+                        event: PresentationEvent::Key { .. },
+                        ..
+                    })
                 ));
             }
             enqueue_presentation_dispatch(
@@ -3801,6 +4200,119 @@ mod tests {
             );
             assert!(queue.len() <= 8);
         }
+    }
+
+    #[test]
+    fn presentation_envelope_reserves_its_whole_expansion_before_receive() {
+        assert!(presentation_command_lane_has_capacity(496, 512));
+        assert!(!presentation_command_lane_has_capacity(497, 512));
+        assert!(!presentation_command_lane_has_capacity(511, 512));
+        assert!(!presentation_command_lane_has_capacity(512, 512));
+
+        let mut queue = (0..496_u64)
+            .map(|watermark| QueuedPresentationEvent {
+                event: PresentationEvent::Text {
+                    pane: 7,
+                    text: watermark.to_string(),
+                },
+                context: DispatchContext {
+                    event_watermark: Some(watermark),
+                    render_token: None,
+                    presentation_events: 1,
+                },
+            })
+            .collect::<VecDeque<_>>();
+        for physical_key in 496..512_u32 {
+            enqueue_presentation_dispatch_with_watermark(
+                &mut queue,
+                512,
+                PresentationEvent::Key {
+                    pane: 7,
+                    physical_key,
+                    logical_key: physical_key.to_string(),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: 0,
+                },
+                Some(u64::from(physical_key)),
+            );
+        }
+        assert_eq!(queue.len(), 512);
+        assert_eq!(
+            queue
+                .front()
+                .and_then(|queued| queued.context.event_watermark),
+            Some(0)
+        );
+        assert_eq!(
+            queue
+                .back()
+                .and_then(|queued| queued.context.event_watermark),
+            Some(511)
+        );
+    }
+
+    #[test]
+    fn full_queue_evicts_only_coalescible_motion_before_reliable_input() {
+        let mut queue = VecDeque::from([
+            QueuedPresentationEvent {
+                event: PresentationEvent::PointerMoved {
+                    pane: 7,
+                    x: 1.0,
+                    y: 2.0,
+                },
+                context: DispatchContext {
+                    event_watermark: Some(1),
+                    render_token: None,
+                    presentation_events: 1,
+                },
+            },
+            QueuedPresentationEvent {
+                event: PresentationEvent::Text {
+                    pane: 7,
+                    text: "kept".to_owned(),
+                },
+                context: DispatchContext {
+                    event_watermark: Some(2),
+                    render_token: None,
+                    presentation_events: 1,
+                },
+            },
+        ]);
+        enqueue_presentation_dispatch_with_watermark(
+            &mut queue,
+            2,
+            PresentationEvent::Key {
+                pane: 7,
+                physical_key: 36,
+                logical_key: "j".to_owned(),
+                pressed: true,
+                repeat: true,
+                modifiers: 0,
+            },
+            Some(3),
+        );
+        assert_eq!(queue.len(), 2);
+        assert!(matches!(
+            queue.front().map(|queued| &queued.event),
+            Some(PresentationEvent::Text { text, .. }) if text == "kept"
+        ));
+        assert!(matches!(
+            queue.back().map(|queued| &queued.event),
+            Some(PresentationEvent::Key { .. })
+        ));
+        assert_eq!(
+            queue
+                .front()
+                .and_then(|queued| queued.context.event_watermark),
+            Some(2)
+        );
+        assert_eq!(
+            queue
+                .back()
+                .and_then(|queued| queued.context.event_watermark),
+            Some(3)
+        );
     }
 
     #[test]
@@ -3983,63 +4495,69 @@ mod tests {
     }
 
     #[test]
-    fn presentation_backlog_never_discards_text() {
+    fn presentation_backlog_retains_reliable_text_until_reserved_capacity_drains() {
+        const CAPACITY: usize = 32;
         let mut queue = VecDeque::new();
-        enqueue_presentation_dispatch(
-            &mut queue,
-            2,
-            PresentationEvent::Text {
-                pane: 1,
-                text: "a".to_string(),
-            },
-        );
-        enqueue_presentation_dispatch(
-            &mut queue,
-            2,
-            PresentationEvent::Text {
-                pane: 1,
-                text: "b".to_string(),
-            },
-        );
+        for index in 0..17 {
+            enqueue_presentation_dispatch(
+                &mut queue,
+                CAPACITY,
+                PresentationEvent::Text {
+                    pane: 1,
+                    text: index.to_string(),
+                },
+            );
+        }
+        assert!(!presentation_command_lane_has_capacity(
+            queue.len(),
+            CAPACITY
+        ));
+        let retained = PresentationEvent::Text {
+            pane: 1,
+            text: "retained".to_string(),
+        };
+        assert!(matches!(
+            queue.pop_front(),
+            Some(QueuedPresentationEvent {
+                event: PresentationEvent::Text { ref text, .. },
+                ..
+            }) if text == "0"
+        ));
+        assert!(presentation_command_lane_has_capacity(
+            queue.len(),
+            CAPACITY
+        ));
+        enqueue_presentation_dispatch(&mut queue, CAPACITY, retained);
+        assert_eq!(queue.len(), 17);
+        assert!(matches!(
+            queue.back().map(|queued| &queued.event),
+            Some(PresentationEvent::Text { text, .. }) if text == "retained"
+        ));
+    }
 
-        enqueue_presentation_dispatch(
-            &mut queue,
-            2,
-            PresentationEvent::Text {
-                pane: 1,
-                text: "c".to_string(),
-            },
-        );
-        assert_eq!(
-            queue.into_iter().collect::<Vec<_>>(),
-            vec![
-                PresentationEvent::Text {
-                    pane: 1,
-                    text: "a".to_string(),
-                },
-                PresentationEvent::Text {
-                    pane: 1,
-                    text: "b".to_string(),
-                },
-                PresentationEvent::Text {
-                    pane: 1,
-                    text: "c".to_string(),
-                },
-            ]
-        );
+    #[test]
+    fn presentation_backlog_rejects_capacity_below_one_maximum_envelope() {
+        assert!(validate_presentation_backlog(15).is_err());
+        assert!(validate_presentation_backlog(16).is_ok());
     }
 
     #[test]
     fn presentation_backlog_evicts_motion_before_text() {
         let mut queue = VecDeque::from([
-            PresentationEvent::PointerMoved {
-                pane: 1,
-                x: 1.0,
-                y: 2.0,
+            QueuedPresentationEvent {
+                event: PresentationEvent::PointerMoved {
+                    pane: 1,
+                    x: 1.0,
+                    y: 2.0,
+                },
+                context: DispatchContext::default(),
             },
-            PresentationEvent::Text {
-                pane: 1,
-                text: "a".to_string(),
+            QueuedPresentationEvent {
+                event: PresentationEvent::Text {
+                    pane: 1,
+                    text: "a".to_string(),
+                },
+                context: DispatchContext::default(),
             },
         ]);
 
@@ -4053,7 +4571,10 @@ mod tests {
         );
 
         assert_eq!(
-            queue.into_iter().collect::<Vec<_>>(),
+            queue
+                .into_iter()
+                .map(|queued| queued.event)
+                .collect::<Vec<_>>(),
             vec![
                 PresentationEvent::Text {
                     pane: 1,
@@ -4069,12 +4590,15 @@ mod tests {
 
     #[test]
     fn presentation_backlog_retains_only_the_latest_consecutive_resize() {
-        let mut queue = VecDeque::from([PresentationEvent::PaneResized {
-            pane: 7,
-            width: 640.0,
-            height: 480.0,
-            scale: 1.0,
-            resize_epoch: Some(41),
+        let mut queue = VecDeque::from([QueuedPresentationEvent {
+            event: PresentationEvent::PaneResized {
+                pane: 7,
+                width: 640.0,
+                height: 480.0,
+                scale: 1.0,
+                resize_epoch: Some(41),
+            },
+            context: DispatchContext::default(),
         }]);
 
         enqueue_presentation_dispatch(
@@ -4089,7 +4613,10 @@ mod tests {
             },
         );
         assert_eq!(
-            queue.into_iter().collect::<Vec<_>>(),
+            queue
+                .into_iter()
+                .map(|queued| queued.event)
+                .collect::<Vec<_>>(),
             [PresentationEvent::PaneResized {
                 pane: 7,
                 width: 1280.0,
@@ -4098,5 +4625,219 @@ mod tests {
                 resize_epoch: Some(42),
             }]
         );
+    }
+
+    #[test]
+    fn presentation_batching_is_opt_in_and_hard_capped() {
+        assert_eq!(normalize_presentation_batch_limit(0), 1);
+        assert_eq!(normalize_presentation_batch_limit(1), 1);
+        assert_eq!(normalize_presentation_batch_limit(8), 8);
+        assert_eq!(normalize_presentation_batch_limit(u8::MAX), 16);
+
+        let mut queue = VecDeque::from([
+            QueuedPresentationEvent {
+                event: PresentationEvent::Text {
+                    pane: 1,
+                    text: "a".to_owned(),
+                },
+                context: DispatchContext {
+                    event_watermark: Some(1),
+                    render_token: None,
+                    presentation_events: 1,
+                },
+            },
+            QueuedPresentationEvent {
+                event: PresentationEvent::Text {
+                    pane: 1,
+                    text: "b".to_owned(),
+                },
+                context: DispatchContext {
+                    event_watermark: Some(2),
+                    render_token: None,
+                    presentation_events: 1,
+                },
+            },
+        ]);
+        let popped = pop_presentation_dispatch(&mut queue, 1);
+        assert!(matches!(
+            &popped,
+            Ok(Some((
+                bindings::exports::brood::plugin::actor::Event::Presentation(_),
+                context
+            ))) if context.event_watermark == Some(1)
+        ));
+        assert_eq!(queue.len(), 1);
+    }
+
+    #[test]
+    fn presentation_batch_preserves_fifo_cutoff_and_keeps_hints_singleton() {
+        use bindings::exports::brood::plugin::actor as abi;
+
+        let mut queue = (1..=20_u64)
+            .map(|watermark| QueuedPresentationEvent {
+                event: PresentationEvent::Text {
+                    pane: 1,
+                    text: watermark.to_string(),
+                },
+                context: DispatchContext {
+                    event_watermark: Some(watermark),
+                    render_token: None,
+                    presentation_events: 1,
+                },
+            })
+            .collect::<VecDeque<_>>();
+        queue.push_back(QueuedPresentationEvent {
+            event: PresentationEvent::RenderHint(RenderHint {
+                token: RenderToken(21),
+                target_presentation_time_ns: 30,
+                submission_deadline_ns: 29,
+                relevant_panes: vec![1],
+                event_watermark: 20,
+            }),
+            context: DispatchContext {
+                event_watermark: Some(20),
+                render_token: Some(RenderToken(21)),
+                presentation_events: 1,
+            },
+        });
+        queue.push_back(QueuedPresentationEvent {
+            event: PresentationEvent::Text {
+                pane: 1,
+                text: "later".to_owned(),
+            },
+            context: DispatchContext {
+                event_watermark: Some(22),
+                render_token: None,
+                presentation_events: 1,
+            },
+        });
+
+        let first = pop_presentation_dispatch(&mut queue, 16);
+        assert!(matches!(
+            &first,
+            Ok(Some((abi::Event::PresentationBatch(events), context)))
+                if events.len() == 16
+                    && context.event_watermark == Some(16)
+                    && context.presentation_events == 16
+        ));
+        let second = pop_presentation_dispatch(&mut queue, 16);
+        assert!(matches!(
+            &second,
+            Ok(Some((abi::Event::PresentationBatch(events), context)))
+                if events.len() == 4
+                    && context.event_watermark == Some(20)
+                    && context.presentation_events == 4
+        ));
+        let hint = pop_presentation_dispatch(&mut queue, 16);
+        assert!(matches!(
+            &hint,
+            Ok(Some((
+                abi::Event::Presentation(abi::PresentationEvent::RenderHint(_)),
+                context
+            ))) if context.render_token == Some(RenderToken(21))
+                && context.presentation_events == 1
+        ));
+        let later = pop_presentation_dispatch(&mut queue, 16);
+        assert!(matches!(
+            &later,
+            Ok(Some((
+                abi::Event::Presentation(abi::PresentationEvent::Text(text)),
+                context
+            ))) if text.text == "later" && context.event_watermark == Some(22)
+        ));
+    }
+
+    #[test]
+    fn large_presentation_payloads_are_singleton_batch_boundaries() {
+        use bindings::exports::brood::plugin::actor as abi;
+
+        let mut queue = VecDeque::from([
+            QueuedPresentationEvent {
+                event: PresentationEvent::Text {
+                    pane: 1,
+                    text: "before".to_owned(),
+                },
+                context: DispatchContext::default(),
+            },
+            QueuedPresentationEvent {
+                event: PresentationEvent::Paste {
+                    pane: 1,
+                    text: "large".repeat(1024),
+                },
+                context: DispatchContext::default(),
+            },
+            QueuedPresentationEvent {
+                event: PresentationEvent::Image {
+                    pane: 1,
+                    name: "image".to_owned(),
+                    mime_type: "image/rgba".to_owned(),
+                    bytes: vec![0; 1024],
+                    preview_width: 1,
+                    preview_height: 1,
+                    preview_rgba8: vec![0; 4],
+                },
+                context: DispatchContext::default(),
+            },
+        ]);
+        let text = pop_presentation_dispatch(&mut queue, 16);
+        assert!(matches!(
+            text,
+            Ok(Some((
+                abi::Event::Presentation(abi::PresentationEvent::Text(_)),
+                _
+            )))
+        ));
+        let paste = pop_presentation_dispatch(&mut queue, 16);
+        assert!(matches!(
+            paste,
+            Ok(Some((
+                abi::Event::Presentation(abi::PresentationEvent::Paste(_)),
+                _
+            )))
+        ));
+        let image = pop_presentation_dispatch(&mut queue, 16);
+        assert!(matches!(
+            image,
+            Ok(Some((
+                abi::Event::Presentation(abi::PresentationEvent::Image(_)),
+                _
+            )))
+        ));
+    }
+
+    #[test]
+    fn coalesced_pointer_motion_retains_the_highest_reduced_watermark() {
+        let mut queue = VecDeque::new();
+        enqueue_presentation_dispatch_with_watermark(
+            &mut queue,
+            8,
+            PresentationEvent::PointerMoved {
+                pane: 1,
+                x: 1.0,
+                y: 1.0,
+            },
+            Some(9),
+        );
+        enqueue_presentation_dispatch_with_watermark(
+            &mut queue,
+            8,
+            PresentationEvent::PointerMoved {
+                pane: 1,
+                x: 2.0,
+                y: 2.0,
+            },
+            Some(7),
+        );
+        assert_eq!(queue.len(), 1);
+        assert_eq!(
+            queue
+                .front()
+                .and_then(|queued| queued.context.event_watermark),
+            Some(9)
+        );
+        assert!(matches!(
+            queue.front().map(|queued| &queued.event),
+            Some(PresentationEvent::PointerMoved { x: 2.0, y: 2.0, .. })
+        ));
     }
 }

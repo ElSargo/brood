@@ -698,6 +698,15 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
             redraw_or_record_error(&mut state);
             Vec::new()
         }
+        PresentationEvent::RenderHint(hint) => {
+            if let Err(error) =
+                brood_plugin_sdk::graphics::render_with_hint(&hint, || redraw(&mut state, None))
+            {
+                state.status = error;
+                state.error = true;
+            }
+            Vec::new()
+        }
         _ => Vec::new(),
     }
 }
@@ -985,7 +994,12 @@ fn redraw_for_resize_or_record_error(state: &mut PickerState, resize_epoch: Opti
     if state.pane == 0 {
         return;
     }
-    if let Err(error) = redraw(state, resize_epoch) {
+    let result = if brood_plugin_sdk::graphics::render_is_active() {
+        redraw(state, resize_epoch)
+    } else {
+        brood_plugin_sdk::graphics::request_render_for_resize(state.pane, resize_epoch)
+    };
+    if let Err(error) = result {
         state.status = error;
         state.error = true;
     }
@@ -1232,7 +1246,7 @@ fn redraw(state: &mut PickerState, resize_epoch: Option<u64>) -> Result<(), Stri
         width: 1.0,
     });
 
-    frame.submit(resize_epoch, &packet, &mut state.text_resources)?;
+    frame.queue(resize_epoch, &packet, &mut state.text_resources)?;
     Ok(())
 }
 
@@ -1272,16 +1286,7 @@ fn add_text(
     max_width: f32,
 ) -> Result<(), String> {
     frame
-        .draw_text_clipped(
-            packet,
-            text,
-            size,
-            max_width,
-            size + 4.0,
-            color,
-            x,
-            y,
-        )
+        .draw_text_clipped(packet, text, size, max_width, size + 4.0, color, x, y)
         .map_err(|error| format!("layout picker text: {error}"))?;
     Ok(())
 }

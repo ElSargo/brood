@@ -66,12 +66,38 @@ interface host {
     enum graphics-error {
         unavailable,
         invalid-pane,
+        invalid-token,
+        duplicate-pane,
+        stale-resize-epoch,
         invalid-argument,
         limit-reached,
         invalid-packet,
         invalid-resource,
         resource-in-use,
         host-failure,
+    }
+
+    enum render-interest-error {
+        unavailable,
+        actor-stopped,
+        invalid-argument,
+        host-failure,
+    }
+
+    /// Host-minted identity for one actor render opportunity. The contained
+    /// value has no guest-visible ordering or timing meaning.
+    record render-token {
+        opaque: u64,
+    }
+
+    /// One changed pane in an atomic actor-frame batch.
+    record actor-frame-draw {
+        pane: u64,
+        /// Present only when this draw targets one synchronized resize.
+        resize-epoch: option<u64>,
+        /// Optional guest-reported causal state included in this exact draw.
+        state-watermark: option<u64>,
+        packet: list<u8>,
     }
 
     enum font-intent {
@@ -112,17 +138,20 @@ interface host {
         line-height: f32,
     }
 
-    graphics-submit-draw-packet: func(
-        pane: u64,
-        packet: list<u8>,
-    ) -> result<u64, graphics-error>;
+    /// Mark this actor dirty and request one render opportunity. Repeated
+    /// requests coalesce without queueing callbacks.
+    render-request: func() -> result<_, render-interest-error>;
 
-    /// Submit content which can satisfy only the named synchronized resize.
-    /// The host stages this packet until that resize is presented or discarded.
-    graphics-submit-tagged-draw-packet: func(
-        pane: u64,
-        resize-epoch: u64,
-        packet: list<u8>,
+    /// Enable or disable continuous render opportunities for this actor.
+    /// Enabling establishes immediate interest. Disabling does not discard a
+    /// separately pending request or cancel an outstanding token.
+    render-set-subscription: func(enabled: bool) -> result<_, render-interest-error>;
+
+    /// Atomically finish one hinted actor frame. An empty batch is a successful
+    /// no-change completion.
+    graphics-finish-actor-frame: func(
+        token: render-token,
+        draws: list<actor-frame-draw>,
     ) -> result<u64, graphics-error>;
 
     /// Reuse the pane's current visible content for one synchronized resize.
@@ -346,6 +375,11 @@ interface actor {
     type operation-id = u64;
     type worker-id = u64;
 
+    /// Opaque copy of the host render token carried in a presentation event.
+    record render-token {
+        opaque: u64,
+    }
+
     record mailbox-message {
         sender: string,
         body: list<u8>,
@@ -560,6 +594,19 @@ interface actor {
         preview-rgba8: list<u8>,
     }
 
+    record render-hint {
+        token: render-token,
+        /// Nanoseconds on the presentation client's monotonic timeline.
+        target-presentation-time-ns: u64,
+        /// Nanoseconds on the presentation client's monotonic timeline.
+        submission-deadline-ns: u64,
+        /// Advisory visibility and damage information for this actor.
+        relevant-panes: list<u64>,
+        /// Every causal actor event at or below this watermark was reduced
+        /// before this hint was dispatched.
+        event-watermark: u64,
+    }
+
     enum isolation-profile {
         isolated,
         direct,
@@ -672,6 +719,7 @@ interface actor {
         text(text-event),
         paste(paste-event),
         image(image-event),
+        render-hint(render-hint),
     }
 
     variant event {
@@ -685,6 +733,9 @@ interface actor {
         /// Lifecycle feedback for apps launched by this session's blessed init actor.
         app(app-event),
         presentation(presentation-event),
+        /// An opt-in, FIFO-preserving group of ordinary presentation events.
+        /// Render hints are always delivered as singleton presentation events.
+        presentation-batch(list<presentation-event>),
         /// Client-realm session catalogue state and command completion.
         session(session-event),
     }
@@ -726,6 +777,9 @@ interface actor {
         /// authenticates the emitting actor generation and validates the
         /// payload before applying any requested capability operation.
         send-host-message(list<u8>),
+        /// Opt into bounded lossless presentation batching. Zero and one
+        /// disable batching; the host clamps larger values to its hard cap.
+        set-presentation-batch-limit(u8),
         stop,
     }
 

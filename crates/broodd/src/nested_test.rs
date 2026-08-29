@@ -12,10 +12,28 @@ pub fn run(args: TestArgs) -> Result<()> {
         TestCommand::ComputerUseSpeedcrunch(args) => run_computer_use_speedcrunch(args),
         TestCommand::ComputerUseAgent(args) => run_computer_use_agent(args),
         TestCommand::Nested(args) => run_nested(args),
+        TestCommand::RenderScheduling(args) => run_render_scheduling(args),
         TestCommand::Editor(args) => run_editor(args),
         TestCommand::Resize(args) => run_resize(args),
         TestCommand::Ssh(args) => run_ssh(args),
     }
+}
+
+fn run_render_scheduling(args: NestedTestArgs) -> Result<()> {
+    let root = find_checkout_root()?;
+    let script = root.join("tools/test-render-scheduling-nested.sh");
+    let mut command = Command::new("bash");
+    command.arg(&script).current_dir(&root);
+    if let Some(out_dir) = args.out_dir {
+        command.env("BROOD_RENDER_SCHEDULING_OUT", out_dir);
+    }
+    let status = command
+        .status()
+        .with_context(|| format!("run {}", script.display()))?;
+    if !status.success() {
+        bail!("render-scheduling nested proof exited with {status}");
+    }
+    Ok(())
 }
 
 fn run_computer_use_agent(args: NestedTestArgs) -> Result<()> {

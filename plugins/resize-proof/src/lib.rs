@@ -8,7 +8,7 @@ use brood_plugin_sdk::{
         Command as ActorCommand, Event, Guest, LifecycleEvent, PresentationEvent, WorkerEvent,
         WorkerRequest,
     },
-    graphics::{submit_packet, submit_tagged_packet},
+    graphics::{queue_packet, queue_tagged_packet},
     runtime::sleep,
 };
 use serde::Deserialize;
@@ -23,7 +23,11 @@ const STALL_AFTER_FIRST_ACTOR_ID: &str = "resize-proof-stall-after-first";
 const MIDDLE_LAYOUT_ACTOR_ID: &str = "workspace";
 const LEAF_LAYOUT_ACTOR_ID: &str = "resize-proof-leaf-layout";
 const COMPONENT_FILE: &str = "brood_resize_proof_plugin.component.wasm";
-const DELAY_MS: u64 = 120;
+// The burst proof deliberately runs one obsolete cycle and one coalesced final
+// cycle. Keep their combined guest delay at 180 ms so the host retains 70 ms
+// of its fixed 250 ms transaction budget for hint dispatch and preparation.
+const DELAY_MS: u64 = 90;
+const _: () = assert!(DELAY_MS * 2 <= 180);
 // Window screenshots need a longer observable projected interval, but this
 // remains below the host's 250 ms synchronized-resize deadline.
 const WINDOW_DELAY_MS: u64 = 180;
@@ -119,7 +123,10 @@ impl ProofMode {
     }
 
     const fn gates_untagged_recovery(self) -> bool {
-        matches!(self, Self::GatedFast | Self::MiddleLayout | Self::LeafLayout)
+        matches!(
+            self,
+            Self::GatedFast | Self::MiddleLayout | Self::LeafLayout
+        )
     }
 }
 
@@ -209,6 +216,12 @@ enum FrameIdentity {
     Initial,
     Recovery,
     Epoch(u64),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PendingDraw {
+    Tagged(PaintTarget),
+    Untagged(UntaggedTarget, FrameIdentity),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -389,6 +402,7 @@ struct ProofState {
     region_proof_armed: bool,
     region_proof_arm_count: u64,
     pending_layout_regions: BTreeMap<u64, PendingLayoutRegion>,
+    pending_draw: Option<PendingDraw>,
 }
 
 impl ProofState {
@@ -415,6 +429,7 @@ impl ProofState {
             region_proof_armed: false,
             region_proof_arm_count: 0,
             pending_layout_regions: BTreeMap::new(),
+            pending_draw: None,
         }
     }
 
@@ -814,6 +829,49 @@ fn layout_region_diagnostic(
 
 fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
     match event {
+        PresentationEvent::RenderHint(hint) => {
+            let Ok(mut state) = STATE.lock() else {
+                return Vec::new();
+            };
+            let pending = state.pending_draw.take();
+            let mode = state.mode;
+            drop(state);
+            let result = brood_plugin_sdk::graphics::render_with_hint(&hint, || match pending {
+                Some(PendingDraw::Tagged(target)) => queue_tagged_packet(
+                    target.pane,
+                    target.epoch,
+                    &proof_packet(
+                        target.width,
+                        target.height,
+                        target.scale,
+                        mode,
+                        FrameIdentity::Epoch(target.epoch),
+                    ),
+                ),
+                Some(PendingDraw::Untagged(target, identity)) => queue_packet(
+                    target.pane,
+                    &proof_packet(target.width, target.height, target.scale, mode, identity),
+                ),
+                None => Ok(()),
+            });
+            if let Ok(mut state) = STATE.lock() {
+                match (pending, result) {
+                    (Some(PendingDraw::Tagged(target)), Ok(())) => {
+                        state.last_submitted = Some(target);
+                        state.error = None;
+                    }
+                    (Some(PendingDraw::Untagged(_, _)), Ok(())) | (None, Ok(())) => {
+                        state.last_submitted = None;
+                        state.error = None;
+                    }
+                    (_, Err(error)) => {
+                        state.pending_draw = pending;
+                        state.error = Some(error);
+                    }
+                }
+            }
+            Vec::new()
+        }
         PresentationEvent::PaneCreated(created) => {
             let Ok(mut state) = STATE.lock() else {
                 return Vec::new();
@@ -841,10 +899,7 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
             let Ok(mut state) = STATE.lock() else {
                 return Vec::new();
             };
-            if state.mode == ProofMode::WindowSlow
-                && button.pane == state.pane
-                && button.pressed
-            {
+            if state.mode == ProofMode::WindowSlow && button.pane == state.pane && button.pressed {
                 if button.button == RIGHT_POINTER_BUTTON && state.window_capture_gate.arm() {
                     let pane = state.pane;
                     drop(state);
@@ -1144,6 +1199,25 @@ fn apply_delay_action(action: DelayAction, mode: ProofMode) -> Vec<ActorCommand>
 }
 
 fn submit_target(target: PaintTarget, mode: ProofMode) -> Vec<ActorCommand> {
+    if !brood_plugin_sdk::graphics::render_is_active() {
+        let result =
+            brood_plugin_sdk::graphics::request_render_for_resize(target.pane, Some(target.epoch));
+        if let Ok(mut state) = STATE.lock() {
+            state.pending_draw = Some(PendingDraw::Tagged(target));
+            if let Err(error) = &result {
+                state.error = Some(error.clone());
+            }
+        }
+        return vec![diagnostic_command(
+            "resize-proof-tagged",
+            mode,
+            target.pane,
+            Some(target.epoch),
+            target.width,
+            target.height,
+            result.is_ok(),
+        )];
+    }
     let packet = proof_packet(
         target.width,
         target.height,
@@ -1151,7 +1225,7 @@ fn submit_target(target: PaintTarget, mode: ProofMode) -> Vec<ActorCommand> {
         mode,
         FrameIdentity::Epoch(target.epoch),
     );
-    let result = submit_tagged_packet(target.pane, target.epoch, &packet);
+    let result = queue_tagged_packet(target.pane, target.epoch, &packet);
     if let Ok(mut state) = STATE.lock() {
         match &result {
             Ok(_sequence) => {
@@ -1173,7 +1247,25 @@ fn submit_target(target: PaintTarget, mode: ProofMode) -> Vec<ActorCommand> {
 }
 
 fn submit_recovery(target: UntaggedTarget, mode: ProofMode) -> Vec<ActorCommand> {
-    let result = submit_packet(
+    if !brood_plugin_sdk::graphics::render_is_active() {
+        let result = brood_plugin_sdk::graphics::request_render();
+        if let Ok(mut state) = STATE.lock() {
+            state.pending_draw = Some(PendingDraw::Untagged(target, FrameIdentity::Recovery));
+            if let Err(error) = &result {
+                state.error = Some(error.clone());
+            }
+        }
+        return vec![diagnostic_command(
+            "resize-proof-recovery",
+            mode,
+            target.pane,
+            None,
+            target.width,
+            target.height,
+            result.is_ok(),
+        )];
+    }
+    let result = queue_packet(
         target.pane,
         &proof_packet(
             target.width,
@@ -1202,13 +1294,29 @@ fn submit_untagged_frame(
     scale: f32,
     mode: ProofMode,
 ) -> Result<u64, String> {
-    submit_packet(
+    if !brood_plugin_sdk::graphics::render_is_active() {
+        if let Ok(mut state) = STATE.lock() {
+            state.pending_draw = Some(PendingDraw::Untagged(
+                UntaggedTarget {
+                    pane,
+                    width,
+                    height,
+                    scale,
+                },
+                FrameIdentity::Initial,
+            ));
+        }
+        brood_plugin_sdk::graphics::request_render()?;
+        return Ok(0);
+    }
+    queue_packet(
         pane,
         &proof_packet(width, height, scale, mode, FrameIdentity::Initial),
-    )
+    )?;
+    Ok(0)
 }
 
-fn record_untagged_result(result: &Result<u64, String>) {
+fn record_untagged_result<T>(result: &Result<T, String>) {
     if let Ok(mut state) = STATE.lock() {
         match result {
             Ok(_sequence) => {
@@ -1566,16 +1674,22 @@ mod tests {
     }
 
     #[test]
-    fn pending_epoch_replacement_never_draws_the_obsolete_target() {
+    fn burst_coalesces_b_through_i_and_only_draws_i_after_two_cycles() {
         let mut scheduler = DelayScheduler::new();
-        let first = target(11, 320.0);
-        let final_target = target(12, 480.0);
+        let targets = (11..=19)
+            .map(|epoch| target(epoch, 320.0 + (epoch - 11) as f32 * 20.0))
+            .collect::<Vec<_>>();
+        let first = targets[0];
+        let final_target = targets[8];
         let first_worker = match scheduler.offer(first) {
             DelayAction::Spawn { worker, target } if target == first => Some(worker),
             _ => None,
         };
         assert!(first_worker.is_some());
-        assert_eq!(scheduler.offer(final_target), DelayAction::None);
+        for replacement in &targets[1..] {
+            assert_eq!(scheduler.offer(*replacement), DelayAction::None);
+        }
+        assert_eq!(scheduler.pending, Some(final_target));
         let Some(first_worker) = first_worker else {
             return;
         };
@@ -1593,6 +1707,7 @@ mod tests {
         );
         assert_eq!(scheduler.pending, None);
         assert_eq!(scheduler.active, None);
+        assert_eq!(scheduler.finish(final_worker), DelayAction::None);
     }
 
     #[test]
@@ -1654,10 +1769,7 @@ mod tests {
         let current = target(22, 560.0);
         assert!(gate.arm());
         assert_eq!(gate.offer(current), WindowGateOffer::Held);
-        assert_eq!(
-            gate.offer(stale),
-            WindowGateOffer::Stale { held: current }
-        );
+        assert_eq!(gate.offer(stale), WindowGateOffer::Stale { held: current });
         assert_eq!(gate.release(), Some(current));
     }
 
@@ -1665,8 +1777,10 @@ mod tests {
     fn window_capture_gate_release_commands_log_before_exact_epoch_submit() {
         let held = target(22, 560.0);
         let commands = window_gate_release_commands(held);
-        let [ActorCommand::SendLocalMessage(released), ActorCommand::SendLocalMessage(submit)] =
-            commands.as_slice()
+        let [
+            ActorCommand::SendLocalMessage(released),
+            ActorCommand::SendLocalMessage(submit),
+        ] = commands.as_slice()
         else {
             panic!("release did not produce two ordered local messages");
         };

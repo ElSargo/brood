@@ -272,6 +272,7 @@ pub struct RuntimeIoHub {
 struct HubInner {
     generation: u64,
     coordination: CoordinationHub,
+    runtime: tokio::runtime::Handle,
     config: RuntimeIoConfig,
     allowed_commands: HashSet<String>,
     alive: AtomicBool,
@@ -372,6 +373,22 @@ impl RuntimeIoHub {
         config: RuntimeIoConfig,
         coordination: CoordinationHub,
     ) -> Result<Self, RuntimeIoError> {
+        Self::new_on(
+            generation,
+            config,
+            coordination,
+            tokio::runtime::Handle::current(),
+        )
+    }
+
+    /// Construct a runtime owner whose async and blocking work is explicitly
+    /// placed on `runtime`, independently of the caller's executor.
+    pub fn new_on(
+        generation: u64,
+        config: RuntimeIoConfig,
+        coordination: CoordinationHub,
+        runtime: tokio::runtime::Handle,
+    ) -> Result<Self, RuntimeIoError> {
         if generation == 0
             || generation != coordination.generation()
             || config.max_resources == 0
@@ -395,6 +412,7 @@ impl RuntimeIoHub {
             inner: Arc::new(HubInner {
                 generation,
                 coordination,
+                runtime,
                 config,
                 allowed_commands,
                 alive: AtomicBool::new(true),
@@ -795,7 +813,7 @@ impl RuntimeIoHub {
         let task_timer = Arc::clone(&timer);
         self.push_task(
             timer.id,
-            tokio::spawn(async move {
+            self.inner.runtime.spawn(async move {
                 tokio::time::sleep_until(deadline).await;
                 if task_timer.alive.load(Ordering::Acquire) {
                     if let Ok(mut status) = task_timer.status.lock() {
@@ -1135,7 +1153,7 @@ impl RuntimeIoHub {
         let monitor = Arc::clone(&state);
         self.push_task(
             state.id,
-            tokio::spawn(async move {
+            self.inner.runtime.spawn(async move {
                 monitor_child(child, &monitor).await;
             }),
         )?;
@@ -1153,7 +1171,7 @@ impl RuntimeIoHub {
         let monitor = Arc::clone(&state);
         self.push_task(
             state.id,
-            tokio::task::spawn_blocking(move || {
+            self.inner.runtime.spawn_blocking(move || {
                 let status = child
                     .wait()
                     .ok()
@@ -1222,7 +1240,7 @@ impl RuntimeIoHub {
         R: AsyncRead + Unpin + Send + 'static,
     {
         let resource = stream.id;
-        let task = tokio::spawn(async move {
+        let task = self.inner.runtime.spawn(async move {
             let mut bytes = [0_u8; 4096];
             while stream.alive.load(Ordering::Acquire) {
                 match reader.read(&mut bytes).await {
@@ -1246,7 +1264,7 @@ impl RuntimeIoHub {
         W: AsyncWrite + Unpin + Send + 'static,
     {
         let resource = stream.id;
-        let task = tokio::spawn(async move {
+        let task = self.inner.runtime.spawn(async move {
             while let Some(bytes) = stream.take_outgoing_async().await {
                 if writer.write_all(&bytes).await.is_err() || writer.flush().await.is_err() {
                     break;
@@ -1262,7 +1280,7 @@ impl RuntimeIoHub {
         R: Read + Send + 'static,
     {
         let resource = stream.id;
-        let task = tokio::task::spawn_blocking(move || {
+        let task = self.inner.runtime.spawn_blocking(move || {
             let mut bytes = [0_u8; 4096];
             while stream.alive.load(Ordering::Acquire) {
                 match reader.read(&mut bytes) {
@@ -1286,7 +1304,7 @@ impl RuntimeIoHub {
         W: Write + Send + 'static,
     {
         let resource = stream.id;
-        let task = tokio::task::spawn_blocking(move || {
+        let task = self.inner.runtime.spawn_blocking(move || {
             while let Some(bytes) = stream.take_outgoing() {
                 if writer.write_all(&bytes).is_err() || writer.flush().is_err() {
                     break;

@@ -26,6 +26,7 @@ use std::{
 };
 
 use anyhow::Result;
+use num_traits::ToPrimitive;
 #[cfg(feature = "shm-fallback")]
 use smithay::backend::renderer::ImportMemWl;
 use smithay::{
@@ -62,7 +63,7 @@ use tracing::{info, warn};
 
 use crate::{
     buffer_readback,
-    state::{Brood, SESSION_OUTPUT_REFRESH_MILLIHZ},
+    state::{Brood, RuntimeStats, SESSION_OUTPUT_REFRESH_MILLIHZ},
 };
 
 type ExportAllocator = DmabufAllocator<GbmAllocator<DrmDeviceFd>>;
@@ -241,6 +242,21 @@ pub fn request_redraw(state: &mut Brood) {
         fast_path.pending_redraw = true;
         return;
     }
+    if fast_path
+        .managed_resizes
+        .tagged_snapshot_cohort_incomplete()
+    {
+        // Configured tagged panes are one atomic export cohort. Publishing a
+        // configure-only scene or the first ready pane would consume the
+        // single in-flight slot and delay the complete tagged scene behind its
+        // presentation acknowledgement.
+        fast_path.pending_redraw = true;
+        return;
+    }
+    // A commit or recovery that opened either barrier above calls this entry
+    // point again. This redraw consumes the retained demand directly; leaving
+    // it set would manufacture one redundant scene after presentation.
+    fast_path.pending_redraw = false;
     let Some(exporter) = state.dmabuf.exporter.clone() else {
         record_failure(
             state,
@@ -249,8 +265,10 @@ pub fn request_redraw(state: &mut Brood) {
         return;
     };
     let started = Instant::now();
-    match render_external_client_scene(&mut exporter.borrow_mut(), state) {
-        Ok(()) => state.stats.record_frame(started.elapsed()),
+    let result = render_external_client_scene(&mut exporter.borrow_mut(), state);
+    let elapsed = started.elapsed();
+    match result {
+        Ok(()) => state.stats.record_frame(elapsed),
         Err(failure) => record_failure(state, &failure),
     }
 }
@@ -392,15 +410,29 @@ struct ExternalWindowFrame {
     window: Window,
 }
 
+fn scaled_logical_dimension(logical: i32, scale: f64) -> i32 {
+    let scaled = (f64::from(logical) * scale).round();
+    if !scaled.is_finite() {
+        return 0;
+    }
+    scaled.to_i32().unwrap_or_else(|| {
+        if scaled.is_sign_negative() {
+            i32::MIN
+        } else {
+            i32::MAX
+        }
+    })
+}
+
 #[derive(Clone)]
-pub(crate) enum ManagedSnapshotBacking {
+pub enum ManagedSnapshotBacking {
     Dmabuf(Dmabuf),
     SharedMemory(Arc<[u8]>),
 }
 
 type RenderedWindowBacking = ManagedSnapshotBacking;
 
-pub(crate) fn capture_managed_commit_snapshot(
+pub fn capture_managed_commit_snapshot(
     state: &mut Brood,
     window: &Window,
     pane: u64,
@@ -435,11 +467,15 @@ pub(crate) fn capture_managed_commit_snapshot(
                 .borrow_mut()
                 .create_exportable_dmabuf(size)
                 .map_err(|error| FrameExportFailure::new("allocate_managed_snapshot", error))?;
-            render_window_dmabuf(&mut exporter.borrow_mut(), state, &frame, &mut dmabuf)?;
+            let waits =
+                render_window_dmabuf(&mut exporter.borrow_mut(), state, &frame, &mut dmabuf)?;
+            record_driver_waits(&mut state.stats, waits);
             Ok(ManagedSnapshotBacking::Dmabuf(dmabuf))
         }
         brood_protocol::FrameTransportKind::SharedMemory => {
-            let pixels = render_window_shared_memory(&mut exporter.borrow_mut(), state, &frame)?;
+            let (pixels, waits) =
+                render_window_shared_memory(&mut exporter.borrow_mut(), state, &frame)?;
+            record_driver_waits(&mut state.stats, waits);
             Ok(ManagedSnapshotBacking::SharedMemory(pixels.into()))
         }
         brood_protocol::FrameTransportKind::Network => Err(FrameExportFailure::new(
@@ -481,8 +517,8 @@ fn render_external_client_scene(
             let source_size = snapshot.as_ref().map_or_else(
                 || {
                     (
-                        (f64::from(logical_size.w) * scale).round() as i32,
-                        (f64::from(logical_size.h) * scale).round() as i32,
+                        scaled_logical_dimension(logical_size.w, scale),
+                        scaled_logical_dimension(logical_size.h, scale),
                     )
                 },
                 |snapshot| snapshot.pixel_size,
@@ -539,7 +575,8 @@ fn render_external_client_scene(
                         FrameExportFailure::new("allocate_window_dmabuf", error)
                     })?,
                 };
-                render_window_dmabuf(exporter, state, &window, &mut dmabuf)?;
+                let waits = render_window_dmabuf(exporter, state, &window, &mut dmabuf)?;
+                record_driver_waits(&mut state.stats, waits);
                 let Some(fast_path) = state.dmabuf.fast_path.as_mut() else {
                     return Err(FrameExportFailure::new(
                         "store_window_dmabuf",
@@ -552,9 +589,9 @@ fn render_external_client_scene(
                 RenderedWindowBacking::Dmabuf(dmabuf)
             }
             brood_protocol::FrameTransportKind::SharedMemory => {
-                RenderedWindowBacking::SharedMemory(
-                    render_window_shared_memory(exporter, state, &window)?.into(),
-                )
+                let (pixels, waits) = render_window_shared_memory(exporter, state, &window)?;
+                record_driver_waits(&mut state.stats, waits);
+                RenderedWindowBacking::SharedMemory(pixels.into())
             }
             brood_protocol::FrameTransportKind::Network => {
                 return Err(FrameExportFailure::new(
@@ -578,12 +615,12 @@ fn render_window_dmabuf(
     state: &Brood,
     window: &ExternalWindowFrame,
     dmabuf: &mut Dmabuf,
-) -> std::result::Result<(), FrameExportFailure> {
+) -> std::result::Result<DriverWaits, FrameExportFailure> {
     let size: Size<i32, Physical> = (window.source_w.max(1), window.source_h.max(1)).into();
     let (output, window_space) = window_render_space(state, window, size);
     let mut damage_tracker = OutputDamageTracker::from_output(&output);
 
-    let sync = {
+    let (sync, sync_wait) = {
         let (renderer, mut framebuffer) = exporter
             .bind_dmabuf(dmabuf)
             .map_err(|error| FrameExportFailure::new("bind_window_dmabuf", error))?;
@@ -600,19 +637,23 @@ fn render_window_dmabuf(
         )
         .map_err(|error| FrameExportFailure::new("render_window_dmabuf", error))?
         .sync;
+        let wait_started = Instant::now();
         sync.wait()
             .map_err(|error| FrameExportFailure::new("wait_window_dmabuf", error))?;
-        sync
+        (sync, wait_started.elapsed())
     };
     drop(sync);
-    Ok(())
+    Ok(DriverWaits {
+        sync: sync_wait,
+        readback: None,
+    })
 }
 
 fn render_window_shared_memory(
     exporter: &mut FrameExporter,
     state: &Brood,
     window: &ExternalWindowFrame,
-) -> std::result::Result<Vec<u8>, FrameExportFailure> {
+) -> std::result::Result<(Vec<u8>, DriverWaits), FrameExportFailure> {
     let size: Size<i32, Physical> = (window.source_w.max(1), window.source_h.max(1)).into();
     let (output, window_space) = window_render_space(state, window, size);
     let mut damage_tracker = OutputDamageTracker::from_output(&output);
@@ -640,13 +681,37 @@ fn render_window_shared_memory(
     )
     .map_err(|error| FrameExportFailure::new("render_window_shared_memory", error))?
     .sync;
+    let wait_started = Instant::now();
     sync.wait()
         .map_err(|error| FrameExportFailure::new("wait_window_shared_memory", error))?;
+    let sync_wait = wait_started.elapsed();
+    // `read_gles_framebuffer` combines driver copy/map calls with an owned CPU
+    // allocation and copy. Those phases are not separately observable here,
+    // so charge the whole readback to the Smithay callback conservatively.
     let frame = buffer_readback::read_gles_framebuffer(renderer, &framebuffer, size)
         .map_err(|error| FrameExportFailure::new("read_window_shared_memory", error))?;
     drop(framebuffer);
     drop(sync);
-    Ok(frame.bytes)
+    Ok((
+        frame.bytes,
+        DriverWaits {
+            sync: sync_wait,
+            readback: None,
+        },
+    ))
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DriverWaits {
+    sync: Duration,
+    readback: Option<Duration>,
+}
+
+fn record_driver_waits(stats: &mut RuntimeStats, waits: DriverWaits) {
+    stats.record_smithay_driver_call(waits.sync);
+    if let Some(readback) = waits.readback {
+        stats.record_smithay_driver_call(readback);
+    }
 }
 
 fn window_render_space(
@@ -695,6 +760,12 @@ fn publish_window_scene(
         fast_path.pending_redraw = true;
         return Ok(());
     }
+    let published_panes = std::env::var_os("BROOD_TRACE_RESIZE").map(|_| {
+        windows
+            .iter()
+            .map(|(window, _backing)| window.window_id)
+            .collect::<Vec<_>>()
+    });
     cleanup_provisional_tagged_resources(fast_path);
     let mut tagged = Vec::new();
     fast_path
@@ -827,6 +898,9 @@ fn publish_window_scene(
         .notify()
         .map_err(|error| FrameExportFailure::new("notify_window_scene", error))?;
     fast_path.in_flight_sequence = Some(sequence);
+    if let Some(published_panes) = published_panes {
+        tracing::info!(sequence, panes = ?published_panes, "published window scene");
+    }
     for (pane, epoch, surface_commit, resource_id) in tagged {
         fast_path.managed_resizes.mark_scene_in_flight(
             pane,
@@ -839,9 +913,7 @@ fn publish_window_scene(
     Ok(())
 }
 
-pub(crate) fn cleanup_provisional_tagged_resources(
-    fast_path: &mut crate::state::PresentationFastPath,
-) {
+pub fn cleanup_provisional_tagged_resources(fast_path: &mut crate::state::PresentationFastPath) {
     let stale_shared = take_stale_provisional_resources(
         &mut fast_path.tagged_shared_image_resources,
         |identity| {
@@ -1218,11 +1290,50 @@ pub fn sanitize_status_value(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, os::fd::AsFd};
+    #![allow(
+        clippy::unwrap_used,
+        reason = "frame-export unit-test fixtures fail fast when resource setup or lookup is invalid"
+    )]
+
+    use std::{collections::HashMap, os::fd::AsFd, time::Duration};
 
     use brood_protocol::{FrameColorSpace, FramePixelFormat};
 
-    use super::{shared_image_resource, take_stale_provisional_resources};
+    use crate::state::RuntimeStats;
+
+    use super::{
+        DriverWaits, record_driver_waits, shared_image_resource, take_stale_provisional_resources,
+    };
+
+    #[test]
+    fn smithay_driver_exclusion_records_only_explicit_wait_intervals() {
+        let mut stats = RuntimeStats::default();
+        let driver_before = stats.smithay_driver_total_micros;
+        record_driver_waits(
+            &mut stats,
+            DriverWaits {
+                sync: Duration::from_micros(7),
+                readback: Some(Duration::from_micros(11)),
+            },
+        );
+
+        assert_eq!(stats.smithay_driver_total_micros, 18);
+        let snapshot = stats.smithay_driver_calls.snapshot();
+        assert_eq!(snapshot.callbacks, 2);
+        assert_eq!(snapshot.maximum_micros, 11);
+        assert_eq!(snapshot.p99_micros, 11);
+
+        // Inventory, sorting, render setup, and publication remain charged to
+        // the callback; only the exact 18 us spent in explicit waits is removed.
+        stats.record_smithay_callback(Duration::from_micros(50), driver_before);
+        let callbacks = stats.smithay_callbacks.snapshot();
+        assert_eq!(callbacks.last_micros, 32);
+
+        stats.reset_smithay_hot_path_metrics();
+        assert_eq!(stats.smithay_driver_total_micros, 0);
+        assert_eq!(stats.smithay_callbacks.snapshot().callbacks, 0);
+        assert_eq!(stats.smithay_driver_calls.snapshot().callbacks, 0);
+    }
 
     #[test]
     fn tagged_shared_image_has_stable_dedicated_ownership_until_release() {

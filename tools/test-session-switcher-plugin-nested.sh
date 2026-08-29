@@ -361,7 +361,10 @@ assert catalog["sessions"] == [], catalog
 assert catalog["active"] == 0, catalog
 PY
   ACTORS_EMPTY="$(ctl actors list)"
-  ! rg -q 'terminal-ui|terminal-session' <<< "$ACTORS_EMPTY"
+  if rg -q 'terminal-ui|terminal-session' <<< "$ACTORS_EMPTY"; then
+    echo "ERR terminal actors unexpectedly started for an empty session catalogue" >&2
+    exit 1
+  fi
   printf '%s\n' "$SESSION_CATALOG" > "$OUT/empty-startup-sessions.json"
   printf '%s\n' "$ACTORS_EMPTY" > "$OUT/empty-startup-actors.txt"
 
@@ -382,7 +385,10 @@ PY
   rg -q "accepted plugin draw packet pane=$STATUS_PANE .* gpu_target=1280x34 " "$CLIENT_LOG"
   rg -q "sent plugin pane resize pane=$SWITCHER_PANE logical_size=320x686 " "$CLIENT_LOG"
   rg -q 'accepted leased actor layout items=2 panes=2 ' "$CLIENT_LOG"
-  ! rg -q "sent plugin pane resize pane=$INBOX_PANE logical_size=(320|480|640)x686 " "$CLIENT_LOG"
+  if rg -q "sent plugin pane resize pane=$INBOX_PANE logical_size=(320|480|640)x686 " "$CLIENT_LOG"; then
+    echo "ERR hidden inbox pane received a visible-width resize" >&2
+    exit 1
+  fi
 
   capture "$OUT/empty-startup.png"
   magick identify -format '%wx%h' "$OUT/empty-startup.png" | rg -qx '1280x720'
@@ -423,7 +429,10 @@ PY
     }
     sleep 0.05
   done
-  ! rg -q 'addressed unknown backend' "$CLIENT_LOG"
+  if rg -q 'addressed unknown backend' "$CLIENT_LOG"; then
+    echo "ERR empty-backend selection addressed an unknown backend" >&2
+    exit 1
+  fi
   rg -q 'presentation actor message realm=Daemon sender=session-switcher recipient=init body=.*"kind":"list-directories"' "$CLIENT_LOG"
   rg -q 'backend actor message backend=1 realm=Daemon sender=init recipient=session-switcher body=.*"success":true.*"type":"directory-list"' "$CLIENT_LOG"
   capture "$OUT/empty-startup-directory-picker.png"

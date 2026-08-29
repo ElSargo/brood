@@ -14,6 +14,8 @@ import subprocess
 import sys
 from typing import Any
 
+from resize_transaction_readiness import validate_transaction_readiness
+
 
 if len(sys.argv) != 10:
     raise SystemExit(
@@ -848,7 +850,9 @@ for event in events:
     if not wait or len(wait) != len(set(wait)):
         raise SystemExit(f"transaction wait set is empty/duplicated: {event}")
     if (
-        int(accepted["request"]) != diagnostic["request_id"]
+        accepted.get("actor") != "session-switcher"
+        or int(accepted["request"]) != diagnostic["request_id"]
+        or int(accepted["interaction"]) != projected["interaction"]
         or int(accepted["event_sequence"]) != diagnostic["event_sequence"]
         or int(accepted["native_resize_revision"])
         != diagnostic["native_resize_revision"]
@@ -891,28 +895,23 @@ for event in events:
             raise SystemExit(
                 f"ordinary layout appeared inside native root transaction: {forbidden}"
             )
-    readiness_lines = client_lines[
-        max(0, event["accepted"]["log_line"] - 8) : event["completed_log_line"]
-    ]
-    missing_readiness = []
-    for pane in wait:
-        staged = any(
-            f"staged plugin draw pane={pane} " in line
-            and f"resize_epoch={projected['epoch']} " in line
-            for line in readiness_lines
+    try:
+        readiness = validate_transaction_readiness(
+            client_lines,
+            actor="session-switcher",
+            request=diagnostic["request_id"],
+            interaction=projected["interaction"],
+            event_sequence=diagnostic["event_sequence"],
+            epoch=projected["epoch"],
+            target_revision=int(accepted["target_revision"]),
+            region_total=int(accepted["region_final"].split("/", 1)[1]),
+            wait_panes=wait,
+            projected_line=event["projected"]["log_line"],
+            promoted_line=event["promoted"]["log_line"],
+            completed_line=event["completed_log_line"],
         )
-        reused = any(
-            f"accepted plugin content reuse pane={pane} " in line
-            and f"resize_epoch={projected['epoch']} " in line
-            for line in readiness_lines
-        )
-        if not staged and not reused:
-            missing_readiness.append(pane)
-    if missing_readiness:
-        raise SystemExit(
-            f"waited panes lack tagged-draw/reuse evidence epoch={projected['epoch']} "
-            f"missing={missing_readiness} event={event}"
-        )
+    except ValueError as error:
+        raise SystemExit(f"invalid aggregate synchronized readiness: {error}; event={event}") from error
     max_staged = max(max_staged, projected["staged_count"], promoted["staged_count"])
     transaction_metrics.append(
         {
@@ -925,7 +924,10 @@ for event in events:
             "wait_for_panes": wait,
             "wait_ready": promoted["wait_ready"],
             "wait_total": promoted["wait_total"],
-            "readiness_evidence": "tagged draw or validated content reuse for every waited pane",
+            "readiness_log_line": readiness["ready_line"],
+            "readiness_evidence": (
+                "identity-matched aggregate ready set equals the exact accepted wait set"
+            ),
             "completed_after_present": True,
         }
     )

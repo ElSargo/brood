@@ -3,39 +3,41 @@ wit_bindgen::generate!({
     world: "brood-plugin",
 });
 
-use std::sync::Mutex;
+use std::{sync::Mutex, time::Duration};
 
-use exports::brood::plugin::actor::{Event, Guest, PresentationEvent};
 use brood::plugin::host;
 use brood_graphics::{BlendMode, Color, Command, Packet, Path, Rect, Transform};
+use exports::brood::plugin::actor::{Command as ActorCommand, Event, Guest, PresentationEvent};
 
 const LEFT_BUTTON: u32 = 0x110;
 
 #[derive(Clone, Copy)]
-struct DemoState {
+struct DemoPane {
     pane: u64,
     width: f32,
     height: f32,
     image: u64,
     text_layout: u64,
+    retired_text_layout: u64,
+    pending_resize_epoch: Option<u64>,
     pointer_x: f32,
     pointer_y: f32,
+}
+
+struct DemoState {
+    panes: Vec<DemoPane>,
     phase: f32,
     active_palette: bool,
+    subscribed: bool,
 }
 
 impl DemoState {
     const fn new() -> Self {
         Self {
-            pane: 0,
-            width: 800.0,
-            height: 600.0,
-            image: 0,
-            text_layout: 0,
-            pointer_x: 400.0,
-            pointer_y: 300.0,
+            panes: Vec::new(),
             phase: 0.0,
             active_palette: false,
+            subscribed: false,
         }
     }
 }
@@ -46,43 +48,68 @@ struct GraphicsDemo;
 
 impl Guest for GraphicsDemo {
     fn dispatch(event: Event) -> Vec<exports::brood::plugin::actor::Command> {
+        if matches!(event, Event::Lifecycle(_)) {
+            return vec![ActorCommand::LifecycleComplete(Ok(()))];
+        }
         let Event::Presentation(event) = event else {
             return Vec::new();
         };
         let Ok(mut state) = STATE.lock() else {
             return Vec::new();
         };
-        let previous_text_layout = state.text_layout;
         let redraw = match event {
             PresentationEvent::PaneCreated(created) => {
-                state.pane = created.pane;
-                state.width = created.width.max(1.0);
-                state.height = created.height.max(1.0);
-                state.pointer_x = state.width * 0.5;
-                state.pointer_y = state.height * 0.5;
-                if state.image == 0 {
-                    state.image = create_checker_image(state.pane).unwrap_or_default();
+                if state.panes.len() >= 16
+                    || state.panes.iter().any(|pane| pane.pane == created.pane)
+                {
+                    return Vec::new();
                 }
-                if let Ok(layout) = create_title_layout(state.pane, state.width) {
-                    state.text_layout = layout;
+                let width = created.width.max(1.0);
+                let height = created.height.max(1.0);
+                state.panes.push(DemoPane {
+                    pane: created.pane,
+                    width,
+                    height,
+                    image: create_checker_image(created.pane).unwrap_or_default(),
+                    text_layout: create_title_layout(created.pane, width).unwrap_or_default(),
+                    retired_text_layout: 0,
+                    pending_resize_epoch: None,
+                    pointer_x: width * 0.5,
+                    pointer_y: height * 0.5,
+                });
+                true
+            }
+            PresentationEvent::PaneResized(resized) => {
+                let Some(pane) = state
+                    .panes
+                    .iter_mut()
+                    .find(|pane| pane.pane == resized.pane)
+                else {
+                    return Vec::new();
+                };
+                pane.width = resized.width.max(1.0);
+                pane.height = resized.height.max(1.0);
+                pane.pending_resize_epoch = resized.resize_epoch;
+                if let Ok(layout) = create_title_layout(pane.pane, pane.width) {
+                    pane.retired_text_layout = pane.text_layout;
+                    pane.text_layout = layout;
                 }
                 true
             }
-            PresentationEvent::PaneResized(resized) if resized.pane == state.pane => {
-                state.width = resized.width.max(1.0);
-                state.height = resized.height.max(1.0);
-                if let Ok(layout) = create_title_layout(state.pane, state.width) {
-                    state.text_layout = layout;
-                }
-                true
-            }
-            PresentationEvent::PointerMoved(pointer) if pointer.pane == state.pane => {
-                state.pointer_x = pointer.x;
-                state.pointer_y = pointer.y;
+            PresentationEvent::PointerMoved(pointer) => {
+                let Some(pane) = state
+                    .panes
+                    .iter_mut()
+                    .find(|pane| pane.pane == pointer.pane)
+                else {
+                    return Vec::new();
+                };
+                pane.pointer_x = pointer.x;
+                pane.pointer_y = pointer.y;
                 true
             }
             PresentationEvent::PointerButton(button)
-                if button.pane == state.pane
+                if state.panes.iter().any(|pane| pane.pane == button.pane)
                     && button.button == LEFT_BUTTON
                     && button.pressed =>
             {
@@ -90,31 +117,62 @@ impl Guest for GraphicsDemo {
                 state.phase += 0.35;
                 true
             }
-            PresentationEvent::PointerScroll(scroll) if scroll.pane == state.pane => {
+            PresentationEvent::PointerScroll(scroll)
+                if state.panes.iter().any(|pane| pane.pane == scroll.pane) =>
+            {
                 state.phase += scroll.vertical * 0.08;
                 true
             }
             PresentationEvent::Key(key)
-                if key.pane == state.pane && key.pressed && !key.repeat =>
+                if state.panes.iter().any(|pane| pane.pane == key.pane)
+                    && key.logical_key == "F8"
+                    && key.pressed
+                    && !key.repeat =>
+            {
+                let subscribed = !state.subscribed;
+                if host::render_set_subscription(subscribed).is_ok() {
+                    state.subscribed = subscribed;
+                }
+                false
+            }
+            PresentationEvent::Key(key)
+                if state.panes.iter().any(|pane| pane.pane == key.pane)
+                    && key.pressed
+                    && !key.repeat =>
             {
                 state.phase += 0.35;
                 true
             }
-            PresentationEvent::Text(text) if text.pane == state.pane => {
+            PresentationEvent::Text(text)
+                if state.panes.iter().any(|pane| pane.pane == text.pane) =>
+            {
                 state.active_palette = !state.active_palette;
                 state.phase += 0.15;
                 true
             }
+            PresentationEvent::RenderHint(hint) => {
+                if state.subscribed {
+                    state.phase = Duration::from_nanos(hint.target_presentation_time_ns)
+                        .as_secs_f32()
+                        * core::f32::consts::TAU;
+                }
+                let submitted = submit_scene(&state, &hint).is_ok();
+                if submitted {
+                    for pane in &mut state.panes {
+                        if pane.retired_text_layout != 0 {
+                            let _ =
+                                host::graphics_drop_resource(pane.pane, pane.retired_text_layout);
+                            pane.retired_text_layout = 0;
+                        }
+                        pane.pending_resize_epoch = None;
+                    }
+                }
+                false
+            }
             _ => false,
         };
         if redraw {
-            let submitted = submit_scene(*state).is_ok();
-            if submitted
-                && previous_text_layout != 0
-                && previous_text_layout != state.text_layout
-            {
-                let _ = host::graphics_drop_resource(state.pane, previous_text_layout);
-            }
+            let _ = host::render_request();
         }
         Vec::new()
     }
@@ -163,32 +221,52 @@ fn create_title_layout(pane: u64, width: f32) -> Result<u64, String> {
     .map_err(|error| format!("layout demo title: {error:?}"))
 }
 
-fn submit_scene(state: DemoState) -> Result<u64, String> {
-    let packet = build_scene(state)
-        .encode()
-        .map_err(|error| error.to_string())?;
-    host::graphics_submit_draw_packet(state.pane, &packet)
-        .map_err(|error| format!("submit demo packet: {error:?}"))
+fn submit_scene(
+    state: &DemoState,
+    hint: &exports::brood::plugin::actor::RenderHint,
+) -> Result<u64, String> {
+    let draws = state
+        .panes
+        .iter()
+        .map(|pane| {
+            let packet = build_scene(*pane, state.phase, state.active_palette)
+                .encode()
+                .map_err(|error| error.to_string())?;
+            Ok(host::ActorFrameDraw {
+                pane: pane.pane,
+                resize_epoch: pane.pending_resize_epoch,
+                state_watermark: None,
+                packet,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    host::graphics_finish_actor_frame(
+        host::RenderToken {
+            opaque: hint.token.opaque,
+        },
+        &draws,
+    )
+    .map_err(|error| format!("submit demo packet: {error:?}"))
 }
 
-fn build_scene(state: DemoState) -> Packet {
+fn build_scene(state: DemoPane, phase: f32, active_palette: bool) -> Packet {
     let mut packet = Packet::new();
     let width = state.width;
     let height = state.height;
     let cell = (width.min(height) / 5.4).max(68.0);
     let gap = cell * 0.12;
     let margin = cell * 0.22;
-    let background = if state.active_palette {
+    let background = if active_palette {
         Color::rgba(0.025, 0.055, 0.075, 1.0)
     } else {
         Color::rgba(0.035, 0.04, 0.065, 1.0)
     };
-    let primary = if state.active_palette {
+    let primary = if active_palette {
         Color::rgba(0.18, 0.88, 0.67, 1.0)
     } else {
         Color::rgba(0.45, 0.36, 0.94, 1.0)
     };
-    let accent = if state.active_palette {
+    let accent = if active_palette {
         Color::rgba(1.0, 0.43, 0.31, 1.0)
     } else {
         Color::rgba(0.98, 0.68, 0.23, 1.0)
@@ -267,17 +345,12 @@ fn build_scene(state: DemoState) -> Packet {
     if state.image != 0 {
         packet.push(Command::DrawImage {
             image: state.image,
-            destination: Rect::new(
-                margin + (cell + gap) * 2.0,
-                second_y,
-                cell,
-                cell,
-            ),
+            destination: Rect::new(margin + (cell + gap) * 2.0, second_y, cell, cell),
         });
     }
 
     // set-transform
-    let angle = state.phase;
+    let angle = phase;
     let cosine = angle.cos();
     let sine = angle.sin();
     let center_x = margin + (cell + gap) * 3.0 + cell * 0.5;
@@ -308,7 +381,7 @@ fn build_scene(state: DemoState) -> Packet {
     packet.push(Command::Save);
     packet.push(Command::SetOpacity(0.72));
     // Exercise both fixed-function and destination-reading GPU blend paths.
-    packet.push(Command::SetBlendMode(if state.active_palette {
+    packet.push(Command::SetBlendMode(if active_palette {
         BlendMode::Multiply
     } else {
         BlendMode::Screen
@@ -319,7 +392,12 @@ fn build_scene(state: DemoState) -> Packet {
         color: primary,
     });
     packet.push(Command::FillRoundedRect {
-        rect: Rect::new(margin + cell * 0.7, third_y + cell * 0.18, cell * 1.7, cell * 0.82),
+        rect: Rect::new(
+            margin + cell * 0.7,
+            third_y + cell * 0.18,
+            cell * 1.7,
+            cell * 0.82,
+        ),
         radius: cell * 0.2,
         color: accent,
     });
@@ -352,7 +430,11 @@ fn build_scene(state: DemoState) -> Packet {
 fn star_path(center_x: f32, center_y: f32, radius: f32) -> Path {
     let mut points = [(0.0_f32, 0.0_f32); 10];
     for (index, point) in points.iter_mut().enumerate() {
-        let point_radius = if index % 2 == 0 { radius } else { radius * 0.42 };
+        let point_radius = if index % 2 == 0 {
+            radius
+        } else {
+            radius * 0.42
+        };
         let angle = -core::f32::consts::FRAC_PI_2 + index as f32 * core::f32::consts::PI / 5.0;
         *point = (
             center_x + angle.cos() * point_radius,

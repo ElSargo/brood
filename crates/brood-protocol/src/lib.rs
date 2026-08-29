@@ -17,6 +17,19 @@ pub const PRESENTATION_PROTOCOL_VERSION: u32 = 24;
 /// Number of fixed scale units in one logical output unit.
 pub const FRACTIONAL_SCALE_DENOMINATOR: u32 = 120;
 
+/// Largest valid synchronized managed-resize epoch.
+///
+/// The local fixed-record codec reserves bit 63 to distinguish an ordinary
+/// recovery authority from a tagged resize epoch. Keeping the semantic epoch
+/// domain below that bit makes every transport encode the same values.
+pub const MAX_MANAGED_RESIZE_EPOCH: u64 = (1_u64 << 63) - 1;
+
+/// Whether an epoch is valid in any managed-resize protocol field.
+#[must_use]
+pub const fn managed_resize_epoch_is_valid(epoch: u64) -> bool {
+    epoch > 0 && epoch <= MAX_MANAGED_RESIZE_EPOCH
+}
+
 /// Maximum actor-message body accepted by every transport profile.
 pub const MAX_ACTOR_MESSAGE_BYTES: u32 = 64 * 1024;
 
@@ -806,6 +819,13 @@ pub enum InputEvent {
         pixel_height: u32,
         scale_120: u32,
         resize_epoch: Option<u64>,
+        /// Explicit causal authority for an ordinary recovery request.
+        ///
+        /// A recovery may retire tagged resize correlations through this
+        /// epoch, but never a newer epoch. Plain ordinary resize requests
+        /// leave this unset and cannot retire tagged authority.
+        #[serde(default)]
+        recover_through_epoch: Option<u64>,
     },
     PointerMotion {
         position: PanePosition,
@@ -1188,11 +1208,11 @@ mod tests {
         ArtifactValidationError, AutomationCursor, AutomationInteractionState, CapsuleFailure,
         CapsuleFailureStage, CapsuleLifecycle, CapsuleStatus, CarrierKind, EndpointCapabilities,
         FrameTransportKind, InputEvent, IsolationProfile, MAX_ARTIFACT_CHUNK_BYTES,
-        ManagedResizeRejectionReason, ManagedResizeStatus, ManagedResizeStatusResult,
-        ManagedWindowAutomationState, ManagedWindowSizeAuthority, NegotiationError,
-        PRESENTATION_PROTOCOL_VERSION, ServerMessage, SessionIsolationStatus, SessionVolumeId,
-        SessionVolumeLifecycle, SessionVolumeStatus, TransportProfile, WindowFrame,
-        negotiate_profile,
+        MAX_MANAGED_RESIZE_EPOCH, ManagedResizeRejectionReason, ManagedResizeStatus,
+        ManagedResizeStatusResult, ManagedWindowAutomationState, ManagedWindowSizeAuthority,
+        NegotiationError, PRESENTATION_PROTOCOL_VERSION, ServerMessage, SessionIsolationStatus,
+        SessionVolumeId, SessionVolumeLifecycle, SessionVolumeStatus, TransportProfile,
+        WindowFrame, managed_resize_epoch_is_valid, negotiate_profile,
     };
 
     #[test]
@@ -1366,6 +1386,7 @@ mod tests {
             pixel_height: 180,
             scale_120: 180,
             resize_epoch: Some(41),
+            recover_through_epoch: None,
         };
         let input_json = serde_json::to_vec(&input);
         assert!(input_json.is_ok());
@@ -1376,6 +1397,44 @@ mod tests {
             return;
         };
         assert_eq!(decoded_input, input);
+
+        let Ok(mut legacy_json) = serde_json::to_value(&input) else {
+            return;
+        };
+        let Some(legacy_payload) = legacy_json
+            .get_mut("window-resize")
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            return;
+        };
+        legacy_payload.remove("recover-through-epoch");
+        let legacy = serde_json::from_value::<InputEvent>(legacy_json);
+        assert_eq!(legacy.ok(), Some(input));
+
+        let recovery = InputEvent::WindowResize {
+            pane: 7,
+            logical_width: 200,
+            logical_height: 120,
+            pixel_width: 300,
+            pixel_height: 180,
+            scale_120: 180,
+            resize_epoch: None,
+            recover_through_epoch: Some(41),
+        };
+        let recovery_json = serde_json::to_vec(&recovery);
+        assert!(recovery_json.is_ok());
+        assert_eq!(
+            recovery_json
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<InputEvent>(&bytes).ok()),
+            Some(recovery)
+        );
+
+        assert!(managed_resize_epoch_is_valid(1));
+        assert!(managed_resize_epoch_is_valid(MAX_MANAGED_RESIZE_EPOCH));
+        assert!(!managed_resize_epoch_is_valid(0));
+        assert!(!managed_resize_epoch_is_valid(1_u64 << 63));
+        assert!(!managed_resize_epoch_is_valid(u64::MAX));
 
         let status = ServerMessage::ManagedResizeStatus(ManagedResizeStatus {
             pane: 7,

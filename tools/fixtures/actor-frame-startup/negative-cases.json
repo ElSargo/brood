@@ -1,0 +1,17 @@
+{
+  "wrong-actor": {"old": "actor=terminal-ui generation=8 token=23", "new": "actor=session-switcher generation=8 token=23"},
+  "wrong-generation": {"old": "actor=terminal-ui generation=8 token=23", "new": "actor=terminal-ui generation=7 token=23"},
+  "wrong-pane": {"old": "pane_count=1 panes=[10]", "new": "pane_count=1 panes=[11]"},
+  "wrong-pane-count": {"old": "pane_count=1 panes=[10]", "new": "pane_count=2 panes=[10]"},
+  "extra-pane-list": {"old": "pane_count=1 panes=[10]", "new": "pane_count=1 panes=[10,11]"},
+  "zero-token": {"old": "token=23 revision=12", "new": "token=0 revision=12"},
+  "zero-revision": {"old": "token=23 revision=12", "new": "token=23 revision=0"},
+  "promotion-before-start": {
+    "old": "started presentation WASM actor id=terminal-ui kind=wasm-component generation=8 pane=10 path=x\nrender scheduling actor-frame promoted actor=terminal-ui generation=8 token=23 revision=12 pane_count=1 panes=[10]",
+    "new": "render scheduling actor-frame promoted actor=terminal-ui generation=8 token=23 revision=12 pane_count=1 panes=[10]\nstarted presentation WASM actor id=terminal-ui kind=wasm-component generation=8 pane=10 path=x"
+  },
+  "restart-invalidates": {
+    "old": "render scheduling actor-frame promoted actor=session-switcher generation=2 token=20 revision=10 pane_count=1 panes=[15]",
+    "new": "render scheduling actor-frame promoted actor=session-switcher generation=2 token=20 revision=10 pane_count=1 panes=[15]\nstarted presentation WASM actor id=terminal-ui kind=wasm-component generation=9 pane=16 path=x"
+  }
+}

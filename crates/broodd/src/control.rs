@@ -78,8 +78,8 @@ const EXTENSION_INTERFACE: &str = "org.brood.Extension";
 const PLUGIN_INTERFACE: &str = "org.brood.Plugin";
 const AGENT_INTERFACE: &str = "org.brood.Agent";
 const CONTROL_REPLY_TIMEOUT: Duration = Duration::from_secs(15);
-const WORKTREE_REPLY_TIMEOUT: Duration = Duration::from_secs(120);
-const NATIVE_TOOL_REPLY_TIMEOUT: Duration = Duration::from_secs(120);
+const WORKTREE_REPLY_TIMEOUT: Duration = Duration::from_mins(2);
+const NATIVE_TOOL_REPLY_TIMEOUT: Duration = Duration::from_mins(2);
 const MAX_NATIVE_TOOL_REQUEST_BYTES: u64 = 1024 * 1024;
 
 type DbusMetadata = BTreeMap<String, String>;
@@ -1163,10 +1163,15 @@ pub fn listen(
     event_loop
         .handle()
         .insert_source(receiver, |event, (), state| {
+            let started = std::time::Instant::now();
+            let driver_before_micros = state.stats.smithay_driver_total_micros;
             let Event::Msg(request) = event else {
                 return;
             };
             execute_state_request(request, state);
+            state
+                .stats
+                .record_smithay_callback(started.elapsed(), driver_before_micros);
         })
         .map_err(|err| anyhow::anyhow!("insert DBus control request channel: {err:?}"))?;
 
@@ -1174,10 +1179,15 @@ pub fn listen(
     event_loop
         .handle()
         .insert_source(local_receiver, |event, (), state| {
+            let started = std::time::Instant::now();
+            let driver_before_micros = state.stats.smithay_driver_total_micros;
             let Event::Msg(request) = event else {
                 return;
             };
             execute_local_state_request(request, state);
+            state
+                .stats
+                .record_smithay_callback(started.elapsed(), driver_before_micros);
         })
         .map_err(|err| anyhow::anyhow!("insert private IPC request channel: {err:?}"))?;
 
@@ -1202,8 +1212,7 @@ fn start_native_tool_service(
     runtime: tokio::runtime::Handle,
 ) -> Result<PathBuf> {
     let runtime_root = env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(env::temp_dir)
+        .map_or_else(env::temp_dir, PathBuf::from)
         .join("brood");
     std::fs::create_dir_all(&runtime_root).with_context(|| {
         format!(
@@ -1350,7 +1359,7 @@ fn serve_local_control_connection(
                 )?;
             }
             Err(error) => {
-                connection.send(&brood_ipc::LocalControlResponse { result: Err(error) }, &[])?
+                connection.send(&brood_ipc::LocalControlResponse { result: Err(error) }, &[])?;
             }
         }
     }
@@ -2573,7 +2582,9 @@ fn execute_state_request(request: DbusStateRequest, state: &mut Brood) {
                     match serde_json::from_str::<brood_computer_use::ComputerScriptRequest>(payload)
                     {
                         Ok(request) => {
-                            crate::computer_use::begin_computer_use_script(state, request, response)
+                            crate::computer_use::begin_computer_use_script(
+                                state, request, response,
+                            );
                         }
                         Err(error) => send_response(response, Err(anyhow::anyhow!(error))),
                     }
@@ -3176,7 +3187,7 @@ fn open_presentation_fast_path(
         last_presented_sequence: None,
         in_flight_sequence: None,
         pending_redraw: false,
-        managed_resizes: Default::default(),
+        managed_resizes: crate::state::ManagedResizeCorrelations::default(),
     };
     state.dmabuf.fast_path = Some(fast_path);
     state.reconfigure_focus_stack();
@@ -3244,11 +3255,17 @@ fn open_presentation_fast_path(
 }
 
 fn drain_fast_path_actor_messages(state: &mut Brood) {
+    let started = std::time::Instant::now();
+    let driver_before_micros = state.stats.smithay_driver_total_micros;
     let Some(mut fast_path) = state.dmabuf.fast_path.take() else {
         return;
     };
     let mut messages = Vec::new();
-    while let Some(message) = fast_path.actor_messages.try_recv() {
+    let mut consumed = 0;
+    while consumed < crate::scheduling_domain::BACKEND_ACTOR_MESSAGES_PER_CALLBACK
+        && let Some(message) = fast_path.actor_messages.try_recv()
+    {
+        consumed += 1;
         if message.connection_generation() != fast_path.generation {
             continue;
         }
@@ -3262,7 +3279,19 @@ fn drain_fast_path_actor_messages(state: &mut Brood) {
         drop(message);
         messages.push((realm, decoded));
     }
+    let deferred =
+        usize::from(consumed == crate::scheduling_domain::BACKEND_ACTOR_MESSAGES_PER_CALLBACK);
     state.dmabuf.fast_path = Some(fast_path);
+    state
+        .stats
+        .backend_actor_messages
+        .record_batch(consumed, deferred);
+    if deferred > 0 {
+        let _deferred = state
+            .loop_handle
+            .insert_idle(drain_fast_path_actor_messages);
+        state.loop_signal.wakeup();
+    }
     for (realm, decoded) in messages {
         match (realm, decoded) {
             (Ok(brood_protocol::BackendActorRealm::Daemon), Ok((sender, recipient, body))) => {
@@ -3300,14 +3329,23 @@ fn drain_fast_path_actor_messages(state: &mut Brood) {
             (_, Err(error)) => warn!(error = %error, "rejected malformed actor-message record"),
         }
     }
+    state
+        .stats
+        .record_smithay_callback(started.elapsed(), driver_before_micros);
 }
 
 fn drain_fast_path_backend_requests(state: &mut Brood) {
+    let started = std::time::Instant::now();
+    let driver_before_micros = state.stats.smithay_driver_total_micros;
     let Some(mut fast_path) = state.dmabuf.fast_path.take() else {
         return;
     };
     let mut requests = Vec::new();
-    while let Some(message) = fast_path.backend_requests.try_recv() {
+    let mut consumed = 0;
+    while consumed < crate::scheduling_domain::BACKEND_REQUESTS_PER_CALLBACK
+        && let Some(message) = fast_path.backend_requests.try_recv()
+    {
+        consumed += 1;
         match message {
             Ok(message) => match message.value {
                 brood_ipc::BackendMessageValue::Request(request) => requests.push(request),
@@ -3318,7 +3356,18 @@ fn drain_fast_path_backend_requests(state: &mut Brood) {
             Err(error) => warn!(%error, "rejected malformed backend request"),
         }
     }
+    let deferred = usize::from(consumed == crate::scheduling_domain::BACKEND_REQUESTS_PER_CALLBACK);
     state.dmabuf.fast_path = Some(fast_path);
+    state
+        .stats
+        .backend_requests
+        .record_batch(consumed, deferred);
+    if deferred > 0 {
+        let _deferred = state
+            .loop_handle
+            .insert_idle(drain_fast_path_backend_requests);
+        state.loop_signal.wakeup();
+    }
 
     for request in requests {
         let response = execute_fast_path_backend_request(state, request);
@@ -3334,6 +3383,9 @@ fn drain_fast_path_backend_requests(state: &mut Brood) {
     if let Err(error) = state.display_handle.flush_clients() {
         warn!(?error, "flush clients after backend IPC request failed");
     }
+    state
+        .stats
+        .record_smithay_callback(started.elapsed(), driver_before_micros);
 }
 
 fn flush_fast_path_backend_responses(fast_path: &mut crate::state::PresentationFastPath) {
@@ -3488,6 +3540,8 @@ fn automation_input_disposition(state: &Brood, input: &InputEvent) -> Automation
 }
 
 fn drain_fast_path_input(state: &mut Brood) {
+    let started = std::time::Instant::now();
+    let driver_before_micros = state.stats.smithay_driver_total_micros;
     let Some(mut fast_path) = state.dmabuf.fast_path.take() else {
         return;
     };
@@ -3495,7 +3549,8 @@ fn drain_fast_path_input(state: &mut Brood) {
     let mut request_redraw = false;
     let mut disconnected = false;
     let mut publish_computer_use_update = false;
-    loop {
+    let mut consumed = 0;
+    while consumed < crate::scheduling_domain::SMITHAY_INPUT_EVENTS_PER_CALLBACK {
         crate::state::flush_managed_resize_statuses(&mut fast_path);
         if !fast_path.deferred_managed_resize_statuses.is_empty() {
             // The unread shared-memory input records remain owned by the
@@ -3507,9 +3562,8 @@ fn drain_fast_path_input(state: &mut Brood) {
             let Some(record) = fast_path.input.try_recv() else {
                 break;
             };
-            if record.connection_generation != fast_path.generation {
-                None
-            } else {
+            consumed += 1;
+            if record.connection_generation == fast_path.generation {
                 match brood_ipc::decode_client_record(&record) {
                     Ok(message) => Some(message),
                     Err(error) => {
@@ -3517,6 +3571,8 @@ fn drain_fast_path_input(state: &mut Brood) {
                         None
                     }
                 }
+            } else {
+                None
             }
         };
         let Some(message) = message else {
@@ -3673,6 +3729,7 @@ fn drain_fast_path_input(state: &mut Brood) {
                 pixel_height,
                 scale_120,
                 resize_epoch,
+                recover_through_epoch,
             }) => {
                 if state.computer_use_owns_pane(pane) {
                     if let Some(epoch) = resize_epoch {
@@ -3698,25 +3755,47 @@ fn drain_fast_path_input(state: &mut Brood) {
                     i32::try_from(logical_width).map_or(i32::MAX, |value| value),
                     i32::try_from(logical_height).map_or(i32::MAX, |value| value),
                 );
-                let configured = if let Some(epoch) = resize_epoch {
-                    state.configure_tagged_presentation_client_pane_size(
-                        &mut fast_path,
+                let Some(authority) = crate::state::managed_resize_request_authority(
+                    resize_epoch,
+                    recover_through_epoch,
+                ) else {
+                    warn!(
                         pane,
-                        logical_size,
-                        (
-                            i32::try_from(pixel_width).map_or(i32::MAX, |value| value),
-                            i32::try_from(pixel_height).map_or(i32::MAX, |value| value),
+                        ?resize_epoch,
+                        ?recover_through_epoch,
+                        "rejected invalid managed resize authority"
+                    );
+                    continue;
+                };
+                let configured = match authority {
+                    crate::state::ManagedResizeRequestAuthority::Tagged(epoch) => state
+                        .configure_tagged_presentation_client_pane_size(
+                            &mut fast_path,
+                            pane,
+                            logical_size,
+                            (
+                                i32::try_from(pixel_width).map_or(i32::MAX, |value| value),
+                                i32::try_from(pixel_height).map_or(i32::MAX, |value| value),
+                            ),
+                            scale_120,
+                            epoch,
                         ),
-                        scale_120,
-                        epoch,
-                    )
-                } else {
-                    state.restart_ordinary_presentation_client_pane_size(
+                    crate::state::ManagedResizeRequestAuthority::RecoverThrough(
+                        recover_through_epoch,
+                    ) => state.recover_ordinary_presentation_client_pane_size(
                         &mut fast_path,
                         pane,
                         logical_size.0,
                         logical_size.1,
-                    )
+                        recover_through_epoch,
+                    ),
+                    crate::state::ManagedResizeRequestAuthority::Ordinary => state
+                        .restart_ordinary_presentation_client_pane_size(
+                            &mut fast_path,
+                            pane,
+                            logical_size.0,
+                            logical_size.1,
+                        ),
                 };
                 if configured {
                     request_redraw = true;
@@ -3744,6 +3823,13 @@ fn drain_fast_path_input(state: &mut Brood) {
             }
         }
     }
+    let deferred = usize::from(
+        !disconnected && consumed == crate::scheduling_domain::SMITHAY_INPUT_EVENTS_PER_CALLBACK,
+    );
+    state
+        .stats
+        .smithay_input_events
+        .record_batch(consumed, deferred);
     if disconnected {
         state.dmabuf.fast_path_input_draining = false;
         state.set_presentation_window_focused(false);
@@ -3752,6 +3838,10 @@ fn drain_fast_path_input(state: &mut Brood) {
     } else {
         state.dmabuf.fast_path = Some(fast_path);
         state.dmabuf.fast_path_input_draining = false;
+        if deferred > 0 {
+            let _deferred = state.loop_handle.insert_idle(drain_fast_path_input);
+            state.loop_signal.wakeup();
+        }
     }
     if publish_computer_use_update
         && let Err(error) = crate::computer_use::publish_observer_update(state)
@@ -3764,6 +3854,9 @@ fn drain_fast_path_input(state: &mut Brood) {
     if let Err(error) = state.display_handle.flush_clients() {
         warn!(?error, "flush clients after fast-path input failed");
     }
+    state
+        .stats
+        .record_smithay_callback(started.elapsed(), driver_before_micros);
 }
 
 fn latest_dmabuf_frame(state: &Brood) -> Result<DbusDmabufFrame> {
@@ -4016,6 +4109,10 @@ fn execute_tokens(tokens: &[String], state: &mut Brood) -> Result<String> {
         }
         "status-json" if args.is_empty() => {
             format!("{}\n", status_json_string(state)?)
+        }
+        "render-scheduling-metrics-reset" if args.is_empty() => {
+            state.stats.reset_smithay_hot_path_metrics();
+            "OK render-scheduling metrics reset\n".to_owned()
         }
         "computer-use" => match args {
             [subcommand, session] if subcommand == "windows" => {
@@ -4627,6 +4724,48 @@ fn plug_wasm_module(
 #[derive(serde::Serialize)]
 struct StatusSnapshot {
     wayland_display: String,
+    smithay_callback_count: u64,
+    smithay_callback_over_budget: u64,
+    smithay_callback_lifetime_over_budget: u64,
+    smithay_callback_last_us: u64,
+    smithay_callback_p99_us: u64,
+    smithay_callback_max_us: u64,
+    smithay_callback_lifetime_max_us: u64,
+    smithay_callback_retained_samples: usize,
+    smithay_callback_sample_capacity: usize,
+    smithay_callback_excludes_driver_calls: bool,
+    smithay_driver_call_count: u64,
+    smithay_driver_call_last_us: u64,
+    smithay_driver_call_p99_us: u64,
+    smithay_driver_call_max_us: u64,
+    smithay_driver_call_lifetime_max_us: u64,
+    smithay_driver_call_retained_samples: usize,
+    smithay_driver_call_sample_capacity: usize,
+    backend_actor_events_completed: u64,
+    backend_actor_event_deferred_turns: u64,
+    backend_actor_event_drops: u64,
+    backend_actor_event_last_batch: usize,
+    backend_actor_event_max_batch: usize,
+    backend_actor_event_max_backlog: usize,
+    backend_actor_progress_by_actor: BTreeMap<String, u64>,
+    backend_actor_progress_capacity: usize,
+    backend_actor_messages_completed: u64,
+    backend_actor_message_deferred_turns: u64,
+    backend_actor_message_drops: u64,
+    backend_actor_message_max_backlog: usize,
+    backend_requests_completed: u64,
+    backend_request_deferred_turns: u64,
+    backend_request_drops: u64,
+    backend_request_max_backlog: usize,
+    smithay_input_events_completed: u64,
+    smithay_input_deferred_turns: u64,
+    smithay_input_drops: u64,
+    smithay_input_max_backlog: usize,
+    backend_lifecycle_admitted: u64,
+    backend_lifecycle_completed: u64,
+    backend_lifecycle_drops: u64,
+    backend_lifecycle_depth: usize,
+    backend_lifecycle_max_depth: usize,
     wayland_client_insert_errors: u64,
     wayland_dispatch_errors: u64,
     xdg_configure_errors: u64,
@@ -4808,9 +4947,59 @@ impl StatusSnapshot {
         let filesystem_watcher_stats = state.filesystem_watcher_stats();
         let hosted_filesystem_watch_stats = state.hosted_filesystem_watch_stats();
         let hosted_runtime_io_stats = state.hosted_runtime_io_stats();
+        let smithay_callbacks = state.stats.smithay_callbacks.snapshot();
+        let smithay_driver_calls = state.stats.smithay_driver_calls.snapshot();
+        let backend_actor_events = state.stats.backend_actor_events;
+        let backend_actor_messages = state.stats.backend_actor_messages;
+        let backend_requests = state.stats.backend_requests;
+        let smithay_input_events = state.stats.smithay_input_events;
+        let backend_lifecycle = state.stats.backend_lifecycle;
 
         Self {
             wayland_display: state.socket_name.to_string_lossy().into_owned(),
+            smithay_callback_count: smithay_callbacks.callbacks,
+            smithay_callback_over_budget: smithay_callbacks.over_budget,
+            smithay_callback_lifetime_over_budget: smithay_callbacks.lifetime_over_budget,
+            smithay_callback_last_us: smithay_callbacks.last_micros,
+            smithay_callback_p99_us: smithay_callbacks.p99_micros,
+            smithay_callback_max_us: smithay_callbacks.maximum_micros,
+            smithay_callback_lifetime_max_us: smithay_callbacks.lifetime_maximum_micros,
+            smithay_callback_retained_samples: smithay_callbacks.retained_samples,
+            smithay_callback_sample_capacity: smithay_callbacks.sample_capacity,
+            smithay_callback_excludes_driver_calls: true,
+            smithay_driver_call_count: smithay_driver_calls.callbacks,
+            smithay_driver_call_last_us: smithay_driver_calls.last_micros,
+            smithay_driver_call_p99_us: smithay_driver_calls.p99_micros,
+            smithay_driver_call_max_us: smithay_driver_calls.maximum_micros,
+            smithay_driver_call_lifetime_max_us: smithay_driver_calls.lifetime_maximum_micros,
+            smithay_driver_call_retained_samples: smithay_driver_calls.retained_samples,
+            smithay_driver_call_sample_capacity: smithay_driver_calls.sample_capacity,
+            backend_actor_events_completed: backend_actor_events.completed,
+            backend_actor_event_deferred_turns: backend_actor_events.deferred_turns,
+            backend_actor_event_drops: backend_actor_events.dropped,
+            backend_actor_event_last_batch: backend_actor_events.last_batch,
+            backend_actor_event_max_batch: backend_actor_events.maximum_batch,
+            backend_actor_event_max_backlog: backend_actor_events.maximum_backlog,
+            backend_actor_progress_by_actor: state.backend_actor_progress_snapshot(),
+            backend_actor_progress_capacity:
+                crate::scheduling_domain::BACKEND_ACTOR_PROGRESS_CAPACITY,
+            backend_actor_messages_completed: backend_actor_messages.completed,
+            backend_actor_message_deferred_turns: backend_actor_messages.deferred_turns,
+            backend_actor_message_drops: backend_actor_messages.dropped,
+            backend_actor_message_max_backlog: backend_actor_messages.maximum_backlog,
+            backend_requests_completed: backend_requests.completed,
+            backend_request_deferred_turns: backend_requests.deferred_turns,
+            backend_request_drops: backend_requests.dropped,
+            backend_request_max_backlog: backend_requests.maximum_backlog,
+            smithay_input_events_completed: smithay_input_events.completed,
+            smithay_input_deferred_turns: smithay_input_events.deferred_turns,
+            smithay_input_drops: smithay_input_events.dropped,
+            smithay_input_max_backlog: smithay_input_events.maximum_backlog,
+            backend_lifecycle_admitted: backend_lifecycle.admitted,
+            backend_lifecycle_completed: backend_lifecycle.completed,
+            backend_lifecycle_drops: backend_lifecycle.dropped,
+            backend_lifecycle_depth: backend_lifecycle.current_depth,
+            backend_lifecycle_max_depth: backend_lifecycle.maximum_backlog,
             wayland_client_insert_errors: state.stats.wayland_client_insert_errors,
             wayland_dispatch_errors: state.stats.wayland_dispatch_errors,
             xdg_configure_errors: state.stats.xdg_configure_errors,

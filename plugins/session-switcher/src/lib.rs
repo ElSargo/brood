@@ -1495,6 +1495,15 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
             redraw_or_record_error(&mut state);
             Vec::new()
         }
+        PresentationEvent::RenderHint(hint) => {
+            if let Err(error) =
+                brood_plugin_sdk::graphics::render_with_hint(&hint, || redraw(&mut state, None))
+            {
+                state.error = true;
+                state.status = error;
+            }
+            Vec::new()
+        }
         _ => Vec::new(),
     }
 }
@@ -4173,6 +4182,23 @@ fn resize_paint_plan(
 }
 
 fn paint_for_resize_or_record_error(state: &mut SwitcherState, paint: ResizePaintPlan) {
+    if !brood_plugin_sdk::graphics::render_is_active() {
+        let result = match paint {
+            ResizePaintPlan::OrdinaryRedraw => brood_plugin_sdk::graphics::request_render(),
+            ResizePaintPlan::TaggedRedraw(resize_epoch) => {
+                brood_plugin_sdk::graphics::request_render_for_resize(
+                    state.pane,
+                    Some(resize_epoch),
+                )
+            }
+            ResizePaintPlan::Reuse(resize_epoch) => reuse_pane_content(state.pane, resize_epoch),
+        };
+        if let Err(error) = result {
+            state.error = true;
+            state.status = error;
+        }
+        return;
+    }
     let result = match paint {
         ResizePaintPlan::OrdinaryRedraw => redraw(state, None),
         ResizePaintPlan::TaggedRedraw(resize_epoch) => redraw(state, Some(resize_epoch))
@@ -4193,7 +4219,12 @@ fn redraw_for_resize_or_record_error(state: &mut SwitcherState, resize_epoch: Op
     if state.pane == 0 {
         return;
     }
-    if let Err(error) = redraw(state, resize_epoch) {
+    let result = if brood_plugin_sdk::graphics::render_is_active() {
+        redraw(state, resize_epoch)
+    } else {
+        brood_plugin_sdk::graphics::request_render_for_resize(state.pane, resize_epoch)
+    };
+    if let Err(error) = result {
         state.error = true;
         state.status = error;
     }
@@ -4565,7 +4596,7 @@ fn redraw_with_cache(
         state.width - 28.0,
     )?;
 
-    cache.submit(resize_epoch, &packet)?;
+    cache.queue(resize_epoch, &packet)?;
     Ok(())
 }
 
@@ -5823,9 +5854,11 @@ mod tests {
         let groups = state.project_groups();
         assert_eq!(groups.len(), 1);
         assert!(groups[0].git);
-        assert!(creation_backend_items(&state)
-            .iter()
-            .any(|item| item.value.action.as_deref() == Some("create-worktree")));
+        assert!(
+            creation_backend_items(&state)
+                .iter()
+                .any(|item| item.value.action.as_deref() == Some("create-worktree"))
+        );
     }
 
     #[test]
@@ -5861,9 +5894,11 @@ mod tests {
 
         assert_eq!(state.sessions.len(), 1);
         assert_eq!(state.sessions[0].id, 3);
-        assert!(creation_backend_items(&state)
-            .iter()
-            .any(|item| item.value.action.as_deref() == Some("create-worktree")));
+        assert!(
+            creation_backend_items(&state)
+                .iter()
+                .any(|item| item.value.action.as_deref() == Some("create-worktree"))
+        );
 
         apply_backend_sessions(
             &mut state,

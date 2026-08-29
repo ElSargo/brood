@@ -132,9 +132,16 @@ impl CompositorHandler for Brood {
                                     let result = state.loop_handle.insert_source(
                                         source,
                                         move |(), (), data| {
+                                            let started = std::time::Instant::now();
+                                            let driver_before_micros =
+                                                data.stats.smithay_driver_total_micros;
                                             let display_handle = data.display_handle.clone();
                                             data.client_compositor_state(&client)
                                                 .blocker_cleared(data, &display_handle);
+                                            data.stats.record_smithay_callback(
+                                                started.elapsed(),
+                                                driver_before_micros,
+                                            );
                                             Ok(())
                                         },
                                     );
@@ -169,9 +176,16 @@ impl CompositorHandler for Brood {
                         if let Some(client) = surface.client() {
                             let result =
                                 state.loop_handle.insert_source(source, move |(), _, data| {
+                                    let started = std::time::Instant::now();
+                                    let driver_before_micros =
+                                        data.stats.smithay_driver_total_micros;
                                     let display_handle = data.display_handle.clone();
                                     data.client_compositor_state(&client)
                                         .blocker_cleared(data, &display_handle);
+                                    data.stats.record_smithay_callback(
+                                        started.elapsed(),
+                                        driver_before_micros,
+                                    );
                                     Ok(())
                                 });
                             match result {

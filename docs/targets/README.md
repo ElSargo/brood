@@ -27,6 +27,7 @@ design-level tensions in [[../frictions/README]].
 - [[systems/layout-actor]]
 - [[systems/plugin-ui]]
 - [[systems/plugin-graphics]]
+- [[systems/render-scheduling]]
 - [[systems/plugin-advanced-graphics]]
 - [[systems/terminal-plugin]]
 - [[systems/editor-plugin]]

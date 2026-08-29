@@ -54,7 +54,7 @@ impl SceneCompileError {
 type CompileResult<T> = std::result::Result<T, SceneCompileError>;
 
 #[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
 struct CanvasVertex {
     position: [f32; 2],
     uv: [f32; 2],
@@ -181,6 +181,29 @@ pub struct GpuCanvasScene {
     scratch: CanvasTarget,
     stencil: StencilTarget,
     dirty: bool,
+}
+
+/// CPU-side lowering produced away from Winit's latency-critical thread.
+///
+/// GPU allocation and resource reuse remain on the renderer thread, but path
+/// tessellation, command validation, and draw-list construction happen before
+/// this value is returned by the bounded graphics-preparation lane.
+#[derive(Debug)]
+pub struct PreparedCanvasScene {
+    snapshot: GraphicsSnapshot,
+    width: u32,
+    height: u32,
+    scale: f32,
+    vertices: Vec<CanvasVertex>,
+    indices: Vec<u32>,
+    ops: Vec<CanvasOp>,
+    layer_count: usize,
+    preparation_us: u128,
+}
+
+#[derive(Clone)]
+pub struct GpuCanvasPreparationContext {
+    glyph_atlas: BTreeMap<GlyphCacheKey, GlyphAtlasEntry>,
 }
 
 impl GpuCanvasScene {
@@ -381,6 +404,56 @@ impl GpuGlyphAtlas {
 }
 
 impl GpuCanvasRenderer {
+    pub fn preparation_context(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        snapshot: &GraphicsSnapshot,
+    ) -> Result<GpuCanvasPreparationContext> {
+        for (key, resource) in &snapshot.glyphs {
+            self.glyph_atlas.ensure(
+                device,
+                queue,
+                &self.texture_layout,
+                &self.sampler,
+                *key,
+                resource,
+            )?;
+        }
+        Ok(GpuCanvasPreparationContext {
+            glyph_atlas: self.glyph_atlas.entries.clone(),
+        })
+    }
+
+    pub fn prepare(
+        snapshot: GraphicsSnapshot,
+        extent: (u32, u32, f32),
+        context: &GpuCanvasPreparationContext,
+    ) -> Result<PreparedCanvasScene> {
+        let started = Instant::now();
+        let (width, height, scale) = extent;
+        let mut compiler = SceneCompiler::new(width, height, scale);
+        compiler.compile(&snapshot, Some(&context.glyph_atlas))?;
+        let SceneCompiler {
+            vertices,
+            indices,
+            ops,
+            layer_count,
+            ..
+        } = compiler;
+        Ok(PreparedCanvasScene {
+            snapshot,
+            width,
+            height,
+            scale,
+            vertices,
+            indices,
+            ops,
+            layer_count,
+            preparation_us: started.elapsed().as_micros(),
+        })
+    }
+
     pub fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -513,35 +586,25 @@ impl GpuCanvasRenderer {
         }
     }
 
-    pub fn compile(
-        &mut self,
+    pub fn finish_prepared(
+        &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        snapshot: &GraphicsSnapshot,
-        extent: (u32, u32, f32),
+        prepared: PreparedCanvasScene,
         previous: Option<&GpuCanvasScene>,
-    ) -> Result<GpuCanvasScene> {
+    ) -> GpuCanvasScene {
         let started = Instant::now();
-        let (width, height, scale) = extent;
-        for (key, resource) in &snapshot.glyphs {
-            self.glyph_atlas.ensure(
-                device,
-                queue,
-                &self.texture_layout,
-                &self.sampler,
-                *key,
-                resource,
-            )?;
-        }
-        let mut compiler = SceneCompiler::new(width, height, scale);
-        compiler.compile(snapshot, Some(&self.glyph_atlas.entries))?;
-        let SceneCompiler {
+        let PreparedCanvasScene {
+            snapshot,
+            width,
+            height,
+            scale,
             vertices,
             indices,
             ops,
             layer_count,
-            ..
-        } = compiler;
+            preparation_us,
+        } = prepared;
         let fallback_vertex = CanvasVertex::zeroed();
         let fallback_index = 0_u32;
         let vertex_bytes = if vertices.is_empty() {
@@ -607,7 +670,7 @@ impl GpuCanvasRenderer {
         if snapshot.sequence <= 3 || snapshot.sequence.is_multiple_of(120) || elapsed >= SLOW_FRAME
         {
             eprintln!(
-                "compiled plugin GPU scene pane={} sequence={} commands={} draws={} vertices={} indices={} layers={} glyph_atlas_pages={} cached_glyphs={} time_us={}",
+                "compiled plugin GPU scene pane={} sequence={} commands={} draws={} vertices={} indices={} layers={} glyph_atlas_pages={} cached_glyphs={} preparation_us={} gpu_finish_us={}",
                 snapshot.pane,
                 snapshot.sequence,
                 snapshot.packet.commands.len(),
@@ -619,10 +682,11 @@ impl GpuCanvasRenderer {
                 layer_count,
                 self.glyph_atlas.pages.len(),
                 self.glyph_atlas.entries.len(),
+                preparation_us,
                 elapsed.as_micros(),
             );
         }
-        Ok(GpuCanvasScene {
+        GpuCanvasScene {
             pane: snapshot.pane,
             sequence: snapshot.sequence,
             width,
@@ -637,7 +701,7 @@ impl GpuCanvasRenderer {
             scratch,
             stencil,
             dirty: true,
-        })
+        }
     }
 
     pub fn encode_if_dirty(

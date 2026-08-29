@@ -44,6 +44,8 @@ MANIFEST="$OUT/frame-manifest.jsonl"
 EVIDENCE="$OUT/evidence.json"
 METRICS="$OUT/metrics.json"
 PROOF="$OUT/proof.json"
+TOPOLOGY_PROOF="$OUT/managed-topology.json"
+ACTOR_FRAME_PROOF="$OUT/actor-frame-startup.json"
 ANALYSIS_LOG="$OUT/analysis-errors.log"
 CONFIG="$OUT/brood.toml"
 DATA_HOME="$OUT/data"
@@ -124,6 +126,7 @@ componentize_session_init() {
 build_fixture() {
   local generated="$OUT/generated"
   local protocols
+  local -a wayland_build_flags
   mkdir -p "$generated"
   protocols="$(pkg-config --variable=pkgdatadir wayland-protocols)"
   for spec in \
@@ -134,13 +137,14 @@ build_fixture() {
     wayland-scanner client-header "$protocols/$spec.xml" "$generated/$stem-client-protocol.h"
     wayland-scanner private-code "$protocols/$spec.xml" "$generated/$stem-protocol.c"
   done
+  read -r -a wayland_build_flags <<< "$(pkg-config --cflags --libs wayland-client)"
   cc -std=c11 -Wall -Wextra -Werror -I "$generated" \
     tools/managed-resize-shm-client.c \
     "$generated/xdg-shell-protocol.c" \
     "$generated/viewporter-protocol.c" \
     "$generated/fractional-scale-v1-protocol.c" \
     -o "$OUT/managed-resize-shm-client" \
-    $(pkg-config --cflags --libs wayland-client)
+    "${wayland_build_flags[@]}"
 }
 
 cargo build -p broodd -p brood-client --bins --locked
@@ -190,6 +194,7 @@ MODE_HEIGHT="$(jq -r 'map(select(.active))[0].current_mode.height' <<< "$OUTPUTS
 
 env -u brood_session -u BROOD_SURFACE_SESSION_ID -u BROOD_PANE_ID \
   XDG_DATA_HOME="$DATA_HOME" \
+  BROOD_TRACE_RESIZE=1 \
   RUST_LOG="${BROOD_MANAGED_SERVER_RUST_LOG:-broodd=info,smithay=warn}" \
   target/debug/brood-sessiond --headless --no-default-modules \
   --config "$CONFIG" --dbus-destination "$DBUS_DESTINATION" \
@@ -241,33 +246,32 @@ CLIENT_PID=$!
 for _ in $(seq 1 1200); do
   TERMINAL_UI_PANE="$(sed -n 's/.*started presentation WASM actor id=terminal-ui .* pane=\([0-9][0-9]*\) .*/\1/p' "$CLIENT_LOG" | tail -n 1)"
   SESSION_SWITCHER_PANE="$(sed -n 's/.*started presentation WASM actor id=session-switcher .* pane=\([0-9][0-9]*\) .*/\1/p' "$CLIENT_LOG" | tail -n 1)"
-  # Child layouts can publish several earlier dividers. Derive the root shell
-  # boundary from its visible sidebar instead of selecting arbitrary chrome.
-  READY_DIVIDER="$(awk -v pane="$SESSION_SWITCHER_PANE" '
-    pane != "" && index($0, "accepted plugin draw packet pane=" pane " ") != 0 \
-      && $0 ~ /gpu_target=[0-9]+x/ {
-        sidebar = $0;
-        sub(/^.* gpu_target=/, "", sidebar);
-        sub(/x.*/, "", sidebar);
-      }
-    index($0, "granted rest layout lease ") != 0 \
-      && index($0, " actor=workspace panes=4") != 0 { rest = NR; next }
-    rest > 0 && index($0, "resize-present ") != 0 \
-      && index($0, " phase=settled ") != 0 \
-      && $0 ~ /composition_size=[0-9]+x/ && sidebar > 0 {
-        composition = $0;
-        sub(/^.* composition_size=/, "", composition);
-        sub(/x.*/, "", composition);
-        print NR "\t" composition - sidebar;
-        exit;
-      }
-  ' "$CLIENT_LOG")"
+  TOPOLOGY_SETUP_JSON="$(python3 tools/check-managed-resize-topology.py --setup "$CLIENT_LOG" 2>/dev/null || true)"
+  TOPOLOGY_REST_LINE=""
+  TOPOLOGY_QUIESCENT_LINE=""
+  if [[ -n "$TOPOLOGY_SETUP_JSON" ]] && jq -e '.verified == true and .phase == "setup"' <<< "$TOPOLOGY_SETUP_JSON" >/dev/null; then
+    TOPOLOGY_REST_LINE="$(jq -r '.rest_grant_line' <<< "$TOPOLOGY_SETUP_JSON")"
+    TOPOLOGY_QUIESCENT_LINE="$(jq -r '.quiescent_line' <<< "$TOPOLOGY_SETUP_JSON")"
+  fi
+  ACTOR_FRAME_JSON="$(python3 tools/check-actor-frame-startup.py "$CLIENT_LOG" 2>/dev/null || true)"
+  ACTOR_FRAMES_READY=""
+  if [[ -n "$ACTOR_FRAME_JSON" ]] && jq -e '.verified == true' <<< "$ACTOR_FRAME_JSON" >/dev/null; then
+    ACTOR_FRAMES_READY=1
+  fi
+  # Setup accepts either an exact stable leased layout or a fully validated
+  # native-bootstrap transaction. Interactive synchronization starts only
+  # after that explicit setup anchor is quiescent.
+  READY_DIVIDER=""
+  if [[ -n "$TOPOLOGY_REST_LINE" ]]; then
+    READY_DIVIDER="$(jq -r '[.divider_line,.ready_divider] | @tsv' <<< "$TOPOLOGY_SETUP_JSON")"
+  fi
   if rg -q 'granted claimed root layout lease actor=session-switcher ' "$CLIENT_LOG" \
-    && rg -q 'granted rest layout lease .* actor=workspace panes=4' "$CLIENT_LOG" \
+    && [[ -n "$TOPOLOGY_REST_LINE" ]] \
+    && [[ -n "$TOPOLOGY_QUIESCENT_LINE" ]] \
     && rg -q 'started component plugin actor actor=brood[.]session[.][0-9]+[.]terminal-session ' "$SERVER_LOG" \
     && [[ -n "$SESSION_SWITCHER_PANE" ]] \
     && [[ -n "$TERMINAL_UI_PANE" ]] \
-    && rg -q "accepted plugin draw packet pane=$TERMINAL_UI_PANE " "$CLIENT_LOG" \
+    && [[ -n "$ACTOR_FRAMES_READY" ]] \
     && [[ "$(rg -c 'uploaded window shared-memory image' "$CLIENT_LOG" || true)" -ge 2 ]] \
     && [[ -n "$READY_DIVIDER" ]]; then
     break
@@ -275,11 +279,16 @@ for _ in $(seq 1 1200); do
   kill -0 "$CLIENT_PID" 2>/dev/null || exit 1
   sleep 0.02
 done
-rg -q 'granted rest layout lease .* actor=workspace panes=4' "$CLIENT_LOG"
+[[ -n "$TOPOLOGY_SETUP_JSON" ]]
+jq -e '.verified == true and .phase == "setup" and (.ordinary_routes | length) == 2' \
+  <<< "$TOPOLOGY_SETUP_JSON" >/dev/null
+[[ "$TOPOLOGY_QUIESCENT_LINE" =~ ^[1-9][0-9]*$ ]]
+[[ -n "$ACTOR_FRAME_JSON" ]]
+jq -e '.verified == true' <<< "$ACTOR_FRAME_JSON" >/dev/null
+printf '%s\n' "$ACTOR_FRAME_JSON" > "$ACTOR_FRAME_PROOF"
 rg -q 'started component plugin actor actor=brood[.]session[.][0-9]+[.]terminal-session ' "$SERVER_LOG"
 [[ -n "$SESSION_SWITCHER_PANE" ]]
 [[ -n "$TERMINAL_UI_PANE" ]]
-rg -q "accepted plugin draw packet pane=$TERMINAL_UI_PANE " "$CLIENT_LOG"
 [[ -n "$READY_DIVIDER" ]]
 
 start_pointer() {
@@ -319,6 +328,122 @@ wait_pattern() {
 field() {
   sed -n "s/.* $1=\\([^ ]*\\).*/\\1/p" <<< "$2"
 }
+
+# A post-grant startup/native transaction is optional. The product-owned setup
+# watermark proves native/synchronized/presentation state is fully quiescent;
+# the setup validator covers the complete selected setup-anchor-to-watermark
+# interval and rejects ambiguity rather than silently draining only one of
+# multiple acceptances.
+SETUP_ANCHOR_KIND="$(jq -r '.anchor_kind' <<< "$TOPOLOGY_SETUP_JSON")"
+STARTUP_SCAN_LINE="$(jq -r '.anchor_start_line' <<< "$TOPOLOGY_SETUP_JSON")"
+STARTUP_QUIESCENT_LINE="$(jq -r '.quiescent_line' <<< "$TOPOLOGY_SETUP_JSON")"
+STARTUP_ACCEPT_COUNT="$(jq -r '.startup_acceptances | length' <<< "$TOPOLOGY_SETUP_JSON")"
+[[ "$SETUP_ANCHOR_KIND" == leased || "$SETUP_ANCHOR_KIND" == native-bootstrap ]]
+[[ "$STARTUP_SCAN_LINE" =~ ^[1-9][0-9]*$ ]]
+[[ "$STARTUP_ACCEPT_COUNT" =~ ^[01]$ ]]
+if [[ "$SETUP_ANCHOR_KIND" == native-bootstrap ]]; then
+  [[ "$STARTUP_ACCEPT_COUNT" == 1 ]]
+  [[ "$(jq -r '.anchor_accept_line' <<< "$TOPOLOGY_SETUP_JSON")" == \
+    "$(jq -r '.startup_acceptances[0].line' <<< "$TOPOLOGY_SETUP_JSON")" ]]
+fi
+if [[ "$STARTUP_ACCEPT_COUNT" == 1 ]]; then
+  read -r STARTUP_ACCEPT_LINE STARTUP_EPOCH < <(
+    jq -r '.startup_acceptances[0] | [.line,.epoch] | @tsv' <<< "$TOPOLOGY_SETUP_JSON"
+  )
+  [[ "$STARTUP_ACCEPT_LINE" =~ ^[1-9][0-9]*$ && "$STARTUP_EPOCH" =~ ^[1-9][0-9]*$ ]]
+  ((STARTUP_SCAN_LINE < STARTUP_ACCEPT_LINE && STARTUP_ACCEPT_LINE < STARTUP_QUIESCENT_LINE))
+  wait_pattern "$CLIENT_LOG" "$STARTUP_ACCEPT_LINE" "^(completed|degraded) synchronized layout actor=session-switcher .* epoch=$STARTUP_EPOCH " 1600
+  STARTUP_TERMINAL_LINE="$WAIT_LINE"
+  STARTUP_TERMINAL_TEXT="$WAIT_TEXT"
+  if [[ "$STARTUP_TERMINAL_TEXT" == degraded\ synchronized\ layout* ]]; then
+  STARTUP_DEGRADED_LINE="$STARTUP_TERMINAL_LINE"
+  STARTUP_DEGRADED_EPOCH="$STARTUP_EPOCH"
+  wait_pattern "$SERVER_LOG" 0 "accepted and armed ordinary managed recovery .*pane=$BACKEND_PANE_A .*recover_through_epoch=$STARTUP_DEGRADED_EPOCH .*recovery_floor=[0-9]+ .*retired=" 1600
+  STARTUP_RECOVERY_ARM_A_LINE="$WAIT_LINE"; STARTUP_RECOVERY_ARM_A_TEXT="$WAIT_TEXT"
+  wait_pattern "$SERVER_LOG" 0 "accepted and armed ordinary managed recovery .*pane=$BACKEND_PANE_B .*recover_through_epoch=$STARTUP_DEGRADED_EPOCH .*recovery_floor=[0-9]+ .*retired=" 1600
+  STARTUP_RECOVERY_ARM_B_LINE="$WAIT_LINE"; STARTUP_RECOVERY_ARM_B_TEXT="$WAIT_TEXT"
+  wait_pattern "$SERVER_LOG" 0 "ordinary managed recovery configure issued .*pane=$BACKEND_PANE_A .*recover_through_epoch=$STARTUP_DEGRADED_EPOCH .*serial=[0-9]+ " 1600
+  STARTUP_RECOVERY_CONFIGURE_A_LINE="$WAIT_LINE"; STARTUP_RECOVERY_CONFIGURE_A_TEXT="$WAIT_TEXT"
+  wait_pattern "$SERVER_LOG" 0 "ordinary managed recovery configure issued .*pane=$BACKEND_PANE_B .*recover_through_epoch=$STARTUP_DEGRADED_EPOCH .*serial=[0-9]+ " 1600
+  STARTUP_RECOVERY_CONFIGURE_B_LINE="$WAIT_LINE"; STARTUP_RECOVERY_CONFIGURE_B_TEXT="$WAIT_TEXT"
+  STARTUP_RECOVERY_SERIAL_A="$(field serial "$STARTUP_RECOVERY_CONFIGURE_A_TEXT")"
+  STARTUP_RECOVERY_SERIAL_B="$(field serial "$STARTUP_RECOVERY_CONFIGURE_B_TEXT")"
+  STARTUP_RECOVERY_ARM_SERIAL_A="$(field serial "$STARTUP_RECOVERY_ARM_A_TEXT")"
+  STARTUP_RECOVERY_ARM_SERIAL_B="$(field serial "$STARTUP_RECOVERY_ARM_B_TEXT")"
+  [[ "$STARTUP_RECOVERY_SERIAL_A" =~ ^[1-9][0-9]*$ && "$STARTUP_RECOVERY_SERIAL_B" =~ ^[1-9][0-9]*$ ]]
+  [[ "$STARTUP_RECOVERY_ARM_SERIAL_A" == "$STARTUP_RECOVERY_SERIAL_A" ]]
+  [[ "$STARTUP_RECOVERY_ARM_SERIAL_B" == "$STARTUP_RECOVERY_SERIAL_B" ]]
+  ((STARTUP_RECOVERY_CONFIGURE_A_LINE < STARTUP_RECOVERY_ARM_A_LINE))
+  ((STARTUP_RECOVERY_CONFIGURE_B_LINE < STARTUP_RECOVERY_ARM_B_LINE))
+  wait_pattern "$FIXTURE_A_LOG" 0 "event=configure-ack .*serial=$STARTUP_RECOVERY_SERIAL_A " 1600
+  STARTUP_RECOVERY_ACK_A_LINE="$WAIT_LINE"
+  wait_pattern "$FIXTURE_A_LOG" "$STARTUP_RECOVERY_ACK_A_LINE" "event=commit .*serial=$STARTUP_RECOVERY_SERIAL_A .*kind=exact " 1600
+  STARTUP_RECOVERY_FIXTURE_COMMIT_A_LINE="$WAIT_LINE"
+  wait_pattern "$FIXTURE_B_LOG" 0 "event=configure-ack .*serial=$STARTUP_RECOVERY_SERIAL_B " 1600
+  STARTUP_RECOVERY_ACK_B_LINE="$WAIT_LINE"
+  wait_pattern "$FIXTURE_B_LOG" "$STARTUP_RECOVERY_ACK_B_LINE" "event=commit .*serial=$STARTUP_RECOVERY_SERIAL_B .*kind=exact " 1600
+  STARTUP_RECOVERY_FIXTURE_COMMIT_B_LINE="$WAIT_LINE"
+  STARTUP_RECOVERY_FLOOR_A="$(field recovery_floor "$STARTUP_RECOVERY_ARM_A_TEXT")"
+  STARTUP_RECOVERY_FLOOR_B="$(field recovery_floor "$STARTUP_RECOVERY_ARM_B_TEXT")"
+  [[ "$STARTUP_RECOVERY_FLOOR_A" =~ ^[0-9]+$ && "$STARTUP_RECOVERY_FLOOR_B" =~ ^[0-9]+$ ]]
+  wait_pattern "$SERVER_LOG" "$STARTUP_RECOVERY_ARM_A_LINE" "ordinary managed recovery commit observed .*pane=$BACKEND_PANE_A .*recovery_floor=$STARTUP_RECOVERY_FLOOR_A .*surface_commit=[0-9]+" 1600
+  STARTUP_RECOVERY_COMMIT_A_LINE="$WAIT_LINE"; STARTUP_RECOVERY_COMMIT_A_TEXT="$WAIT_TEXT"
+  wait_pattern "$SERVER_LOG" "$STARTUP_RECOVERY_ARM_B_LINE" "ordinary managed recovery commit observed .*pane=$BACKEND_PANE_B .*recovery_floor=$STARTUP_RECOVERY_FLOOR_B .*surface_commit=[0-9]+" 1600
+  STARTUP_RECOVERY_COMMIT_B_LINE="$WAIT_LINE"; STARTUP_RECOVERY_COMMIT_B_TEXT="$WAIT_TEXT"
+  STARTUP_RECOVERY_SURFACE_A="$(field surface_commit "$STARTUP_RECOVERY_COMMIT_A_TEXT")"
+  STARTUP_RECOVERY_SURFACE_B="$(field surface_commit "$STARTUP_RECOVERY_COMMIT_B_TEXT")"
+  [[ "$STARTUP_RECOVERY_FLOOR_A" =~ ^[0-9]+$ && "$STARTUP_RECOVERY_SURFACE_A" =~ ^[1-9][0-9]*$ ]]
+  [[ "$STARTUP_RECOVERY_FLOOR_B" =~ ^[0-9]+$ && "$STARTUP_RECOVERY_SURFACE_B" =~ ^[1-9][0-9]*$ ]]
+  ((STARTUP_RECOVERY_SURFACE_A > STARTUP_RECOVERY_FLOOR_A))
+  ((STARTUP_RECOVERY_SURFACE_B > STARTUP_RECOVERY_FLOOR_B))
+  STARTUP_RECOVERY_COMMIT_LINE="$STARTUP_RECOVERY_COMMIT_A_LINE"
+  if ((STARTUP_RECOVERY_COMMIT_B_LINE > STARTUP_RECOVERY_COMMIT_LINE)); then
+    STARTUP_RECOVERY_COMMIT_LINE="$STARTUP_RECOVERY_COMMIT_B_LINE"
+  fi
+  STARTUP_ROUTE_A="$(jq -r --argjson pane "$BACKEND_PANE_A" \
+    '.ordinary_routes[] | select(.backend_pane == $pane) |
+      [.backend,.connection_generation,.pane,.backend_pane] | join(":")' \
+    <<< "$TOPOLOGY_SETUP_JSON")"
+  STARTUP_ROUTE_B="$(jq -r --argjson pane "$BACKEND_PANE_B" \
+    '.ordinary_routes[] | select(.backend_pane == $pane) |
+      [.backend,.connection_generation,.pane,.backend_pane] | join(":")' \
+    <<< "$TOPOLOGY_SETUP_JSON")"
+  [[ "$STARTUP_ROUTE_A" =~ ^[1-9][0-9]*:[1-9][0-9]*:[1-9][0-9]*:[1-9][0-9]*$ ]]
+  [[ "$STARTUP_ROUTE_B" =~ ^[1-9][0-9]*:[1-9][0-9]*:[1-9][0-9]*:[1-9][0-9]*$ ]]
+  STARTUP_RECOVERY_ACCEPTANCE=""
+  for _ in $(seq 1 1600); do
+    STARTUP_RECOVERY_ACCEPTANCE="$(python3 tools/check-managed-recovery-acceptance.py \
+      "$CLIENT_LOG" "$SERVER_LOG" "$STARTUP_RECOVERY_COMMIT_LINE" \
+      "$STARTUP_DEGRADED_EPOCH" "$STARTUP_DEGRADED_LINE" \
+      "$STARTUP_ROUTE_A" "$STARTUP_ROUTE_B")"
+    jq -e '.verified == true' <<< "$STARTUP_RECOVERY_ACCEPTANCE" >/dev/null && break
+    kill -0 "$CLIENT_PID" 2>/dev/null || exit 1
+    sleep 0.005
+  done
+  jq -e '.verified == true' <<< "$STARTUP_RECOVERY_ACCEPTANCE" >/dev/null
+  STARTUP_ACCEPTED_A_LINE="$(jq -r '.line_a' <<< "$STARTUP_RECOVERY_ACCEPTANCE")"
+  STARTUP_ACCEPTED_B_LINE="$(jq -r '.line_b' <<< "$STARTUP_RECOVERY_ACCEPTANCE")"
+  STARTUP_RECOVERY_SCENE_LINE="$(jq -r '.scene_line' <<< "$STARTUP_RECOVERY_ACCEPTANCE")"
+  STARTUP_RECOVERY_SCENE_SEQUENCE="$(jq -r '.sequence' <<< "$STARTUP_RECOVERY_ACCEPTANCE")"
+  [[ "$STARTUP_ACCEPTED_A_LINE" =~ ^[1-9][0-9]*$ && "$STARTUP_ACCEPTED_B_LINE" =~ ^[1-9][0-9]*$ ]]
+  printf 'startup managed recovery drained epoch=%s backend_panes=%s,%s recovery_configures=%s:%s,%s:%s recovery_arms=%s,%s fixture_ack_commits=%s:%s,%s:%s recovery_commits=%s,%s scene_line=%s scene_sequence=%s accepted_lines=%s,%s\n' \
+    "$STARTUP_DEGRADED_EPOCH" "$BACKEND_PANE_A" "$BACKEND_PANE_B" \
+    "$STARTUP_RECOVERY_CONFIGURE_A_LINE" "$STARTUP_RECOVERY_SERIAL_A" \
+    "$STARTUP_RECOVERY_CONFIGURE_B_LINE" "$STARTUP_RECOVERY_SERIAL_B" \
+    "$STARTUP_RECOVERY_ARM_A_LINE" "$STARTUP_RECOVERY_ARM_B_LINE" \
+    "$STARTUP_RECOVERY_ACK_A_LINE" "$STARTUP_RECOVERY_FIXTURE_COMMIT_A_LINE" \
+    "$STARTUP_RECOVERY_ACK_B_LINE" "$STARTUP_RECOVERY_FIXTURE_COMMIT_B_LINE" \
+    "$STARTUP_RECOVERY_COMMIT_A_LINE" "$STARTUP_RECOVERY_COMMIT_B_LINE" \
+    "$STARTUP_RECOVERY_SCENE_LINE" "$STARTUP_RECOVERY_SCENE_SEQUENCE" \
+    "$STARTUP_ACCEPTED_A_LINE" "$STARTUP_ACCEPTED_B_LINE"
+  else
+    printf 'startup managed recovery drained epoch=%s backend_panes=%s,%s\n' \
+      "$STARTUP_EPOCH" "$BACKEND_PANE_A" "$BACKEND_PANE_B"
+  fi
+else
+  [[ "$STARTUP_QUIESCENT_LINE" =~ ^[1-9][0-9]*$ ]]
+  printf 'startup managed recovery skipped: no post-grant synchronized transaction before pointer\n'
+fi
 
 capture_now() {
   local label="$1" trace_line="$2" trace_text="$3"
@@ -366,8 +491,52 @@ send_pointer pointer-press press
 send_pointer pointer-motion-a "motion $((DIVIDER_X - 20)) $DIVIDER_Y"
 wait_pattern "$CLIENT_LOG" "$INITIAL_LINE" 'accepted synchronized layout actor=session-switcher .* interaction=[1-9][0-9]*.* native_resize_revision=0 epoch=[1-9][0-9]*.*target_rects=[[][^]]*[]]$'
 POINTER_OLD_ACCEPT_LINE="$WAIT_LINE"; POINTER_OLD_ACCEPT_TEXT="$WAIT_TEXT"; POINTER_OLD_EPOCH="$(field epoch "$WAIT_TEXT")"
-wait_pattern "$CLIENT_LOG" "$POINTER_OLD_ACCEPT_LINE" "proof held complete tagged managed scene epoch=$POINTER_OLD_EPOCH " 800
+
+# Bind topology to this exact pointer acceptance before waiting for any proof
+# gate record. The checker may briefly wait for the acceptance's route records,
+# but it cannot select a startup/native transaction or a later epoch.
+POINTER_TOPOLOGY_AFTER_LINE=$((POINTER_OLD_ACCEPT_LINE - 1))
+TOPOLOGY_JSON=""
+for _ in $(seq 1 800); do
+  TOPOLOGY_JSON="$(python3 tools/check-managed-resize-topology.py \
+    --after-line "$POINTER_TOPOLOGY_AFTER_LINE" \
+    --accepted-line "$POINTER_OLD_ACCEPT_LINE" \
+    --epoch "$POINTER_OLD_EPOCH" \
+    "$CLIENT_LOG" 2>/dev/null || true)"
+  if [[ -n "$TOPOLOGY_JSON" ]] && jq -e '.verified == true and .phase == "transaction"' <<< "$TOPOLOGY_JSON" >/dev/null; then
+    break
+  fi
+  kill -0 "$CLIENT_PID" 2>/dev/null || exit 1
+  sleep 0.005
+done
+[[ -n "$TOPOLOGY_JSON" ]]
+jq -e --argjson after "$POINTER_TOPOLOGY_AFTER_LINE" \
+  --argjson accepted "$POINTER_OLD_ACCEPT_LINE" --argjson epoch "$POINTER_OLD_EPOCH" \
+  '.verified == true and .phase == "transaction"
+    and .after_line == $after and .accepted_line == $accepted and .epoch == $epoch' \
+  <<< "$TOPOLOGY_JSON" >/dev/null
+printf '%s\n' "$TOPOLOGY_JSON" > "$TOPOLOGY_PROOF"
+
+wait_pattern "$CLIENT_LOG" "$INITIAL_LINE" "proof armed complete tagged managed scene .*epoch=$POINTER_OLD_EPOCH .*backend_panes=" 800
+POINTER_GATE_ARM_LINE="$WAIT_LINE"
+wait_pattern "$CLIENT_LOG" "$POINTER_GATE_ARM_LINE" "proof held complete tagged managed scene .*epoch=$POINTER_OLD_EPOCH .*tagged_windows=2 " 800
 POINTER_HELD_LINE="$WAIT_LINE"
+POINTER_HOLD_PROOF="$(
+  python3 tools/check-managed-proof-hold.py \
+    "$CLIENT_LOG" "$SERVER_LOG" \
+    "$INITIAL_LINE" "$POINTER_OLD_ACCEPT_LINE" "$POINTER_GATE_ARM_LINE" "$POINTER_HELD_LINE" \
+    "$POINTER_OLD_EPOCH" "$BACKEND_PANE_A" "$BACKEND_PANE_B"
+)"
+jq -e '.verified == true and (.bare_requests | length) == 0
+  and (.terminal_before_hold | length) == 0
+  and (.tagged_requests | length) == 2
+  and (.snapshots | length) == 2' <<< "$POINTER_HOLD_PROOF" >/dev/null
+printf 'managed proof hold verified epoch=%s accept=%s arm=%s held=%s tagged=%s snapshots=%s\n' \
+  "$POINTER_OLD_EPOCH" "$POINTER_OLD_ACCEPT_LINE" "$POINTER_GATE_ARM_LINE" \
+  "$POINTER_HELD_LINE" \
+  "$(jq -c '.tagged_requests' <<< "$POINTER_HOLD_PROOF")" \
+  "$(jq -c '.snapshots' <<< "$POINTER_HOLD_PROOF")"
+
 arm_fixture "$FIFO_B" 'delay 120'
 send_pointer pointer-motion-b "motion $((DIVIDER_X - 42)) $DIVIDER_Y"
 wait_pattern "$CLIENT_LOG" "$POINTER_OLD_ACCEPT_LINE" 'accepted synchronized layout actor=session-switcher .* interaction=[1-9][0-9]*.* native_resize_revision=0 epoch=[1-9][0-9]*.*target_rects=[[][^]]*[]]$'
@@ -391,10 +560,26 @@ PY
 [[ "$VIEW_PANE_A" -gt 0 && "$VIEW_PANE_B" -gt 0 && "$VIEW_PANE_A" != "$VIEW_PANE_B" ]]
 wait_pattern "$CLIENT_LOG" "$POINTER_ACCEPT_LINE" "proof released complete tagged managed scene held_epoch=$POINTER_OLD_EPOCH active_epoch=$POINTER_EPOCH" 1600
 POINTER_GATE_RELEASE_LINE="$WAIT_LINE"
-wait_pattern "$CLIENT_LOG" "$POINTER_GATE_RELEASE_LINE" "dropped stale or unissued tagged managed frame .*resize_epoch=Some[()]$POINTER_OLD_EPOCH[()]" 800
+wait_pattern "$CLIENT_LOG" "$POINTER_GATE_RELEASE_LINE" "dropped stale or unissued tagged managed frame .*resize_epoch=Some[()]${POINTER_OLD_EPOCH}[()]" 800
 POINTER_DROP_LINE="$WAIT_LINE"
-wait_pattern "$CLIENT_LOG" "$WAIT_LINE" "resize-present .* epoch=$POINTER_EPOCH .* phase=promoted "
+wait_pattern "$CLIENT_LOG" "$WAIT_LINE" "resize-present .* epoch=$POINTER_EPOCH .* phase=promoted .* degraded=false "
 POINTER_PROMOTED_LINE="$WAIT_LINE"; POINTER_PROMOTED_TEXT="$WAIT_TEXT"
+POINTER_SUCCESSOR_PROOF="$(
+  python3 tools/check-managed-proof-hold.py --verify-successor \
+    "$CLIENT_LOG" "$SERVER_LOG" \
+    "$POINTER_HELD_LINE" "$POINTER_ACCEPT_LINE" "$POINTER_GATE_RELEASE_LINE" \
+    "$POINTER_PROMOTED_LINE" "$POINTER_OLD_EPOCH" "$POINTER_EPOCH" \
+    "$BACKEND_PANE_A" "$BACKEND_PANE_B" "$VIEW_PANE_A" "$VIEW_PANE_B"
+)"
+jq -e '.verified == true and (.forbidden_recovery | length) == 0
+  and (.tagged_requests | length) == 2
+  and (.configures | length) == 2
+  and (.drops | length) == 2' <<< "$POINTER_SUCCESSOR_PROOF" >/dev/null
+printf 'managed successor verified old_epoch=%s epoch=%s tagged=%s configures=%s drops=%s\n' \
+  "$POINTER_OLD_EPOCH" "$POINTER_EPOCH" \
+  "$(jq -c '.tagged_requests' <<< "$POINTER_SUCCESSOR_PROOF")" \
+  "$(jq -c '.configures' <<< "$POINTER_SUCCESSOR_PROOF")" \
+  "$(jq -c '.drops' <<< "$POINTER_SUCCESSOR_PROOF")"
 capture_now pointer-promoted "$POINTER_PROMOTED_LINE" "$POINTER_PROMOTED_TEXT"
 arm_fixture "$FIFO_B" normal
 RELEASE_START="$(wc -l < "$CLIENT_LOG")"
@@ -403,7 +588,10 @@ wait_pattern "$CLIENT_LOG" "$RELEASE_START" 'accepted synchronized layout actor=
 RELEASE_ACCEPT_LINE="$WAIT_LINE"; RELEASE_ACCEPT_TEXT="$WAIT_TEXT"; RELEASE_EPOCH="$(field epoch "$WAIT_TEXT")"
 wait_pattern "$CLIENT_LOG" "$RELEASE_ACCEPT_LINE" "resize-present .* epoch=$RELEASE_EPOCH .* phase=promoted " 1600
 RELEASE_PROMOTED_LINE="$WAIT_LINE"; RELEASE_PROMOTED_TEXT="$WAIT_TEXT"
-printf 'quit\n' >&"$POINTER_WRITE_FD"; IFS= read -r -t 5 -u "$POINTER_READ_FD" done; wait "$POINTER_PID"; POINTER_PID=""
+printf 'quit\n' >&"$POINTER_WRITE_FD"
+IFS= read -r -t 5 -u "$POINTER_READ_FD" _
+wait "$POINTER_PID"
+POINTER_PID=""
 
 # Native mixed lane with one ACK/new-configure then old-size buffer. It cannot
 # satisfy the barrier. An explicit exact commit supplies the final snapshot.
@@ -498,9 +686,9 @@ TIMEOUT_PROMOTED_LINE="$WAIT_LINE"; TIMEOUT_PROMOTED_TEXT="$WAIT_TEXT"
 capture_now timeout-degraded "$TIMEOUT_PROMOTED_LINE" "$TIMEOUT_PROMOTED_TEXT"
 ORDINARY_START="$(wc -l < "$CLIENT_LOG")"
 arm_fixture "$FIFO_B" ordinary
-wait_pattern "$SERVER_LOG" 0 'retired managed resize epochs for ordinary recovery' 1200
+wait_pattern "$SERVER_LOG" 0 "accepted and armed ordinary managed recovery .*pane=$BACKEND_PANE_B .*recover_through_epoch=$TIMEOUT_EPOCH .*recovery_floor=[0-9]+" 1200
 wait_pattern "$FIXTURE_B_LOG" 0 'event=commit .*kind=ordinary-command' 1200
-wait_pattern "$CLIENT_LOG" "$ORDINARY_START" "accepted ordinary managed frame .* pane=$VIEW_PANE_B[[:space:]]+backend_pane=$BACKEND_PANE_B[[:space:]]" 1200
+wait_pattern "$CLIENT_LOG" "$ORDINARY_START" "accepted ordinary managed frame .* pane=${VIEW_PANE_B}[[:space:]]+backend_pane=${BACKEND_PANE_B}[[:space:]]" 1200
 TIMEOUT_ORDINARY_LINE="$WAIT_LINE"
 
 # Inventory authority lane. Close B after acceptance; the exact target pane
@@ -519,7 +707,7 @@ ABORT_LINE="$WAIT_LINE"; ABORT_TEXT="$WAIT_TEXT"
 # reads the append-only client log.
 wait_pattern "$CLIENT_LOG" "$ABORT_LINE" 'queued layout-state revision=[0-9]+ lease=2 actor=workspace$' 1600
 ABORT_INVENTORY_LINE="$WAIT_LINE"; ABORT_INVENTORY_REVISION="$(field revision "$WAIT_TEXT")"
-wait_pattern "$CLIENT_LOG" "$ABORT_INVENTORY_LINE" "accepted leased actor layout items=[0-9]+ panes=5 revision=$ABORT_INVENTORY_REVISION pending_presented_layout_revision=[0-9]+$" 1600
+wait_pattern "$CLIENT_LOG" "$ABORT_INVENTORY_LINE" "accepted leased actor layout items=[0-9]+ panes=5 revision=$ABORT_INVENTORY_REVISION pending_presented_layout_revision=[0-9]+ pane_rects=\\[[^]]*\\]$" 1600
 ABORT_REPLACEMENT_LINE="$WAIT_LINE"; ABORT_PRESENTED_REVISION="$(field pending_presented_layout_revision "$WAIT_TEXT")"
 wait_pattern "$CLIENT_LOG" "$ABORT_REPLACEMENT_LINE" "presented committed layout revision=$ABORT_PRESENTED_REVISION$" 1600
 

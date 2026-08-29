@@ -57,8 +57,8 @@ pub use completion_io::{
 };
 pub use component_actor::{
     ComponentActor, ComponentActorConfig, ComponentActorEvent, ComponentActorEventWaker,
-    ComponentActorMailboxStats, ComponentActorSendError, ComponentAppEvent, ComponentChildEvent,
-    PresentationScope, WorkerId,
+    ComponentActorMailboxStats, ComponentActorPresentationEnvelopeSendError,
+    ComponentActorSendError, ComponentAppEvent, ComponentChildEvent, PresentationScope, WorkerId,
 };
 pub use computer_use_js::{
     ComputerUseJsConfig, ComputerUseJsExecution, ComputerUseJsIsolate, ComputerUseJsMetrics,
@@ -89,8 +89,8 @@ pub use lifecycle::{
     PluginStopContext, PluginStopReason,
 };
 pub use mailbox::{
-    ActorId, MAX_MAILBOX_GENERATION_BYTES, MAX_MAILBOX_MESSAGE_BYTES, Mailbox, MailboxEnvelope,
-    MailboxRegistry, PreparedMailboxRegistration,
+    ActorId, MAX_MAILBOX_GENERATION_BYTES, MAX_MAILBOX_MESSAGE_BYTES, Mailbox, MailboxAddress,
+    MailboxEnvelope, MailboxRegistry, PreparedMailboxRegistration,
 };
 pub use module::{
     DEFAULT_ACTOR_MAILBOX_CAPACITY, DEFAULT_ACTOR_NAME, LegacyWasmPluginArtifact,

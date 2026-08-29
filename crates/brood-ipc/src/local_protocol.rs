@@ -1,8 +1,9 @@
 //! Local fixed-record codec for transport-neutral client messages.
 
 use brood_protocol::{
-    ClientLifecycle, ClientMessage, InputEvent, Lane, ManagedResizeRejectionReason,
-    ManagedResizeStatus, ManagedResizeStatusResult, PanePosition,
+    ClientLifecycle, ClientMessage, InputEvent, Lane, MAX_MANAGED_RESIZE_EPOCH,
+    ManagedResizeRejectionReason, ManagedResizeStatus, ManagedResizeStatusResult, PanePosition,
+    managed_resize_epoch_is_valid,
 };
 use thiserror::Error;
 
@@ -21,6 +22,7 @@ const MANAGED_RESIZE_PANE_UNAVAILABLE: u32 = 2;
 const MANAGED_RESIZE_CORRELATION_CAPACITY: u32 = 3;
 const MANAGED_RESIZE_CONFIGURE_FAILED: u32 = 4;
 const MANAGED_RESIZE_SIZE_UNSATISFIED: u32 = 5;
+const MANAGED_RESIZE_RECOVERY_AUTHORITY: u64 = MAX_MANAGED_RESIZE_EPOCH + 1;
 
 /// A semantic message cannot be represented by the local fixed-record ABI.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
@@ -96,15 +98,20 @@ pub fn decode_client_record(record: &CriticalRecord) -> Result<ClientMessage, Lo
         INPUT_WINDOW_FOCUS => InputEvent::WindowFocus {
             pane: record.arguments[0],
         },
-        INPUT_WINDOW_RESIZE => InputEvent::WindowResize {
-            pane: nonzero_u64(record.arguments[0])?,
-            logical_width: nonzero_pair(record.arguments[1])?.0,
-            logical_height: nonzero_pair(record.arguments[1])?.1,
-            pixel_width: nonzero_pair(record.arguments[2])?.0,
-            pixel_height: nonzero_pair(record.arguments[2])?.1,
-            scale_120: nonzero_u32(record.arguments[3])?,
-            resize_epoch: (record.arguments[4] != 0).then_some(record.arguments[4]),
-        },
+        INPUT_WINDOW_RESIZE => {
+            let (resize_epoch, recover_through_epoch) =
+                decode_resize_authority(record.arguments[4])?;
+            InputEvent::WindowResize {
+                pane: nonzero_u64(record.arguments[0])?,
+                logical_width: nonzero_pair(record.arguments[1])?.0,
+                logical_height: nonzero_pair(record.arguments[1])?.1,
+                pixel_width: nonzero_pair(record.arguments[2])?.0,
+                pixel_height: nonzero_pair(record.arguments[2])?.1,
+                scale_120: nonzero_u32(record.arguments[3])?,
+                resize_epoch,
+                recover_through_epoch,
+            }
+        }
         INPUT_WINDOW_POINTER_MOTION => InputEvent::PointerMotion {
             position: position(record),
         },
@@ -167,7 +174,9 @@ pub fn encode_window_frame_record(
         || frame.resource == 0
         || frame.source[2] <= 0
         || frame.source[3] <= 0
-        || frame.resize_epoch == Some(0)
+        || frame
+            .resize_epoch
+            .is_some_and(|epoch| !managed_resize_epoch_is_valid(epoch))
     {
         return Err(LocalProtocolError::InvalidValue);
     }
@@ -202,12 +211,16 @@ pub fn decode_window_frame_record(
     if source_width <= 0 || source_height <= 0 {
         return Err(LocalProtocolError::InvalidValue);
     }
+    let resize_epoch = (record.arguments[4] != 0).then_some(record.arguments[4]);
+    if resize_epoch.is_some_and(|epoch| !managed_resize_epoch_is_valid(epoch)) {
+        return Err(LocalProtocolError::InvalidValue);
+    }
     Ok(LocalWindowFrame {
         pane: record.arguments[0],
         resource: record.arguments[1],
         source: [source_x, source_y, source_width, source_height],
         active: record.flags & FRAME_WINDOW_FLAG_ACTIVE != 0,
-        resize_epoch: (record.arguments[4] != 0).then_some(record.arguments[4]),
+        resize_epoch,
     })
 }
 
@@ -253,6 +266,7 @@ fn encode_input(input: &InputEvent) -> (u32, [u64; 5]) {
             pixel_height,
             scale_120,
             resize_epoch,
+            recover_through_epoch,
         } => (
             INPUT_WINDOW_RESIZE,
             [
@@ -260,7 +274,7 @@ fn encode_input(input: &InputEvent) -> (u32, [u64; 5]) {
                 encode_u32_pair(*logical_width, *logical_height),
                 encode_u32_pair(*pixel_width, *pixel_height),
                 u64::from(*scale_120),
-                resize_epoch.unwrap_or_default(),
+                encode_resize_authority(*resize_epoch, *recover_through_epoch),
             ],
         ),
         InputEvent::PointerMotion { position } => (
@@ -332,6 +346,25 @@ fn nonzero_u64(value: u64) -> Result<u64, LocalProtocolError> {
         .ok_or(LocalProtocolError::InvalidValue)
 }
 
+fn encode_resize_authority(resize_epoch: Option<u64>, recover_through_epoch: Option<u64>) -> u64 {
+    resize_epoch
+        .or_else(|| recover_through_epoch.map(|epoch| MANAGED_RESIZE_RECOVERY_AUTHORITY | epoch))
+        .unwrap_or_default()
+}
+
+fn decode_resize_authority(
+    authority: u64,
+) -> Result<(Option<u64>, Option<u64>), LocalProtocolError> {
+    if authority == 0 {
+        return Ok((None, None));
+    }
+    if authority & MANAGED_RESIZE_RECOVERY_AUTHORITY == 0 {
+        return Ok((Some(authority), None));
+    }
+    let epoch = authority & !MANAGED_RESIZE_RECOVERY_AUTHORITY;
+    Ok((None, Some(nonzero_u64(epoch)?)))
+}
+
 fn validate_local_input(input: &InputEvent) -> Result<(), LocalProtocolError> {
     let valid = match input {
         InputEvent::PresentationSize {
@@ -348,6 +381,7 @@ fn validate_local_input(input: &InputEvent) -> Result<(), LocalProtocolError> {
             pixel_height,
             scale_120,
             resize_epoch,
+            recover_through_epoch,
         } => {
             *pane != 0
                 && *logical_width != 0
@@ -355,7 +389,9 @@ fn validate_local_input(input: &InputEvent) -> Result<(), LocalProtocolError> {
                 && *pixel_width != 0
                 && *pixel_height != 0
                 && *scale_120 != 0
-                && *resize_epoch != Some(0)
+                && resize_epoch.is_none_or(managed_resize_epoch_is_valid)
+                && recover_through_epoch.is_none_or(managed_resize_epoch_is_valid)
+                && !(resize_epoch.is_some() && recover_through_epoch.is_some())
         }
         InputEvent::KeyboardKey { .. }
         | InputEvent::KeyboardReset
@@ -383,7 +419,7 @@ pub fn encode_managed_resize_status_record(
     connection_generation: u64,
     sequence: u64,
 ) -> Result<CriticalRecord, LocalProtocolError> {
-    if status.pane == 0 || status.resize_epoch == 0 {
+    if status.pane == 0 || !managed_resize_epoch_is_valid(status.resize_epoch) {
         return Err(LocalProtocolError::InvalidValue);
     }
     let (flags, logical_size, pixel_size, scale_120) = match status.result {
@@ -435,7 +471,7 @@ pub fn decode_managed_resize_status_record(
 ) -> Result<ManagedResizeStatus, LocalProtocolError> {
     if record.opcode != FRAME_MANAGED_RESIZE_STATUS
         || record.arguments[0] == 0
-        || record.arguments[1] == 0
+        || !managed_resize_epoch_is_valid(record.arguments[1])
     {
         return Err(LocalProtocolError::InvalidValue);
     }
@@ -495,12 +531,12 @@ mod tests {
         ManagedResizeStatus, ManagedResizeStatusResult, PanePosition,
     };
 
-    use crate::{CriticalRecord, FRAME_WINDOW_DMABUF};
+    use crate::{CriticalRecord, FRAME_WINDOW_DMABUF, INPUT_WINDOW_RESIZE, encode_u32_pair};
 
     use super::{
-        LocalProtocolError, LocalWindowFrame, decode_client_record,
-        decode_managed_resize_status_record, decode_window_frame_record, encode_client_record,
-        encode_managed_resize_status_record, encode_window_frame_record,
+        LocalProtocolError, LocalWindowFrame, MANAGED_RESIZE_RECOVERY_AUTHORITY,
+        decode_client_record, decode_managed_resize_status_record, decode_window_frame_record,
+        encode_client_record, encode_managed_resize_status_record, encode_window_frame_record,
         is_coalescible_client_record,
     };
 
@@ -543,6 +579,7 @@ mod tests {
                 pixel_height: 180,
                 scale_120: 180,
                 resize_epoch: Some(41),
+                recover_through_epoch: None,
             }),
             ClientMessage::Input(InputEvent::WindowResize {
                 pane: 7,
@@ -552,6 +589,17 @@ mod tests {
                 pixel_height: 180,
                 scale_120: 180,
                 resize_epoch: None,
+                recover_through_epoch: None,
+            }),
+            ClientMessage::Input(InputEvent::WindowResize {
+                pane: 7,
+                logical_width: 200,
+                logical_height: 120,
+                pixel_width: 300,
+                pixel_height: 180,
+                scale_120: 180,
+                resize_epoch: None,
+                recover_through_epoch: Some(41),
             }),
             ClientMessage::Lifecycle(ClientLifecycle::FramePresented { sequence: 99 }),
             ClientMessage::ReleaseResource { resource: 73 },
@@ -649,9 +697,114 @@ mod tests {
             pixel_height: 180,
             scale_120: 180,
             resize_epoch: Some(0),
+            recover_through_epoch: None,
         });
         assert_eq!(
             encode_client_record(invalid, 9, 13),
+            Err(LocalProtocolError::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn local_resize_input_rejects_zero_or_conflicting_recovery_authority() {
+        for (resize_epoch, recover_through_epoch) in [
+            (None, Some(0)),
+            (Some(41), Some(40)),
+            (Some(MANAGED_RESIZE_RECOVERY_AUTHORITY), None),
+            (None, Some(MANAGED_RESIZE_RECOVERY_AUTHORITY)),
+        ] {
+            let invalid = ClientMessage::Input(InputEvent::WindowResize {
+                pane: 7,
+                logical_width: 200,
+                logical_height: 120,
+                pixel_width: 300,
+                pixel_height: 180,
+                scale_120: 180,
+                resize_epoch,
+                recover_through_epoch,
+            });
+            assert_eq!(
+                encode_client_record(invalid, 9, 13),
+                Err(LocalProtocolError::InvalidValue)
+            );
+        }
+        let mut malformed = CriticalRecord {
+            opcode: INPUT_WINDOW_RESIZE,
+            arguments: [
+                7,
+                encode_u32_pair(200, 120),
+                encode_u32_pair(300, 180),
+                180,
+                MANAGED_RESIZE_RECOVERY_AUTHORITY,
+            ],
+            ..CriticalRecord::default()
+        };
+        assert_eq!(
+            decode_client_record(&malformed),
+            Err(LocalProtocolError::InvalidValue)
+        );
+        malformed.arguments[4] = MANAGED_RESIZE_RECOVERY_AUTHORITY | 0x29;
+        assert_eq!(
+            decode_client_record(&malformed),
+            Ok(ClientMessage::Input(InputEvent::WindowResize {
+                pane: 7,
+                logical_width: 200,
+                logical_height: 120,
+                pixel_width: 300,
+                pixel_height: 180,
+                scale_120: 180,
+                resize_epoch: None,
+                recover_through_epoch: Some(41),
+            }))
+        );
+    }
+
+    #[test]
+    fn local_managed_scene_and_status_reject_the_reserved_epoch_bit() {
+        let frame = LocalWindowFrame {
+            pane: 7,
+            resource: 9,
+            source: [0, 0, 200, 120],
+            active: false,
+            resize_epoch: Some(MANAGED_RESIZE_RECOVERY_AUTHORITY),
+        };
+        assert_eq!(
+            encode_window_frame_record(crate::FRAME_WINDOW_SHM, 3, 5, frame),
+            Err(LocalProtocolError::InvalidValue)
+        );
+        let mut encoded_frame = frame;
+        encoded_frame.resize_epoch = Some(41);
+        let Ok(mut encoded_frame) =
+            encode_window_frame_record(crate::FRAME_WINDOW_SHM, 3, 5, encoded_frame)
+        else {
+            return;
+        };
+        encoded_frame.arguments[4] = MANAGED_RESIZE_RECOVERY_AUTHORITY;
+        assert_eq!(
+            decode_window_frame_record(&encoded_frame),
+            Err(LocalProtocolError::InvalidValue)
+        );
+
+        let status = ManagedResizeStatus {
+            pane: 7,
+            resize_epoch: MANAGED_RESIZE_RECOVERY_AUTHORITY,
+            result: ManagedResizeStatusResult::Rejected {
+                reason: ManagedResizeRejectionReason::ConfigureFailed,
+            },
+        };
+        assert_eq!(
+            encode_managed_resize_status_record(status, 3, 5),
+            Err(LocalProtocolError::InvalidValue)
+        );
+        let mut encoded_status = status;
+        encoded_status.resize_epoch = 41;
+        let Ok(mut encoded_status) = encode_managed_resize_status_record(encoded_status, 3, 5)
+        else {
+            return;
+        };
+        encoded_status.arguments[1] = MANAGED_RESIZE_RECOVERY_AUTHORITY;
+        assert_eq!(
+            decode_managed_resize_status_record(&encoded_status),
             Err(LocalProtocolError::InvalidValue)
         );
     }

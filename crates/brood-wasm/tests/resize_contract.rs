@@ -1,3 +1,10 @@
+#![allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    reason = "contract fixtures deliberately fail fast when encoding or field lookup changes"
+)]
+
 use brood_wasm::{
     FailLayoutRegion, HostMessage, InteractionId, LayoutLeaseToken, LayoutRegionNotification,
     LayoutRegionResized, LayoutSize, PresentationMode, ResizeEpoch, ResolvedLayout,
@@ -197,7 +204,7 @@ fn accepted_layout_abort_carries_the_exact_epoch_and_reason() {
     );
 }
 
-fn test_resize_epoch() -> ResizeEpoch {
+const fn test_resize_epoch() -> ResizeEpoch {
     ResizeEpoch {
         id: 61,
         lease: 31,

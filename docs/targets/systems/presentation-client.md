@@ -376,5 +376,6 @@ The following remain open without changing the ownership model:
 - [[plugin-runtime]]
 - [[plugin-ui]]
 - [[plugin-graphics]]
+- [[render-scheduling]]
 - [[../../systems/testing]]
 - [[../../frictions/terminal-plugin]]

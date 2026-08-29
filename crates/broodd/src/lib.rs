@@ -21,6 +21,7 @@ pub mod launch_context;
 mod nested_test;
 mod plugin_runtime;
 mod runtime;
+pub mod scheduling_domain;
 mod session_bus;
 mod session_bus_state;
 mod session_runner;

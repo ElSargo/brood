@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail, ensure};
 use brood_protocol::{
     BackendActorRealm, CarrierKind, ClientMessage, EndpointCapabilities, FrameColorSpace,
     FramePixelFormat, Lane, MAX_ACTOR_ID_BYTES, MAX_ACTOR_MESSAGE_BYTES, MAX_NETWORK_FRAME_BYTES,
-    ServerMessage, TransportProfile, negotiate_profile,
+    ServerMessage, TransportProfile, managed_resize_epoch_is_valid, negotiate_profile,
 };
 use quinn::{
     AckFrequencyConfig, Connection, Endpoint, Incoming, RecvStream, SendStream, VarInt,
@@ -802,7 +802,7 @@ fn validate_server_message(message: &ServerMessage) -> Result<()> {
             Ok(())
         }
         ServerMessage::ManagedResizeStatus(status) => {
-            ensure!(status.pane != 0 && status.resize_epoch != 0);
+            ensure!(status.pane != 0 && managed_resize_epoch_is_valid(status.resize_epoch));
             if let brood_protocol::ManagedResizeStatusResult::Configured {
                 logical_size,
                 pixel_size,
@@ -860,6 +860,7 @@ fn validate_input(input: &brood_protocol::InputEvent) -> Result<()> {
             pixel_height,
             scale_120,
             resize_epoch,
+            recover_through_epoch,
         } => {
             ensure!(
                 *pane != 0
@@ -868,7 +869,9 @@ fn validate_input(input: &brood_protocol::InputEvent) -> Result<()> {
                     && *pixel_width != 0
                     && *pixel_height != 0
                     && *scale_120 != 0
-                    && *resize_epoch != Some(0),
+                    && resize_epoch.is_none_or(managed_resize_epoch_is_valid)
+                    && recover_through_epoch.is_none_or(managed_resize_epoch_is_valid)
+                    && !(resize_epoch.is_some() && recover_through_epoch.is_some()),
                 "managed resize request has invalid units"
             );
         }
@@ -968,7 +971,11 @@ fn validate_scene(scene: &brood_protocol::FrameScene) -> Result<()> {
             "network scene repeats a frame resource"
         );
         ensure!(
-            window.source[2] > 0 && window.source[3] > 0 && window.resize_epoch != Some(0),
+            window.source[2] > 0
+                && window.source[3] > 0
+                && window
+                    .resize_epoch
+                    .is_none_or(managed_resize_epoch_is_valid),
             "network scene has an invalid source extent or resize epoch"
         );
     }
@@ -1201,9 +1208,9 @@ mod tests {
         BackendResponse, BackendResponseValue, CatalogSession, CatalogSnapshot, CatalogWindow,
         ClientMessage, EndpointCapabilities, FrameColorSpace, FramePixelFormat, FrameResourceRef,
         FrameScene, InputEvent, Lane, MAX_ACTOR_MESSAGE_BYTES, MAX_ARTIFACT_CHUNK_BYTES,
-        ManagedResizeStatus, ManagedResizeStatusResult, ManagedWindowAutomationState,
-        ManagedWindowSizeAuthority, PanePosition, ServerMessage, SessionIsolationStatus,
-        WindowFrame,
+        MAX_MANAGED_RESIZE_EPOCH, ManagedResizeStatus, ManagedResizeStatusResult,
+        ManagedWindowAutomationState, ManagedWindowSizeAuthority, PanePosition, ServerMessage,
+        SessionIsolationStatus, WindowFrame,
     };
     use quinn::Endpoint;
     use rcgen::{CertifiedKey, generate_simple_self_signed};
@@ -1343,8 +1350,28 @@ mod tests {
             pixel_height: 180,
             scale_120: 180,
             resize_epoch: Some(0),
+            recover_through_epoch: None,
         });
         assert!(validate_client_message(&invalid_input).is_err());
+
+        for (resize_epoch, recover_through_epoch) in [
+            (None, Some(0)),
+            (Some(41), Some(40)),
+            (Some(MAX_MANAGED_RESIZE_EPOCH + 1), None),
+            (None, Some(MAX_MANAGED_RESIZE_EPOCH + 1)),
+        ] {
+            let invalid_recovery = ClientMessage::Input(InputEvent::WindowResize {
+                pane: 7,
+                logical_width: 200,
+                logical_height: 120,
+                pixel_width: 300,
+                pixel_height: 180,
+                scale_120: 180,
+                resize_epoch,
+                recover_through_epoch,
+            });
+            assert!(validate_client_message(&invalid_recovery).is_err());
+        }
 
         let invalid_status = ServerMessage::ManagedResizeStatus(ManagedResizeStatus {
             pane: 7,
@@ -1367,6 +1394,29 @@ mod tests {
                 source: [0, 0, 300, 180],
                 active: true,
                 resize_epoch: Some(0),
+            }],
+        });
+        assert!(validate_server_message(&invalid_scene).is_err());
+
+        let invalid_status = ServerMessage::ManagedResizeStatus(ManagedResizeStatus {
+            pane: 7,
+            resize_epoch: MAX_MANAGED_RESIZE_EPOCH + 1,
+            result: ManagedResizeStatusResult::Rejected {
+                reason: brood_protocol::ManagedResizeRejectionReason::ConfigureFailed,
+            },
+        });
+        assert!(validate_server_message(&invalid_status).is_err());
+
+        let invalid_scene = ServerMessage::Scene(FrameScene {
+            backend: brood_protocol::BackendId(7),
+            sequence: 2,
+            extent: [1_280, 800],
+            windows: vec![WindowFrame {
+                pane: 7,
+                resource: FrameResourceRef::Network { resource: 1 },
+                source: [0, 0, 300, 180],
+                active: true,
+                resize_epoch: Some(MAX_MANAGED_RESIZE_EPOCH + 1),
             }],
         });
         assert!(validate_server_message(&invalid_scene).is_err());
@@ -1530,6 +1580,7 @@ mod tests {
                     pixel_height: 180,
                     scale_120: 180,
                     resize_epoch: Some(41),
+                    recover_through_epoch: None,
                 })
             );
             let disconnect = connection
@@ -1670,6 +1721,7 @@ mod tests {
                 pixel_height: 180,
                 scale_120: 180,
                 resize_epoch: Some(41),
+                recover_through_epoch: None,
             }))
             .await
             .unwrap_or_else(|error| unreachable!("{error}"));

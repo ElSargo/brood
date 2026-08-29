@@ -6,9 +6,7 @@ use brood_plugin_sdk::{
     exports::brood::plugin::actor::{
         Command, Event, Guest, LifecycleEvent, LocalActorMessage, PresentationEvent,
     },
-    graphics::{
-        UiFrame, reuse_pane_content,
-    },
+    graphics::{UiFrame, reuse_pane_content},
     input::BUTTON_PRIMARY as LEFT_BUTTON,
     text::one_line,
 };
@@ -266,6 +264,14 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
             redraw_or_record_error(&mut state);
             Vec::new()
         }
+        PresentationEvent::RenderHint(hint) => {
+            if let Err(error) =
+                brood_plugin_sdk::graphics::render_with_hint(&hint, || redraw(&mut state, None))
+            {
+                state.error = error;
+            }
+            Vec::new()
+        }
         _ => Vec::new(),
     }
 }
@@ -309,6 +315,22 @@ fn resize_paint_plan(
 }
 
 fn paint_for_resize_or_record_error(state: &mut InboxState, paint: ResizePaintPlan) {
+    if !brood_plugin_sdk::graphics::render_is_active() {
+        let result = match paint {
+            ResizePaintPlan::OrdinaryRedraw => brood_plugin_sdk::graphics::request_render(),
+            ResizePaintPlan::TaggedRedraw(resize_epoch) => {
+                brood_plugin_sdk::graphics::request_render_for_resize(
+                    state.pane,
+                    Some(resize_epoch),
+                )
+            }
+            ResizePaintPlan::Reuse(resize_epoch) => reuse_pane_content(state.pane, resize_epoch),
+        };
+        if let Err(error) = result {
+            state.error = error;
+        }
+        return;
+    }
     let result = match paint {
         ResizePaintPlan::OrdinaryRedraw => redraw(state, None),
         ResizePaintPlan::TaggedRedraw(resize_epoch) => redraw(state, Some(resize_epoch)),
@@ -321,7 +343,12 @@ fn paint_for_resize_or_record_error(state: &mut InboxState, paint: ResizePaintPl
 }
 
 fn redraw_for_resize_or_record_error(state: &mut InboxState, resize_epoch: Option<u64>) {
-    if let Err(error) = redraw(state, resize_epoch) {
+    let result = if brood_plugin_sdk::graphics::render_is_active() {
+        redraw(state, resize_epoch)
+    } else {
+        brood_plugin_sdk::graphics::request_render_for_resize(state.pane, resize_epoch)
+    };
+    if let Err(error) = result {
         state.error = error;
     }
 }
@@ -473,7 +500,7 @@ fn redraw(state: &mut InboxState, resize_epoch: Option<u64>) -> Result<(), Strin
             state.width - 24.0,
         )?;
     }
-    frame.submit(resize_epoch, &packet, &mut state.text_resources)?;
+    frame.queue(resize_epoch, &packet, &mut state.text_resources)?;
     state.error.clear();
     Ok(())
 }

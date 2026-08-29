@@ -39,7 +39,10 @@ let
     inherit src;
     filter =
       path: type:
-      craneLib.filterCargoSources path type || lib.hasSuffix ".wit" path || lib.hasSuffix ".witx" path;
+      craneLib.filterCargoSources path type
+      || lib.hasSuffix ".wit" path
+      || lib.hasSuffix ".witx" path
+      || lib.hasSuffix "/.cargo/config.toml" path;
   };
 
   packageManifestSrc = lib.cleanSourceWith {

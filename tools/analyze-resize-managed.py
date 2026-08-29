@@ -747,7 +747,8 @@ def analyze(root: pathlib.Path, evidence_path: pathlib.Path) -> dict[str, Any]:
         timeout["ready"],
     )
     timeout_server_restart = first(
-        server_lines, r"retired managed resize epochs for ordinary recovery"
+        server_lines,
+        rf"accepted and armed ordinary managed recovery .*pane={backend_b} .*recover_through_epoch={timeout['epoch']} .*recovery_floor=\d+",
     )
     timeout_ordinary = first(fixture_lines[1], r"event=commit .*kind=ordinary-command")
     timeout_ordinary_client = client_line(timeout["ordinary"])

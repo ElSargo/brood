@@ -23,23 +23,39 @@ pub fn run(args: RunArgs) -> Result<()> {
 }
 
 pub fn serve_session(args: SessionArgs) -> Result<()> {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .thread_name("brood-tokio")
+    let worker_partition =
+        crate::scheduling_domain::backend_worker_partition(available_parallelism());
+    let general_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_partition.general_io)
+        .max_blocking_threads(32)
+        .thread_name("brood-io")
         .enable_all()
         .build()
-        .context("start Tokio runtime")?;
-    let runtime_handle = runtime.handle().clone();
+        .context("start backend I/O runtime")?;
+    let actor_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_partition.actors)
+        .max_blocking_threads(8)
+        .thread_name("brood-backend-actor")
+        .enable_all()
+        .build()
+        .context("start backend actor runtime")?;
+    let general_handle = general_runtime.handle().clone();
+    let actor_handle = actor_runtime.handle().clone();
     let (result_tx, result_rx) = std::sync::mpsc::channel();
     let calloop_thread = thread::Builder::new()
         .name("brood-calloop".to_string())
         .spawn(move || {
             result_tx
-                .send(serve_session_on_calloop_thread(&args, runtime_handle))
+                .send(serve_session_on_calloop_thread(
+                    &args,
+                    general_handle,
+                    actor_handle,
+                ))
                 .ok();
         })
         .context("spawn calloop compositor thread")?;
 
-    runtime.block_on(async move {
+    let result = general_runtime.block_on(async move {
         tokio::task::spawn_blocking(move || {
             let result = result_rx
                 .recv()
@@ -51,7 +67,15 @@ pub fn serve_session(args: SessionArgs) -> Result<()> {
         })
         .await
         .context("join calloop compositor thread")?
-    })
+    });
+    // The actor runtime remains alive until calloop has synchronously joined
+    // every generation-owned actor task.
+    drop(actor_runtime);
+    result
+}
+
+fn available_parallelism() -> usize {
+    thread::available_parallelism().map_or(2, std::num::NonZero::get)
 }
 
 fn compositor_thread_panic(payload: &(dyn std::any::Any + Send)) -> anyhow::Error {
@@ -70,23 +94,34 @@ fn compositor_thread_panic(payload: &(dyn std::any::Any + Send)) -> anyhow::Erro
 )]
 fn serve_session_on_calloop_thread(
     args: &SessionArgs,
-    runtime: tokio::runtime::Handle,
+    general_runtime: tokio::runtime::Handle,
+    actor_runtime: tokio::runtime::Handle,
 ) -> Result<()> {
     let mut event_loop: EventLoop<'static, Brood> = EventLoop::try_new()?;
     let display: Display<Brood> = Display::new()?;
     let mut state = Brood::new(&mut event_loop, display);
-    configure_session(&mut event_loop, &mut state, args, runtime)?;
+    configure_session(
+        &mut event_loop,
+        &mut state,
+        args,
+        general_runtime,
+        actor_runtime,
+    )?;
 
     info!("broodd compositor running");
+    state.begin_event_loop();
     let event_loop_result = event_loop.run(None, &mut state, service_runtime_tick);
+    state.end_event_loop();
 
     // Shutdown is unconditional: a calloop error must not strand plugin Stores,
     // workers, completion tasks, or legacy actor tasks.
     let harness_shutdown = state.shutdown_test_harness();
+    let lifecycle_shutdown = state.finish_backend_lifecycle_tasks();
     let hosted_shutdown = state.stop_all_hosted_io_actors();
     let legacy_shutdown = state.stop_legacy_wasm_plugin_actors();
     event_loop_result?;
     harness_shutdown?;
+    lifecycle_shutdown?;
     hosted_shutdown?;
     legacy_shutdown?;
     report_harness_completion(&state)
@@ -96,9 +131,10 @@ fn configure_session(
     event_loop: &mut EventLoop<'static, Brood>,
     state: &mut Brood,
     args: &SessionArgs,
-    runtime: tokio::runtime::Handle,
+    general_runtime: tokio::runtime::Handle,
+    actor_runtime: tokio::runtime::Handle,
 ) -> Result<()> {
-    state.set_async_runtime(runtime.clone());
+    state.set_runtime_domains(general_runtime.clone(), actor_runtime);
     frame_export::initialize(state).context("initialize headless frame exporter")?;
     state.test_surface_markers = args.test_surface_markers;
     let config_path = args
@@ -111,7 +147,7 @@ fn configure_session(
     config::load_runtime_settings(state, &config_path)?;
     let control_target =
         control::ControlTarget::new(args.dbus_name.clone(), args.dbus_address.clone());
-    let native_tool_socket = control::listen(event_loop, control_target.clone(), runtime)?;
+    let native_tool_socket = control::listen(event_loop, control_target.clone(), general_runtime)?;
     configure_control_environment(state, &control_target, &native_tool_socket);
     let backend_init_actor = if args.no_init {
         None
@@ -195,8 +231,13 @@ fn print_session_environment(state: &Brood, target: &control::ControlTarget) {
 }
 
 fn service_runtime_tick(state: &mut Brood) {
+    let started = std::time::Instant::now();
+    let driver_before_micros = state.stats.smithay_driver_total_micros;
     state.service_test_harness();
     state.service_realm_init_actor();
+    state
+        .stats
+        .record_smithay_callback(started.elapsed(), driver_before_micros);
 }
 
 fn report_harness_completion(state: &Brood) -> Result<()> {

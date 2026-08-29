@@ -44,20 +44,22 @@ commands. The host sees those commands, not the component that produced them.
 ## Draw Packets
 
 A **draw packet** is a bounded, versioned sequence of canvas commands describing
-the latest visual state of one pane. The stable Component Model API is
-conceptually:
+the latest visual state of one pane. Actors submit changed pane packets as one
+atomic actor-frame batch. The stable Component Model API is conceptually:
 
 ```text
-submit_draw_packet(pane, packet_bytes) -> submit_result
+finish_actor_frame(render_token, [{ pane, optional_resize_epoch, optional_state_watermark, packet_bytes }])
+  -> actor_frame_sequence
 ```
 
-The packet bytes are passed as an owned or borrowed byte list through the
-Component Model ABI. The host copies them before returning. A raw guest address,
-host pointer, Rust object layout, WGPU object, or pointer retained into guest
-memory is never part of the product contract.
+The batch and packet bytes are passed as owned or borrowed lists through the
+Component Model ABI. The host copies and validates the complete batch before
+returning. A raw guest address, host pointer, Rust object layout, WGPU object,
+or pointer retained into guest memory is never part of the product contract.
 
-An accepted packet atomically replaces the pane's previous packet. This gives
-the path latest-state rather than queue semantics:
+An accepted batch atomically replaces the changed panes' previous packets and
+creates one actor-frame revision. This gives the path latest-state rather than
+queue semantics:
 
 - the actor may immediately reuse its encoding memory;
 - an unchanged pane can redraw while its actor is dormant;
@@ -66,18 +68,38 @@ the path latest-state rather than queue semantics:
 - intermediate submissions may be superseded;
 - rejection leaves the previous packet intact.
 
-Acceptance is the final per-packet state, not admission to later validation.
-Every command and referenced resource is already valid and renderable when the
-packet becomes active. Before replacement, the client performs the same bounded
-path tessellation used by the renderer at its finest supported tolerance and
-checks the resulting vertex and index budgets. WGPU lowering does not later
-reject an individual accepted packet. Device loss, allocation failure, or
-another renderer-wide failure enters client renderer recovery and replays the
-accepted CPU-side scene; it is not reported as delayed packet rejection.
+Acceptance is the final batch state, not admission to later validation. An
+invalid pane, duplicate pane, packet, token, resource, or resize epoch rejects
+the complete batch and leaves every previous pane state intact. Every command
+and referenced resource is already valid and renderable when the actor frame
+becomes active. Before replacement, the client performs the same bounded path
+tessellation used by the renderer at its finest supported tolerance and checks
+the resulting vertex and index budgets. WGPU lowering does not later reject an
+individual accepted packet. Device loss, allocation failure, or another
+renderer-wide failure enters client renderer recovery and replays the accepted
+CPU-side scene; it is not reported as delayed packet rejection.
 
-The host assigns the submission sequence used for diagnostics. An actor may
-also include its own view revision for correlating input, drawing, and optional
-semantic metadata, but it does not choose the host sequence.
+The host assigns the actor-frame sequence and changed-pane revisions used for
+diagnostics. An actor may also include its own view revision for correlating
+input, drawing, and optional semantic metadata, but it does not choose the host
+sequences.
+
+Each draw may report an optional causal state watermark identifying the exact
+guest state used to build that packet. The default is absent, preserving
+ordinary draws with no external correlation. A present watermark is used only
+for correlation: it does not alter packet rendering or host frame ordering, and
+it remains attached to that exact pane scene through deferred preparation,
+replay, supersession, and presentation. The host retains a bounded monotonic
+latest-complete admitted-state bound per pane. It accepts a reported watermark
+only when the pane has such a bound and the value does not exceed it; a missing
+bound or future value rejects the complete actor frame before packet/resource
+preparation or token consumption. An older value remains conservative rather
+than being promoted to the host's latest bound.
+
+This field is a coordinated structural change to the current experimental
+`brood:plugin@0.1.0` world. Brood rebuilds its bundled components atomically
+with the host; this target does not claim binary compatibility for stale
+components.
 
 ## Packet Encoding
 
@@ -293,10 +315,10 @@ editor(...)     -> guest document state + text layouts + selection drawing
 ```
 
 The presentation client delivers pane resize, focus, pointer, keyboard, text,
-IME, visibility, and frame events. The actor or SDK maps pane-local input onto
-its own component state and submits a replacement packet when the visible state
-changes. Brood does not retain a component tree, patch widget nodes, preserve
-widget identity, or translate backend widget events.
+IME, visibility, and actor-scoped render hints. The actor or SDK maps pane-local
+input onto its own component state, requests rendering, and finishes the changed
+pane set when the hint arrives. Brood does not retain a component tree, patch
+widget nodes, preserve widget identity, or translate backend widget events.
 
 Accessibility is orthogonal to component implementation. A later or optional
 semantic channel may describe roles, bounds, labels, values, and actions for
@@ -311,11 +333,14 @@ after the host has copied and validated the packet. Rendering and presentation
 happen on the client renderer's normal frame path.
 
 Static panes are redrawn from their retained packet only when damaged, exposed,
-resized, or recomposed. An actor that needs animation requests a frame event,
-advances its state, submits a new packet, and requests another frame if needed.
-Hidden panes do not receive an unbounded frame stream. More specialized
-host-driven shader animation belongs to [[plugin-advanced-graphics]], not the
-base canvas contract.
+resized, or recomposed. An actor that needs to draw requests or subscribes to a
+render hint, samples its visual state for the hint's target presentation time,
+and returns the hint token with its replacement packet. The presentation client
+uses that correlation to pace future hints and trace the accepted state through
+composition and presentation. Hidden panes do not receive an unbounded hint
+stream. The complete timing, token, executor-isolation, and recovery contract is
+defined by [[render-scheduling]]. More specialized host-driven shader animation
+belongs to [[plugin-advanced-graphics]], not the base canvas contract.
 
 ## Limits And Diagnostics
 
@@ -353,6 +378,7 @@ not this base protocol.
 Related:
 
 - [[plugin-ui]]
+- [[render-scheduling]]
 - [[plugin-advanced-graphics]]
 - [[presentation-client]]
 - [[plugin-runtime]]

@@ -15,6 +15,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 
 [[package]]
+name = "brood-graphics"
+version = "0.1.0"
+
+[[package]]
+name = "brood-plugin-graphics-example"
+version = "0.1.0"
+dependencies = [
+ "brood-graphics",
+ "wit-bindgen",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -86,18 +98,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
-]
-
-[[package]]
-name = "brood-graphics"
-version = "0.1.0"
-
-[[package]]
-name = "brood-plugin-graphics-example"
-version = "0.1.0"
-dependencies = [
- "brood-graphics",
- "wit-bindgen",
 ]
 
 [[package]]

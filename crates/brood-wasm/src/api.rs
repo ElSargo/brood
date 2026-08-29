@@ -4,7 +4,7 @@ use anyhow::{Context, Result, ensure};
 use wasmtime::{AsContext, AsContextMut, Config, Engine, Instance, Memory, Module, TypedFunc};
 
 use crate::{
-    mailbox::{ActorId, Mailbox, MailboxRegistry, PreparedMailboxRegistration},
+    mailbox::{ActorId, Mailbox, MailboxAddress, MailboxRegistry, PreparedMailboxRegistration},
     policy_provider::{
         DEFAULT_PUBLICATION_SLOT, PublicationFrameLease, PublicationRegistry, PublicationSummary,
     },
@@ -86,6 +86,15 @@ impl Registry {
             .activate_prepared(registrations, replace_names)
     }
 
+    pub fn activate_prepared_actor_with_address(
+        &mut self,
+        registration: PreparedMailboxRegistration,
+        replace_names: &[String],
+    ) -> Result<MailboxAddress> {
+        self.mailboxes
+            .activate_prepared_with_address(registration, replace_names)
+    }
+
     pub fn validate_prepared_actors(
         &self,
         registrations: &[PreparedMailboxRegistration],
@@ -101,6 +110,10 @@ impl Registry {
 
     pub fn actor_id_for_name(&self, name: &str) -> Option<ActorId> {
         self.mailboxes.actor_id_for_name(name)
+    }
+
+    pub fn mailbox_address(&self, actor_id: ActorId) -> Result<MailboxAddress> {
+        self.mailboxes.mailbox_address(actor_id)
     }
 
     /// Report whether `name` still names `actor_id` but its receiver is gone.

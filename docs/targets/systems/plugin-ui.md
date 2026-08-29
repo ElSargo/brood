@@ -73,15 +73,20 @@ pane shell and routes lifecycle and pane-local input events to the actor:
 ```text
 Client -> Actor: PaneCreated { pane, size, scale, capabilities }
 Client -> Actor: PaneResized { optional resize epoch } / PaneFocused / PaneHidden / PaneDestroyed
-Client -> Actor: Pointer / Key / Text / Ime / Frame
-Actor -> Client: SubmitDrawPacket { pane, optional resize epoch, bytes }
+Client -> Actor: Pointer / Key / Text / Ime
+Client -> Actor: RenderHint { token, target time, deadline, relevant panes, watermark }
+Actor -> Client: RequestRender / SetRenderSubscription
+Actor -> Client: FinishActorFrame { token, changed pane draw packets }
 Actor -> Client: ReusePaneContent { pane, resize epoch }
-Actor -> Client: RequestFrame / CommandRequest / Status
+Actor -> Client: CommandRequest / Status
 ```
 
 The actor returns from each dispatch without waiting for I/O, a worker, or GPU
-execution. It may delegate unrelated work and update the pane when a completion
-arrives. Drawing is normal actor output, not a synchronous key decision lane.
+execution. It may delegate unrelated work and request rendering when a
+completion arrives. The render hint is actor-scoped, and the actor atomically
+finishes all changed owned panes in one token-bearing batch. Drawing is normal
+actor output, not a synchronous key decision lane. The complete pacing and
+token lifecycle is defined by [[render-scheduling]].
 
 A resize-epoch-tagged packet is staged rather than replacing the visible pane
 immediately. When a synchronized layout waits for that pane, only a packet or
@@ -141,7 +146,7 @@ A session-switcher SDK may implement a list, buttons, query editor, selection,
 and fuzzy matching entirely in guest code. The host provides session events,
 command capabilities, pane input, canvas rendering, and text layout. A button
 click becomes a pane-local pointer event interpreted by the SDK, followed by a
-normal command request and replacement draw packet.
+normal command request and render request.
 
 The client never receives a `Button` node or preserves a host widget instance.
 
@@ -172,6 +177,7 @@ client and verify both rendered output and client/actor metrics.
 Related:
 
 - [[plugin-graphics]]
+- [[render-scheduling]]
 - [[plugin-advanced-graphics]]
 - [[presentation-client]]
 - [[plugin-runtime]]

@@ -8,10 +8,215 @@ use std::{
 use brood_graphics::{Color, Packet};
 
 use crate::brood::plugin::host;
+use crate::exports::brood::plugin::actor;
 
 pub use brood_graphics::{Command, PacketError, Rect, theme};
 
 static DEFERRED_RESOURCE_DROPS: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+static ACTIVE_ACTOR_FRAME: Mutex<Option<ActorFrame>> = Mutex::new(None);
+static PENDING_RESIZE_EPOCHS: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
+const MAX_ACTOR_PANES: usize = 16;
+
+/// One owned draw retained until an actor-frame batch is finished.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActorFrameDraw {
+    pub pane: u64,
+    pub resize_epoch: Option<u64>,
+    pub state_watermark: Option<u64>,
+    pub packet: Vec<u8>,
+}
+
+/// Builder for one atomic, actor-scoped frame submission.
+///
+/// Use [`Self::from_render_hint`] for paced rendering. Every submission needs
+/// a host-issued opportunity; there is deliberately no unhinted constructor.
+#[derive(Debug)]
+pub struct ActorFrame {
+    token: host::RenderToken,
+    draws: Vec<ActorFrameDraw>,
+    panes: BTreeSet<u64>,
+    consumed_resize_epochs: BTreeMap<u64, u64>,
+    finished: bool,
+}
+
+impl ActorFrame {
+    #[must_use]
+    pub const fn from_render_hint(hint: &actor::RenderHint) -> Self {
+        Self {
+            token: host::RenderToken {
+                opaque: hint.token.opaque,
+            },
+            draws: Vec::new(),
+            panes: BTreeSet::new(),
+            consumed_resize_epochs: BTreeMap::new(),
+            finished: false,
+        }
+    }
+
+    /// Add one changed pane. Duplicate panes are rejected before the host call.
+    pub fn draw(
+        &mut self,
+        pane: u64,
+        resize_epoch: Option<u64>,
+        packet: &Packet,
+    ) -> Result<(), String> {
+        let packet = packet
+            .encode()
+            .map_err(|error| format!("encode plugin draw packet: {error}"))?;
+        self.draw_encoded(pane, resize_epoch, packet)
+    }
+
+    /// Add one already encoded changed pane.
+    pub fn draw_encoded(
+        &mut self,
+        pane: u64,
+        resize_epoch: Option<u64>,
+        packet: Vec<u8>,
+    ) -> Result<(), String> {
+        self.draw_encoded_with_state_watermark(pane, resize_epoch, None, packet)
+    }
+
+    /// Add one encoded pane with the exact causal state used to build it.
+    pub fn draw_encoded_with_state_watermark(
+        &mut self,
+        pane: u64,
+        resize_epoch: Option<u64>,
+        state_watermark: Option<u64>,
+        packet: Vec<u8>,
+    ) -> Result<(), String> {
+        if self.finished {
+            return Err("actor frame is already finished".to_owned());
+        }
+        if !self.panes.contains(&pane) && self.panes.len() >= MAX_ACTOR_PANES {
+            return Err(format!(
+                "actor frame contains more than {MAX_ACTOR_PANES} panes"
+            ));
+        }
+        if !self.panes.insert(pane) {
+            return Err(format!("actor frame contains duplicate pane {pane}"));
+        }
+        self.draws.push(ActorFrameDraw {
+            pane,
+            resize_epoch,
+            state_watermark,
+            packet,
+        });
+        Ok(())
+    }
+
+    /// Finish the complete actor frame, including an empty no-change frame.
+    pub fn finish(&mut self) -> Result<u64, String> {
+        self.finish_raw()
+            .map_err(|error| format!("finish actor frame: {error:?}"))
+    }
+
+    fn finish_raw(&mut self) -> Result<u64, host::GraphicsError> {
+        if self.finished {
+            return Err(host::GraphicsError::InvalidToken);
+        }
+        let revision = finish_encoded_actor_frame_raw(self.token, &self.draws)?;
+        self.finished = true;
+        Ok(revision)
+    }
+}
+
+impl Drop for ActorFrame {
+    fn drop(&mut self) {
+        if self.finished || self.consumed_resize_epochs.is_empty() {
+            return;
+        }
+        let mut pending = PENDING_RESIZE_EPOCHS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        restore_consumed_resize_epochs(&mut pending, &self.consumed_resize_epochs);
+    }
+}
+
+fn restore_consumed_resize_epochs(pending: &mut BTreeMap<u64, u64>, consumed: &BTreeMap<u64, u64>) {
+    for (pane, resize_epoch) in consumed {
+        pending.entry(*pane).or_insert(*resize_epoch);
+    }
+}
+
+/// Whether the current dispatch is reducing a render hint.
+#[must_use]
+pub fn render_is_active() -> bool {
+    ACTIVE_ACTOR_FRAME
+        .lock()
+        .is_ok_and(|active| active.is_some())
+}
+
+/// Run visual construction for one hint and finish its complete actor batch.
+/// Pane queue helpers are valid only inside this scope.
+pub fn render_with_hint<T>(
+    hint: &actor::RenderHint,
+    render: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    {
+        let mut active = ACTIVE_ACTOR_FRAME
+            .lock()
+            .map_err(|_poisoned| "actor frame scope is poisoned".to_owned())?;
+        if active.is_some() {
+            return Err("actor frame scope is already active".to_owned());
+        }
+        *active = Some(ActorFrame::from_render_hint(hint));
+    }
+
+    let rendered = render();
+    let mut frame = ACTIVE_ACTOR_FRAME
+        .lock()
+        .map_err(|_poisoned| "actor frame scope is poisoned".to_owned())?
+        .take()
+        .ok_or_else(|| "actor frame scope disappeared".to_owned())?;
+    let value = rendered?;
+    match frame.finish_raw() {
+        Ok(_) => {}
+        Err(host::GraphicsError::StaleResizeEpoch) => {
+            for draw in &mut frame.draws {
+                draw.resize_epoch = None;
+            }
+            frame.finish()?;
+        }
+        Err(error) => return Err(format!("finish actor frame: {error:?}")),
+    }
+    Ok(value)
+}
+
+/// Request one coalesced render opportunity for the current actor.
+pub fn request_render() -> Result<(), String> {
+    host::render_request().map_err(|error| format!("request actor render: {error:?}"))
+}
+
+/// Remember synchronized-resize metadata for the actor's next hinted batch.
+pub fn request_render_for_resize(pane: u64, resize_epoch: Option<u64>) -> Result<(), String> {
+    if let Some(resize_epoch) = resize_epoch {
+        let mut pending = PENDING_RESIZE_EPOCHS
+            .lock()
+            .map_err(|_poisoned| "pending resize epochs are poisoned".to_owned())?;
+        remember_resize_epoch(&mut pending, pane, resize_epoch)?;
+    }
+    request_render()
+}
+
+fn remember_resize_epoch(
+    pending: &mut BTreeMap<u64, u64>,
+    pane: u64,
+    resize_epoch: u64,
+) -> Result<(), String> {
+    if !pending.contains_key(&pane) && pending.len() >= MAX_ACTOR_PANES {
+        return Err(format!(
+            "actor has more than {MAX_ACTOR_PANES} pending pane resize epochs"
+        ));
+    }
+    pending.insert(pane, resize_epoch);
+    Ok(())
+}
+
+/// Enable or disable continuous render opportunities for the current actor.
+pub fn set_render_subscription(enabled: bool) -> Result<(), String> {
+    host::render_set_subscription(enabled)
+        .map_err(|error| format!("set actor render subscription: {error:?}"))
+}
 
 /// Construct the common UI text shape while keeping width bounded.
 #[must_use]
@@ -104,17 +309,17 @@ impl UiFrame {
         Ok(layout)
     }
 
-    pub fn submit(
+    pub fn queue(
         mut self,
         resize_epoch: Option<u64>,
         packet: &Packet,
         active_resources: &mut Vec<u64>,
-    ) -> Result<u64, String> {
-        match submit_packet_for_resize(self.pane, resize_epoch, packet) {
-            Ok(sequence) => {
+    ) -> Result<(), String> {
+        match queue_packet_for_resize(self.pane, resize_epoch, packet) {
+            Ok(()) => {
                 drop_resources(self.pane, active_resources.drain(..));
                 *active_resources = std::mem::take(&mut self.resources);
-                Ok(sequence)
+                Ok(())
             }
             Err(error) => {
                 drop_resources(self.pane, self.resources.drain(..));
@@ -244,9 +449,9 @@ impl TextLayoutCache {
         Ok(layout)
     }
 
-    pub fn submit(&mut self, resize_epoch: Option<u64>, packet: &Packet) -> Result<u64, String> {
-        match submit_packet_for_resize(self.pane, resize_epoch, packet) {
-            Ok(sequence) => {
+    pub fn queue(&mut self, resize_epoch: Option<u64>, packet: &Packet) -> Result<(), String> {
+        match queue_packet_for_resize(self.pane, resize_epoch, packet) {
+            Ok(()) => {
                 let stale = self
                     .layouts
                     .keys()
@@ -256,7 +461,7 @@ impl TextLayoutCache {
                 self.retire(stale);
                 self.created.clear();
                 self.used.clear();
-                Ok(sequence)
+                Ok(())
             }
             Err(error) => {
                 self.abort_frame();
@@ -292,76 +497,100 @@ fn draw_layout_clipped(
     packet.push(Command::Restore);
 }
 
-/// Encode and submit a complete packet.
-///
-/// A plugin should submit the replacement packet before dropping resources
-/// referenced by the previous packet.
-pub fn submit_packet(pane: u64, packet: &Packet) -> Result<u64, String> {
-    let bytes = packet
-        .encode()
-        .map_err(|error| format!("encode plugin draw packet: {error}"))?;
-    host::graphics_submit_draw_packet(pane, &bytes)
-        .map_err(|error| format!("submit plugin draw packet: {error:?}"))
+/// Queue one pane into the active hinted actor-frame batch.
+pub fn queue_packet(pane: u64, packet: &Packet) -> Result<(), String> {
+    queue_packet_for_resize(pane, None, packet)
 }
 
-/// Encode and submit a packet for one synchronized resize epoch.
-///
-/// Unlike [`submit_packet`], the host stages this packet until the matching
-/// resize transaction is presented or discarded.
-pub fn submit_tagged_packet(pane: u64, resize_epoch: u64, packet: &Packet) -> Result<u64, String> {
-    let bytes = packet
-        .encode()
-        .map_err(|error| format!("encode tagged plugin draw packet: {error}"))?;
-    host::graphics_submit_tagged_draw_packet(pane, resize_epoch, &bytes)
-        .map_err(|error| format!("submit tagged plugin draw packet: {error:?}"))
+/// Queue one synchronized-resize pane into the active actor-frame batch.
+pub fn queue_tagged_packet(pane: u64, resize_epoch: u64, packet: &Packet) -> Result<(), String> {
+    queue_packet_for_resize(pane, Some(resize_epoch), packet)
 }
 
-/// Submit a replacement packet for an ordinary draw or synchronized resize.
-///
-/// Resize epochs can be superseded while a guest is shaping text or building
-/// its packet. An inactive epoch is an expected race, so retry that packet as
-/// an ordinary draw. The host either presents it immediately or defers it
-/// behind the newer active resize. All other tagged-submit errors remain
-/// failures.
-pub fn submit_packet_for_resize(
+/// Queue one pane with optional synchronized-resize metadata.
+pub fn queue_packet_for_resize(
     pane: u64,
     resize_epoch: Option<u64>,
     packet: &Packet,
-) -> Result<u64, String> {
+) -> Result<(), String> {
     let bytes = packet
         .encode()
         .map_err(|error| format!("encode plugin draw packet: {error}"))?;
-    submit_encoded_packet_for_resize(pane, resize_epoch, &bytes)
+    queue_encoded_packet_for_resize(pane, resize_epoch, bytes)
 }
 
-/// Submit an already encoded replacement packet with stale-epoch recovery.
-pub fn submit_encoded_packet_for_resize(
+/// Queue an already encoded pane into the active hinted actor-frame batch.
+#[allow(
+    clippy::significant_drop_tightening,
+    reason = "the actor-frame guard must remain held while resize metadata is consumed so a concurrent frame close cannot lose that metadata"
+)]
+pub fn queue_encoded_packet_for_resize(
     pane: u64,
     resize_epoch: Option<u64>,
-    bytes: &[u8],
-) -> Result<u64, String> {
-    submit_with_resize_recovery(
-        resize_epoch,
-        || host::graphics_submit_draw_packet(pane, bytes),
-        |resize_epoch| host::graphics_submit_tagged_draw_packet(pane, resize_epoch, bytes),
-    )
+    bytes: Vec<u8>,
+) -> Result<(), String> {
+    queue_encoded_packet_for_resize_with_state_watermark(pane, resize_epoch, None, bytes)
 }
 
-fn submit_with_resize_recovery(
+/// Queue an encoded pane with the exact causal state used to build it.
+#[allow(
+    clippy::significant_drop_tightening,
+    reason = "the actor-frame guard must remain held while resize metadata is consumed so a concurrent frame close cannot lose that metadata"
+)]
+pub fn queue_encoded_packet_for_resize_with_state_watermark(
+    pane: u64,
     resize_epoch: Option<u64>,
-    mut submit_ordinary: impl FnMut() -> Result<u64, host::GraphicsError>,
-    submit_tagged: impl FnOnce(u64) -> Result<u64, host::GraphicsError>,
-) -> Result<u64, String> {
-    let Some(resize_epoch) = resize_epoch else {
-        return submit_ordinary().map_err(|error| format!("submit plugin draw packet: {error:?}"));
+    state_watermark: Option<u64>,
+    bytes: Vec<u8>,
+) -> Result<(), String> {
+    let mut active = ACTIVE_ACTOR_FRAME
+        .lock()
+        .map_err(|_poisoned| "actor frame scope is poisoned".to_owned())?;
+    let frame = active
+        .as_mut()
+        .ok_or_else(|| "pane draw requires an active render hint".to_owned())?;
+    let remembered = if resize_epoch.is_none() {
+        PENDING_RESIZE_EPOCHS
+            .lock()
+            .map_err(|_poisoned| "pending resize epochs are poisoned".to_owned())?
+            .remove(&pane)
+    } else {
+        None
     };
-    match submit_tagged(resize_epoch) {
-        Ok(sequence) => Ok(sequence),
-        Err(host::GraphicsError::InvalidArgument) => submit_ordinary().map_err(|error| {
-            format!("submit plugin draw packet after stale resize epoch: {error:?}")
-        }),
-        Err(error) => Err(format!("submit tagged plugin draw packet: {error:?}")),
+    let resize_epoch = resize_epoch.or(remembered);
+    match frame.draw_encoded_with_state_watermark(pane, resize_epoch, state_watermark, bytes) {
+        Ok(()) => {
+            if let Some(resize_epoch) = remembered {
+                frame.consumed_resize_epochs.insert(pane, resize_epoch);
+            }
+            Ok(())
+        }
+        Err(error) => {
+            if let Some(resize_epoch) = remembered {
+                let mut pending = PENDING_RESIZE_EPOCHS
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                pending.entry(pane).or_insert(resize_epoch);
+            }
+            Err(error)
+        }
     }
+}
+
+fn finish_encoded_actor_frame_raw(
+    token: host::RenderToken,
+    draws: &[ActorFrameDraw],
+) -> Result<u64, host::GraphicsError> {
+    let draws = draws
+        .iter()
+        .map(|draw| host::ActorFrameDraw {
+            pane: draw.pane,
+            resize_epoch: draw.resize_epoch,
+            state_watermark: draw.state_watermark,
+            packet: draw.packet.clone(),
+        })
+        .collect::<Vec<_>>();
+    host::graphics_finish_actor_frame(token, &draws)
 }
 
 /// Mark one synchronized resize ready using the pane's current visible content.
@@ -397,44 +626,138 @@ pub fn drop_resources(pane: u64, resources: impl IntoIterator<Item = u64>) {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
-
     use super::*;
 
     #[test]
-    fn stale_resize_epoch_retries_as_an_ordinary_draw() {
-        let ordinary_calls = Cell::new(0);
-        let tagged_epoch = Cell::new(0);
-        let result = submit_with_resize_recovery(
-            Some(41),
-            || {
-                ordinary_calls.set(ordinary_calls.get() + 1);
-                Ok(9)
-            },
-            |epoch| {
-                tagged_epoch.set(epoch);
-                Err(host::GraphicsError::InvalidArgument)
-            },
+    fn actor_frame_rejects_duplicate_panes_before_submission() {
+        let hint = actor::RenderHint {
+            token: actor::RenderToken { opaque: 4 },
+            target_presentation_time_ns: 10,
+            submission_deadline_ns: 9,
+            relevant_panes: vec![7],
+            event_watermark: 3,
+        };
+        let mut frame = ActorFrame::from_render_hint(&hint);
+        assert!(frame.draw_encoded(7, None, vec![1]).is_ok());
+        assert_eq!(
+            frame.draw_encoded(7, Some(4), vec![2]),
+            Err("actor frame contains duplicate pane 7".to_owned())
         );
-
-        assert_eq!(result, Ok(9));
-        assert_eq!(tagged_epoch.get(), 41);
-        assert_eq!(ordinary_calls.get(), 1);
     }
 
     #[test]
-    fn non_epoch_errors_remain_failures() {
-        let ordinary_calls = Cell::new(0);
-        let result = submit_with_resize_recovery(
-            Some(41),
-            || {
-                ordinary_calls.set(ordinary_calls.get() + 1);
-                Ok(9)
-            },
-            |_epoch| Err(host::GraphicsError::InvalidPacket),
+    fn actor_frame_rejects_more_than_the_bounded_actor_pane_set() {
+        let hint = actor::RenderHint {
+            token: actor::RenderToken { opaque: 5 },
+            target_presentation_time_ns: 10,
+            submission_deadline_ns: 9,
+            relevant_panes: Vec::new(),
+            event_watermark: 3,
+        };
+        let mut frame = ActorFrame::from_render_hint(&hint);
+        for pane in 0..MAX_ACTOR_PANES as u64 {
+            assert!(frame.draw_encoded(pane, None, vec![1]).is_ok());
+        }
+        assert_eq!(
+            frame.draw_encoded(MAX_ACTOR_PANES as u64, None, vec![1]),
+            Err(format!(
+                "actor frame contains more than {MAX_ACTOR_PANES} panes"
+            ))
         );
+    }
 
-        assert!(result.is_err());
-        assert_eq!(ordinary_calls.get(), 0);
+    #[test]
+    fn actor_frame_draws_default_to_no_watermark_and_preserve_explicit_state() {
+        let hint = actor::RenderHint {
+            token: actor::RenderToken { opaque: 6 },
+            target_presentation_time_ns: 10,
+            submission_deadline_ns: 9,
+            relevant_panes: vec![7, 8],
+            event_watermark: 3,
+        };
+        let mut frame = ActorFrame::from_render_hint(&hint);
+        assert!(frame.draw_encoded(7, None, vec![1]).is_ok());
+        assert!(
+            frame
+                .draw_encoded_with_state_watermark(8, None, Some(720), vec![2])
+                .is_ok()
+        );
+        assert_eq!(
+            frame.draws.first().map(|draw| draw.state_watermark),
+            Some(None)
+        );
+        assert_eq!(
+            frame.draws.get(1).map(|draw| draw.state_watermark),
+            Some(Some(720))
+        );
+    }
+
+    #[test]
+    fn pending_resize_epochs_are_bounded_and_existing_panes_can_update() {
+        let mut pending = BTreeMap::new();
+        for pane in 0..MAX_ACTOR_PANES as u64 {
+            assert!(remember_resize_epoch(&mut pending, pane, pane + 10).is_ok());
+        }
+        assert!(remember_resize_epoch(&mut pending, 99, 1).is_err());
+        assert!(remember_resize_epoch(&mut pending, 0, 77).is_ok());
+        assert_eq!(pending.get(&0), Some(&77));
+        assert_eq!(pending.len(), MAX_ACTOR_PANES);
+    }
+
+    #[test]
+    fn rejected_and_abandoned_frames_restore_pending_resize_metadata() {
+        let mut active = ACTIVE_ACTOR_FRAME
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *active = None;
+        let mut pending = PENDING_RESIZE_EPOCHS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pending.clear();
+        pending.insert(7, 41);
+        drop(pending);
+        drop(active);
+
+        assert_eq!(
+            queue_encoded_packet_for_resize(7, None, vec![1]),
+            Err("pane draw requires an active render hint".to_owned())
+        );
+        let pending = PENDING_RESIZE_EPOCHS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(pending.get(&7), Some(&41));
+        drop(pending);
+
+        let hint = actor::RenderHint {
+            token: actor::RenderToken { opaque: 8 },
+            target_presentation_time_ns: 10,
+            submission_deadline_ns: 9,
+            relevant_panes: vec![7],
+            event_watermark: 3,
+        };
+        let mut active = ACTIVE_ACTOR_FRAME
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *active = Some(ActorFrame::from_render_hint(&hint));
+        drop(active);
+        assert!(queue_encoded_packet_for_resize(7, None, vec![1]).is_ok());
+        let abandoned = ACTIVE_ACTOR_FRAME
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        drop(abandoned);
+        let mut pending = PENDING_RESIZE_EPOCHS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(pending.get(&7), Some(&41));
+        pending.clear();
+    }
+
+    #[test]
+    fn abandoned_frame_restores_consumed_resize_without_overwriting_newer_metadata() {
+        let mut pending = BTreeMap::from([(7, 42)]);
+        let consumed = BTreeMap::from([(7, 41), (8, 51)]);
+        restore_consumed_resize_epochs(&mut pending, &consumed);
+        assert_eq!(pending, BTreeMap::from([(7, 42), (8, 51)]));
     }
 }

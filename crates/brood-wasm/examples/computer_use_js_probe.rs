@@ -46,7 +46,9 @@ fn main() -> Result<()> {
     )?;
     for name in ["process", "require", "fetch", "WebSocket", "Deno"] {
         ensure!(
-            authority[name] == "undefined",
+            authority
+                .get(name)
+                .is_some_and(|value| value == "undefined"),
             "unexpected {name} authority"
         );
     }

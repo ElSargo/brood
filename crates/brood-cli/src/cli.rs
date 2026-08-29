@@ -60,6 +60,8 @@ pub enum TestCommand {
     Editor(NestedTestArgs),
     /// Capture and validate synchronized divider resizing frame by frame.
     Resize(NestedTestArgs),
+    /// Validate actor-scoped render scheduling, frame pacing, and hot-path isolation.
+    RenderScheduling(NestedTestArgs),
     /// Deploy to an SSH host and verify one client against local and remote backends.
     Ssh(SshTestArgs),
 }
@@ -478,6 +480,27 @@ mod tests {
                     })),
                 })),
             }) if out_dir == std::path::Path::new("resize-proof")
+        ));
+    }
+
+    #[test]
+    fn render_scheduling_test_command_accepts_an_artifact_directory() {
+        let parsed = Args::try_parse_from([
+            "brood",
+            "test",
+            "render-scheduling",
+            "--out-dir",
+            "render-scheduling-proof",
+        ]);
+        assert!(matches!(
+            parsed,
+            Ok(Args {
+                command: Some(Command::Test(TestArgs {
+                    command: Some(TestCommand::RenderScheduling(NestedTestArgs {
+                        out_dir: Some(out_dir),
+                    })),
+                })),
+            }) if out_dir == std::path::Path::new("render-scheduling-proof")
         ));
     }
 }

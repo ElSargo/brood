@@ -30,7 +30,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
-use brood_protocol::{BackendActorRealm, SessionIsolationStatus};
+use brood_protocol::{BackendActorRealm, SessionIsolationStatus, managed_resize_epoch_is_valid};
 #[cfg(feature = "shm-fallback")]
 use smithay::wayland::shm::ShmState;
 use smithay::{
@@ -73,7 +73,7 @@ use smithay::{
         viewporter::ViewporterState,
     },
 };
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
     BROOD_HOST_DBUS_ADDRESS_ENV, BROOD_PANE_ID_ENV, BROOD_SESSION_ENV, BROODD_DBUS_ADDRESS_ENV,
@@ -84,6 +84,11 @@ use crate::{
     geometry::{WindowSizeNegotiation, negotiate_window_size},
     plugin_runtime::{
         PluginActorSummary, PluginHostEvent, PluginHostMessage, PluginMailboxSummary, PluginRuntime,
+    },
+    scheduling_domain::{
+        ActorProgressMetrics, BACKEND_ACTOR_EVENTS_PER_ACTOR, BACKEND_ACTOR_EVENTS_PER_TURN,
+        BACKEND_LIFECYCLE_CAPACITY, BoundedWorkMetrics, CallbackMetrics, LifecycleAdmission,
+        bounded_round_robin_plan, try_admit_lifecycle_request_id,
     },
     session_bus::{SessionBusHandle, SessionBusRealm},
     state_services::{FocusService, SurfaceSessionService, TestHarnessService},
@@ -647,6 +652,44 @@ struct BackendActorHostMessage {
     presentation_actor: Option<String>,
 }
 
+enum BackendLifecycleCompletion {
+    HostedReplacementReady {
+        request: u64,
+        actor_id: String,
+        path: PathBuf,
+        purpose: HostedReplacementPurpose,
+        lifecycle: Option<ConfiguredPluginLifecycle>,
+        result: std::result::Result<Box<brood_wasm::HostedWasmActor>, String>,
+    },
+    LegacyReplacementReady {
+        request: u64,
+        path: PathBuf,
+        generation: Option<brood_wasm::LegacyWasmActorGeneration>,
+        result: std::result::Result<(), String>,
+    },
+    RealmChildStopped {
+        session: SurfaceSessionId,
+        id: String,
+        result: std::result::Result<(), String>,
+    },
+    ActorRetired {
+        actor_id: String,
+        result: std::result::Result<(), String>,
+    },
+}
+
+#[derive(Clone, Debug)]
+enum HostedReplacementPurpose {
+    Generic,
+    RealmRoot {
+        session: SurfaceSessionId,
+    },
+    RealmChild {
+        session: SurfaceSessionId,
+        id: String,
+    },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ConfiguredWorkspacePlugin {
     path: PathBuf,
@@ -713,6 +756,33 @@ const fn legacy_instance_id_to_validate(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PresentationConfigurePolicy {
+    Deduplicate,
+    Force,
+}
+
+impl PresentationConfigurePolicy {
+    const fn should_emit(self, already_configured: bool) -> bool {
+        matches!(self, Self::Force) || !already_configured
+    }
+}
+
+fn emit_presentation_toplevel_configure(
+    toplevel: &smithay::wayland::shell::xdg::ToplevelSurface,
+    size: Size<i32, Logical>,
+    policy: PresentationConfigurePolicy,
+) -> Option<Serial> {
+    toplevel.with_pending_state(|state| {
+        state.size = Some(size);
+        state.bounds = Some(size);
+    });
+    match policy {
+        PresentationConfigurePolicy::Deduplicate => toplevel.send_pending_configure(),
+        PresentationConfigurePolicy::Force => Some(toplevel.send_configure()),
+    }
+}
+
 pub struct Brood {
     pub start_time: Instant,
     pub socket_name: OsString,
@@ -773,6 +843,20 @@ pub struct Brood {
     wasm_host_mailbox: Option<brood_wasm::Mailbox>,
     legacy_wasm_actor_generation: Option<brood_wasm::LegacyWasmActorGeneration>,
     wasm_io_actors: BTreeMap<String, brood_wasm::HostedWasmActor>,
+    backend_actor_drain_cursor: usize,
+    backend_actor_progress: ActorProgressMetrics,
+    backend_lifecycle_completion_sender: tokio::sync::mpsc::Sender<BackendLifecycleCompletion>,
+    backend_lifecycle_completions: tokio::sync::mpsc::Receiver<BackendLifecycleCompletion>,
+    backend_lifecycle_tasks: Vec<tokio::task::JoinHandle<()>>,
+    backend_lifecycle_admission: LifecycleAdmission,
+    event_loop_active: bool,
+    next_hosted_replacement_request: u64,
+    pending_hosted_replacements: BTreeMap<String, u64>,
+    pending_hosted_startup_messages: BTreeMap<String, Vec<(String, String)>>,
+    pending_legacy_replacement: Option<u64>,
+    pending_legacy_actor_names: BTreeSet<String>,
+    starting_realm_children: BTreeSet<(SurfaceSessionId, String)>,
+    stop_requested_while_starting: BTreeSet<(SurfaceSessionId, String)>,
     backend_init_actor: Option<PathBuf>,
     backend_init: Option<RealmInitState>,
     next_managed_worktree_request: u64,
@@ -797,6 +881,7 @@ pub struct Brood {
     hosted_children: Vec<HostedChild>,
     hosted_child_event_sender: channel::Sender<HostedChildEvent>,
     async_runtime: Option<tokio::runtime::Handle>,
+    actor_runtime: Option<tokio::runtime::Handle>,
     hosted_child_exits: u64,
     hosted_child_failures: u64,
     hosted_child_last_status: Option<String>,
@@ -848,6 +933,8 @@ impl Brood {
         let wasm_host_mailbox = wasm_registry
             .register_host_mailbox(256)
             .expect("register WASM host mailbox");
+        let (backend_lifecycle_completion_sender, backend_lifecycle_completions) =
+            tokio::sync::mpsc::channel(BACKEND_LIFECYCLE_CAPACITY);
 
         Self {
             start_time,
@@ -905,6 +992,20 @@ impl Brood {
             wasm_host_mailbox: Some(wasm_host_mailbox),
             legacy_wasm_actor_generation: None,
             wasm_io_actors: BTreeMap::new(),
+            backend_actor_drain_cursor: 0,
+            backend_actor_progress: ActorProgressMetrics::default(),
+            backend_lifecycle_completion_sender,
+            backend_lifecycle_completions,
+            backend_lifecycle_tasks: Vec::with_capacity(BACKEND_LIFECYCLE_CAPACITY),
+            backend_lifecycle_admission: LifecycleAdmission::default(),
+            event_loop_active: false,
+            next_hosted_replacement_request: 1,
+            pending_hosted_replacements: BTreeMap::new(),
+            pending_hosted_startup_messages: BTreeMap::new(),
+            pending_legacy_replacement: None,
+            pending_legacy_actor_names: BTreeSet::new(),
+            starting_realm_children: BTreeSet::new(),
+            stop_requested_while_starting: BTreeSet::new(),
             backend_init_actor: None,
             backend_init: None,
             next_managed_worktree_request: 1,
@@ -931,6 +1032,7 @@ impl Brood {
             hosted_children: Vec::new(),
             hosted_child_event_sender,
             async_runtime: None,
+            actor_runtime: None,
             hosted_child_exits: 0,
             hosted_child_failures: 0,
             hosted_child_last_status: None,
@@ -938,15 +1040,33 @@ impl Brood {
         }
     }
 
-    pub fn set_async_runtime(&mut self, runtime: tokio::runtime::Handle) {
+    pub fn set_runtime_domains(
+        &mut self,
+        general_runtime: tokio::runtime::Handle,
+        actor_runtime: tokio::runtime::Handle,
+    ) {
         if self.plugin_runtime.is_none() {
             self.plugin_runtime = Some(PluginRuntime::start_builtin(
-                &runtime,
+                &actor_runtime,
                 self.plugin_host_event_sender.clone(),
             ));
             self.plugin_actor_last_status = Some("builtin:started".to_string());
         }
-        self.async_runtime = Some(runtime);
+        self.async_runtime = Some(general_runtime);
+        self.actor_runtime = Some(actor_runtime);
+    }
+
+    /// Mark the point after startup configuration where the calloop owner may
+    /// no longer synchronously wait for backend actor work.
+    pub(crate) const fn begin_event_loop(&mut self) {
+        self.event_loop_active = true;
+    }
+
+    /// Mark the point after calloop has stopped. Ordered shutdown may use the
+    /// blocking join helpers because no latency-sensitive owner callback can
+    /// run after this point.
+    pub(crate) const fn end_event_loop(&mut self) {
+        self.event_loop_active = false;
     }
 
     pub fn send_plugin_actor_message(
@@ -966,6 +1086,7 @@ impl Brood {
             .legacy_wasm_actor_generation
             .as_ref()
             .is_some_and(|generation| generation.contains_actor(actor_id))
+            || self.pending_legacy_actor_names.contains(actor_id)
         {
             self.try_route_wasm_actor_message(actor_id, sender, body.into_bytes())?;
             self.plugin_actor_messages += 1;
@@ -1357,7 +1478,7 @@ impl Brood {
         if let Some(actor) = self.wasm_io_actors.get(actor_id) {
             return actor.try_send_message(sender, payload);
         }
-        self.block_on_wasm_registry(|registry| {
+        self.try_with_wasm_registry(|registry| {
             registry.try_post_named_message(actor_id, payload)
         })??;
         Ok(())
@@ -1369,7 +1490,7 @@ impl Brood {
             .as_ref()
             .map_or_else(Vec::new, |generation| generation.subscribers(event));
         for actor in actor_names {
-            let result = self.block_on_wasm_registry(|registry| {
+            let result = self.try_with_wasm_registry(|registry| {
                 registry.try_post_named_message(&actor, payload.as_bytes().to_vec())
             });
             match result {
@@ -1386,19 +1507,15 @@ impl Brood {
         }
     }
 
-    fn block_on_wasm_registry<T>(
+    fn try_with_wasm_registry<T>(
         &self,
         f: impl FnOnce(&mut brood_wasm::Registry) -> T,
     ) -> Result<T> {
-        let registry = Arc::clone(&self.wasm_registry);
-        let runtime = self
-            .async_runtime
-            .as_ref()
-            .context("async runtime is not initialized for WASM registry use")?;
-        Ok(runtime.block_on(async move {
-            let mut registry = registry.lock().await;
-            f(&mut registry)
-        }))
+        let mut registry = self
+            .wasm_registry
+            .try_lock()
+            .context("WASM registry is busy; caller must retry")?;
+        Ok(f(&mut registry))
     }
 
     fn drain_wasm_host_mailbox(&mut self) {
@@ -1525,6 +1642,26 @@ impl Brood {
         self.plugin_actor_last_status.as_deref()
     }
 
+    pub(crate) fn backend_actor_progress_snapshot(&self) -> BTreeMap<String, u64> {
+        self.backend_actor_progress
+            .snapshot(|actor_name, generation| {
+                self.wasm_io_actors
+                    .get(actor_name)
+                    .is_some_and(|actor| actor.generation() == generation)
+            })
+    }
+
+    fn record_backend_actor_progress(&mut self, actor_name: &str) {
+        let Some(generation) = self
+            .wasm_io_actors
+            .get(actor_name)
+            .map(brood_wasm::HostedWasmActor::generation)
+        else {
+            return;
+        };
+        self.backend_actor_progress.record(actor_name, generation);
+    }
+
     fn drain_hosted_actor_events(&mut self) {
         enum InitRequest {
             StartActor(SurfaceSessionId, String, String, Vec<String>),
@@ -1532,16 +1669,44 @@ impl Brood {
             StartApp(SurfaceSessionId, String, Vec<String>),
         }
 
-        let mut events = Vec::new();
+        self.backend_actor_progress
+            .retain_current(|actor_name, generation| {
+                self.wasm_io_actors
+                    .get(actor_name)
+                    .is_some_and(|actor| actor.generation() == generation)
+            });
+        let mut events = Vec::with_capacity(BACKEND_ACTOR_EVENTS_PER_TURN);
         let mut init_requests = Vec::new();
         let mut local_messages = Vec::new();
         let mut presentation_messages = Vec::new();
         let mut host_messages = Vec::new();
-        for (actor_name, actor) in &mut self.wasm_io_actors {
+        let actor_names = self.wasm_io_actors.keys().cloned().collect::<Vec<_>>();
+        let actor_count = actor_names.len();
+        let plan = bounded_round_robin_plan(
+            actor_count,
+            self.backend_actor_drain_cursor,
+            BACKEND_ACTOR_EVENTS_PER_TURN,
+            BACKEND_ACTOR_EVENTS_PER_ACTOR,
+        );
+        let mut saturated_actors = 0;
+        for (index, actor_budget) in &plan.actors {
+            let Some(actor_name) = actor_names.get(*index) else {
+                continue;
+            };
+            let Some(actor) = self.wasm_io_actors.get_mut(actor_name) else {
+                continue;
+            };
             match actor {
                 brood_wasm::HostedWasmActor::Component(actor) => {
-                    while let Some(event) = actor.try_recv_event() {
+                    let mut actor_events = 0;
+                    while actor_events < *actor_budget
+                        && let Some(event) = actor.try_recv_event()
+                    {
                         events.push((actor_name.clone(), Ok(event)));
+                        actor_events += 1;
+                    }
+                    if actor_events == *actor_budget {
+                        saturated_actors += 1;
                     }
                 }
                 brood_wasm::HostedWasmActor::Preview1(actor) => {
@@ -1550,6 +1715,18 @@ impl Brood {
                     }
                 }
             }
+        }
+
+        self.backend_actor_drain_cursor = plan.next_cursor;
+
+        let observed_backlog = saturated_actors + plan.unvisited_actors;
+        self.stats
+            .backend_actor_events
+            .record_batch(events.len(), observed_backlog);
+        if observed_backlog > 0 {
+            // A bounded drain must never require unrelated Wayland or input
+            // traffic to resume actor progress.
+            self.loop_signal.wakeup();
         }
 
         for (actor_name, event) in events {
@@ -1571,6 +1748,13 @@ impl Brood {
                     continue;
                 }
             };
+            if matches!(
+                event,
+                brood_wasm::ComponentActorEvent::DispatcherReturned
+                    | brood_wasm::ComponentActorEvent::PresentationTurnReturned { .. }
+            ) {
+                self.record_backend_actor_progress(&actor_name);
+            }
             match event {
                 brood_wasm::ComponentActorEvent::DispatcherFailed { message } => {
                     self.plugin_actor_failures = self.plugin_actor_failures.saturating_add(1);
@@ -1830,17 +2014,25 @@ impl Brood {
 
         loop_handle
             .insert_source(listening_socket, move |client_stream, (), state| {
+                let started = Instant::now();
+                let driver_before_micros = state.stats.smithay_driver_total_micros;
                 let result = state
                     .display_handle
                     .insert_client(client_stream, Arc::new(ClientState::default()));
                 if let Err(err) = result {
                     state.stats.wayland_client_insert_errors += 1;
                     warn!(?err, "insert Wayland client failed");
+                    state
+                        .stats
+                        .record_smithay_callback(started.elapsed(), driver_before_micros);
                     return;
                 }
                 if let Err(err) = state.display_handle.flush_clients() {
                     warn!(?err, "flush clients after insert failed");
                 }
+                state
+                    .stats
+                    .record_smithay_callback(started.elapsed(), driver_before_micros);
             })
             .expect("insert wayland socket");
 
@@ -1848,10 +2040,15 @@ impl Brood {
             .insert_source(
                 Generic::new(display, Interest::READ, Mode::Level),
                 |_, display, state| {
+                    let started = Instant::now();
+                    let driver_before_micros = state.stats.smithay_driver_total_micros;
                     dispatch_wayland_clients(display, state);
                     if let Err(err) = state.display_handle.flush_clients() {
                         warn!(?err, "flush clients after dispatch failed");
                     }
+                    state
+                        .stats
+                        .record_smithay_callback(started.elapsed(), driver_before_micros);
                     Ok(PostAction::Continue)
                 },
             )
@@ -1867,6 +2064,8 @@ impl Brood {
         event_loop
             .handle()
             .insert_source(receiver, |event, (), state| {
+                let started = Instant::now();
+                let driver_before_micros = state.stats.smithay_driver_total_micros;
                 let channel::Event::Msg(event) = event else {
                     return;
                 };
@@ -1880,6 +2079,9 @@ impl Brood {
                     HostedChildEvent::Exited(exit) => state.record_hosted_child_exit(exit),
                 }
                 state.refresh_window_state_from_lifecycle_event();
+                state
+                    .stats
+                    .record_smithay_callback(started.elapsed(), driver_before_micros);
             })
             .expect("insert hosted child event source");
         sender
@@ -1892,10 +2094,15 @@ impl Brood {
         event_loop
             .handle()
             .insert_source(receiver, |event, (), state| {
+                let started = Instant::now();
+                let driver_before_micros = state.stats.smithay_driver_total_micros;
                 let channel::Event::Msg(event) = event else {
                     return;
                 };
                 state.handle_host_clipboard_event(event);
+                state
+                    .stats
+                    .record_smithay_callback(started.elapsed(), driver_before_micros);
             })
             .expect("insert host clipboard event source");
         HostClipboardBridge::start(sender)
@@ -1908,10 +2115,15 @@ impl Brood {
         event_loop
             .handle()
             .insert_source(receiver, |event, (), state| {
+                let started = Instant::now();
+                let driver_before_micros = state.stats.smithay_driver_total_micros;
                 let channel::Event::Msg(event) = event else {
                     return;
                 };
                 state.handle_plugin_host_event(event);
+                state
+                    .stats
+                    .record_smithay_callback(started.elapsed(), driver_before_micros);
             })
             .expect("insert plugin host event source");
         sender
@@ -3276,8 +3488,7 @@ impl Brood {
         let requested = (width.max(1), height.max(1));
         self.presentation_client_requested_sizes
             .insert(pane, requested);
-        self.configure_presentation_client_toplevel_size(pane, &surface, toplevel, requested);
-        true
+        self.configure_presentation_client_toplevel_size(pane, &surface, toplevel, requested)
     }
 
     pub(crate) fn computer_use_owns_pane(&self, pane: u64) -> bool {
@@ -3361,24 +3572,107 @@ impl Brood {
         width: i32,
         height: i32,
     ) -> bool {
-        let retired = fast_path
-            .managed_resizes
-            .retire_pending_for_ordinary_resize(pane);
-        crate::frame_export::cleanup_provisional_tagged_resources(fast_path);
-        if !retired.is_empty() {
-            // Do not export the already-current surface as recovery. Wait for
-            // a later untagged commit after this request. This preserves the
-            // complete old waited set during the degraded presentation.
-            fast_path
-                .managed_resizes
-                .wait_for_ordinary_recovery_commit(pane);
-            info!(
-                pane,
-                ?retired,
-                "retired managed resize epochs for ordinary recovery"
-            );
+        match fast_path.managed_resizes.decide_ordinary_resize(pane, None) {
+            OrdinaryManagedResizeDecision::Configure => {}
+            OrdinaryManagedResizeDecision::IgnoreUnscoped => {
+                info!(
+                    pane,
+                    "ignored unscoped ordinary resize during tagged authority"
+                );
+                return false;
+            }
+            OrdinaryManagedResizeDecision::IgnoreStaleRecovery
+            | OrdinaryManagedResizeDecision::RecoverThrough(_) => return false,
         }
         self.configure_presentation_client_pane_size(pane, width, height)
+    }
+
+    pub fn recover_ordinary_presentation_client_pane_size(
+        &mut self,
+        fast_path: &mut PresentationFastPath,
+        pane: u64,
+        width: i32,
+        height: i32,
+        recover_through_epoch: u64,
+    ) -> bool {
+        if !managed_resize_epoch_is_valid(recover_through_epoch) {
+            return false;
+        }
+        // Validate the complete configure target before retiring authority.
+        // Once this succeeds, send_configure below is infallible and always
+        // emits a fresh serial, including when the negotiated size is already
+        // current. That fresh serial is the causal source of the commit floor.
+        let Some(surface) = self.content_surface_for_pane(pane) else {
+            return false;
+        };
+        let Some(window) = self.window_for_any_toplevel_surface(&surface) else {
+            return false;
+        };
+        let Some(toplevel) = window.toplevel() else {
+            return false;
+        };
+        let requested = (width.max(1), height.max(1));
+        let constraints = with_states(&surface, |states| {
+            *states.cached_state.get::<SurfaceCachedState>().current()
+        });
+        let (configured_size, negotiation) = negotiate_window_size(
+            requested,
+            constraints.min_size.into(),
+            constraints.max_size.into(),
+        );
+        if configured_size.0 <= 0 || configured_size.1 <= 0 {
+            return false;
+        }
+        if fast_path
+            .managed_resizes
+            .has_epoch_after(pane, recover_through_epoch)
+        {
+            info!(
+                pane,
+                recover_through_epoch,
+                "ignored stale ordinary recovery behind newer tagged authority"
+            );
+            return false;
+        }
+        let retired = fast_path
+            .managed_resizes
+            .retire_pending_through_epoch(pane, recover_through_epoch);
+        crate::frame_export::cleanup_provisional_tagged_resources(fast_path);
+        let size: Size<i32, Logical> = configured_size.into();
+        let serial = emit_presentation_toplevel_configure(
+            toplevel,
+            size,
+            PresentationConfigurePolicy::Force,
+        )
+        .expect("forced presentation configure always emits one serial");
+        self.presentation_client_requested_sizes
+            .insert(pane, requested);
+        info!(
+            pane,
+            recover_through_epoch,
+            serial = u32::from(serial),
+            requested_width = requested.0,
+            requested_height = requested.1,
+            configured_width = configured_size.0,
+            configured_height = configured_size.1,
+            ?negotiation,
+            "ordinary managed recovery configure issued"
+        );
+        // The configure response cannot commit synchronously. Arm after the
+        // configure was accepted and before returning to the control loop,
+        // which requests redraw for this successful operation.
+        let recovery_floor = fast_path
+            .managed_resizes
+            .wait_for_ordinary_recovery_commit(pane);
+        info!(
+            pane,
+            recover_through_epoch,
+            serial = u32::from(serial),
+            recovery_floor,
+            ?retired,
+            "accepted and armed ordinary managed recovery"
+        );
+        true
     }
 
     pub fn configure_tagged_presentation_client_pane_size(
@@ -3422,7 +3716,7 @@ impl Brood {
             );
             return false;
         };
-        if epoch == 0
+        if !managed_resize_epoch_is_valid(epoch)
             || scale_120 == 0
             || logical_size.0 <= 0
             || logical_size.1 <= 0
@@ -3587,14 +3881,15 @@ impl Brood {
                     current.size == Some(size) && current.bounds == Some(size)
                 })
         });
-        if already_configured {
+        if !PresentationConfigurePolicy::Deduplicate.should_emit(already_configured) {
             return false;
         }
-        toplevel.with_pending_state(|state| {
-            state.size = Some(size);
-            state.bounds = Some(size);
-        });
-        let configured = toplevel.send_pending_configure().is_some();
+        let configured = emit_presentation_toplevel_configure(
+            toplevel,
+            size,
+            PresentationConfigurePolicy::Deduplicate,
+        )
+        .is_some();
         if configured && negotiation != WindowSizeNegotiation::Requested {
             info!(
                 pane,
@@ -4271,6 +4566,7 @@ impl Brood {
             false,
             None,
             true,
+            HostedReplacementPurpose::Generic,
         )?;
         self.configured_plugin_lifecycles
             .insert(BACKEND_INIT_ACTOR_ID.to_string(), lifecycle);
@@ -4714,6 +5010,7 @@ impl Brood {
             true,
             Some(session),
             true,
+            HostedReplacementPurpose::RealmRoot { session },
         )?;
         self.configured_plugin_lifecycles
             .insert(actor_id.clone(), lifecycle);
@@ -4734,6 +5031,28 @@ impl Brood {
     }
 
     fn stop_session_init_actor(&mut self, session: SurfaceSessionId) -> Result<()> {
+        let retirement_count = self.realm_inits.get(&session).map_or(0, |init| {
+            init.children
+                .values()
+                .filter(|actor_id| self.wasm_io_actors.contains_key(*actor_id))
+                .count()
+                + usize::from(self.wasm_io_actors.contains_key(&init.actor_id))
+        });
+        ensure!(
+            self.backend_lifecycle_admission
+                .active()
+                .saturating_add(retirement_count)
+                <= BACKEND_LIFECYCLE_CAPACITY,
+            "backend actor lifecycle lane has no shutdown capacity"
+        );
+        let starting = std::mem::take(&mut self.starting_realm_children);
+        for key in starting {
+            if key.0 == session {
+                self.stop_requested_while_starting.insert(key);
+            } else {
+                self.starting_realm_children.insert(key);
+            }
+        }
         let stale_requests = self
             .pending_realm_artifacts
             .iter()
@@ -4748,32 +5067,41 @@ impl Brood {
         };
         let mut first_error = None;
         for actor_id in init.children.values() {
-            if let Err(error) = self.stop_hosted_io_actor(actor_id)
-                && first_error.is_none()
+            let lifecycle = self.configured_plugin_lifecycles.remove(actor_id);
+            let Some(actor) = self.wasm_io_actors.remove(actor_id) else {
+                continue;
+            };
+            if let Err(error) = self.spawn_actor_retirement(
+                actor_id.clone(),
+                actor,
+                lifecycle,
+                brood_wasm::PluginStopReason::Shutdown,
+                None,
+            ) && first_error.is_none()
             {
                 first_error = Some(error);
             }
         }
-        if let Err(error) = self.stop_hosted_io_actor_lifecycle(
-            &init.actor_id,
-            brood_wasm::PluginStopReason::Shutdown,
-            None,
-        ) && first_error.is_none()
-        {
-            first_error = Some(error);
-        }
-        if let Err(error) = self.stop_hosted_io_actor(&init.actor_id)
+        let lifecycle = self.configured_plugin_lifecycles.remove(&init.actor_id);
+        if let Some(actor) = self.wasm_io_actors.remove(&init.actor_id)
+            && let Err(error) = self.spawn_actor_retirement(
+                init.actor_id.clone(),
+                actor,
+                lifecycle,
+                brood_wasm::PluginStopReason::Shutdown,
+                None,
+            )
             && first_error.is_none()
         {
             first_error = Some(error);
         }
-        self.configured_plugin_lifecycles.remove(&init.actor_id);
         first_error.map_or(Ok(()), Err)
     }
 
     /// Service lifecycle requests and failure feedback for the session init
     /// actor. This is safe to call on every compositor turn.
     pub(crate) fn service_realm_init_actor(&mut self) {
+        self.drain_backend_lifecycle_completions();
         self.flush_presentation_actor_messages();
         if let Some(fast_path) = self.dmabuf.fast_path.as_mut() {
             flush_managed_resize_statuses(fast_path);
@@ -4820,12 +5148,7 @@ impl Brood {
     ) {
         let result = self.start_realm_init_child(session, &id, guest_path, capabilities);
         match result {
-            Ok(generation) => {
-                self.send_realm_init_child_event(
-                    session,
-                    brood_wasm::ComponentChildEvent::Started { id, generation },
-                );
-            }
+            Ok(()) => {}
             Err(error) if error.downcast_ref::<MissingRealmArtifact>().is_some() => {
                 let request = self.next_realm_artifact_request;
                 self.next_realm_artifact_request =
@@ -4862,7 +5185,7 @@ impl Brood {
         id: &str,
         guest_path: &str,
         capabilities: &[String],
-    ) -> Result<u64> {
+    ) -> Result<()> {
         ensure!(
             !id.trim().is_empty(),
             "init child actor id must not be empty"
@@ -4874,11 +5197,10 @@ impl Brood {
         let actor_id = session_init_child_actor_id(session, id);
         ensure!(
             !self.wasm_io_actors.contains_key(&actor_id)
-                || self
-                    .realm_inits
-                    .get(&session)
-                    .is_some_and(|init| init.children.get(id) == Some(&actor_id)),
-            "init actor cannot replace an actor it does not own"
+                && !self
+                    .starting_realm_children
+                    .contains(&(session, id.to_string())),
+            "init child actor is already running or starting"
         );
         let relative = Path::new(guest_path);
         ensure!(
@@ -4950,8 +5272,10 @@ impl Brood {
             stop_timeout: Duration::from_secs(2),
             data: BTreeMap::new(),
         };
-        let lifecycle_request = (lifecycle.clone(), brood_wasm::PluginStartReason::Initial);
-        self.replace_wasm_component_actor(
+        let lifecycle_request = (lifecycle, brood_wasm::PluginStartReason::Initial);
+        self.starting_realm_children
+            .insert((session, id.to_string()));
+        let load_result = self.replace_wasm_component_actor(
             &actor_id,
             &path,
             filesystem.as_ref(),
@@ -4970,21 +5294,410 @@ impl Brood {
             false,
             Some(session),
             true,
-        )?;
-        let generation = self
-            .wasm_io_actors
-            .get(&actor_id)
-            .context("init child did not produce a hosted actor")?
-            .generation();
-        if let Some(init) = self.realm_inits.get_mut(&session) {
-            init.children.insert(id.to_string(), actor_id.clone());
+            HostedReplacementPurpose::RealmChild {
+                session,
+                id: id.to_string(),
+            },
+        );
+        if let Err(error) = load_result {
+            self.starting_realm_children
+                .remove(&(session, id.to_string()));
+            return Err(error);
         }
-        self.configured_plugin_lifecycles
-            .insert(actor_id, lifecycle);
-        Ok(generation)
+        Ok(())
+    }
+
+    fn spawn_realm_child_stop(
+        &mut self,
+        session: SurfaceSessionId,
+        id: String,
+        actor_id: String,
+        mut actor: brood_wasm::HostedWasmActor,
+        lifecycle: Option<ConfiguredPluginLifecycle>,
+    ) -> Result<()> {
+        ensure!(
+            self.try_admit_backend_lifecycle_reserved(),
+            "backend actor lifecycle lane is full"
+        );
+        let runtime = self
+            .actor_runtime
+            .clone()
+            .context("backend actor runtime is not initialized")?;
+        let completion = self.backend_lifecycle_completion_sender.clone();
+        let signal = self.loop_signal.clone();
+        let task = runtime.spawn(async move {
+            let lifecycle_result = if let Some(lifecycle) = lifecycle {
+                let generation = actor.generation();
+                let event = brood_wasm::PluginLifecycleEvent::Stop(brood_wasm::PluginStopContext {
+                    instance_id: actor_id,
+                    generation,
+                    reason: brood_wasm::PluginStopReason::Shutdown,
+                    next_generation: None,
+                });
+                actor
+                    .lifecycle(event, lifecycle.stop_timeout)
+                    .await
+                    .map_err(|error| format!("plugin stop lifecycle failed: {error:#}"))
+            } else {
+                Ok(())
+            };
+            let shutdown_result = actor
+                .shutdown()
+                .await
+                .map_err(|error| format!("plugin shutdown failed: {error:#}"));
+            let result = lifecycle_result.and(shutdown_result);
+            signal.wakeup();
+            let _sent = completion
+                .send(BackendLifecycleCompletion::RealmChildStopped {
+                    session,
+                    id,
+                    result,
+                })
+                .await;
+            signal.wakeup();
+        });
+        self.backend_lifecycle_tasks.push(task);
+        self.stats
+            .backend_lifecycle
+            .record_admission(self.backend_lifecycle_admission.active());
+        Ok(())
+    }
+
+    fn spawn_actor_retirement(
+        &mut self,
+        actor_id: String,
+        mut actor: brood_wasm::HostedWasmActor,
+        lifecycle: Option<ConfiguredPluginLifecycle>,
+        reason: brood_wasm::PluginStopReason,
+        next_generation: Option<u64>,
+    ) -> Result<()> {
+        ensure!(
+            self.try_admit_backend_lifecycle_reserved(),
+            "backend actor lifecycle lane is full"
+        );
+        let runtime = self
+            .actor_runtime
+            .clone()
+            .context("backend actor runtime is not initialized")?;
+        let completion = self.backend_lifecycle_completion_sender.clone();
+        let signal = self.loop_signal.clone();
+        let task_actor_id = actor_id.clone();
+        let task = runtime.spawn(async move {
+            let lifecycle_result = if let Some(lifecycle) = lifecycle {
+                let generation = actor.generation();
+                let event = brood_wasm::PluginLifecycleEvent::Stop(brood_wasm::PluginStopContext {
+                    instance_id: task_actor_id,
+                    generation,
+                    reason,
+                    next_generation,
+                });
+                actor
+                    .lifecycle(event, lifecycle.stop_timeout)
+                    .await
+                    .map_err(|error| format!("plugin stop lifecycle failed: {error:#}"))
+            } else {
+                Ok(())
+            };
+            let shutdown_result = actor
+                .shutdown()
+                .await
+                .map_err(|error| format!("plugin shutdown failed: {error:#}"));
+            let result = lifecycle_result.and(shutdown_result);
+            signal.wakeup();
+            let _sent = completion
+                .send(BackendLifecycleCompletion::ActorRetired { actor_id, result })
+                .await;
+            signal.wakeup();
+        });
+        self.backend_lifecycle_tasks.push(task);
+        self.stats
+            .backend_lifecycle
+            .record_admission(self.backend_lifecycle_admission.active());
+        Ok(())
+    }
+
+    fn drain_backend_lifecycle_completions(&mut self) {
+        self.backend_lifecycle_tasks
+            .retain(|task| !task.is_finished());
+        for _ in 0..BACKEND_LIFECYCLE_CAPACITY {
+            let Ok(completion) = self.backend_lifecycle_completions.try_recv() else {
+                break;
+            };
+            self.backend_lifecycle_admission.complete();
+            self.stats
+                .backend_lifecycle
+                .record_completion(self.backend_lifecycle_admission.active());
+            match completion {
+                BackendLifecycleCompletion::HostedReplacementReady {
+                    request,
+                    actor_id,
+                    path,
+                    purpose,
+                    lifecycle,
+                    result,
+                } => {
+                    let current =
+                        self.pending_hosted_replacements.get(&actor_id).copied() == Some(request);
+                    if !current {
+                        if let Ok(actor) = result {
+                            let generation = actor.generation();
+                            if let Err(error) = self.spawn_actor_retirement(
+                                actor_id.clone(),
+                                *actor,
+                                lifecycle,
+                                brood_wasm::PluginStopReason::Replacement,
+                                None,
+                            ) {
+                                warn!(actor = %actor_id, error = %error, "failed to retire stale hosted actor candidate");
+                            }
+                            debug!(actor = %actor_id, generation, "discarded stale hosted actor candidate");
+                        }
+                        continue;
+                    }
+                    self.pending_hosted_replacements.remove(&actor_id);
+                    let actor = match result {
+                        Ok(actor) => *actor,
+                        Err(message) => {
+                            self.plugin_actor_failures =
+                                self.plugin_actor_failures.saturating_add(1);
+                            self.plugin_actor_last_status =
+                                Some(format!("{actor_id}:replacement_failed"));
+                            match purpose {
+                                HostedReplacementPurpose::RealmChild { session, id } => {
+                                    self.starting_realm_children.remove(&(session, id.clone()));
+                                    self.stop_requested_while_starting
+                                        .remove(&(session, id.clone()));
+                                    self.send_realm_init_child_event(
+                                        session,
+                                        brood_wasm::ComponentChildEvent::Failed { id, message },
+                                    );
+                                }
+                                HostedReplacementPurpose::RealmRoot { session } => {
+                                    self.realm_inits.remove(&session);
+                                    warn!(actor = %actor_id, surface_session = session.raw(), path = %path.display(), error = %message, "realm root actor start failed");
+                                }
+                                HostedReplacementPurpose::Generic => {
+                                    warn!(actor = %actor_id, path = %path.display(), error = %message, "hosted actor replacement failed");
+                                }
+                            }
+                            continue;
+                        }
+                    };
+                    let generation = actor.generation();
+                    if let HostedReplacementPurpose::RealmChild { session, id } = &purpose {
+                        self.starting_realm_children.remove(&(*session, id.clone()));
+                        let cancelled = self
+                            .stop_requested_while_starting
+                            .remove(&(*session, id.clone()));
+                        let realm_exists = self.realm_inits.contains_key(session);
+                        if cancelled || !realm_exists {
+                            if let Err(error) = self.spawn_actor_retirement(
+                                actor_id.clone(),
+                                actor,
+                                lifecycle,
+                                brood_wasm::PluginStopReason::Shutdown,
+                                None,
+                            ) {
+                                warn!(actor = %actor_id, error = %error, "failed to retire cancelled realm child candidate");
+                            }
+                            continue;
+                        }
+                    }
+                    if let HostedReplacementPurpose::RealmRoot { session } = &purpose
+                        && !self.realm_inits.contains_key(session)
+                    {
+                        if let Err(error) = self.spawn_actor_retirement(
+                            actor_id.clone(),
+                            actor,
+                            lifecycle,
+                            brood_wasm::PluginStopReason::Shutdown,
+                            None,
+                        ) {
+                            warn!(actor = %actor_id, error = %error, "failed to retire cancelled realm root candidate");
+                        }
+                        continue;
+                    }
+                    let old_lifecycle = self.configured_plugin_lifecycles.remove(&actor_id);
+                    let old_actor = self.wasm_io_actors.insert(actor_id.clone(), actor);
+                    if let Some(config) = lifecycle.clone() {
+                        self.configured_plugin_lifecycles
+                            .insert(actor_id.clone(), config);
+                    }
+                    if let Some(old_actor) = old_actor
+                        && let Err(error) = self.spawn_actor_retirement(
+                            actor_id.clone(),
+                            old_actor,
+                            old_lifecycle,
+                            brood_wasm::PluginStopReason::Replacement,
+                            Some(generation),
+                        )
+                    {
+                        warn!(actor = %actor_id, error = %error, "failed to retire replaced hosted actor");
+                    }
+                    match purpose {
+                        HostedReplacementPurpose::Generic => {
+                            self.plugin_actor_last_status =
+                                Some(format!("{actor_id}:replacement_started"));
+                        }
+                        HostedReplacementPurpose::RealmRoot { .. } => {
+                            self.plugin_actor_last_status =
+                                Some(format!("{actor_id}:realm_started"));
+                        }
+                        HostedReplacementPurpose::RealmChild { session, id } => {
+                            if let Some(init) = self.realm_inits.get_mut(&session) {
+                                init.children.insert(id.clone(), actor_id.clone());
+                            }
+                            self.send_realm_init_child_event(
+                                session,
+                                brood_wasm::ComponentChildEvent::Started { id, generation },
+                            );
+                        }
+                    }
+                    if let Some(messages) = self.pending_hosted_startup_messages.remove(&actor_id) {
+                        for (sender, body) in messages {
+                            if let Err(error) =
+                                self.send_plugin_actor_message(&actor_id, sender, body)
+                            {
+                                warn!(actor = %actor_id, error = %error, "failed to deliver queued hosted actor startup message");
+                            }
+                        }
+                    }
+                    info!(actor = %actor_id, generation, path = %path.display(), "committed hosted actor replacement");
+                }
+                BackendLifecycleCompletion::LegacyReplacementReady {
+                    request,
+                    path,
+                    generation,
+                    result,
+                } => {
+                    if self.pending_legacy_replacement != Some(request) {
+                        warn!(request, path = %path.display(), "discarded stale legacy replacement completion");
+                        if let Some(generation) = generation {
+                            let runtime = self.actor_runtime.clone();
+                            if let Some(runtime) = runtime {
+                                self.backend_lifecycle_tasks.push(runtime.spawn(async move {
+                                    generation.cancel_and_join().await;
+                                }));
+                            }
+                        }
+                        continue;
+                    }
+                    self.pending_legacy_replacement = None;
+                    self.pending_legacy_actor_names.clear();
+                    if let Some(generation) = generation {
+                        self.legacy_wasm_actor_generation = Some(generation);
+                    }
+                    match result {
+                        Ok(()) => {
+                            self.plugin_actor_last_status =
+                                Some("legacy:replacement_started".to_string());
+                            info!(path = %path.display(), "committed legacy WASM actor replacement");
+                        }
+                        Err(message) => {
+                            self.plugin_actor_failures =
+                                self.plugin_actor_failures.saturating_add(1);
+                            self.plugin_actor_last_status =
+                                Some("legacy:replacement_failed".to_string());
+                            warn!(path = %path.display(), error = %message, "legacy WASM actor replacement failed");
+                        }
+                    }
+                }
+                BackendLifecycleCompletion::RealmChildStopped {
+                    session,
+                    id,
+                    result,
+                } => {
+                    let event = match result {
+                        Ok(()) => brood_wasm::ComponentChildEvent::Stopped { id },
+                        Err(message) => brood_wasm::ComponentChildEvent::Failed { id, message },
+                    };
+                    self.send_realm_init_child_event(session, event);
+                }
+                BackendLifecycleCompletion::ActorRetired { actor_id, result } => {
+                    if let Err(message) = result {
+                        warn!(actor = %actor_id, error = %message, "backend actor retirement failed");
+                    }
+                }
+            }
+        }
+        if !self.backend_lifecycle_completions.is_empty() {
+            self.loop_signal.wakeup();
+        }
+    }
+
+    fn admit_backend_lifecycle_start_request(&mut self) -> Result<u64> {
+        if let Some(request) = try_admit_lifecycle_request_id(
+            &mut self.next_hosted_replacement_request,
+            &mut self.backend_lifecycle_admission,
+        )
+        .context("allocate backend actor lifecycle request ID")?
+        {
+            return Ok(request);
+        }
+        self.stats.backend_lifecycle.deferred_turns = self
+            .stats
+            .backend_lifecycle
+            .deferred_turns
+            .saturating_add(1);
+        self.stats.backend_lifecycle.dropped =
+            self.stats.backend_lifecycle.dropped.saturating_add(1);
+        anyhow::bail!("backend actor lifecycle start lane is full")
+    }
+
+    const fn try_admit_backend_lifecycle_reserved(&mut self) -> bool {
+        if self.backend_lifecycle_admission.try_admit_reserved() {
+            true
+        } else {
+            self.stats.backend_lifecycle.deferred_turns = self
+                .stats
+                .backend_lifecycle
+                .deferred_turns
+                .saturating_add(1);
+            self.stats.backend_lifecycle.dropped =
+                self.stats.backend_lifecycle.dropped.saturating_add(1);
+            false
+        }
+    }
+
+    /// Join the bounded lifecycle lane after calloop has exited, then commit
+    /// its queued completions. Completion handling can schedule retirement,
+    /// so shutdown repeats until no generation-owned lifecycle task remains.
+    pub(crate) fn finish_backend_lifecycle_tasks(&mut self) -> Result<()> {
+        ensure!(
+            !self.event_loop_active,
+            "backend lifecycle joins are shutdown-only"
+        );
+        let runtime = self
+            .actor_runtime
+            .clone()
+            .context("backend actor runtime is not initialized")?;
+        let mut first_error = None;
+        while !self.backend_lifecycle_tasks.is_empty() {
+            let tasks = std::mem::take(&mut self.backend_lifecycle_tasks);
+            runtime.block_on(async {
+                for task in tasks {
+                    if let Err(error) = task.await
+                        && first_error.is_none()
+                    {
+                        first_error = Some(anyhow::anyhow!(
+                            "backend lifecycle task failed to join: {error}"
+                        ));
+                    }
+                }
+            });
+            self.drain_backend_lifecycle_completions();
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     fn handle_realm_init_stop(&mut self, session: SurfaceSessionId, id: String) {
+        if self
+            .starting_realm_children
+            .contains(&(session, id.clone()))
+        {
+            self.stop_requested_while_starting.insert((session, id));
+            return;
+        }
         let owned = self
             .realm_inits
             .get(&session)
@@ -5000,33 +5713,46 @@ impl Brood {
             );
             return;
         };
-        let lifecycle_result = self.stop_hosted_io_actor_lifecycle(
-            &actor_id,
-            brood_wasm::PluginStopReason::Shutdown,
-            None,
-        );
-        let stop_result = self.stop_hosted_io_actor(&actor_id);
-        self.configured_plugin_lifecycles.remove(&actor_id);
-        let result = lifecycle_result.and(stop_result);
+        if self.backend_lifecycle_admission.active() >= BACKEND_LIFECYCLE_CAPACITY {
+            self.stats.backend_lifecycle.deferred_turns = self
+                .stats
+                .backend_lifecycle
+                .deferred_turns
+                .saturating_add(1);
+            self.send_realm_init_child_event(
+                session,
+                brood_wasm::ComponentChildEvent::Failed {
+                    id,
+                    message: "backend actor lifecycle lane is full".to_string(),
+                },
+            );
+            return;
+        }
+        let actor = self.wasm_io_actors.remove(&actor_id);
+        let lifecycle = self.configured_plugin_lifecycles.remove(&actor_id);
         if let Some(init) = self.realm_inits.get_mut(&session) {
             init.children.remove(&id);
         }
-        match result {
-            Ok(()) => {
-                self.send_realm_init_child_event(
-                    session,
-                    brood_wasm::ComponentChildEvent::Stopped { id },
-                );
-            }
-            Err(error) => {
-                self.send_realm_init_child_event(
-                    session,
-                    brood_wasm::ComponentChildEvent::Failed {
-                        id,
-                        message: format!("{error:#}"),
-                    },
-                );
-            }
+        let Some(actor) = actor else {
+            self.send_realm_init_child_event(
+                session,
+                brood_wasm::ComponentChildEvent::Failed {
+                    id,
+                    message: "init child actor is unavailable".to_string(),
+                },
+            );
+            return;
+        };
+        if let Err(error) =
+            self.spawn_realm_child_stop(session, id.clone(), actor_id, actor, lifecycle)
+        {
+            self.send_realm_init_child_event(
+                session,
+                brood_wasm::ComponentChildEvent::Failed {
+                    id,
+                    message: format!("{error:#}"),
+                },
+            );
         }
     }
 
@@ -5212,8 +5938,10 @@ impl Brood {
             resources,
             runtime_io.clone(),
         )?;
+        let hosted_or_pending = self.wasm_io_actors.contains_key(module_id)
+            || self.pending_hosted_replacements.contains_key(module_id);
         if let Some(writable) = workspace_filesystem_writable
-            && self.wasm_io_actors.contains_key(module_id)
+            && hosted_or_pending
         {
             self.configured_workspace_plugins.insert(
                 module_id.to_string(),
@@ -5229,7 +5957,7 @@ impl Brood {
         } else {
             self.configured_workspace_plugins.remove(module_id);
         }
-        if self.wasm_io_actors.contains_key(module_id) {
+        if hosted_or_pending {
             self.configured_plugin_resources
                 .insert(module_id.to_string(), resources);
             self.configured_plugin_runtime_io
@@ -5246,7 +5974,14 @@ impl Brood {
             self.configured_plugin_lifecycles.remove(module_id);
         }
         if let Some(message) = startup_message {
-            self.send_plugin_actor_message(module_id, "host".to_string(), message)?;
+            if self.pending_hosted_replacements.contains_key(module_id) {
+                self.pending_hosted_startup_messages
+                    .entry(module_id.to_string())
+                    .or_default()
+                    .push(("host".to_string(), message));
+            } else {
+                self.send_plugin_actor_message(module_id, "host".to_string(), message)?;
+            }
         }
         Ok(())
     }
@@ -5258,13 +5993,20 @@ impl Brood {
             .cloned()
             .collect::<Vec<_>>();
         for actor_name in actor_names {
-            let lifecycle_result = self.stop_hosted_io_actor_lifecycle(
-                &actor_name,
-                brood_wasm::PluginStopReason::SessionRebind,
-                None,
-            );
-            let hard_result = self.stop_hosted_io_actor(&actor_name);
-            let result = lifecycle_result.and(hard_result);
+            let result = if self.backend_lifecycle_admission.active() >= BACKEND_LIFECYCLE_CAPACITY
+            {
+                Err(anyhow::anyhow!("backend actor lifecycle lane is full"))
+            } else if let Some(actor) = self.wasm_io_actors.remove(&actor_name) {
+                self.spawn_actor_retirement(
+                    actor_name.clone(),
+                    actor,
+                    self.configured_plugin_lifecycles.get(&actor_name).cloned(),
+                    brood_wasm::PluginStopReason::Shutdown,
+                    None,
+                )
+            } else {
+                Ok(())
+            };
             if let Err(error) = result {
                 self.plugin_actor_failures = self.plugin_actor_failures.saturating_add(1);
                 self.plugin_actor_last_status =
@@ -5307,7 +6049,18 @@ impl Brood {
                 )
                 .and_then(|()| {
                     if let Some(message) = plugin.startup_message {
-                        self.send_plugin_actor_message(&actor_name, "host".to_string(), message)?;
+                        if self.pending_hosted_replacements.contains_key(&actor_name) {
+                            self.pending_hosted_startup_messages
+                                .entry(actor_name.clone())
+                                .or_default()
+                                .push(("host".to_string(), message));
+                        } else {
+                            self.send_plugin_actor_message(
+                                &actor_name,
+                                "host".to_string(),
+                                message,
+                            )?;
+                        }
                     }
                     Ok(())
                 });
@@ -5328,10 +6081,14 @@ impl Brood {
         reason: brood_wasm::PluginStartReason,
         session: Option<SurfaceSessionId>,
     ) -> Result<()> {
+        ensure!(
+            !self.event_loop_active,
+            "blocking plugin lifecycle start is startup-only"
+        );
         let runtime = self
-            .async_runtime
+            .actor_runtime
             .clone()
-            .context("async runtime is not initialized")?;
+            .context("backend actor runtime is not initialized")?;
         let context = brood_wasm::PluginStartContext {
             instance_id: actor_name.to_string(),
             generation: actor.generation(),
@@ -5362,6 +6119,10 @@ impl Brood {
         reason: brood_wasm::PluginStopReason,
         next_generation: Option<u64>,
     ) -> Result<()> {
+        ensure!(
+            !self.event_loop_active,
+            "blocking plugin lifecycle stop is shutdown/startup-only"
+        );
         let Some(lifecycle) = self.configured_plugin_lifecycles.get(actor_name).cloned() else {
             return Ok(());
         };
@@ -5369,9 +6130,9 @@ impl Brood {
             return Ok(());
         };
         let runtime = self
-            .async_runtime
+            .actor_runtime
             .clone()
-            .context("async runtime is not initialized")?;
+            .context("backend actor runtime is not initialized")?;
         let context = brood_wasm::PluginStopContext {
             instance_id: actor_name.to_string(),
             generation: actor.generation(),
@@ -5419,6 +6180,7 @@ impl Brood {
                         false,
                         Some(self.sessions.active()),
                         false,
+                        HostedReplacementPurpose::Generic,
                     )
                     .with_context(|| {
                         format!(
@@ -5468,9 +6230,10 @@ impl Brood {
         app_management: bool,
         lifecycle_session: Option<SurfaceSessionId>,
         presentation_messaging: bool,
+        purpose: HostedReplacementPurpose,
     ) -> Result<()> {
-        let Some(runtime) = self.async_runtime.clone() else {
-            anyhow::bail!("async runtime is not initialized");
+        let Some(runtime) = self.actor_runtime.clone() else {
+            anyhow::bail!("backend actor runtime is not initialized");
         };
         // Build the candidate before disturbing the currently reachable
         // generation. The candidate cannot receive messages until it is
@@ -5517,36 +6280,105 @@ impl Brood {
                 environment.contains_key(std::ffi::OsStr::new(crate::BROOD_NATIVE_TOOL_SOCKET_ENV)),
             "configured component actor process environment"
         );
-        let actor = runtime.block_on(brood_wasm::ComponentActor::load(
-            path,
-            brood_wasm::ComponentActorConfig {
-                // Actors without an explicit workspace grant receive the
-                // narrowest useful default: their package directory read-only.
-                filesystem: Some(brood_wasm::FilesystemGrant {
-                    host_path,
-                    guest_path: ".".to_string(),
-                    writable,
-                }),
-                filesystem_watcher_service: self.filesystem_watcher_service.clone(),
-                max_filesystem_watches: resources.filesystem_watches,
-                max_filesystem_watch_events: resources.filesystem_watch_events,
-                runtime_io: brood_wasm::RuntimeIoConfig {
-                    capabilities: runtime_io,
-                    working_directory,
-                    environment,
-                    removed_environment,
-                    ..brood_wasm::RuntimeIoConfig::default()
-                },
-                actor_management,
-                app_management,
-                presentation_messaging,
-                event_waker: Some(brood_wasm::ComponentActorEventWaker::new({
-                    let signal = self.loop_signal.clone();
-                    move || signal.wakeup()
-                })),
-                ..brood_wasm::ComponentActorConfig::default()
+        let config = brood_wasm::ComponentActorConfig {
+            // Actors without an explicit workspace grant receive the
+            // narrowest useful default: their package directory read-only.
+            filesystem: Some(brood_wasm::FilesystemGrant {
+                host_path,
+                guest_path: ".".to_string(),
+                writable,
+            }),
+            filesystem_watcher_service: self.filesystem_watcher_service.clone(),
+            max_filesystem_watches: resources.filesystem_watches,
+            max_filesystem_watch_events: resources.filesystem_watch_events,
+            runtime_io: brood_wasm::RuntimeIoConfig {
+                capabilities: runtime_io,
+                working_directory,
+                environment,
+                removed_environment,
+                ..brood_wasm::RuntimeIoConfig::default()
             },
-        ))?;
+            io_runtime: self.async_runtime.clone(),
+            actor_management,
+            app_management,
+            presentation_messaging,
+            event_waker: Some(brood_wasm::ComponentActorEventWaker::new({
+                let signal = self.loop_signal.clone();
+                move || signal.wakeup()
+            })),
+            ..brood_wasm::ComponentActorConfig::default()
+        };
+        if self.event_loop_active {
+            let request = self.admit_backend_lifecycle_start_request()?;
+            self.pending_hosted_replacements
+                .insert(actor_name.to_string(), request);
+            let actor_id = actor_name.to_string();
+            let actor_path = path.to_path_buf();
+            let lifecycle = lifecycle.cloned();
+            let completion_lifecycle = lifecycle.as_ref().map(|(config, _)| config.clone());
+            let completion = self.backend_lifecycle_completion_sender.clone();
+            let signal = self.loop_signal.clone();
+            let task_actor_id = actor_id.clone();
+            let task_path = actor_path.clone();
+            let task = runtime.spawn(async move {
+                let result = async {
+                    let actor = brood_wasm::ComponentActor::load(&task_path, config)
+                        .await
+                        .map_err(|error| format!("load component actor: {error:#}"))?;
+                    let mut candidate = brood_wasm::HostedWasmActor::Component(actor);
+                    if let Some((lifecycle, reason)) = lifecycle {
+                        let event = brood_wasm::PluginLifecycleEvent::Start(
+                            brood_wasm::PluginStartContext {
+                                instance_id: task_actor_id.clone(),
+                                generation: candidate.generation(),
+                                reason,
+                                backend_id: None,
+                                session_id: lifecycle_session.map(SurfaceSessionId::raw),
+                                workspace_root: ".".to_string(),
+                                data: lifecycle
+                                    .data
+                                    .iter()
+                                    .map(|(key, value)| brood_wasm::PluginLifecycleEntry {
+                                        key: key.clone(),
+                                        value: value.clone(),
+                                    })
+                                    .collect(),
+                            },
+                        );
+                        if let Err(error) =
+                            candidate.lifecycle(event, lifecycle.start_timeout).await
+                        {
+                            let _shutdown = candidate.shutdown().await;
+                            return Err(format!("plugin start lifecycle failed: {error:#}"));
+                        }
+                    }
+                    Ok(Box::new(candidate))
+                }
+                .await;
+                signal.wakeup();
+                let _sent = completion
+                    .send(BackendLifecycleCompletion::HostedReplacementReady {
+                        request,
+                        actor_id,
+                        path: actor_path,
+                        purpose,
+                        lifecycle: completion_lifecycle,
+                        result,
+                    })
+                    .await;
+                signal.wakeup();
+            });
+            self.backend_lifecycle_tasks.push(task);
+            self.stats
+                .backend_lifecycle
+                .record_admission(self.backend_lifecycle_admission.active());
+            return Ok(());
+        }
+        ensure!(
+            !self.event_loop_active,
+            "blocking component actor load is startup-only"
+        );
+        let actor = runtime.block_on(brood_wasm::ComponentActor::load(path, config))?;
         let mut candidate = brood_wasm::HostedWasmActor::Component(actor);
         let next_generation = candidate.generation();
         if let Err(error) = self.stop_hosted_io_actor_lifecycle(
@@ -5571,7 +6403,38 @@ impl Brood {
         }
         self.wasm_io_actors
             .insert(actor_name.to_string(), candidate);
-        self.plugin_actor_last_status = Some(format!("{actor_name}:component_started"));
+        match purpose {
+            HostedReplacementPurpose::Generic => {
+                self.plugin_actor_last_status = Some(format!("{actor_name}:component_started"));
+            }
+            HostedReplacementPurpose::RealmRoot { .. } => {
+                // `start_session_init_actor` publishes the realm only after
+                // this startup transaction has returned successfully.
+                self.plugin_actor_last_status = Some(format!("{actor_name}:realm_started"));
+            }
+            HostedReplacementPurpose::RealmChild { session, id } => {
+                self.starting_realm_children.remove(&(session, id.clone()));
+                let generation = self
+                    .wasm_io_actors
+                    .get(actor_name)
+                    .map(brood_wasm::HostedWasmActor::generation)
+                    .context("startup realm child disappeared before publication")?;
+                self.realm_inits
+                    .get_mut(&session)
+                    .context("startup realm child lost its init actor")?
+                    .children
+                    .insert(id.clone(), actor_name.to_string());
+                if let Some((config, _reason)) = lifecycle {
+                    self.configured_plugin_lifecycles
+                        .insert(actor_name.to_string(), config.clone());
+                }
+                self.send_realm_init_child_event(
+                    session,
+                    brood_wasm::ComponentChildEvent::Started { id, generation },
+                );
+                self.plugin_actor_last_status = Some(format!("{actor_name}:realm_started"));
+            }
+        }
         info!(actor = %actor_name, path = %path.display(), "started component plugin actor");
         Ok(())
     }
@@ -5585,8 +6448,8 @@ impl Brood {
         resources: ConfiguredPluginResources,
         runtime_io: brood_wasm::RuntimeIoCapabilities,
     ) -> Result<()> {
-        let Some(runtime) = self.async_runtime.clone() else {
-            anyhow::bail!("async runtime is not initialized");
+        let Some(runtime) = self.actor_runtime.clone() else {
+            anyhow::bail!("backend actor runtime is not initialized");
         };
         // Instantiate an unreachable candidate first so a bad replacement
         // cannot take a healthy actor offline.
@@ -5597,23 +6460,102 @@ impl Brood {
             |grant| grant.host_path.clone(),
         );
         let writable = filesystem.is_some_and(|grant| grant.writable);
+        let capabilities = brood_wasm::Preview1ActorCapabilities {
+            filesystem: Some(brood_wasm::Preview1FilesystemGrant {
+                host_path,
+                guest_path: ".".to_string(),
+                writable,
+            }),
+            runtime_io,
+            io_runtime: self.async_runtime.clone(),
+        };
+        let worker_config = brood_wasm::Preview1WorkerConfig {
+            max_filesystem_watches: resources.filesystem_watches,
+            max_filesystem_watch_events: resources.filesystem_watch_events,
+            ..brood_wasm::Preview1WorkerConfig::default()
+        };
+        let watcher_service = self.filesystem_watcher_service.clone();
+        if self.event_loop_active {
+            let request = self.admit_backend_lifecycle_start_request()?;
+            self.pending_hosted_replacements
+                .insert(actor_name.to_string(), request);
+            let actor_id = actor_name.to_string();
+            let actor_path = path.to_path_buf();
+            let lifecycle = lifecycle.cloned();
+            let completion_lifecycle = lifecycle.as_ref().map(|(config, _)| config.clone());
+            let completion = self.backend_lifecycle_completion_sender.clone();
+            let signal = self.loop_signal.clone();
+            let task_actor_id = actor_id.clone();
+            let task_path = actor_path.clone();
+            let task = runtime.spawn(async move {
+                let result = async {
+                    let actor = brood_wasm::Preview1CompatActor::load_with_watcher_service(
+                        &task_path,
+                        capabilities,
+                        worker_config,
+                        watcher_service,
+                    )
+                    .await
+                    .map_err(|error| format!("load Preview 1 actor: {error:#}"))?;
+                    let mut candidate = brood_wasm::HostedWasmActor::Preview1(actor);
+                    if let Some((lifecycle, reason)) = lifecycle {
+                        let event = brood_wasm::PluginLifecycleEvent::Start(
+                            brood_wasm::PluginStartContext {
+                                instance_id: task_actor_id.clone(),
+                                generation: candidate.generation(),
+                                reason,
+                                backend_id: None,
+                                session_id: None,
+                                workspace_root: ".".to_string(),
+                                data: lifecycle
+                                    .data
+                                    .iter()
+                                    .map(|(key, value)| brood_wasm::PluginLifecycleEntry {
+                                        key: key.clone(),
+                                        value: value.clone(),
+                                    })
+                                    .collect(),
+                            },
+                        );
+                        if let Err(error) =
+                            candidate.lifecycle(event, lifecycle.start_timeout).await
+                        {
+                            let _shutdown = candidate.shutdown().await;
+                            return Err(format!("plugin start lifecycle failed: {error:#}"));
+                        }
+                    }
+                    Ok(Box::new(candidate))
+                }
+                .await;
+                signal.wakeup();
+                let _sent = completion
+                    .send(BackendLifecycleCompletion::HostedReplacementReady {
+                        request,
+                        actor_id,
+                        path: actor_path,
+                        purpose: HostedReplacementPurpose::Generic,
+                        lifecycle: completion_lifecycle,
+                        result,
+                    })
+                    .await;
+                signal.wakeup();
+            });
+            self.backend_lifecycle_tasks.push(task);
+            self.stats
+                .backend_lifecycle
+                .record_admission(self.backend_lifecycle_admission.active());
+            return Ok(());
+        }
+        ensure!(
+            !self.event_loop_active,
+            "blocking Preview 1 actor load is startup-only"
+        );
         let actor =
             runtime.block_on(brood_wasm::Preview1CompatActor::load_with_watcher_service(
                 path,
-                brood_wasm::Preview1ActorCapabilities {
-                    filesystem: Some(brood_wasm::Preview1FilesystemGrant {
-                        host_path,
-                        guest_path: ".".to_string(),
-                        writable,
-                    }),
-                    runtime_io,
-                },
-                brood_wasm::Preview1WorkerConfig {
-                    max_filesystem_watches: resources.filesystem_watches,
-                    max_filesystem_watch_events: resources.filesystem_watch_events,
-                    ..brood_wasm::Preview1WorkerConfig::default()
-                },
-                self.filesystem_watcher_service.clone(),
+                capabilities,
+                worker_config,
+                watcher_service,
             ))?;
         let mut candidate = brood_wasm::HostedWasmActor::Preview1(actor);
         let next_generation = candidate.generation();
@@ -5693,12 +6635,16 @@ impl Brood {
     }
 
     fn stop_hosted_io_actor(&mut self, actor_name: &str) -> Result<()> {
+        ensure!(
+            !self.event_loop_active,
+            "blocking hosted actor join is shutdown/startup-only"
+        );
         self.drain_hosted_actor_events();
         let Some(mut actor) = self.wasm_io_actors.remove(actor_name) else {
             return Ok(());
         };
-        let Some(runtime) = self.async_runtime.as_ref() else {
-            anyhow::bail!("cannot join hosted I/O actor without the async runtime");
+        let Some(runtime) = self.actor_runtime.as_ref() else {
+            anyhow::bail!("cannot join hosted I/O actor without the backend actor runtime");
         };
         runtime.block_on(async {
             let result = match &mut actor {
@@ -5717,6 +6663,10 @@ impl Brood {
     }
 
     pub(crate) fn stop_all_hosted_io_actors(&mut self) -> Result<()> {
+        ensure!(
+            !self.event_loop_active,
+            "hosted actor teardown is shutdown-only"
+        );
         let actor_names = self.wasm_io_actors.keys().cloned().collect::<Vec<_>>();
         let mut first_error = None;
         for actor_name in actor_names {
@@ -5738,12 +6688,18 @@ impl Brood {
     }
 
     pub(crate) fn stop_legacy_wasm_plugin_actors(&mut self) -> Result<()> {
+        ensure!(
+            !self.event_loop_active,
+            "legacy actor teardown is shutdown-only"
+        );
         let Some(generation) = self.legacy_wasm_actor_generation.take() else {
             return Ok(());
         };
         let actor_ids = generation.actor_ids().clone();
-        let Some(runtime) = self.async_runtime.as_ref() else {
-            anyhow::bail!("cannot cancel and join legacy WASM actors without the async runtime");
+        let Some(runtime) = self.actor_runtime.as_ref() else {
+            anyhow::bail!(
+                "cannot cancel and join legacy WASM actors without the backend actor runtime"
+            );
         };
         let registry = Arc::clone(&self.wasm_registry);
         runtime.block_on(async move {
@@ -5761,10 +6717,115 @@ impl Brood {
         path: &Path,
         actors: &[brood_wasm::WasmActorDeclaration],
     ) -> Result<()> {
-        let Some(runtime) = self.async_runtime.clone() else {
-            anyhow::bail!("async runtime is not initialized");
+        let Some(runtime) = self.actor_runtime.clone() else {
+            anyhow::bail!("backend actor runtime is not initialized");
         };
         let registry = Arc::clone(&self.wasm_registry);
+        if self.event_loop_active {
+            ensure!(
+                self.pending_legacy_replacement.is_none(),
+                "legacy WASM replacement is already in progress"
+            );
+            let request = self.admit_backend_lifecycle_start_request()?;
+            self.pending_legacy_replacement = Some(request);
+            self.pending_legacy_actor_names =
+                actors.iter().map(|actor| actor.name.clone()).collect();
+            if let Some(old_generation) = self.legacy_wasm_actor_generation.as_ref() {
+                self.pending_legacy_actor_names
+                    .extend(old_generation.actor_names());
+            }
+            let declarations = actors.to_vec();
+            let actor_path = path.to_path_buf();
+            let task_path = actor_path.clone();
+            let old_generation = self.legacy_wasm_actor_generation.take();
+            let completion = self.backend_lifecycle_completion_sender.clone();
+            let signal = self.loop_signal.clone();
+            let host_events = self.plugin_host_event_sender.clone();
+            let actor_runtime = runtime.clone();
+            let task = runtime.spawn(async move {
+                let old_names = old_generation
+                    .as_ref()
+                    .map_or_else(Vec::new, brood_wasm::LegacyWasmActorGeneration::actor_names);
+                let prepared = async {
+                    let mut candidates = Vec::with_capacity(declarations.len());
+                    let mut actor_ids = BTreeMap::new();
+                    let mut registrations = Vec::with_capacity(declarations.len());
+                    for declaration in &declarations {
+                        let (registration, mailbox) = registry
+                            .lock()
+                            .await
+                            .prepare_actor(declaration.name.clone(), 64)?;
+                        let candidate = brood_wasm::WasmActor::load_named(
+                            &task_path,
+                            mailbox,
+                            &declaration.export_name,
+                        )
+                        .await
+                        .with_context(|| {
+                            format!("load candidate WASM actor {:?}", declaration.name)
+                        })?;
+                        actor_ids.insert(declaration.name.clone(), candidate.actor_id());
+                        registrations.push(registration);
+                        candidates.push((declaration.clone(), candidate));
+                    }
+                    registry
+                        .lock()
+                        .await
+                        .validate_prepared_actors(&registrations, &old_names)?;
+                    Ok::<_, anyhow::Error>((candidates, actor_ids, registrations))
+                }
+                .await;
+                let (generation, result) = match prepared {
+                    Err(error) => (old_generation, Err(format!("{error:#}"))),
+                    Ok((candidates, actor_ids, registrations)) => {
+                        if let Some(old_generation) = old_generation {
+                            old_generation.cancel_and_join().await;
+                        }
+                        let activation = registry
+                            .lock()
+                            .await
+                            .activate_prepared_actors(registrations, &old_names);
+                        if let Err(error) = activation {
+                            (None, Err(format!("activate legacy actors: {error:#}")))
+                        } else {
+                            let generation = brood_wasm::LegacyWasmActorGeneration::start(
+                                &actor_runtime,
+                                candidates,
+                                actor_ids,
+                                Arc::clone(&registry),
+                                &task_path,
+                                move |event| {
+                                    let brood_wasm::LegacyWasmRuntimeEvent::DrainHostMailbox =
+                                        event;
+                                    let _sent =
+                                        host_events.send(PluginHostEvent::DrainWasmHostMailbox);
+                                },
+                            );
+                            (Some(generation), Ok(()))
+                        }
+                    }
+                };
+                signal.wakeup();
+                let _sent = completion
+                    .send(BackendLifecycleCompletion::LegacyReplacementReady {
+                        request,
+                        path: actor_path,
+                        generation,
+                        result,
+                    })
+                    .await;
+                signal.wakeup();
+            });
+            self.backend_lifecycle_tasks.push(task);
+            self.stats
+                .backend_lifecycle
+                .record_admission(self.backend_lifecycle_admission.active());
+            return Ok(());
+        }
+        ensure!(
+            !self.event_loop_active,
+            "blocking legacy actor load is startup-only"
+        );
         let mut candidates = Vec::with_capacity(actors.len());
         let mut actor_ids = BTreeMap::new();
         let mut registrations = Vec::with_capacity(actors.len());
@@ -6820,6 +7881,14 @@ struct WindowRefreshOutcome {
 
 #[derive(Default)]
 pub struct RuntimeStats {
+    pub smithay_callbacks: CallbackMetrics,
+    pub smithay_driver_calls: CallbackMetrics,
+    pub smithay_driver_total_micros: u128,
+    pub backend_actor_events: BoundedWorkMetrics,
+    pub backend_actor_messages: BoundedWorkMetrics,
+    pub backend_requests: BoundedWorkMetrics,
+    pub smithay_input_events: BoundedWorkMetrics,
+    pub backend_lifecycle: BoundedWorkMetrics,
     pub wayland_client_insert_errors: u64,
     pub wayland_dispatch_errors: u64,
     pub xdg_configure_errors: u64,
@@ -6883,6 +7952,29 @@ pub struct RuntimeStats {
 }
 
 impl RuntimeStats {
+    pub fn reset_smithay_hot_path_metrics(&mut self) {
+        self.smithay_callbacks = CallbackMetrics::default();
+        self.smithay_driver_calls = CallbackMetrics::default();
+        self.smithay_driver_total_micros = 0;
+    }
+
+    pub fn record_smithay_callback(&mut self, elapsed: Duration, driver_before_micros: u128) {
+        let nested_driver_micros = self
+            .smithay_driver_total_micros
+            .saturating_sub(driver_before_micros);
+        let exclusive_micros = elapsed.as_micros().saturating_sub(nested_driver_micros);
+        self.smithay_callbacks.record(Duration::from_micros(
+            u64::try_from(exclusive_micros).unwrap_or(u64::MAX),
+        ));
+    }
+
+    pub fn record_smithay_driver_call(&mut self, elapsed: Duration) {
+        self.smithay_driver_total_micros = self
+            .smithay_driver_total_micros
+            .saturating_add(elapsed.as_micros());
+        self.smithay_driver_calls.record(elapsed);
+    }
+
     pub fn record_input(&mut self, can_present_input: bool) {
         self.input_events += 1;
         if can_present_input {
@@ -7092,7 +8184,7 @@ fn managed_commit_is_suitable(
         })
 }
 
-fn managed_resize_needs_cleanup_rejection(state: &ManagedResizeCorrelationState) -> bool {
+const fn managed_resize_needs_cleanup_rejection(state: &ManagedResizeCorrelationState) -> bool {
     matches!(
         state,
         ManagedResizeCorrelationState::ConfigureSent
@@ -7107,7 +8199,38 @@ const fn managed_resize_suppresses_ordinary_renegotiation(
     input_draining || active_correlation
 }
 
-pub(crate) struct ManagedResizeCorrelation {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManagedResizeRequestAuthority {
+    Tagged(u64),
+    RecoverThrough(u64),
+    Ordinary,
+}
+
+pub const fn managed_resize_request_authority(
+    resize_epoch: Option<u64>,
+    recover_through_epoch: Option<u64>,
+) -> Option<ManagedResizeRequestAuthority> {
+    match (resize_epoch, recover_through_epoch) {
+        (Some(epoch), None) if managed_resize_epoch_is_valid(epoch) => {
+            Some(ManagedResizeRequestAuthority::Tagged(epoch))
+        }
+        (None, Some(epoch)) if managed_resize_epoch_is_valid(epoch) => {
+            Some(ManagedResizeRequestAuthority::RecoverThrough(epoch))
+        }
+        (None, None) => Some(ManagedResizeRequestAuthority::Ordinary),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum OrdinaryManagedResizeDecision {
+    Configure,
+    IgnoreUnscoped,
+    IgnoreStaleRecovery,
+    RecoverThrough(Vec<u64>),
+}
+
+pub struct ManagedResizeCorrelation {
     pub epoch: u64,
     pub serial: Serial,
     pub logical_size: (i32, i32),
@@ -7118,7 +8241,7 @@ pub(crate) struct ManagedResizeCorrelation {
     pub state: ManagedResizeCorrelationState,
 }
 
-pub(crate) enum ManagedResizeCorrelationState {
+pub enum ManagedResizeCorrelationState {
     ConfigureSent,
     CurrentUnsuitable,
     SnapshotQueued {
@@ -7133,7 +8256,7 @@ pub(crate) enum ManagedResizeCorrelationState {
     },
 }
 
-pub(crate) struct QueuedManagedSnapshot {
+pub struct QueuedManagedSnapshot {
     pub epoch: u64,
     pub pixel_size: (i32, i32),
     pub surface_commit: u64,
@@ -7147,7 +8270,7 @@ struct ManagedCommitObservation {
 }
 
 #[derive(Default)]
-pub(crate) struct ManagedResizeCorrelations {
+pub struct ManagedResizeCorrelations {
     pub records: BTreeMap<u64, VecDeque<ManagedResizeCorrelation>>,
     pub surface_commits: BTreeMap<u64, u64>,
     pub reserved_bytes: u64,
@@ -7160,6 +8283,32 @@ impl ManagedResizeCorrelations {
         self.records
             .get(&pane)
             .is_some_and(|records| !records.is_empty())
+    }
+
+    fn has_epoch_after(&self, pane: u64, epoch: u64) -> bool {
+        self.records
+            .get(&pane)
+            .is_some_and(|records| records.iter().any(|record| record.epoch > epoch))
+    }
+
+    fn decide_ordinary_resize(
+        &mut self,
+        pane: u64,
+        recover_through_epoch: Option<u64>,
+    ) -> OrdinaryManagedResizeDecision {
+        let Some(recover_through_epoch) = recover_through_epoch else {
+            return if self.has_active(pane) {
+                OrdinaryManagedResizeDecision::IgnoreUnscoped
+            } else {
+                OrdinaryManagedResizeDecision::Configure
+            };
+        };
+        if self.has_epoch_after(pane, recover_through_epoch) {
+            return OrdinaryManagedResizeDecision::IgnoreStaleRecovery;
+        }
+        OrdinaryManagedResizeDecision::RecoverThrough(
+            self.retire_pending_through_epoch(pane, recover_through_epoch),
+        )
     }
 
     fn has_active_serial(&self, pane: u64, serial: Serial) -> bool {
@@ -7228,6 +8377,9 @@ impl ManagedResizeCorrelations {
         epoch: u64,
         pixel_size: (i32, i32),
     ) -> std::result::Result<u64, brood_protocol::ManagedResizeRejectionReason> {
+        if !managed_resize_epoch_is_valid(epoch) {
+            return Err(brood_protocol::ManagedResizeRejectionReason::SizeUnsatisfied);
+        }
         let Some(bytes) = Self::reservation_bytes(pixel_size) else {
             return Err(brood_protocol::ManagedResizeRejectionReason::SizeUnsatisfied);
         };
@@ -7291,26 +8443,51 @@ impl ManagedResizeCorrelations {
     pub fn next_surface_commit(&mut self, pane: u64) -> u64 {
         let commit = self.surface_commits.entry(pane).or_default();
         *commit = commit.saturating_add(1);
-        if self
+        let recovered_floor = self
             .ordinary_recovery_commit_floors
             .get(&pane)
-            .is_some_and(|floor| *commit > *floor)
-        {
+            .copied()
+            .filter(|floor| *commit > *floor);
+        if let Some(recovery_floor) = recovered_floor {
             self.ordinary_recovery_commit_floors.remove(&pane);
+            info!(
+                pane,
+                recovery_floor,
+                surface_commit = *commit,
+                "ordinary managed recovery commit observed"
+            );
         }
         *commit
     }
 
-    pub fn wait_for_ordinary_recovery_commit(&mut self, pane: u64) -> bool {
-        let Some(floor) = self.surface_commits.get(&pane).copied() else {
-            return false;
-        };
+    pub fn wait_for_ordinary_recovery_commit(&mut self, pane: u64) -> u64 {
+        let floor = self.current_surface_commit(pane);
         self.ordinary_recovery_commit_floors.insert(pane, floor);
-        true
+        floor
     }
 
     pub fn ordinary_recovery_commit_pending(&self) -> bool {
         !self.ordinary_recovery_commit_floors.is_empty()
+    }
+
+    /// Tagged resize requests admitted in one input drain form an epoch
+    /// cohort. Exporting while only a prefix has reached `SnapshotQueued`
+    /// would occupy the single in-flight scene with configure-only or mixed
+    /// content and prevent the complete cohort from reaching the client.
+    pub fn tagged_snapshot_cohort_incomplete(&self) -> bool {
+        let mut cohorts = BTreeMap::<u64, (usize, usize)>::new();
+        for record in self.records.values().flatten() {
+            let queued = match record.state {
+                ManagedResizeCorrelationState::ConfigureSent
+                | ManagedResizeCorrelationState::CurrentUnsuitable => false,
+                ManagedResizeCorrelationState::SnapshotQueued { .. } => true,
+                ManagedResizeCorrelationState::SceneInFlight { .. } => continue,
+            };
+            let cohort = cohorts.entry(record.epoch).or_default();
+            cohort.0 = cohort.0.saturating_add(1);
+            cohort.1 = cohort.1.saturating_add(usize::from(queued));
+        }
+        cohorts.values().any(|(members, queued)| members != queued)
     }
 
     pub fn current_surface_commit(&self, pane: u64) -> u64 {
@@ -7330,8 +8507,7 @@ impl ManagedResizeCorrelations {
         records
     }
 
-    pub fn retire_pending_for_ordinary_resize(&mut self, pane: u64) -> Vec<u64> {
-        self.commit_observations.remove(&pane);
+    pub fn retire_pending_through_epoch(&mut self, pane: u64, epoch: u64) -> Vec<u64> {
         let mut released_bytes = 0_u64;
         let mut retired_epochs = Vec::new();
         if let Some(records) = self.records.get_mut(&pane) {
@@ -7339,7 +8515,8 @@ impl ManagedResizeCorrelations {
                 if matches!(
                     record.state,
                     ManagedResizeCorrelationState::SceneInFlight { .. }
-                ) {
+                ) || record.epoch > epoch
+                {
                     return true;
                 }
                 released_bytes = released_bytes.saturating_add(record.reserved_bytes);
@@ -7348,6 +8525,26 @@ impl ManagedResizeCorrelations {
             });
         }
         self.records.retain(|_pane, records| !records.is_empty());
+        let active_serials = self.records.get(&pane).map_or_else(Vec::new, |records| {
+            records
+                .iter()
+                .filter(|record| {
+                    matches!(
+                        record.state,
+                        ManagedResizeCorrelationState::ConfigureSent
+                            | ManagedResizeCorrelationState::CurrentUnsuitable
+                    )
+                })
+                .map(|record| record.serial)
+                .collect()
+        });
+        if let Some(observations) = self.commit_observations.get_mut(&pane) {
+            observations.retain(|observation| active_serials.contains(&observation.serial));
+            let empty = observations.is_empty();
+            if empty {
+                self.commit_observations.remove(&pane);
+            }
+        }
         self.reserved_bytes = self.reserved_bytes.saturating_sub(released_bytes);
         retired_epochs
     }
@@ -7475,7 +8672,7 @@ impl ManagedResizeCorrelations {
     }
 }
 
-pub(crate) fn emit_managed_resize_status(
+pub fn emit_managed_resize_status(
     fast_path: &mut PresentationFastPath,
     status: brood_protocol::ManagedResizeStatus,
 ) {
@@ -7534,7 +8731,7 @@ pub(crate) fn emit_managed_resize_status(
     info!(pane, epoch, ?result, "managed resize status emitted");
 }
 
-pub(crate) fn flush_managed_resize_statuses(fast_path: &mut PresentationFastPath) {
+pub fn flush_managed_resize_statuses(fast_path: &mut PresentationFastPath) {
     let published = flush_retained_critical_records(
         &mut fast_path.frames,
         &fast_path.frame_notifications,
@@ -7646,6 +8843,11 @@ impl ClientData for ClientState {
 
 #[cfg(test)]
 mod managed_resize_tests {
+    #![allow(
+        clippy::indexing_slicing,
+        reason = "managed-resize fixtures construct exact pane and epoch entries before asserting their states"
+    )]
+
     use super::*;
     use std::os::fd::AsFd;
 
@@ -7738,9 +8940,97 @@ mod managed_resize_tests {
             ));
     }
 
+    fn queue_snapshot(
+        correlations: &mut ManagedResizeCorrelations,
+        pane: u64,
+        epoch: u64,
+        surface_commit: u64,
+    ) {
+        let record = correlations
+            .records
+            .get_mut(&pane)
+            .and_then(|records| records.iter_mut().find(|record| record.epoch == epoch))
+            .unwrap();
+        record.state = ManagedResizeCorrelationState::SnapshotQueued {
+            surface_commit,
+            committed_at: Instant::now(),
+            backing: crate::frame_export::ManagedSnapshotBacking::SharedMemory(Arc::<[u8]>::from(
+                [u8::try_from(pane).unwrap_or_default()],
+            )),
+        };
+    }
+
+    #[test]
+    fn tagged_snapshot_cohort_exports_only_after_every_member_is_queued() {
+        let mut correlations = ManagedResizeCorrelations::default();
+        reserve_and_insert(&mut correlations, 1, 7);
+        reserve_and_insert(&mut correlations, 2, 7);
+        let reserved = correlations.reserved_bytes;
+        assert!(correlations.tagged_snapshot_cohort_incomplete());
+
+        queue_snapshot(&mut correlations, 2, 7, 12);
+        assert!(correlations.tagged_snapshot_cohort_incomplete());
+        assert!(correlations.queued_snapshot(1).is_none());
+        assert_eq!(correlations.queued_snapshot(2).unwrap().epoch, 7);
+
+        queue_snapshot(&mut correlations, 1, 7, 11);
+        assert!(!correlations.tagged_snapshot_cohort_incomplete());
+        assert_eq!(correlations.reserved_bytes, reserved);
+        assert_eq!(correlations.queued_snapshot(1).unwrap().surface_commit, 11);
+        assert_eq!(correlations.queued_snapshot(2).unwrap().surface_commit, 12);
+
+        correlations.mark_scene_in_flight(1, 7, 11, 41, 101);
+        correlations.mark_scene_in_flight(2, 7, 12, 41, 102);
+        assert!(!correlations.tagged_snapshot_cohort_incomplete());
+        for (pane, resource) in [(1, 101), (2, 102)] {
+            assert!(matches!(
+                correlations.records[&pane][0].state,
+                ManagedResizeCorrelationState::SceneInFlight {
+                    scene_sequence: 41,
+                    transport_resource,
+                    ..
+                } if transport_resource == resource
+            ));
+        }
+    }
+
+    #[test]
+    fn tagged_snapshot_cohort_handles_one_pane_mixed_epochs_and_retirement() {
+        let mut correlations = ManagedResizeCorrelations::default();
+        reserve_and_insert(&mut correlations, 1, 6);
+        assert!(correlations.tagged_snapshot_cohort_incomplete());
+        queue_snapshot(&mut correlations, 1, 6, 9);
+        assert!(!correlations.tagged_snapshot_cohort_incomplete());
+
+        reserve_and_insert(&mut correlations, 2, 7);
+        assert!(correlations.tagged_snapshot_cohort_incomplete());
+        assert_eq!(correlations.retire_pending_through_epoch(2, 7), vec![7]);
+        assert!(!correlations.tagged_snapshot_cohort_incomplete());
+        assert_eq!(correlations.queued_snapshot(1).unwrap().epoch, 6);
+
+        correlations.mark_scene_in_flight(1, 6, 9, 40, 100);
+        reserve_and_insert(&mut correlations, 1, 8);
+        assert!(correlations.tagged_snapshot_cohort_incomplete());
+        queue_snapshot(&mut correlations, 1, 8, 10);
+        assert!(!correlations.tagged_snapshot_cohort_incomplete());
+        assert!(matches!(
+            correlations.records[&1][0].state,
+            ManagedResizeCorrelationState::SceneInFlight {
+                scene_sequence: 40,
+                transport_resource: 100,
+                ..
+            }
+        ));
+        assert_eq!(correlations.queued_snapshot(1).unwrap().epoch, 8);
+    }
+
     #[test]
     fn managed_resize_reservation_has_absolute_count_and_per_pane_byte_bounds() {
         let mut correlations = ManagedResizeCorrelations::default();
+        assert_eq!(
+            correlations.reserve(1, brood_protocol::MAX_MANAGED_RESIZE_EPOCH + 1, (1, 1)),
+            Err(brood_protocol::ManagedResizeRejectionReason::SizeUnsatisfied)
+        );
         for pane in 1..=MAX_MANAGED_RESIZE_SNAPSHOTS as u64 {
             reserve_and_insert(&mut correlations, pane, pane);
         }
@@ -7814,7 +9104,7 @@ mod managed_resize_tests {
     }
 
     #[test]
-    fn ordinary_recovery_reports_all_pending_epochs_but_keeps_in_flight_scenes() {
+    fn scoped_ordinary_recovery_retires_through_authority_and_keeps_newer_and_in_flight() {
         let mut correlations = ManagedResizeCorrelations::default();
         let bytes = ManagedResizeCorrelations::reservation_bytes((300, 150)).unwrap();
         let records = correlations.records.entry(1).or_default();
@@ -7848,12 +9138,18 @@ mod managed_resize_tests {
                 ),
             },
         ));
-        correlations.reserved_bytes = bytes * 4;
-        let retired = correlations.retire_pending_for_ordinary_resize(1);
+        records.push_back(correlation(
+            5,
+            bytes,
+            ManagedResizeCorrelationState::ConfigureSent,
+        ));
+        correlations.reserved_bytes = bytes * 5;
+        let retired = correlations.retire_pending_through_epoch(1, 4);
         assert_eq!(retired, vec![2, 3, 4]);
-        assert_eq!(correlations.records[&1].len(), 1);
+        assert_eq!(correlations.records[&1].len(), 2);
         assert_eq!(correlations.records[&1][0].epoch, 1);
-        assert_eq!(correlations.reserved_bytes, bytes);
+        assert_eq!(correlations.records[&1][1].epoch, 5);
+        assert_eq!(correlations.reserved_bytes, bytes * 2);
         assert!(matches!(
             correlations.records[&1][0].state,
             ManagedResizeCorrelationState::SceneInFlight { .. }
@@ -7861,32 +9157,237 @@ mod managed_resize_tests {
     }
 
     #[test]
-    fn ordinary_recovery_waits_for_one_later_commit_and_cleans_up() {
+    fn stale_recovery_is_pane_scoped_and_cannot_retire_a_newer_exact_correlation() {
         let mut correlations = ManagedResizeCorrelations::default();
-        assert!(!correlations.wait_for_ordinary_recovery_commit(99));
-        assert!(correlations.ordinary_recovery_commit_floors.is_empty());
-        assert_eq!(correlations.next_surface_commit(1), 1);
-        assert!(correlations.wait_for_ordinary_recovery_commit(1));
-        assert!(correlations.ordinary_recovery_commit_pending());
-        assert!(
-            correlations
-                .ordinary_recovery_commit_floors
-                .keys()
-                .all(|pane| correlations.surface_commits.contains_key(pane))
-        );
+        reserve_and_insert(&mut correlations, 1, 1);
+        reserve_and_insert(&mut correlations, 1, 2);
+        reserve_and_insert(&mut correlations, 2, 2);
 
-        // Commits for another pane cannot release this pane's recovery gate.
+        assert!(correlations.has_epoch_after(1, 1));
+        assert_eq!(
+            correlations.retire_pending_through_epoch(1, 1),
+            Vec::<u64>::new()
+        );
+        assert_eq!(
+            correlations.records[&1]
+                .iter()
+                .map(|record| record.epoch)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+        assert_eq!(correlations.records[&2][0].epoch, 2);
+
+        for pane in [1, 2] {
+            let record = correlations
+                .records
+                .get_mut(&pane)
+                .unwrap()
+                .front_mut()
+                .unwrap();
+            record.state = ManagedResizeCorrelationState::SnapshotQueued {
+                surface_commit: 7,
+                committed_at: Instant::now(),
+                backing: crate::frame_export::ManagedSnapshotBacking::SharedMemory(
+                    Arc::<[u8]>::from([]),
+                ),
+            };
+        }
+        assert_eq!(
+            correlations
+                .queued_snapshot(1)
+                .map(|snapshot| snapshot.epoch),
+            Some(2)
+        );
+        assert_eq!(
+            correlations
+                .queued_snapshot(2)
+                .map(|snapshot| snapshot.epoch),
+            Some(2)
+        );
+        for pane in [1, 2] {
+            correlations.mark_scene_in_flight(pane, 2, 7, 77, pane + 100);
+        }
+        let mut completed = correlations.complete_scene(77);
+        completed.sort_unstable();
+        assert_eq!(completed, vec![(1, 2, 7), (2, 2, 7)]);
+        assert!(correlations.records.is_empty());
+    }
+
+    #[test]
+    fn control_authority_drives_bare_suppression_stale_ignore_and_scoped_retirement() {
+        assert_eq!(
+            managed_resize_request_authority(None, None),
+            Some(ManagedResizeRequestAuthority::Ordinary)
+        );
+        assert_eq!(
+            managed_resize_request_authority(None, Some(1)),
+            Some(ManagedResizeRequestAuthority::RecoverThrough(1))
+        );
+        assert_eq!(
+            managed_resize_request_authority(Some(2), None),
+            Some(ManagedResizeRequestAuthority::Tagged(2))
+        );
+        assert_eq!(managed_resize_request_authority(Some(2), Some(1)), None);
+
+        let bytes = ManagedResizeCorrelations::reservation_bytes((300, 150)).unwrap();
+        let mut correlations = ManagedResizeCorrelations::default();
+        correlations.records.entry(7).or_default().extend([
+            correlation(1, bytes, ManagedResizeCorrelationState::ConfigureSent),
+            correlation(2, bytes, ManagedResizeCorrelationState::CurrentUnsuitable),
+        ]);
+        correlations.reserved_bytes = bytes * 2;
+
+        assert_eq!(
+            correlations.decide_ordinary_resize(7, None),
+            OrdinaryManagedResizeDecision::IgnoreUnscoped
+        );
+        assert_eq!(correlations.records[&7].len(), 2);
+        assert_eq!(
+            correlations.decide_ordinary_resize(7, Some(1)),
+            OrdinaryManagedResizeDecision::IgnoreStaleRecovery
+        );
+        assert_eq!(correlations.reserved_bytes, bytes * 2);
+        assert_eq!(
+            correlations.records[&7]
+                .iter()
+                .map(|record| record.epoch)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(matches!(
+            correlations.records[&7][0].state,
+            ManagedResizeCorrelationState::ConfigureSent
+        ));
+        assert!(matches!(
+            correlations.records[&7][1].state,
+            ManagedResizeCorrelationState::CurrentUnsuitable
+        ));
+        assert_eq!(
+            correlations.decide_ordinary_resize(7, Some(2)),
+            OrdinaryManagedResizeDecision::RecoverThrough(vec![1, 2])
+        );
+        assert!(!correlations.has_active(7));
+        assert_eq!(correlations.reserved_bytes, 0);
+        assert_eq!(
+            correlations.decide_ordinary_resize(7, None),
+            OrdinaryManagedResizeDecision::Configure
+        );
+    }
+
+    #[test]
+    fn scoped_recovery_forces_one_configure_while_ordinary_deduplicates_current_size() {
+        assert!(PresentationConfigurePolicy::Force.should_emit(true));
+        assert!(PresentationConfigurePolicy::Force.should_emit(false));
+        assert!(!PresentationConfigurePolicy::Deduplicate.should_emit(true));
+        assert!(PresentationConfigurePolicy::Deduplicate.should_emit(false));
+    }
+
+    #[test]
+    fn two_pane_recovery_requires_both_later_same_pane_commits() {
+        let mut correlations = ManagedResizeCorrelations::default();
+        for _ in 0..4 {
+            correlations.next_surface_commit(1);
+        }
+        for _ in 0..5 {
+            correlations.next_surface_commit(2);
+        }
+        reserve_and_insert(&mut correlations, 1, 7);
+        reserve_and_insert(&mut correlations, 2, 7);
+
+        assert_eq!(correlations.retire_pending_through_epoch(1, 7), vec![7]);
+        assert_eq!(correlations.retire_pending_through_epoch(2, 7), vec![7]);
+        assert_eq!(correlations.wait_for_ordinary_recovery_commit(1), 4);
+        assert_eq!(correlations.wait_for_ordinary_recovery_commit(2), 5);
+        assert!(correlations.records.is_empty());
+        assert!(correlations.ordinary_recovery_commit_pending());
+
+        assert_eq!(correlations.next_surface_commit(3), 1);
+        assert!(correlations.ordinary_recovery_commit_pending());
+        assert_eq!(correlations.next_surface_commit(1), 5);
+        assert!(correlations.ordinary_recovery_commit_pending());
+        assert_eq!(correlations.next_surface_commit(2), 6);
+        assert!(!correlations.ordinary_recovery_commit_pending());
+    }
+
+    #[test]
+    fn retired_pending_recovery_arms_until_one_later_same_pane_commit() {
+        let mut correlations = ManagedResizeCorrelations::default();
+        assert_eq!(correlations.next_surface_commit(1), 1);
+        reserve_and_insert(&mut correlations, 1, 7);
+        assert_eq!(
+            correlations.decide_ordinary_resize(1, Some(7)),
+            OrdinaryManagedResizeDecision::RecoverThrough(vec![7])
+        );
+        assert_eq!(correlations.wait_for_ordinary_recovery_commit(1), 1);
+        assert!(correlations.ordinary_recovery_commit_pending());
+
+        // The redraw gate remains closed until this exact pane advances.
         assert_eq!(correlations.next_surface_commit(2), 1);
         assert!(correlations.ordinary_recovery_commit_pending());
         assert_eq!(correlations.next_surface_commit(1), 2);
         assert!(!correlations.ordinary_recovery_commit_pending());
+    }
 
-        assert!(correlations.wait_for_ordinary_recovery_commit(1));
+    #[test]
+    fn scene_in_flight_recovery_preserves_scene_and_still_arms_commit_floor() {
+        let mut correlations = ManagedResizeCorrelations::default();
+        assert_eq!(correlations.next_surface_commit(1), 1);
+        let bytes = ManagedResizeCorrelations::reservation_bytes((300, 150)).unwrap();
+        correlations
+            .records
+            .entry(1)
+            .or_default()
+            .push_back(correlation(
+                7,
+                bytes,
+                ManagedResizeCorrelationState::SceneInFlight {
+                    surface_commit: 1,
+                    scene_sequence: 11,
+                    transport_resource: 17,
+                },
+            ));
+        correlations.reserved_bytes = bytes;
+        assert_eq!(
+            correlations.decide_ordinary_resize(1, Some(7)),
+            OrdinaryManagedResizeDecision::RecoverThrough(Vec::new())
+        );
+        assert!(matches!(
+            correlations.records[&1][0].state,
+            ManagedResizeCorrelationState::SceneInFlight { .. }
+        ));
+        assert_eq!(correlations.wait_for_ordinary_recovery_commit(1), 1);
+        assert!(correlations.ordinary_recovery_commit_pending());
+        assert_eq!(correlations.next_surface_commit(1), 2);
+        assert!(!correlations.ordinary_recovery_commit_pending());
+        assert_eq!(correlations.records[&1][0].epoch, 7);
+    }
+
+    #[test]
+    fn no_record_and_idempotent_recovery_rearm_the_current_commit_floor() {
+        let mut correlations = ManagedResizeCorrelations::default();
+        for _ in 0..2 {
+            assert_eq!(
+                correlations.decide_ordinary_resize(1, Some(7)),
+                OrdinaryManagedResizeDecision::RecoverThrough(Vec::new())
+            );
+            assert_eq!(correlations.wait_for_ordinary_recovery_commit(1), 0);
+        }
+        assert!(correlations.ordinary_recovery_commit_pending());
+        assert_eq!(correlations.next_surface_commit(2), 1);
+        assert!(correlations.ordinary_recovery_commit_pending());
+        assert_eq!(correlations.next_surface_commit(1), 1);
+        assert!(!correlations.ordinary_recovery_commit_pending());
+
+        assert_eq!(
+            correlations.decide_ordinary_resize(1, Some(7)),
+            OrdinaryManagedResizeDecision::RecoverThrough(Vec::new())
+        );
+        assert_eq!(correlations.wait_for_ordinary_recovery_commit(1), 1);
         correlations.remove_pane(1);
         assert!(!correlations.ordinary_recovery_commit_pending());
 
         assert_eq!(correlations.next_surface_commit(1), 1);
-        assert!(correlations.wait_for_ordinary_recovery_commit(1));
+        assert_eq!(correlations.wait_for_ordinary_recovery_commit(1), 1);
         assert_eq!(
             correlations.reserve(1, 7, (i32::MAX, i32::MAX)),
             Err(brood_protocol::ManagedResizeRejectionReason::CorrelationCapacity)
@@ -8010,7 +9511,7 @@ mod managed_resize_tests {
             None
         );
         assert!(correlations.record_commit_observation(1, Serial::from(2), (300, 150)));
-        correlations.retire_pending_for_ordinary_resize(1);
+        correlations.retire_pending_through_epoch(1, 2);
         assert_eq!(
             correlations.take_commit_observation(1, Serial::from(2)),
             None

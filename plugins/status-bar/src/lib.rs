@@ -94,6 +94,17 @@ impl Guest for StatusBar {
                 }
                 Vec::new()
             }
+            Event::Presentation(PresentationEvent::RenderHint(hint)) => {
+                let Ok(mut state) = STATE.lock() else {
+                    return Vec::new();
+                };
+                if let Err(error) =
+                    brood_plugin_sdk::graphics::render_with_hint(&hint, || redraw(&mut state, None))
+                {
+                    state.error = error;
+                }
+                Vec::new()
+            }
             Event::Session(SessionEvent::Snapshot(snapshot)) => {
                 let Ok(mut state) = STATE.lock() else {
                     return Vec::new();
@@ -141,7 +152,12 @@ fn redraw_or_record_error(state: &mut StatusBarState) {
 }
 
 fn redraw_for_resize_or_record_error(state: &mut StatusBarState, resize_epoch: Option<u64>) {
-    if let Err(error) = redraw(state, resize_epoch) {
+    let result = if brood_plugin_sdk::graphics::render_is_active() {
+        redraw(state, resize_epoch)
+    } else {
+        brood_plugin_sdk::graphics::request_render_for_resize(state.pane, resize_epoch)
+    };
+    if let Err(error) = result {
         state.error = error;
     }
 }
@@ -174,10 +190,10 @@ fn redraw(state: &mut StatusBarState, resize_epoch: Option<u64>) -> Result<(), S
         // Establish the pane's canvas even if text shaping is temporarily
         // unavailable. The accepted layout can then resize the pane and a
         // later resize/session event retries the complete packet.
-        frame.submit(resize_epoch, &packet, &mut state.text_resources)?;
+        frame.queue(resize_epoch, &packet, &mut state.text_resources)?;
         return Err(format!("layout status bar text: {error}"));
     }
-    frame.submit(resize_epoch, &packet, &mut state.text_resources)?;
+    frame.queue(resize_epoch, &packet, &mut state.text_resources)?;
     state.error.clear();
     Ok(())
 }

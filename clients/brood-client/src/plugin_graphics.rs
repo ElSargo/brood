@@ -1,17 +1,20 @@
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet},
     fmt,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
-        mpsc::{self, Sender},
+        mpsc::{self, SyncSender},
     },
     thread,
     time::Instant,
 };
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use brood_graphics::{Command, Packet, PacketError};
+use brood_wasm::presentation::{
+    ActorFrameDraw, RenderHint as GuestRenderHint, RenderToken as GuestRenderToken,
+};
 use brood_wasm::{
     FontIntent, FontStyle, FontWeight, PresentationError, PresentationHost, TextLayoutOptions,
     TextLayoutResult,
@@ -20,9 +23,17 @@ use cosmic_text::{
     Attrs, Buffer, CacheKey, Family, FeatureTag, FontFeatures, FontSystem, Metrics, Shaping,
     Style as CosmicStyle, SwashCache, SwashContent, Weight, Wrap,
 };
+use serde::Serialize;
 use winit::event_loop::EventLoopProxy;
 
-use crate::ClientEvent;
+use crate::{
+    ClientEvent,
+    render_scheduler::{
+        ActorSchedulerProgress, ActorScope, COLD_HOST_COST_NS, DIAGNOSTIC_WARMUP_OPPORTUNITIES,
+        FramePredictor, MAX_RELEVANT_PANES, MAX_RENDER_ACTORS, RenderScheduler, RenderToken,
+        SchedulerMetrics,
+    },
+};
 
 const MAX_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_RESOURCE_DIMENSION: u32 = 4_096;
@@ -30,13 +41,20 @@ const MAX_TEXT_BYTES: usize = 256 * 1024;
 const MAX_TEXT_LAYOUT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_RESOURCES_PER_PANE: usize = 1_024;
 const MAX_RESOURCE_BYTES_PER_PANE: usize = 64 * 1024 * 1024;
+const GLYPH_RASTER_QUEUE_CAPACITY: usize = 128;
+const COLD_WINIT_REDRAW_HOP_NS: u64 = 1_000_000;
+const MAX_WINIT_REDRAW_HOP_NS: u64 = 50_000_000;
 
 #[derive(Clone)]
 pub struct PluginGraphicsBridge {
     shared: Arc<Mutex<GraphicsState>>,
     text_system: Arc<Mutex<TextSystem>>,
-    glyph_raster_tx: Sender<GlyphRasterRequest>,
+    glyph_raster_tx: SyncSender<GlyphRasterRequest>,
     proxy: EventLoopProxy<ClientEvent>,
+    render_scheduler: Arc<Mutex<RenderScheduler>>,
+    render_clock_origin: Instant,
+    host_tail_ns: Arc<AtomicU64>,
+    winit_redraw_hop_ns: Arc<AtomicU64>,
 }
 
 impl fmt::Debug for PluginGraphicsBridge {
@@ -49,7 +67,8 @@ impl fmt::Debug for PluginGraphicsBridge {
 
 #[derive(Debug)]
 pub struct ActorPresentationHost {
-    pane: u64,
+    actor: String,
+    panes: BTreeSet<u64>,
     generation: AtomicU64,
     bridge: PluginGraphicsBridge,
 }
@@ -66,7 +85,7 @@ pub struct GraphicsSnapshot {
     pub glyphs: BTreeMap<GlyphCacheKey, GlyphImageResource>,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct GraphicsDiagnostics {
     pub accepted_packets: u64,
     pub max_packet_bytes: usize,
@@ -75,6 +94,46 @@ pub struct GraphicsDiagnostics {
     pub text_layouts_dropped: u64,
     pub live_text_layouts: usize,
     pub peak_text_layouts: usize,
+    pub glyph_raster_backpressure: u64,
+    pub render_scheduler: SchedulerMetrics,
+    pub key_to_present_p50_ns: u64,
+    pub key_to_present_p95_ns: u64,
+    pub key_to_present_p99_ns: u64,
+    pub key_to_present_max_ns: u64,
+    pub key_to_present_stddev_ns: u64,
+    pub frame_interval_samples: usize,
+    pub frame_interval_p95_ns: u64,
+    pub frame_interval_p99_ns: u64,
+    pub key_to_present_ns: Vec<u64>,
+    pub frame_intervals_ns: Vec<u64>,
+    pub measured_key_to_present_ns: Vec<u64>,
+    pub measured_frame_intervals_ns: Vec<u64>,
+    pub warmup_opportunities: u64,
+    pub measured_opportunities: u64,
+    pub measured_deadline_misses: u64,
+    pub measured_target_misses: u64,
+    pub actor_progress: Vec<ActorSchedulerProgress>,
+    pub actor_frames_accepted: u64,
+    pub actor_frames_ready: u64,
+    pub actor_frames_promoted: u64,
+    pub actor_frames_promoted_multi_pane: u64,
+    pub actor_frame_partial_promotion_violations: u64,
+    pub visibility_changes: u64,
+    pub max_visible_panes: usize,
+    pub global_host_tail_estimate_ns: u64,
+    pub winit_redraw_hop_estimate_ns: u64,
+}
+
+pub struct RenderSchedulerService {
+    pub hints: Vec<(ActorScope, GuestRenderHint)>,
+    pub composition_tokens: Vec<u64>,
+    pub request_redraw_target_ns: Option<u64>,
+}
+
+#[derive(Default)]
+pub struct CompositionRelease {
+    pub tokens: Vec<u64>,
+    pub request_redraw_target_ns: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -93,6 +152,33 @@ struct PaneScene {
     resize_epoch: Option<u64>,
     terminal_input_sequence: Option<u64>,
     packet: Packet,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ActorFrameGraphicsChange {
+    pub pane: u64,
+    pub sequence: u64,
+    pub resize_epoch: Option<u64>,
+    pub terminal_input_sequence: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ActorFramePromotion {
+    Claimed,
+    Stale,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ActorFramePreparationClaim {
+    Prepare,
+    PrepareDeferred,
+    Stale,
+}
+
+#[derive(Debug, Default)]
+pub struct DeferredActorFrameResolutionPlan {
+    pub retain: BTreeSet<u64>,
+    pub commit: BTreeMap<u64, BTreeMap<u64, u64>>,
 }
 
 struct TextSystem {
@@ -165,7 +251,7 @@ struct GraphicsState {
     staged_panes: BTreeMap<(u64, u64), PaneScene>,
     deferred_panes: BTreeMap<u64, PaneScene>,
     active_resize_epochs: BTreeMap<u64, u64>,
-    pending_terminal_input_sequences: BTreeMap<u64, VecDeque<u64>>,
+    latest_complete_state_watermarks: BTreeMap<u64, u64>,
     images: BTreeMap<u64, ImageResource>,
     text_layouts: BTreeMap<u64, TextLayoutEntry>,
     accepted_packets: u64,
@@ -174,6 +260,36 @@ struct GraphicsState {
     text_layouts_created: u64,
     text_layouts_dropped: u64,
     peak_text_layouts: usize,
+    glyph_raster_backpressure: u64,
+    visible_panes: BTreeSet<u64>,
+    pending_actor_frames: BTreeMap<u64, PendingGraphicsActorFrame>,
+    deferred_actor_frames: BTreeMap<u64, PendingGraphicsActorFrame>,
+    settled_actor_frame_correlations: BTreeMap<u64, Vec<(u64, u64, Option<u64>)>>,
+    actor_panes: BTreeMap<ActorScope, BTreeSet<u64>>,
+    actor_frames_accepted: u64,
+    actor_frames_ready: u64,
+    actor_frames_promoted: u64,
+    actor_frames_promoted_multi_pane: u64,
+    actor_frame_partial_promotion_violations: u64,
+    visibility_changes: u64,
+    max_visible_panes: usize,
+}
+
+#[derive(Debug)]
+struct PendingGraphicsActorFrame {
+    actor: ActorScope,
+    token: u64,
+    revision: u64,
+    scenes: BTreeMap<u64, PaneScene>,
+    ready_notified: bool,
+    required_panes: Option<BTreeSet<u64>>,
+    blocker_epochs: BTreeSet<u64>,
+}
+
+struct DeferredActorFrameStage {
+    token: u64,
+    blocker_epochs: BTreeSet<u64>,
+    superseded_revisions: Vec<u64>,
 }
 
 struct ReferencedResources {
@@ -181,6 +297,435 @@ struct ReferencedResources {
     text_layouts: BTreeMap<u64, TextLayoutResource>,
     glyphs: BTreeMap<GlyphCacheKey, GlyphImageResource>,
     ready: bool,
+}
+
+fn record_complete_state_watermark(state: &mut GraphicsState, pane: u64, watermark: u64) {
+    state
+        .latest_complete_state_watermarks
+        .entry(pane)
+        .and_modify(|latest| *latest = (*latest).max(watermark))
+        .or_insert(watermark);
+}
+
+fn validate_state_watermark(
+    state: &GraphicsState,
+    pane: u64,
+    watermark: Option<u64>,
+) -> Result<(), PresentationError> {
+    let Some(watermark) = watermark else {
+        return Ok(());
+    };
+    let Some(latest_complete) = state.latest_complete_state_watermarks.get(&pane) else {
+        return Err(PresentationError::InvalidPacket);
+    };
+    if watermark > *latest_complete {
+        return Err(PresentationError::InvalidPacket);
+    }
+    Ok(())
+}
+
+fn validate_actor_frame_before_preparation<T>(
+    draws: Vec<ActorFrameDraw>,
+    mut validate: impl FnMut(&ActorFrameDraw) -> Result<(), PresentationError>,
+    mut prepare: impl FnMut(ActorFrameDraw) -> Result<T, PresentationError>,
+) -> Result<Vec<T>, PresentationError> {
+    for draw in &draws {
+        validate(draw)?;
+    }
+    draws.into_iter().map(&mut prepare).collect()
+}
+
+fn ready_actor_frame_notifications(
+    state: &mut GraphicsState,
+) -> Vec<(u64, u64, Vec<ActorFrameGraphicsChange>)> {
+    let revisions = state
+        .pending_actor_frames
+        .keys()
+        .copied()
+        .collect::<Vec<_>>();
+    let mut notifications = Vec::new();
+    for revision in revisions {
+        let Some(frame) = state.pending_actor_frames.get(&revision) else {
+            continue;
+        };
+        if frame.ready_notified {
+            continue;
+        }
+        let visible = if let Some(required) = &frame.required_panes {
+            if !required.is_subset(&state.visible_panes) {
+                continue;
+            }
+            required
+                .iter()
+                .filter_map(|pane| frame.scenes.get_key_value(pane))
+                .collect::<Vec<_>>()
+        } else {
+            frame
+                .scenes
+                .iter()
+                .filter(|(pane, _scene)| state.visible_panes.contains(pane))
+                .collect::<Vec<_>>()
+        };
+        if visible.is_empty()
+            || visible.iter().any(|(pane, scene)| {
+                referenced_resources(state, **pane, scene.generation, &scene.packet)
+                    .map_or(true, |resources| !resources.ready)
+            })
+        {
+            continue;
+        }
+        let changes = visible
+            .into_iter()
+            .map(|(pane, scene)| ActorFrameGraphicsChange {
+                pane: *pane,
+                sequence: scene.sequence,
+                resize_epoch: scene.resize_epoch,
+                terminal_input_sequence: scene.terminal_input_sequence,
+            })
+            .collect::<Vec<_>>();
+        notifications.push((frame.token, frame.revision, changes));
+        if let Some(frame) = state.pending_actor_frames.get_mut(&revision) {
+            frame.ready_notified = true;
+            state.actor_frames_ready = state.actor_frames_ready.saturating_add(1);
+        }
+    }
+    notifications
+}
+
+fn publish_actor_frame_notifications(
+    proxy: &EventLoopProxy<ClientEvent>,
+    notifications: Vec<(u64, u64, Vec<ActorFrameGraphicsChange>)>,
+) {
+    for (token, actor_frame_revision, changes) in notifications {
+        if proxy
+            .send_event(ClientEvent::PluginActorFrameChanged {
+                token,
+                actor_frame_revision,
+                changes,
+                ready_at: Instant::now(),
+            })
+            .is_err()
+        {
+            eprintln!(
+                "failed to publish ready plugin actor frame token={token} revision={actor_frame_revision}"
+            );
+        }
+    }
+}
+
+fn actor_frame_snapshots_from_state(
+    state: &GraphicsState,
+    revision: u64,
+    panes: impl IntoIterator<Item = u64>,
+) -> Result<Option<Vec<GraphicsSnapshot>>> {
+    let Some(frame) = state.pending_actor_frames.get(&revision) else {
+        return Ok(None);
+    };
+    panes
+        .into_iter()
+        .map(|pane| {
+            let scene = frame
+                .scenes
+                .get(&pane)
+                .context("actor frame pane is unavailable")?;
+            let resources = referenced_resources(state, pane, scene.generation, &scene.packet)
+                .map_err(|_error| anyhow!("actor frame lost a referenced resource"))?;
+            anyhow::ensure!(resources.ready, "actor frame pane resources are not ready");
+            Ok(GraphicsSnapshot {
+                pane,
+                sequence: scene.sequence,
+                resize_epoch: scene.resize_epoch,
+                packet: scene.packet.clone(),
+                images: resources.images,
+                text_layouts: resources.text_layouts,
+                glyphs: resources.glyphs,
+            })
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
+}
+
+fn promote_actor_frame_in_state(
+    state: &mut GraphicsState,
+    revision: u64,
+    panes: &[u64],
+) -> Result<ActorFramePromotion> {
+    let Some(mut frame) = state.pending_actor_frames.remove(&revision) else {
+        return Ok(ActorFramePromotion::Stale);
+    };
+    let promoted_panes = panes.iter().copied().collect::<BTreeSet<_>>();
+    if promoted_panes.len() != panes.len()
+        || promoted_panes
+            .iter()
+            .any(|pane| !frame.scenes.contains_key(pane))
+    {
+        state.actor_frame_partial_promotion_violations = state
+            .actor_frame_partial_promotion_violations
+            .saturating_add(1);
+        state.pending_actor_frames.insert(revision, frame);
+        anyhow::bail!("actor frame promotion pane set is invalid");
+    }
+    let actor = frame.actor.clone();
+    let token = frame.token;
+    for pane in panes {
+        let scene = frame
+            .scenes
+            .remove(pane)
+            .context("actor frame pane is unavailable")?;
+        if let Some(epoch) = scene.resize_epoch {
+            state.staged_panes.insert((*pane, epoch), scene);
+        } else if state.active_resize_epochs.contains_key(pane) {
+            state.deferred_panes.insert(*pane, scene);
+        } else {
+            state.panes.insert(*pane, scene);
+        }
+    }
+    if !frame.scenes.is_empty() {
+        frame.ready_notified = false;
+        frame.required_panes = None;
+        state.pending_actor_frames.insert(revision, frame);
+    }
+    state.actor_frames_promoted = state.actor_frames_promoted.saturating_add(1);
+    if panes.len() >= 2 {
+        state.actor_frames_promoted_multi_pane =
+            state.actor_frames_promoted_multi_pane.saturating_add(1);
+    }
+    eprintln!(
+        "render scheduling actor-frame promoted actor={} generation={} token={} revision={} pane_count={} panes={panes:?}",
+        actor.name,
+        actor.generation,
+        token,
+        revision,
+        panes.len(),
+    );
+    Ok(ActorFramePromotion::Claimed)
+}
+
+fn claim_actor_frame_for_preparation_in_state(
+    state: &mut GraphicsState,
+    revision: u64,
+    panes: &[u64],
+) -> Result<ActorFramePreparationClaim> {
+    let Some(frame) = state.pending_actor_frames.get(&revision) else {
+        return Ok(ActorFramePreparationClaim::Stale);
+    };
+    let claimed_panes = panes.iter().copied().collect::<BTreeSet<_>>();
+    if claimed_panes.len() != panes.len()
+        || claimed_panes
+            .iter()
+            .any(|pane| !frame.scenes.contains_key(pane))
+        || frame
+            .required_panes
+            .as_ref()
+            .is_some_and(|required| required != &claimed_panes)
+    {
+        state.actor_frame_partial_promotion_violations = state
+            .actor_frame_partial_promotion_violations
+            .saturating_add(1);
+        anyhow::bail!("actor frame preparation claim pane set is invalid");
+    }
+    let blocker_epochs = frame
+        .scenes
+        .iter()
+        .filter_map(|(pane, scene)| {
+            scene
+                .resize_epoch
+                .or_else(|| state.active_resize_epochs.get(pane).copied())
+        })
+        .collect::<BTreeSet<_>>();
+    if blocker_epochs.is_empty() {
+        return Ok(ActorFramePreparationClaim::Prepare);
+    }
+    let frame = state
+        .pending_actor_frames
+        .get_mut(&revision)
+        .context("blocked actor frame disappeared during preparation claim")?;
+    frame.required_panes = Some(claimed_panes);
+    frame.blocker_epochs = blocker_epochs;
+    Ok(ActorFramePreparationClaim::PrepareDeferred)
+}
+
+fn defer_prepared_actor_frame_in_state(
+    state: &mut GraphicsState,
+    revision: u64,
+    panes: &[u64],
+) -> Result<Option<DeferredActorFrameStage>> {
+    let Some(frame) = state.pending_actor_frames.get(&revision) else {
+        return Ok(None);
+    };
+    let claimed = panes.iter().copied().collect::<BTreeSet<_>>();
+    anyhow::ensure!(
+        frame.required_panes.as_ref() == Some(&claimed) && !frame.blocker_epochs.is_empty(),
+        "prepared deferred actor frame claim changed"
+    );
+    let frame = state
+        .pending_actor_frames
+        .remove(&revision)
+        .context("prepared deferred actor frame disappeared")?;
+    let token = frame.token;
+    let blocker_epochs = frame.blocker_epochs.clone();
+    let actor = frame.actor.clone();
+    let superseded = state
+        .deferred_actor_frames
+        .iter()
+        .filter_map(|(revision, deferred)| (deferred.actor == actor).then_some(*revision))
+        .collect::<Vec<_>>();
+    state
+        .deferred_actor_frames
+        .retain(|_revision, deferred| deferred.actor != actor);
+    state.deferred_actor_frames.insert(revision, frame);
+    Ok(Some(DeferredActorFrameStage {
+        token,
+        blocker_epochs,
+        superseded_revisions: superseded,
+    }))
+}
+
+fn release_deferred_actor_frames_for_epoch(
+    state: &mut GraphicsState,
+    resize_epoch: u64,
+    resolved_panes: &BTreeSet<u64>,
+    promote_tagged: bool,
+) -> Vec<(u64, u64, Option<u64>)> {
+    let mut released = Vec::new();
+    let revisions = state
+        .deferred_actor_frames
+        .iter()
+        .filter_map(|(revision, frame)| {
+            (frame.blocker_epochs.contains(&resize_epoch)
+                && frame
+                    .scenes
+                    .keys()
+                    .any(|pane| resolved_panes.contains(pane)))
+            .then_some(*revision)
+        })
+        .collect::<Vec<_>>();
+    for revision in revisions {
+        let Some(mut frame) = state.deferred_actor_frames.remove(&revision) else {
+            continue;
+        };
+        frame.blocker_epochs.remove(&resize_epoch);
+        if promote_tagged {
+            for scene in frame.scenes.values_mut() {
+                if scene.resize_epoch == Some(resize_epoch) {
+                    scene.resize_epoch = None;
+                }
+            }
+        } else {
+            // Tagged content was never presented and is invalid after an abort
+            // or degraded completion. Ordinary members, including panes not in
+            // the wait set, remain one atomic recovery frame.
+            frame
+                .scenes
+                .retain(|_pane, scene| scene.resize_epoch != Some(resize_epoch));
+        }
+        if !frame.blocker_epochs.is_empty() {
+            state.deferred_actor_frames.insert(revision, frame);
+            continue;
+        }
+        let unresolved_tags = frame
+            .scenes
+            .values()
+            .filter_map(|scene| scene.resize_epoch)
+            .collect::<BTreeSet<_>>();
+        if !unresolved_tags.is_empty() {
+            frame.blocker_epochs = unresolved_tags;
+            state.deferred_actor_frames.insert(revision, frame);
+            continue;
+        }
+        if frame.scenes.is_empty() {
+            continue;
+        }
+        for (pane, scene) in frame.scenes {
+            if state
+                .panes
+                .get(&pane)
+                .is_none_or(|visible| scene.sequence > visible.sequence)
+            {
+                released.push((pane, scene.sequence, scene.terminal_input_sequence));
+                state.panes.insert(pane, scene);
+            }
+        }
+    }
+    released
+}
+
+fn deferred_actor_frame_resolution_plan_in_state(
+    state: &mut GraphicsState,
+    resize_epoch: u64,
+    promote_tagged: bool,
+) -> DeferredActorFrameResolutionPlan {
+    let mut plan = DeferredActorFrameResolutionPlan::default();
+    let revisions = state
+        .deferred_actor_frames
+        .keys()
+        .copied()
+        .collect::<Vec<_>>();
+    for revision in revisions {
+        let Some(mut frame) = state.deferred_actor_frames.remove(&revision) else {
+            continue;
+        };
+        if !frame.blocker_epochs.remove(&resize_epoch) {
+            plan.retain.insert(revision);
+            state.deferred_actor_frames.insert(revision, frame);
+            continue;
+        }
+        if promote_tagged {
+            for scene in frame.scenes.values_mut() {
+                if scene.resize_epoch == Some(resize_epoch) {
+                    scene.resize_epoch = None;
+                }
+            }
+        } else {
+            frame
+                .scenes
+                .retain(|_pane, scene| scene.resize_epoch != Some(resize_epoch));
+        }
+        if !frame.blocker_epochs.is_empty() {
+            plan.retain.insert(revision);
+            state.deferred_actor_frames.insert(revision, frame);
+            continue;
+        }
+        let unresolved_tags = frame
+            .scenes
+            .values()
+            .filter_map(|scene| scene.resize_epoch)
+            .collect::<BTreeSet<_>>();
+        if !unresolved_tags.is_empty() {
+            frame.blocker_epochs = unresolved_tags;
+            plan.retain.insert(revision);
+            state.deferred_actor_frames.insert(revision, frame);
+            continue;
+        }
+        let mut members = BTreeMap::new();
+        let mut correlations = Vec::new();
+        for (pane, scene) in frame.scenes {
+            let latest_sequence =
+                state
+                    .panes
+                    .get(&pane)
+                    .map(|visible| visible.sequence)
+                    .into_iter()
+                    .chain(state.staged_panes.iter().filter_map(
+                        |((staged_pane, _epoch), staged)| {
+                            (*staged_pane == pane).then_some(staged.sequence)
+                        },
+                    ))
+                    .max();
+            if latest_sequence.is_none_or(|latest| scene.sequence > latest) {
+                members.insert(pane, scene.sequence);
+                correlations.push((pane, scene.sequence, scene.terminal_input_sequence));
+                state.panes.insert(pane, scene);
+            }
+        }
+        state
+            .settled_actor_frame_correlations
+            .entry(resize_epoch)
+            .or_default()
+            .extend(correlations);
+        plan.commit.insert(revision, members);
+    }
+    plan
 }
 
 fn resize_epoch_is_active(state: &GraphicsState, pane: u64, resize_epoch: u64) -> bool {
@@ -233,6 +778,7 @@ fn abort_resize_epoch_state(
         .iter()
         .filter_map(|(pane, epoch)| (*epoch == resize_epoch).then_some(*pane))
         .collect::<Vec<_>>();
+    let resolved_panes = panes.iter().copied().collect::<BTreeSet<_>>();
     let mut deferred = Vec::new();
     for pane in panes {
         state.active_resize_epochs.remove(&pane);
@@ -245,7 +791,34 @@ fn abort_resize_epoch_state(
     state
         .staged_panes
         .retain(|(_pane, epoch), _scene| *epoch != resize_epoch);
+    deferred.extend(release_deferred_actor_frames_for_epoch(
+        state,
+        resize_epoch,
+        &resolved_panes,
+        false,
+    ));
+    deferred.extend(
+        state
+            .settled_actor_frame_correlations
+            .remove(&resize_epoch)
+            .unwrap_or_default(),
+    );
     deferred
+}
+
+fn retire_pending_actor_frames_for_epoch(state: &mut GraphicsState, resize_epoch: u64) -> Vec<u64> {
+    let mut cancelled_tokens = Vec::new();
+    state.pending_actor_frames.retain(|_revision, frame| {
+        let retired = frame
+            .scenes
+            .values()
+            .any(|scene| scene.resize_epoch == Some(resize_epoch));
+        if retired {
+            cancelled_tokens.push(frame.token);
+        }
+        !retired
+    });
+    cancelled_tokens
 }
 
 fn complete_resize_epoch_state(
@@ -258,6 +831,7 @@ fn complete_resize_epoch_state(
         .iter()
         .filter_map(|(pane, epoch)| (*epoch == resize_epoch).then_some(*pane))
         .collect::<Vec<_>>();
+    let resolved_panes = panes.iter().copied().collect::<BTreeSet<_>>();
     let mut deferred = Vec::new();
     for pane in panes {
         state.active_resize_epochs.remove(&pane);
@@ -289,6 +863,18 @@ fn complete_resize_epoch_state(
     state
         .staged_panes
         .retain(|(_pane, epoch), _scene| *epoch != resize_epoch);
+    deferred.extend(release_deferred_actor_frames_for_epoch(
+        state,
+        resize_epoch,
+        &resolved_panes,
+        promote_tagged,
+    ));
+    deferred.extend(
+        state
+            .settled_actor_frame_correlations
+            .remove(&resize_epoch)
+            .unwrap_or_default(),
+    );
     deferred
 }
 
@@ -307,15 +893,415 @@ impl PluginGraphicsBridge {
             text_system,
             glyph_raster_tx,
             proxy,
+            render_scheduler: Arc::new(Mutex::new(RenderScheduler::default())),
+            render_clock_origin: Instant::now(),
+            host_tail_ns: Arc::new(AtomicU64::new(COLD_HOST_COST_NS)),
+            winit_redraw_hop_ns: Arc::new(AtomicU64::new(COLD_WINIT_REDRAW_HOP_NS)),
         }
     }
 
-    pub fn actor_host(&self, pane: u64) -> Arc<ActorPresentationHost> {
+    pub fn actor_host(
+        &self,
+        actor: impl Into<String>,
+        panes: impl IntoIterator<Item = u64>,
+    ) -> Arc<ActorPresentationHost> {
         Arc::new(ActorPresentationHost {
-            pane,
+            actor: actor.into(),
+            panes: panes.into_iter().collect(),
             generation: AtomicU64::new(0),
             bridge: self.clone(),
         })
+    }
+
+    pub fn render_now_ns(&self) -> u64 {
+        u64::try_from(self.render_clock_origin.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    }
+
+    pub fn service_render_scheduler(
+        &self,
+        predictor: &mut FramePredictor,
+    ) -> Result<RenderSchedulerService> {
+        let now_ns = self.render_now_ns();
+        let host_cost_ns = self.host_tail_ns.load(Ordering::Acquire);
+        let redraw_hop_ns = self.winit_redraw_hop_ns.load(Ordering::Acquire);
+        let mut scheduler = self
+            .render_scheduler
+            .lock()
+            .map_err(|_poisoned| anyhow!("render scheduler is poisoned"))?;
+        for missed in scheduler.drain_deadline_results() {
+            predictor.note_deadline_result(missed);
+        }
+        scheduler.arm_all(now_ns, predictor, host_cost_ns);
+        let request_redraw_target_ns =
+            scheduler.request_due_redraw(now_ns, host_cost_ns, redraw_hop_ns);
+        let hints = scheduler
+            .dispatch_due(now_ns)
+            .into_iter()
+            .map(|(actor, hint)| {
+                (
+                    actor,
+                    GuestRenderHint {
+                        token: GuestRenderToken(hint.token.0),
+                        target_presentation_time_ns: hint.target_presentation_time_ns,
+                        submission_deadline_ns: hint.submission_deadline_ns,
+                        relevant_panes: hint.relevant_panes,
+                        event_watermark: hint.event_watermark,
+                    },
+                )
+            })
+            .collect();
+        let composition_tokens = scheduler
+            .release_ready_composition()
+            .into_iter()
+            .map(|token| token.0)
+            .collect();
+        drop(scheduler);
+        Ok(RenderSchedulerService {
+            hints,
+            composition_tokens,
+            request_redraw_target_ns,
+        })
+    }
+
+    pub fn note_host_tail(&self, measured_ns: u64) {
+        let measured_ns = measured_ns.clamp(1, 50_000_000);
+        let _updated =
+            self.host_tail_ns
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    Some(if measured_ns > current {
+                        measured_ns
+                    } else {
+                        current
+                            .saturating_mul(7)
+                            .saturating_add(measured_ns)
+                            .saturating_div(8)
+                            .max(1)
+                    })
+                });
+    }
+
+    pub fn note_winit_redraw_hop(&self, measured_ns: u64) {
+        let measured_ns = measured_ns.clamp(1, MAX_WINIT_REDRAW_HOP_NS);
+        let _updated =
+            self.winit_redraw_hop_ns
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    Some(if measured_ns > current {
+                        measured_ns
+                    } else {
+                        current
+                            .saturating_mul(7)
+                            .saturating_add(measured_ns)
+                            .saturating_div(8)
+                            .max(1)
+                    })
+                });
+    }
+
+    pub fn next_render_deadline(&self) -> Result<Option<Instant>> {
+        let scheduler = self
+            .render_scheduler
+            .lock()
+            .map_err(|_poisoned| anyhow!("render scheduler is poisoned"))?;
+        let host_cost_ns = self.host_tail_ns.load(Ordering::Acquire);
+        let redraw_hop_ns = self.winit_redraw_hop_ns.load(Ordering::Acquire);
+        Ok(scheduler
+            .next_deadline_ns()
+            .into_iter()
+            .chain(scheduler.next_redraw_request_deadline_ns(host_cost_ns, redraw_hop_ns))
+            .min()
+            .map(|deadline| self.render_clock_origin + std::time::Duration::from_nanos(deadline)))
+    }
+
+    pub fn mark_graphics_ready(
+        &self,
+        token: u64,
+        panes: impl IntoIterator<Item = u64>,
+    ) -> CompositionRelease {
+        let now = self.render_now_ns();
+        if let Ok(mut scheduler) = self.render_scheduler.lock() {
+            for pane in panes {
+                scheduler.mark_graphics_ready(RenderToken(token), pane, now);
+            }
+            let redraw_hop_ns = self.winit_redraw_hop_ns.load(Ordering::Acquire);
+            let tokens = scheduler
+                .release_ready_composition()
+                .into_iter()
+                .map(|token| token.0)
+                .collect::<Vec<_>>();
+            let target_redraw_consumed = tokens
+                .iter()
+                .any(|token| scheduler.token_target_redraw_consumed(RenderToken(*token)));
+            return CompositionRelease {
+                tokens,
+                request_redraw_target_ns: if target_redraw_consumed {
+                    scheduler.token_target_ns(RenderToken(token))
+                } else {
+                    scheduler.request_due_redraw(
+                        now,
+                        self.host_tail_ns.load(Ordering::Acquire),
+                        redraw_hop_ns,
+                    )
+                },
+            };
+        }
+        CompositionRelease {
+            tokens: Vec::new(),
+            request_redraw_target_ns: None,
+        }
+    }
+
+    pub fn mark_winit_redraw_started(&self) -> Option<u64> {
+        if let Ok(mut scheduler) = self.render_scheduler.lock() {
+            return Some(scheduler.mark_redraw_consumed());
+        }
+        None
+    }
+
+    pub fn composable_tokens_through(
+        &self,
+        tokens: impl IntoIterator<Item = u64>,
+        target_ns: u64,
+    ) -> Vec<u64> {
+        let Ok(scheduler) = self.render_scheduler.lock() else {
+            return Vec::new();
+        };
+        tokens
+            .into_iter()
+            .filter(|token| {
+                scheduler
+                    .token_target_ns(RenderToken(*token))
+                    .is_some_and(|token_target_ns| token_target_ns <= target_ns)
+            })
+            .collect()
+    }
+
+    pub fn mark_frames_composed(
+        &self,
+        tokens: impl IntoIterator<Item = u64>,
+        composed_at: Instant,
+    ) {
+        let composed_ns = u64::try_from(
+            composed_at
+                .saturating_duration_since(self.render_clock_origin)
+                .as_nanos(),
+        )
+        .unwrap_or(u64::MAX);
+        if let Ok(mut scheduler) = self.render_scheduler.lock() {
+            for token in tokens {
+                scheduler.mark_composed(RenderToken(token), composed_ns);
+            }
+        }
+    }
+
+    pub fn mark_frame_presented(
+        &self,
+        tokens: impl IntoIterator<Item = u64>,
+        submitted_at: Instant,
+        presented_at: Instant,
+        estimated: bool,
+    ) -> bool {
+        let to_ns = |instant: Instant| {
+            u64::try_from(
+                instant
+                    .saturating_duration_since(self.render_clock_origin)
+                    .as_nanos(),
+            )
+            .unwrap_or(u64::MAX)
+        };
+        let submitted_ns = to_ns(submitted_at);
+        let presented_ns = to_ns(presented_at);
+        if let Ok(mut scheduler) = self.render_scheduler.lock() {
+            let warmup_before = scheduler.warmup_opportunities();
+            for token in tokens {
+                let token = RenderToken(token);
+                scheduler.mark_gpu_submitted(token, submitted_ns);
+                scheduler.mark_presented(token, presented_ns, estimated);
+            }
+            return warmup_before < DIAGNOSTIC_WARMUP_OPPORTUNITIES
+                && scheduler.warmup_opportunities() == DIAGNOSTIC_WARMUP_OPPORTUNITIES;
+        }
+        false
+    }
+
+    pub fn cancel_accepted_tokens(&self, tokens: impl IntoIterator<Item = u64>) {
+        if let Ok(mut scheduler) = self.render_scheduler.lock() {
+            for token in tokens {
+                scheduler.cancel_accepted(RenderToken(token));
+            }
+        }
+    }
+
+    pub fn admit_actor_event(&self, actor: &ActorScope, key_input: bool) -> Option<u64> {
+        let now = self.render_now_ns();
+        self.render_scheduler.lock().ok().and_then(|mut scheduler| {
+            let watermark = scheduler.admit_event(actor, false)?;
+            if key_input {
+                scheduler.note_key_input(actor, watermark, now);
+            }
+            Some(watermark)
+        })
+    }
+
+    pub fn complete_actor_turn(
+        &self,
+        actor: &ActorScope,
+        event_watermark: Option<u64>,
+        render_token: Option<u64>,
+    ) {
+        let now = self.render_now_ns();
+        if let Ok(mut scheduler) = self.render_scheduler.lock() {
+            if let Some(watermark) = event_watermark {
+                scheduler.mark_reduced_through(actor, watermark);
+            }
+            if let Some(token) = render_token
+                && scheduler.token_belongs_to(actor, RenderToken(token))
+            {
+                scheduler.abandon(actor, now);
+            }
+        }
+        drop(self.proxy.send_event(ClientEvent::RenderSchedulingChanged));
+    }
+
+    pub fn set_visible_panes(
+        &self,
+        panes: impl IntoIterator<Item = u64>,
+        composition_panes: impl IntoIterator<Item = u64>,
+    ) -> Result<()> {
+        let mut state = self
+            .shared
+            .lock()
+            .map_err(|_poisoned| anyhow!("plugin graphics state is poisoned"))?;
+        let panes = panes.into_iter().collect::<BTreeSet<_>>();
+        let composition_panes = composition_panes.into_iter().collect::<BTreeSet<_>>();
+        if state.visible_panes != panes {
+            state.visible_panes = panes;
+            state.max_visible_panes = state.max_visible_panes.max(state.visible_panes.len());
+            state.visibility_changes = state.visibility_changes.saturating_add(1);
+            for frame in state.pending_actor_frames.values_mut() {
+                frame.ready_notified = false;
+            }
+        }
+        let notifications = ready_actor_frame_notifications(&mut state);
+        let actor_visibility = state
+            .actor_panes
+            .iter()
+            .map(|(actor, owned)| {
+                (
+                    actor.clone(),
+                    owned
+                        .intersection(&composition_panes)
+                        .copied()
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        drop(state);
+        if let Ok(mut scheduler) = self.render_scheduler.lock() {
+            for (actor, relevant) in actor_visibility {
+                scheduler.set_relevant_panes(&actor, relevant);
+            }
+        }
+        publish_actor_frame_notifications(&self.proxy, notifications);
+        Ok(())
+    }
+
+    pub fn renderer_recreated(&self) -> Result<()> {
+        // The renderer generation changes, but the Winit event loop, window,
+        // compositor path, and established encode/submit tail remain the same
+        // scheduling domain. Preserve both estimates so recovered targets are
+        // prearmed with trained costs instead of relearning through misses.
+        if let Ok(mut scheduler) = self.render_scheduler.lock() {
+            scheduler.reset_redraw_frontier();
+        }
+        let mut state = self
+            .shared
+            .lock()
+            .map_err(|_poisoned| anyhow!("plugin graphics state is poisoned"))?;
+        for frame in state.pending_actor_frames.values_mut() {
+            frame.ready_notified = false;
+        }
+        let notifications = ready_actor_frame_notifications(&mut state);
+        drop(state);
+        publish_actor_frame_notifications(&self.proxy, notifications);
+        Ok(())
+    }
+
+    pub fn actor_frame_snapshots(
+        &self,
+        revision: u64,
+        panes: impl IntoIterator<Item = u64>,
+    ) -> Result<Option<Vec<GraphicsSnapshot>>> {
+        let state = self
+            .shared
+            .lock()
+            .map_err(|_poisoned| anyhow!("plugin graphics state is poisoned"))?;
+        actor_frame_snapshots_from_state(&state, revision, panes)
+    }
+
+    /// Claim a complete actor frame before any renderer-side packet or
+    /// resource preparation begins. An ordinary draw for a pane currently
+    /// held by a synchronized-resize barrier retires the complete frame; only
+    /// its blocked ordinary panes remain deferred for abort/post-present
+    /// recovery.
+    pub fn claim_actor_frame_for_preparation(
+        &self,
+        revision: u64,
+        panes: &[u64],
+    ) -> Result<ActorFramePreparationClaim> {
+        let mut state = self
+            .shared
+            .lock()
+            .map_err(|_poisoned| anyhow!("plugin graphics state is poisoned"))?;
+        claim_actor_frame_for_preparation_in_state(&mut state, revision, panes)
+    }
+
+    pub fn defer_prepared_actor_frame(
+        &self,
+        revision: u64,
+        panes: &[u64],
+    ) -> Result<Option<(BTreeSet<u64>, Vec<u64>)>> {
+        let deferred = {
+            let mut state = self
+                .shared
+                .lock()
+                .map_err(|_poisoned| anyhow!("plugin graphics state is poisoned"))?;
+            defer_prepared_actor_frame_in_state(&mut state, revision, panes)?
+        };
+        let Some(deferred) = deferred else {
+            return Ok(None);
+        };
+        self.cancel_accepted_tokens([deferred.token]);
+        drop(self.proxy.send_event(ClientEvent::RenderSchedulingChanged));
+        Ok(Some((
+            deferred.blocker_epochs,
+            deferred.superseded_revisions,
+        )))
+    }
+
+    pub fn promote_actor_frame(&self, revision: u64, panes: &[u64]) -> Result<ActorFramePromotion> {
+        let mut state = self
+            .shared
+            .lock()
+            .map_err(|_poisoned| anyhow!("plugin graphics state is poisoned"))?;
+        promote_actor_frame_in_state(&mut state, revision, panes)
+    }
+
+    /// Retire an actor frame whose complete atomic batch can no longer be
+    /// presented. This is used when asynchronous preparation resumes after a
+    /// resize epoch in the batch has already been promoted or superseded.
+    pub fn discard_actor_frame(&self, revision: u64) -> Result<bool> {
+        let token = self
+            .shared
+            .lock()
+            .map_err(|_poisoned| anyhow!("plugin graphics state is poisoned"))?
+            .pending_actor_frames
+            .remove(&revision)
+            .map(|frame| frame.token);
+        if let Some(token) = token {
+            self.cancel_accepted_tokens([token]);
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     pub fn expect_terminal_snapshot(&self, pane: u64, input_sequence: u64) -> Result<()> {
@@ -323,11 +1309,7 @@ impl PluginGraphicsBridge {
             .shared
             .lock()
             .map_err(|_poisoned| anyhow!("plugin graphics state is poisoned"))?;
-        state
-            .pending_terminal_input_sequences
-            .entry(pane)
-            .or_default()
-            .push_back(input_sequence);
+        record_complete_state_watermark(&mut state, pane, input_sequence);
         drop(state);
         Ok(())
     }
@@ -448,7 +1430,11 @@ impl PluginGraphicsBridge {
         state
             .active_resize_epochs
             .retain(|_pane, epoch| *epoch != resize_epoch);
-        Ok(before.saturating_sub(state.staged_panes.len()))
+        let cancelled_tokens = retire_pending_actor_frames_for_epoch(&mut state, resize_epoch);
+        let discarded = before.saturating_sub(state.staged_panes.len());
+        drop(state);
+        self.cancel_accepted_tokens(cancelled_tokens);
+        Ok(discarded)
     }
 
     /// Panes admitted to an epoch, including panes whose tagged GPU scene may
@@ -465,6 +1451,22 @@ impl PluginGraphicsBridge {
             .collect())
     }
 
+    pub fn deferred_actor_frame_resolution_plan(
+        &self,
+        resize_epoch: u64,
+        promote_tagged: bool,
+    ) -> Result<DeferredActorFrameResolutionPlan> {
+        let mut state = self
+            .shared
+            .lock()
+            .map_err(|_poisoned| anyhow!("plugin graphics state is poisoned"))?;
+        Ok(deferred_actor_frame_resolution_plan_in_state(
+            &mut state,
+            resize_epoch,
+            promote_tagged,
+        ))
+    }
+
     /// Abort one admitted epoch without making its tagged scenes visible.
     ///
     /// Ordinary scenes submitted while the barrier was active are newer than
@@ -477,7 +1479,11 @@ impl PluginGraphicsBridge {
             .lock()
             .map_err(|_poisoned| anyhow!("plugin graphics state is poisoned"))?;
         let deferred = abort_resize_epoch_state(&mut state, resize_epoch);
+        let cancelled_tokens = retire_pending_actor_frames_for_epoch(&mut state, resize_epoch);
+        let notifications = ready_actor_frame_notifications(&mut state);
         drop(state);
+        self.cancel_accepted_tokens(cancelled_tokens);
+        publish_actor_frame_notifications(&self.proxy, notifications);
         Ok(deferred)
     }
 
@@ -496,7 +1502,11 @@ impl PluginGraphicsBridge {
             .lock()
             .map_err(|_poisoned| anyhow!("plugin graphics state is poisoned"))?;
         let deferred = complete_resize_epoch_state(&mut state, resize_epoch, promote_tagged);
+        let cancelled_tokens = retire_pending_actor_frames_for_epoch(&mut state, resize_epoch);
+        let notifications = ready_actor_frame_notifications(&mut state);
         drop(state);
+        self.cancel_accepted_tokens(cancelled_tokens);
+        publish_actor_frame_notifications(&self.proxy, notifications);
         Ok(deferred)
     }
 
@@ -505,6 +1515,73 @@ impl PluginGraphicsBridge {
             .shared
             .lock()
             .map_err(|_poisoned| anyhow!("plugin graphics state is poisoned"))?;
+        let scheduler_metrics;
+        let actor_progress;
+        let key_to_present_ns;
+        let frame_intervals_ns;
+        let measured_key_to_present_ns;
+        let measured_frame_intervals_ns;
+        let warmup_opportunities;
+        let measured_opportunities;
+        let measured_deadline_misses;
+        let measured_target_misses;
+        {
+            let scheduler = self
+                .render_scheduler
+                .lock()
+                .map_err(|_poisoned| anyhow!("render scheduler is poisoned"))?;
+            scheduler_metrics = scheduler.metrics();
+            actor_progress = scheduler.actor_progress();
+            key_to_present_ns = scheduler
+                .key_to_present_ns()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>();
+            frame_intervals_ns = scheduler
+                .presentation_intervals_ns()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>();
+            measured_key_to_present_ns = scheduler
+                .measured_key_to_present_ns()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>();
+            measured_frame_intervals_ns = scheduler
+                .measured_presentation_intervals_ns()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>();
+            warmup_opportunities = scheduler.warmup_opportunities();
+            measured_opportunities = scheduler.measured_opportunities();
+            measured_deadline_misses = scheduler.measured_deadline_misses();
+            measured_target_misses = scheduler.measured_target_misses();
+        }
+        let mut key_samples = measured_key_to_present_ns.clone();
+        let mut frame_intervals = measured_frame_intervals_ns.clone();
+        key_samples.sort_unstable();
+        frame_intervals.sort_unstable();
+        let percentile = |samples: &[u64], percent: usize| {
+            samples
+                .get(samples.len().saturating_sub(1).saturating_mul(percent) / 100)
+                .copied()
+                .unwrap_or(0)
+        };
+        let mean = key_samples
+            .iter()
+            .copied()
+            .map(|value| value as f64)
+            .sum::<f64>()
+            / key_samples.len().max(1) as f64;
+        let variance = key_samples
+            .iter()
+            .copied()
+            .map(|value| {
+                let distance = value as f64 - mean;
+                distance * distance
+            })
+            .sum::<f64>()
+            / key_samples.len().max(1) as f64;
         Ok(GraphicsDiagnostics {
             accepted_packets: state.accepted_packets,
             max_packet_bytes: state.max_packet_bytes,
@@ -513,6 +1590,35 @@ impl PluginGraphicsBridge {
             text_layouts_dropped: state.text_layouts_dropped,
             live_text_layouts: state.text_layouts.len(),
             peak_text_layouts: state.peak_text_layouts,
+            glyph_raster_backpressure: state.glyph_raster_backpressure,
+            render_scheduler: scheduler_metrics,
+            key_to_present_p50_ns: percentile(&key_samples, 50),
+            key_to_present_p95_ns: percentile(&key_samples, 95),
+            key_to_present_p99_ns: percentile(&key_samples, 99),
+            key_to_present_max_ns: key_samples.last().copied().unwrap_or(0),
+            key_to_present_stddev_ns: variance.sqrt() as u64,
+            frame_interval_samples: frame_intervals.len(),
+            frame_interval_p95_ns: percentile(&frame_intervals, 95),
+            frame_interval_p99_ns: percentile(&frame_intervals, 99),
+            key_to_present_ns,
+            frame_intervals_ns,
+            measured_key_to_present_ns,
+            measured_frame_intervals_ns,
+            warmup_opportunities,
+            measured_opportunities,
+            measured_deadline_misses,
+            measured_target_misses,
+            actor_progress,
+            actor_frames_accepted: state.actor_frames_accepted,
+            actor_frames_ready: state.actor_frames_ready,
+            actor_frames_promoted: state.actor_frames_promoted,
+            actor_frames_promoted_multi_pane: state.actor_frames_promoted_multi_pane,
+            actor_frame_partial_promotion_violations: state
+                .actor_frame_partial_promotion_violations,
+            visibility_changes: state.visibility_changes,
+            max_visible_panes: state.max_visible_panes,
+            global_host_tail_estimate_ns: self.host_tail_ns.load(Ordering::Acquire),
+            winit_redraw_hop_estimate_ns: self.winit_redraw_hop_ns.load(Ordering::Acquire),
         })
     }
 }
@@ -521,8 +1627,8 @@ fn start_glyph_raster_worker(
     shared: Arc<Mutex<GraphicsState>>,
     text_system: Arc<Mutex<TextSystem>>,
     proxy: EventLoopProxy<ClientEvent>,
-) -> Sender<GlyphRasterRequest> {
-    let (sender, receiver) = mpsc::channel::<GlyphRasterRequest>();
+) -> SyncSender<GlyphRasterRequest> {
+    let (sender, receiver) = mpsc::sync_channel::<GlyphRasterRequest>(GLYPH_RASTER_QUEUE_CAPACITY);
     let spawn_result = thread::Builder::new()
         .name("brood-glyph-raster".to_owned())
         .spawn(move || {
@@ -559,7 +1665,7 @@ fn finish_glyph_raster(
     request: &GlyphRasterRequest,
     result: Result<TextLayoutResource, PresentationError>,
 ) {
-    let notifications = {
+    let (notifications, actor_frame_notifications) = {
         let Ok(mut state) = shared.lock() else {
             return;
         };
@@ -582,7 +1688,7 @@ fn finish_glyph_raster(
                 return;
             }
         }
-        state
+        let notifications = state
             .panes
             .get(&request.pane)
             .into_iter()
@@ -606,7 +1712,9 @@ fn finish_glyph_raster(
                         scene.terminal_input_sequence,
                     ))
             })
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        let actor_frame_notifications = ready_actor_frame_notifications(&mut state);
+        (notifications, actor_frame_notifications)
     };
     for (sequence, resize_epoch, terminal_input_sequence) in notifications {
         if proxy
@@ -625,6 +1733,7 @@ fn finish_glyph_raster(
             );
         }
     }
+    publish_actor_frame_notifications(proxy, actor_frame_notifications);
 }
 
 fn packet_references_text_layout(packet: &Packet, handle: u64) -> bool {
@@ -633,33 +1742,70 @@ fn packet_references_text_layout(packet: &Packet, handle: u64) -> bool {
     )
 }
 
+fn release_actor_pane_state(state: &mut GraphicsState, actor: &str, panes: &BTreeSet<u64>) {
+    state
+        .images
+        .retain(|_, resource| !panes.contains(&resource.pane));
+    let previous_text_layouts = state.text_layouts.len();
+    state
+        .text_layouts
+        .retain(|_, resource| !panes.contains(&resource.pane));
+    state
+        .latest_complete_state_watermarks
+        .retain(|pane, _| !panes.contains(pane));
+    state
+        .staged_panes
+        .retain(|(pane, _epoch), _scene| !panes.contains(pane));
+    state.deferred_panes.retain(|pane, _| !panes.contains(pane));
+    state
+        .active_resize_epochs
+        .retain(|pane, _| !panes.contains(pane));
+    let removed = previous_text_layouts.saturating_sub(state.text_layouts.len());
+    state.text_layouts_dropped = state
+        .text_layouts_dropped
+        .saturating_add(u64::try_from(removed).unwrap_or(u64::MAX));
+    state.panes.retain(|pane, _| !panes.contains(pane));
+    state
+        .pending_actor_frames
+        .retain(|_revision, frame| frame.actor.name != actor);
+    state
+        .deferred_actor_frames
+        .retain(|_revision, frame| frame.actor.name != actor);
+    state
+        .actor_panes
+        .retain(|scope, _panes| scope.name != actor);
+}
+
 impl ActorPresentationHost {
     pub fn bind_generation(&self, generation: u64) {
+        let previous = self.generation.swap(generation, Ordering::AcqRel);
+        let scope = ActorScope::new(self.actor.clone(), generation);
         if let Ok(mut state) = self.bridge.shared.lock() {
-            self.generation.store(generation, Ordering::Release);
-            state
-                .images
-                .retain(|_, resource| resource.pane != self.pane);
-            let previous_text_layouts = state.text_layouts.len();
-            state
-                .text_layouts
-                .retain(|_, resource| resource.pane != self.pane);
-            state.pending_terminal_input_sequences.remove(&self.pane);
-            state
-                .staged_panes
-                .retain(|(pane, _epoch), _scene| *pane != self.pane);
-            state.deferred_panes.remove(&self.pane);
-            state.active_resize_epochs.remove(&self.pane);
-            state.text_layouts_dropped = state.text_layouts_dropped.saturating_add(
-                u64::try_from(previous_text_layouts.saturating_sub(state.text_layouts.len()))
-                    .unwrap_or(u64::MAX),
-            );
-            state.panes.remove(&self.pane);
+            release_actor_pane_state(&mut state, &self.actor, &self.panes);
+            state.actor_panes.insert(scope.clone(), self.panes.clone());
+        }
+        if let Ok(mut scheduler) = self.bridge.render_scheduler.lock() {
+            if previous != 0 {
+                scheduler.cancel_generation(&ActorScope::new(self.actor.clone(), previous));
+            }
+            if scheduler.register(scope.clone()) {
+                scheduler.set_relevant_panes(&scope, std::iter::empty());
+                scheduler.request_render(&scope);
+            }
         }
     }
 
+    fn authorize_actor(&self, actor_generation: u64) -> Result<ActorScope, PresentationError> {
+        if actor_generation == 0 || actor_generation != self.generation.load(Ordering::Acquire) {
+            return Err(PresentationError::ActorStopped);
+        }
+        Ok(ActorScope::new(self.actor.clone(), actor_generation))
+    }
+
     fn authorize(&self, actor_generation: u64, pane: u64) -> Result<(), PresentationError> {
-        if pane != self.pane || actor_generation != self.generation.load(Ordering::Acquire) {
+        if !self.panes.contains(&pane)
+            || actor_generation != self.generation.load(Ordering::Acquire)
+        {
             return Err(PresentationError::InvalidPane);
         }
         Ok(())
@@ -669,188 +1815,204 @@ impl ActorPresentationHost {
 impl Drop for ActorPresentationHost {
     fn drop(&mut self) {
         if let Ok(mut state) = self.bridge.shared.lock() {
-            state
-                .images
-                .retain(|_, resource| resource.pane != self.pane);
-            let previous_text_layouts = state.text_layouts.len();
-            state
-                .text_layouts
-                .retain(|_, resource| resource.pane != self.pane);
-            state.pending_terminal_input_sequences.remove(&self.pane);
-            state
-                .staged_panes
-                .retain(|(pane, _epoch), _scene| *pane != self.pane);
-            state.deferred_panes.remove(&self.pane);
-            state.active_resize_epochs.remove(&self.pane);
-            let removed = previous_text_layouts.saturating_sub(state.text_layouts.len());
-            state.text_layouts_dropped = state
-                .text_layouts_dropped
-                .saturating_add(u64::try_from(removed).unwrap_or(u64::MAX));
-            state.panes.remove(&self.pane);
+            release_actor_pane_state(&mut state, &self.actor, &self.panes);
         }
-    }
-}
-
-impl ActorPresentationHost {
-    fn submit_draw_packet_inner(
-        &self,
-        actor_generation: u64,
-        pane: u64,
-        resize_epoch: Option<u64>,
-        packet: &[u8],
-    ) -> Result<u64, PresentationError> {
-        self.authorize(actor_generation, pane)?;
-        if resize_epoch == Some(0) {
-            return Err(PresentationError::InvalidArgument);
-        }
-        let packet_bytes = packet.len();
-        let packet = Packet::decode(packet).map_err(|error| match error {
-            PacketError::Limit(_) => PresentationError::LimitReached,
-            PacketError::Invalid(_) => PresentationError::InvalidPacket,
-        })?;
-        let resources = {
-            let state = self
-                .bridge
-                .shared
-                .lock()
-                .map_err(|_poisoned| PresentationError::HostFailure)?;
-            if actor_generation != self.generation.load(Ordering::Acquire) {
-                return Err(PresentationError::InvalidPane);
-            }
-            if let Some(resize_epoch) = resize_epoch
-                && !resize_epoch_is_active(&state, pane, resize_epoch)
-            {
-                return Err(PresentationError::InvalidArgument);
-            }
-            referenced_resources(&state, pane, actor_generation, &packet)?
-        };
-        let candidate = GraphicsSnapshot {
-            pane,
-            sequence: 0,
-            resize_epoch,
-            packet,
-            images: resources.images,
-            text_layouts: resources.text_layouts,
-            glyphs: resources.glyphs,
-        };
-        crate::plugin_gpu::validate_snapshot_lowering(&candidate)?;
-        let packet = candidate.packet;
-        let (sequence, terminal_input_sequence, previous, ready, deferred_ordinary) = {
-            let mut state = self
-                .bridge
-                .shared
-                .lock()
-                .map_err(|_poisoned| PresentationError::HostFailure)?;
-            if actor_generation != self.generation.load(Ordering::Acquire) {
-                return Err(PresentationError::InvalidPane);
-            }
-            if let Some(resize_epoch) = resize_epoch
-                && !resize_epoch_is_active(&state, pane, resize_epoch)
-            {
-                return Err(PresentationError::InvalidArgument);
-            }
-            let resources = referenced_resources(&state, pane, actor_generation, &packet)?;
-            state.accepted_packets = state.accepted_packets.saturating_add(1);
-            state.max_packet_bytes = state.max_packet_bytes.max(packet_bytes);
-            state.max_packet_commands = state.max_packet_commands.max(packet.commands.len());
-            state.next_sequence = state
-                .next_sequence
-                .checked_add(1)
-                .ok_or(PresentationError::LimitReached)?;
-            let sequence = state.next_sequence;
-            let terminal_input_sequence = resize_epoch
-                .is_none()
-                .then(|| {
-                    state
-                        .pending_terminal_input_sequences
-                        .get_mut(&pane)
-                        .and_then(VecDeque::pop_front)
-                })
-                .flatten();
-            let scene = PaneScene {
-                generation: actor_generation,
-                sequence,
-                resize_epoch,
-                terminal_input_sequence,
-                packet,
-            };
-            let deferred_ordinary = resize_epoch.is_none()
-                && (state.active_resize_epochs.contains_key(&pane) || !resources.ready);
-            let previous = if let Some(resize_epoch) = resize_epoch {
-                state.staged_panes.insert((pane, resize_epoch), scene)
-            } else if deferred_ordinary {
-                state.deferred_panes.insert(pane, scene)
-            } else {
-                state.panes.insert(pane, scene)
-            };
-            drop(state);
-            (
-                sequence,
-                terminal_input_sequence,
-                previous,
-                resources.ready,
-                deferred_ordinary,
-            )
-        };
-        if ready
-            && self
-                .bridge
-                .proxy
-                .send_event(ClientEvent::PluginGraphicsChanged {
-                    pane,
-                    sequence,
-                    resize_epoch,
-                    terminal_input_sequence,
-                    ready_at: Instant::now(),
-                })
-                .is_err()
+        let generation = self.generation.load(Ordering::Acquire);
+        if generation != 0
+            && let Ok(mut scheduler) = self.bridge.render_scheduler.lock()
         {
-            if let Ok(mut state) = self.bridge.shared.lock() {
-                match previous {
-                    Some(previous) => {
-                        if let Some(resize_epoch) = resize_epoch {
-                            state.staged_panes.insert((pane, resize_epoch), previous);
-                        } else if deferred_ordinary {
-                            state.deferred_panes.insert(pane, previous);
-                        } else {
-                            state.panes.insert(pane, previous);
-                        }
-                    }
-                    None => {
-                        if let Some(resize_epoch) = resize_epoch {
-                            state.staged_panes.remove(&(pane, resize_epoch));
-                        } else if deferred_ordinary {
-                            state.deferred_panes.remove(&pane);
-                        } else {
-                            state.panes.remove(&pane);
-                        }
-                    }
-                }
-            }
-            return Err(PresentationError::HostFailure);
+            scheduler.cancel_generation(&ActorScope::new(self.actor.clone(), generation));
         }
-        Ok(sequence)
     }
 }
 
 impl PresentationHost for ActorPresentationHost {
-    fn submit_draw_packet(
-        &self,
-        actor_generation: u64,
-        pane: u64,
-        packet: Vec<u8>,
-    ) -> Result<u64, PresentationError> {
-        self.submit_draw_packet_inner(actor_generation, pane, None, &packet)
+    fn request_render(&self, actor_generation: u64) -> Result<(), PresentationError> {
+        let scope = self.authorize_actor(actor_generation)?;
+        let mut scheduler = self
+            .bridge
+            .render_scheduler
+            .lock()
+            .map_err(|_poisoned| PresentationError::HostFailure)?;
+        if !scheduler.request_render(&scope) {
+            return Err(PresentationError::ActorStopped);
+        }
+        drop(scheduler);
+        self.bridge
+            .proxy
+            .send_event(ClientEvent::RenderSchedulingChanged)
+            .map_err(|_closed| PresentationError::ActorStopped)
     }
 
-    fn submit_tagged_draw_packet(
+    fn set_render_subscription(
         &self,
         actor_generation: u64,
-        pane: u64,
-        resize_epoch: u64,
-        packet: Vec<u8>,
+        enabled: bool,
+    ) -> Result<(), PresentationError> {
+        let scope = self.authorize_actor(actor_generation)?;
+        let mut scheduler = self
+            .bridge
+            .render_scheduler
+            .lock()
+            .map_err(|_poisoned| PresentationError::HostFailure)?;
+        if !scheduler.set_subscription(&scope, enabled) {
+            return Err(PresentationError::ActorStopped);
+        }
+        drop(scheduler);
+        self.bridge
+            .proxy
+            .send_event(ClientEvent::RenderSchedulingChanged)
+            .map_err(|_closed| PresentationError::ActorStopped)
+    }
+
+    fn finish_actor_frame(
+        &self,
+        actor_generation: u64,
+        token: GuestRenderToken,
+        draws: Vec<ActorFrameDraw>,
     ) -> Result<u64, PresentationError> {
-        self.submit_draw_packet_inner(actor_generation, pane, Some(resize_epoch), &packet)
+        let guest_finished_ns = self.bridge.render_now_ns();
+        let validation_started = Instant::now();
+        let scope = self.authorize_actor(actor_generation)?;
+        if draws.len() > MAX_RELEVANT_PANES {
+            return Err(PresentationError::LimitReached);
+        }
+        let mut panes = BTreeSet::new();
+        let mut state = self
+            .bridge
+            .shared
+            .lock()
+            .map_err(|_poisoned| PresentationError::HostFailure)?;
+        if state.pending_actor_frames.len() >= MAX_RENDER_ACTORS
+            && !state
+                .pending_actor_frames
+                .values()
+                .any(|frame| frame.actor == scope)
+        {
+            return Err(PresentationError::LimitReached);
+        }
+        // Validate the complete batch's identity and causal bounds before
+        // decoding packets, resolving resources, or consuming the render
+        // token. One invalid pane therefore rejects the batch transactionally.
+        let decoded = validate_actor_frame_before_preparation(
+            draws,
+            |draw| {
+                self.authorize(actor_generation, draw.pane)?;
+                if !panes.insert(draw.pane) {
+                    return Err(PresentationError::DuplicatePane);
+                }
+                if draw.resize_epoch == Some(0) {
+                    return Err(PresentationError::StaleResizeEpoch);
+                }
+                validate_state_watermark(&state, draw.pane, draw.state_watermark)?;
+                if let Some(epoch) = draw.resize_epoch
+                    && !resize_epoch_is_active(&state, draw.pane, epoch)
+                {
+                    return Err(PresentationError::StaleResizeEpoch);
+                }
+                Ok(())
+            },
+            |draw| {
+                let packet = Packet::decode(&draw.packet).map_err(|error| match error {
+                    PacketError::Limit(_) => PresentationError::LimitReached,
+                    PacketError::Invalid(_) => PresentationError::InvalidPacket,
+                })?;
+                let resources = referenced_resources(&state, draw.pane, actor_generation, &packet)?;
+                let candidate = GraphicsSnapshot {
+                    pane: draw.pane,
+                    sequence: 0,
+                    resize_epoch: draw.resize_epoch,
+                    packet,
+                    images: resources.images,
+                    text_layouts: resources.text_layouts,
+                    glyphs: resources.glyphs,
+                };
+                crate::plugin_gpu::validate_snapshot_lowering(&candidate)?;
+                Ok((
+                    draw.pane,
+                    draw.resize_epoch,
+                    draw.state_watermark,
+                    draw.packet.len(),
+                    candidate.packet,
+                ))
+            },
+        )?;
+        let next_sequence = state
+            .next_sequence
+            .checked_add(1)
+            .ok_or(PresentationError::LimitReached)?;
+        // This is the exact serial-stage boundary: guest validation ends here
+        // and accepted-to-graphics-ready readiness begins here. Sampling the
+        // host cost after scheduler acceptance would count that acceptance in
+        // both estimates.
+        let actor_host_cost_ns =
+            u64::try_from(validation_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let accepted_ns = self.bridge.render_now_ns();
+        let mut scheduler = self
+            .bridge
+            .render_scheduler
+            .lock()
+            .map_err(|_poisoned| PresentationError::HostFailure)?;
+        let accepted = scheduler
+            .finish_for_actor_timed(
+                &scope,
+                RenderToken(token.0),
+                guest_finished_ns,
+                accepted_ns,
+                &panes.iter().copied().collect::<Vec<_>>(),
+            )
+            .map_err(|_error| PresentationError::InvalidToken)?;
+        scheduler.note_actor_host_cost(&scope, actor_host_cost_ns);
+        drop(scheduler);
+        let Some(accepted) = accepted else {
+            drop(state);
+            self.bridge
+                .proxy
+                .send_event(ClientEvent::RenderSchedulingChanged)
+                .map_err(|_closed| PresentationError::ActorStopped)?;
+            return Ok(0);
+        };
+        state.next_sequence = next_sequence;
+        state
+            .pending_actor_frames
+            .retain(|_revision, frame| frame.actor != scope);
+        let mut scenes = BTreeMap::new();
+        for (pane, resize_epoch, state_watermark, packet_bytes, packet) in decoded {
+            state.accepted_packets = state.accepted_packets.saturating_add(1);
+            state.max_packet_bytes = state.max_packet_bytes.max(packet_bytes);
+            state.max_packet_commands = state.max_packet_commands.max(packet.commands.len());
+            scenes.insert(
+                pane,
+                PaneScene {
+                    generation: actor_generation,
+                    sequence: next_sequence,
+                    resize_epoch,
+                    terminal_input_sequence: state_watermark,
+                    packet,
+                },
+            );
+        }
+        state.pending_actor_frames.insert(
+            accepted.actor_frame_revision,
+            PendingGraphicsActorFrame {
+                actor: scope,
+                token: token.0,
+                revision: accepted.actor_frame_revision,
+                scenes,
+                ready_notified: false,
+                required_panes: None,
+                blocker_epochs: BTreeSet::new(),
+            },
+        );
+        state.actor_frames_accepted = state.actor_frames_accepted.saturating_add(1);
+        let notifications = ready_actor_frame_notifications(&mut state);
+        drop(state);
+        publish_actor_frame_notifications(&self.bridge.proxy, notifications);
+        self.bridge
+            .proxy
+            .send_event(ClientEvent::RenderSchedulingChanged)
+            .map_err(|_closed| PresentationError::ActorStopped)?;
+        Ok(accepted.actor_frame_revision)
     }
 
     fn reuse_pane_content(
@@ -981,11 +2143,12 @@ impl PresentationHost for ActorPresentationHost {
             options,
             plan,
         };
-        if self.bridge.glyph_raster_tx.send(request).is_err() {
+        if self.bridge.glyph_raster_tx.try_send(request).is_err() {
             if let Ok(mut state) = self.bridge.shared.lock() {
                 state.text_layouts.remove(&handle);
+                state.glyph_raster_backpressure = state.glyph_raster_backpressure.saturating_add(1);
             }
-            return Err(PresentationError::HostFailure);
+            return Err(PresentationError::LimitReached);
         }
         let elapsed = started.elapsed();
         if std::env::var_os("BROOD_TRACE_PLUGIN_TEXT").is_some() || elapsed.as_millis() >= 8 {
@@ -1399,6 +2562,10 @@ fn linear_premultiplied_srgba8([red, green, blue, alpha]: [u8; 4]) -> [u8; 4] {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "graphics contract tests fail immediately when required staged state is absent"
+)]
 mod tests {
     use super::*;
 
@@ -1432,6 +2599,619 @@ mod tests {
             glyphs: Arc::from([]),
             glyph_images: BTreeMap::new(),
         }
+    }
+
+    fn resize_test_scene(sequence: u64, resize_epoch: Option<u64>) -> PaneScene {
+        PaneScene {
+            generation: 2,
+            sequence,
+            resize_epoch,
+            terminal_input_sequence: Some(sequence),
+            packet: Packet::default(),
+        }
+    }
+
+    fn insert_resize_test_frame(
+        state: &mut GraphicsState,
+        revision: u64,
+        token: u64,
+        scenes: impl IntoIterator<Item = (u64, PaneScene)>,
+    ) {
+        state.pending_actor_frames.insert(
+            revision,
+            PendingGraphicsActorFrame {
+                actor: ActorScope::new(format!("resize-{revision}"), 2),
+                token,
+                revision,
+                scenes: scenes.into_iter().collect(),
+                ready_notified: true,
+                required_panes: None,
+                blocker_epochs: BTreeSet::new(),
+            },
+        );
+    }
+
+    fn visible_resize_sequences(state: &GraphicsState) -> Vec<(u64, u64)> {
+        state
+            .panes
+            .iter()
+            .map(|(pane, scene)| (*pane, scene.sequence))
+            .collect()
+    }
+
+    fn defer_resize_test_frame(
+        state: &mut GraphicsState,
+        revision: u64,
+        panes: &[u64],
+    ) -> Option<(u64, BTreeSet<u64>, Vec<u64>)> {
+        defer_prepared_actor_frame_in_state(state, revision, panes)
+            .unwrap()
+            .map(|stage| {
+                (
+                    stage.token,
+                    stage.blocker_epochs,
+                    stage.superseded_revisions,
+                )
+            })
+    }
+
+    #[test]
+    fn active_resize_actor_frames_stage_complete_tagged_epoch_without_ordinary_leaks() {
+        let mut state = GraphicsState::default();
+        state.panes.insert(7, resize_test_scene(5, None));
+        state.panes.insert(8, resize_test_scene(5, None));
+        state.visible_panes.extend([7, 8]);
+        state.active_resize_epochs.extend([(7, 6), (8, 6)]);
+
+        insert_resize_test_frame(&mut state, 10, 100, [(7, resize_test_scene(6, None))]);
+        assert_eq!(
+            claim_actor_frame_for_preparation_in_state(&mut state, 10, &[7]).unwrap(),
+            ActorFramePreparationClaim::PrepareDeferred
+        );
+        assert_eq!(
+            defer_resize_test_frame(&mut state, 10, &[7]),
+            Some((100, BTreeSet::from([6]), Vec::new()))
+        );
+        assert_eq!(visible_resize_sequences(&state), [(7, 5), (8, 5)]);
+        assert!(
+            actor_frame_snapshots_from_state(&state, 10, [7])
+                .unwrap()
+                .is_none()
+        );
+
+        insert_resize_test_frame(&mut state, 11, 101, [(8, resize_test_scene(7, None))]);
+        assert_eq!(
+            claim_actor_frame_for_preparation_in_state(&mut state, 11, &[8]).unwrap(),
+            ActorFramePreparationClaim::PrepareDeferred
+        );
+        assert_eq!(
+            defer_resize_test_frame(&mut state, 11, &[8]),
+            Some((101, BTreeSet::from([6]), Vec::new()))
+        );
+        assert_eq!(visible_resize_sequences(&state), [(7, 5), (8, 5)]);
+        assert_eq!(state.deferred_actor_frames.len(), 2);
+
+        insert_resize_test_frame(&mut state, 12, 102, [(8, resize_test_scene(8, Some(6)))]);
+        assert_eq!(
+            claim_actor_frame_for_preparation_in_state(&mut state, 12, &[8]).unwrap(),
+            ActorFramePreparationClaim::PrepareDeferred
+        );
+        assert_eq!(
+            defer_resize_test_frame(&mut state, 12, &[8]),
+            Some((102, BTreeSet::from([6]), Vec::new()))
+        );
+        assert_eq!(visible_resize_sequences(&state), [(7, 5), (8, 5)]);
+
+        insert_resize_test_frame(&mut state, 13, 103, [(7, resize_test_scene(9, Some(6)))]);
+        assert_eq!(
+            claim_actor_frame_for_preparation_in_state(&mut state, 13, &[7]).unwrap(),
+            ActorFramePreparationClaim::PrepareDeferred
+        );
+        assert_eq!(
+            defer_resize_test_frame(&mut state, 13, &[7]),
+            Some((103, BTreeSet::from([6]), Vec::new()))
+        );
+        assert_eq!(visible_resize_sequences(&state), [(7, 5), (8, 5)]);
+
+        complete_resize_epoch_state(&mut state, 6, true);
+        assert_eq!(visible_resize_sequences(&state), [(7, 9), (8, 8)]);
+        assert!(state.active_resize_epochs.is_empty());
+        assert!(state.staged_panes.is_empty());
+        assert!(state.deferred_panes.is_empty());
+        assert!(state.deferred_actor_frames.is_empty());
+        assert!(state.pending_actor_frames.is_empty());
+    }
+
+    #[test]
+    fn active_resize_actor_frames_preserve_and_replay_a_mixed_batch_without_partial_promotion() {
+        let mut state = GraphicsState::default();
+        state.panes.insert(7, resize_test_scene(5, None));
+        state.panes.insert(8, resize_test_scene(5, None));
+        state.visible_panes.extend([7, 8]);
+        state.active_resize_epochs.extend([(7, 6), (8, 6)]);
+        insert_resize_test_frame(
+            &mut state,
+            20,
+            200,
+            [
+                (7, resize_test_scene(6, None)),
+                (8, resize_test_scene(6, Some(6))),
+            ],
+        );
+
+        assert_eq!(
+            claim_actor_frame_for_preparation_in_state(&mut state, 20, &[7, 8]).unwrap(),
+            ActorFramePreparationClaim::PrepareDeferred
+        );
+        assert_eq!(
+            defer_resize_test_frame(&mut state, 20, &[7, 8]),
+            Some((200, BTreeSet::from([6]), Vec::new()))
+        );
+        assert_eq!(visible_resize_sequences(&state), [(7, 5), (8, 5)]);
+        let deferred = state.deferred_actor_frames.get(&20).unwrap();
+        assert_eq!(deferred.scenes.len(), 2);
+        assert_eq!(deferred.scenes.get(&7).map(|scene| scene.sequence), Some(6));
+        assert_eq!(
+            deferred.scenes.get(&8).and_then(|scene| scene.resize_epoch),
+            Some(6)
+        );
+        assert!(state.deferred_panes.is_empty());
+        assert!(state.staged_panes.is_empty());
+        assert!(state.pending_actor_frames.is_empty());
+        assert!(
+            actor_frame_snapshots_from_state(&state, 20, [7, 8])
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(state.actor_frames_promoted, 0);
+
+        // Successful resolution makes the previously tagged member ordinary,
+        // then replays the preserved two-pane transaction as one claim.
+        complete_resize_epoch_state(&mut state, 6, true);
+        assert!(state.deferred_actor_frames.is_empty());
+        assert_eq!(visible_resize_sequences(&state), [(7, 6), (8, 6)]);
+        assert!(state.pending_actor_frames.is_empty());
+
+        let mut unrelated = GraphicsState::default();
+        unrelated.panes.insert(7, resize_test_scene(5, None));
+        unrelated.panes.insert(9, resize_test_scene(5, None));
+        unrelated.visible_panes.extend([7, 9]);
+        unrelated.active_resize_epochs.insert(7, 6);
+        insert_resize_test_frame(
+            &mut unrelated,
+            21,
+            201,
+            [
+                (7, resize_test_scene(6, None)),
+                (9, resize_test_scene(6, None)),
+            ],
+        );
+        assert_eq!(
+            claim_actor_frame_for_preparation_in_state(&mut unrelated, 21, &[7, 9]).unwrap(),
+            ActorFramePreparationClaim::PrepareDeferred
+        );
+        assert_eq!(
+            defer_resize_test_frame(&mut unrelated, 21, &[7, 9]),
+            Some((201, BTreeSet::from([6]), Vec::new()))
+        );
+        assert_eq!(
+            unrelated.deferred_actor_frames.get(&21).map(|frame| frame
+                .scenes
+                .keys()
+                .copied()
+                .collect::<Vec<_>>()),
+            Some(vec![7, 9])
+        );
+        abort_resize_epoch_state(&mut unrelated, 6);
+        assert_eq!(visible_resize_sequences(&unrelated), [(7, 6), (9, 6)]);
+    }
+
+    #[test]
+    fn active_resize_actor_frames_recover_deferred_content_after_abort_or_degradation() {
+        for degraded in [false, true] {
+            let mut state = GraphicsState::default();
+            state.panes.insert(7, resize_test_scene(5, None));
+            state.panes.insert(8, resize_test_scene(5, None));
+            state.active_resize_epochs.extend([(7, 6), (8, 6)]);
+            insert_resize_test_frame(&mut state, 30, 300, [(7, resize_test_scene(6, None))]);
+            insert_resize_test_frame(&mut state, 31, 301, [(8, resize_test_scene(7, None))]);
+            assert_eq!(
+                claim_actor_frame_for_preparation_in_state(&mut state, 30, &[7]).unwrap(),
+                ActorFramePreparationClaim::PrepareDeferred
+            );
+            assert_eq!(
+                defer_resize_test_frame(&mut state, 30, &[7]),
+                Some((300, BTreeSet::from([6]), Vec::new()))
+            );
+            assert_eq!(
+                claim_actor_frame_for_preparation_in_state(&mut state, 31, &[8]).unwrap(),
+                ActorFramePreparationClaim::PrepareDeferred
+            );
+            assert_eq!(
+                defer_resize_test_frame(&mut state, 31, &[8]),
+                Some((301, BTreeSet::from([6]), Vec::new()))
+            );
+
+            if degraded {
+                complete_resize_epoch_state(&mut state, 6, false);
+            } else {
+                abort_resize_epoch_state(&mut state, 6);
+            }
+            assert!(state.deferred_actor_frames.is_empty());
+            assert_eq!(visible_resize_sequences(&state), [(7, 6), (8, 7)]);
+            assert!(state.active_resize_epochs.is_empty());
+            assert!(state.deferred_panes.is_empty());
+            assert!(state.staged_panes.is_empty());
+        }
+    }
+
+    #[test]
+    fn deferred_actor_frame_waits_for_every_blocker_epoch_before_recovery() {
+        let deferred_state = || {
+            let mut state = GraphicsState::default();
+            state.panes.insert(7, resize_test_scene(5, None));
+            state.panes.insert(8, resize_test_scene(5, None));
+            state.panes.insert(9, resize_test_scene(5, None));
+            state.active_resize_epochs.extend([(7, 6), (8, 7)]);
+            insert_resize_test_frame(
+                &mut state,
+                35,
+                305,
+                [
+                    (7, resize_test_scene(6, None)),
+                    (8, resize_test_scene(6, None)),
+                    (9, resize_test_scene(6, Some(6))),
+                ],
+            );
+            assert_eq!(
+                claim_actor_frame_for_preparation_in_state(&mut state, 35, &[7, 8, 9]).unwrap(),
+                ActorFramePreparationClaim::PrepareDeferred
+            );
+            assert_eq!(
+                defer_resize_test_frame(&mut state, 35, &[7, 8, 9]),
+                Some((305, BTreeSet::from([6, 7]), Vec::new()))
+            );
+            state
+        };
+
+        let mut state = deferred_state();
+        let plan = deferred_actor_frame_resolution_plan_in_state(&mut state, 6, false);
+        assert_eq!(plan.retain, BTreeSet::from([35]));
+        assert!(plan.commit.is_empty());
+        abort_resize_epoch_state(&mut state, 6);
+        assert_eq!(visible_resize_sequences(&state), [(7, 5), (8, 5), (9, 5)]);
+        assert_eq!(
+            state
+                .deferred_actor_frames
+                .get(&35)
+                .map(|frame| frame.blocker_epochs.clone()),
+            Some(BTreeSet::from([7]))
+        );
+        let plan = deferred_actor_frame_resolution_plan_in_state(&mut state, 7, true);
+        assert_eq!(
+            plan.commit.get(&35).cloned(),
+            Some(BTreeMap::from([(7, 6), (8, 6)]))
+        );
+        complete_resize_epoch_state(&mut state, 7, true);
+        assert_eq!(visible_resize_sequences(&state), [(7, 6), (8, 6), (9, 5)]);
+        assert!(state.deferred_actor_frames.is_empty());
+
+        let mut reverse = deferred_state();
+        let plan = deferred_actor_frame_resolution_plan_in_state(&mut reverse, 6, true);
+        assert_eq!(plan.retain, BTreeSet::from([35]));
+        complete_resize_epoch_state(&mut reverse, 6, true);
+        assert_eq!(visible_resize_sequences(&reverse), [(7, 5), (8, 5), (9, 5)]);
+        let plan = deferred_actor_frame_resolution_plan_in_state(&mut reverse, 7, false);
+        assert_eq!(
+            plan.commit.get(&35).cloned(),
+            Some(BTreeMap::from([(7, 6), (8, 6), (9, 6)]))
+        );
+        abort_resize_epoch_state(&mut reverse, 7);
+        assert_eq!(visible_resize_sequences(&reverse), [(7, 6), (8, 6), (9, 6)]);
+        assert!(reverse.deferred_actor_frames.is_empty());
+    }
+
+    #[test]
+    fn tagged_only_epoch_remains_an_atomic_actor_frame_blocker() {
+        let deferred_state = || {
+            let mut state = GraphicsState::default();
+            state.panes.insert(7, resize_test_scene(5, None));
+            state.panes.insert(8, resize_test_scene(5, None));
+            state.active_resize_epochs.extend([(7, 6), (8, 7)]);
+            insert_resize_test_frame(
+                &mut state,
+                36,
+                306,
+                [
+                    (7, resize_test_scene(6, None)),
+                    (8, resize_test_scene(7, Some(7))),
+                ],
+            );
+            assert_eq!(
+                claim_actor_frame_for_preparation_in_state(&mut state, 36, &[7, 8]).unwrap(),
+                ActorFramePreparationClaim::PrepareDeferred
+            );
+            assert_eq!(
+                defer_resize_test_frame(&mut state, 36, &[7, 8]),
+                Some((306, BTreeSet::from([6, 7]), Vec::new()))
+            );
+            state
+        };
+
+        let mut success = deferred_state();
+        let plan = deferred_actor_frame_resolution_plan_in_state(&mut success, 6, true);
+        assert_eq!(plan.retain, BTreeSet::from([36]));
+        assert!(plan.commit.is_empty());
+        complete_resize_epoch_state(&mut success, 6, true);
+        assert_eq!(visible_resize_sequences(&success), [(7, 5), (8, 5)]);
+        let plan = deferred_actor_frame_resolution_plan_in_state(&mut success, 7, true);
+        assert_eq!(
+            plan.commit.get(&36).cloned(),
+            Some(BTreeMap::from([(7, 6), (8, 7)]))
+        );
+        complete_resize_epoch_state(&mut success, 7, true);
+        assert_eq!(visible_resize_sequences(&success), [(7, 6), (8, 7)]);
+        assert!(success.deferred_actor_frames.is_empty());
+
+        for degraded in [false, true] {
+            let mut recovery = deferred_state();
+            let plan = deferred_actor_frame_resolution_plan_in_state(&mut recovery, 7, false);
+            assert_eq!(plan.retain, BTreeSet::from([36]));
+            assert!(plan.commit.is_empty());
+            if degraded {
+                complete_resize_epoch_state(&mut recovery, 7, false);
+            } else {
+                abort_resize_epoch_state(&mut recovery, 7);
+            }
+            assert_eq!(visible_resize_sequences(&recovery), [(7, 5), (8, 5)]);
+            assert_eq!(
+                recovery.deferred_actor_frames.get(&36).map(|frame| frame
+                    .scenes
+                    .keys()
+                    .copied()
+                    .collect::<Vec<_>>()),
+                Some(vec![7])
+            );
+            let plan = deferred_actor_frame_resolution_plan_in_state(&mut recovery, 6, true);
+            assert_eq!(
+                plan.commit.get(&36).cloned(),
+                Some(BTreeMap::from([(7, 6)]))
+            );
+            complete_resize_epoch_state(&mut recovery, 6, true);
+            assert_eq!(visible_resize_sequences(&recovery), [(7, 6), (8, 5)]);
+            assert!(recovery.deferred_actor_frames.is_empty());
+        }
+    }
+
+    #[test]
+    fn active_resize_actor_frame_retirement_returns_the_exact_token_for_cancellation() {
+        let scope = ActorScope::new("resize-token", 2);
+        let predictor = FramePredictor::new(16_666_667);
+        let mut scheduler = RenderScheduler::default();
+        assert!(scheduler.register(scope.clone()));
+        assert!(scheduler.set_relevant_panes(&scope, [7]));
+        assert!(scheduler.request_render(&scope));
+        assert!(scheduler.arm(&scope, 0, &predictor, 1_000_000));
+        let deadline = scheduler.next_deadline_ns().unwrap();
+        let token = scheduler.dispatch_due(deadline).pop().unwrap().1.token;
+        scheduler.finish(token, deadline, &[7]).unwrap();
+
+        let mut state = GraphicsState::default();
+        state.panes.insert(7, resize_test_scene(5, None));
+        state.active_resize_epochs.insert(7, 6);
+        state.pending_actor_frames.insert(
+            40,
+            PendingGraphicsActorFrame {
+                actor: scope,
+                token: token.0,
+                revision: 40,
+                scenes: BTreeMap::from([(7, resize_test_scene(6, None))]),
+                ready_notified: true,
+                required_panes: None,
+                blocker_epochs: BTreeSet::new(),
+            },
+        );
+        assert_eq!(
+            claim_actor_frame_for_preparation_in_state(&mut state, 40, &[7]).unwrap(),
+            ActorFramePreparationClaim::PrepareDeferred
+        );
+        let deferred = defer_prepared_actor_frame_in_state(&mut state, 40, &[7])
+            .unwrap()
+            .unwrap();
+        assert_eq!(deferred.token, token.0);
+        assert_eq!(deferred.blocker_epochs, BTreeSet::from([6]));
+        assert!(deferred.superseded_revisions.is_empty());
+        assert!(scheduler.cancel_accepted(token));
+        assert!(scheduler.completed_traces().iter().any(|trace| {
+            trace.token == token
+                && trace.settlement == Some(crate::render_scheduler::Settlement::Cancelled)
+        }));
+    }
+
+    #[test]
+    fn actor_host_teardown_clears_live_resources_and_preserves_history() {
+        let actor = "terminal-ui";
+        let panes = BTreeSet::from([7, 8]);
+        let scope = ActorScope::new(actor, 11);
+        let scene = |pane| PaneScene {
+            generation: 11,
+            sequence: pane,
+            resize_epoch: None,
+            terminal_input_sequence: Some(pane),
+            packet: Packet::default(),
+        };
+        let mut state = GraphicsState {
+            accepted_packets: 9,
+            text_layouts_created: 5,
+            text_layouts_dropped: 2,
+            ..GraphicsState::default()
+        };
+        for (handle, pane) in [(1, 7), (2, 8)] {
+            let mut layout = pending_text_entry();
+            layout.pane = pane;
+            state.text_layouts.insert(handle, layout);
+            state.images.insert(
+                handle,
+                ImageResource {
+                    pane,
+                    generation: 11,
+                    width: 1,
+                    height: 1,
+                    linear_premultiplied_rgba8: Arc::from([0_u8; 4]),
+                },
+            );
+            state.panes.insert(pane, scene(pane));
+            state.latest_complete_state_watermarks.insert(pane, pane);
+        }
+        state.actor_panes.insert(scope.clone(), panes.clone());
+        state.pending_actor_frames.insert(
+            1,
+            PendingGraphicsActorFrame {
+                actor: scope,
+                token: 4,
+                revision: 1,
+                scenes: BTreeMap::from([(7, scene(7)), (8, scene(8))]),
+                ready_notified: true,
+                required_panes: None,
+                blocker_epochs: BTreeSet::new(),
+            },
+        );
+
+        // This is the exact state-release path used by ActorPresentationHost::drop.
+        // The pre-shutdown snapshot is live, while a fresh post-drop snapshot is
+        // empty without erasing the lifetime counters reported alongside it.
+        assert_eq!(state.text_layouts.len(), 2);
+        assert_eq!(state.text_layouts_created, 5);
+        assert_eq!(state.text_layouts_dropped, 2);
+        assert_eq!(state.accepted_packets, 9);
+
+        release_actor_pane_state(&mut state, actor, &panes);
+
+        assert!(state.text_layouts.is_empty());
+        assert!(state.images.is_empty());
+        assert!(state.panes.is_empty());
+        assert!(state.latest_complete_state_watermarks.is_empty());
+        assert!(state.pending_actor_frames.is_empty());
+        assert!(state.actor_panes.is_empty());
+        assert_eq!(state.text_layouts_created, 5);
+        assert_eq!(state.text_layouts_dropped, 4);
+        assert_eq!(state.accepted_packets, 9);
+    }
+
+    #[test]
+    fn complete_state_watermarks_coalesce_and_report_the_exact_draw_state() {
+        let mut state = GraphicsState::default();
+        state.visible_panes.insert(7);
+        for watermark in 1..=720 {
+            record_complete_state_watermark(&mut state, 7, watermark);
+        }
+        assert_eq!(state.latest_complete_state_watermarks.get(&7), Some(&720));
+        assert_eq!(validate_state_watermark(&state, 7, Some(720)), Ok(()));
+        assert_eq!(
+            validate_state_watermark(&state, 7, Some(721)),
+            Err(PresentationError::InvalidPacket)
+        );
+
+        // A conservative older draw stays older. The host never promotes it
+        // to the latest admitted state and therefore cannot falsely drain
+        // correlations for state that the guest did not render.
+        assert_eq!(validate_state_watermark(&state, 7, Some(719)), Ok(()));
+        state.pending_actor_frames.insert(
+            1,
+            PendingGraphicsActorFrame {
+                actor: ActorScope::new("watermark", 1),
+                token: 11,
+                revision: 1,
+                scenes: BTreeMap::from([(
+                    7,
+                    PaneScene {
+                        generation: 1,
+                        sequence: 1,
+                        resize_epoch: None,
+                        terminal_input_sequence: Some(719),
+                        packet: Packet::default(),
+                    },
+                )]),
+                ready_notified: false,
+                required_panes: None,
+                blocker_epochs: BTreeSet::new(),
+            },
+        );
+        let notifications = ready_actor_frame_notifications(&mut state);
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(
+            notifications
+                .first()
+                .and_then(|(_, _, scenes)| scenes.first())
+                .and_then(|scene| scene.terminal_input_sequence),
+            Some(719)
+        );
+    }
+
+    #[test]
+    fn state_watermark_validation_is_pane_scoped_optional_and_token_preserving() {
+        let mut state = GraphicsState::default();
+        record_complete_state_watermark(&mut state, 7, 20);
+        record_complete_state_watermark(&mut state, 8, 40);
+        assert_eq!(validate_state_watermark(&state, 7, None), Ok(()));
+        assert_eq!(validate_state_watermark(&state, 7, Some(20)), Ok(()));
+        assert_eq!(validate_state_watermark(&state, 8, Some(40)), Ok(()));
+        assert_eq!(
+            validate_state_watermark(&state, 8, Some(41)),
+            Err(PresentationError::InvalidPacket)
+        );
+        assert_eq!(
+            validate_state_watermark(&state, 9, Some(1)),
+            Err(PresentationError::InvalidPacket)
+        );
+
+        let preparation_calls = std::cell::Cell::new(0_u64);
+        let invalid_mixed_batch = vec![
+            ActorFrameDraw {
+                pane: 7,
+                resize_epoch: None,
+                state_watermark: Some(20),
+                packet: Vec::new(),
+            },
+            ActorFrameDraw {
+                pane: 8,
+                resize_epoch: None,
+                state_watermark: Some(41),
+                packet: Vec::new(),
+            },
+        ];
+        assert_eq!(
+            validate_actor_frame_before_preparation(
+                invalid_mixed_batch,
+                |draw| validate_state_watermark(&state, draw.pane, draw.state_watermark),
+                |_draw| {
+                    preparation_calls.set(preparation_calls.get().saturating_add(1));
+                    Ok(())
+                },
+            ),
+            Err(PresentationError::InvalidPacket)
+        );
+        assert_eq!(preparation_calls.get(), 0);
+
+        // The production frame path performs all watermark validation before
+        // scheduler.finish. Model that boundary directly: a future watermark
+        // in one member of a mixed-pane batch leaves its dispatched token
+        // valid for a corrected retry.
+        let scope = ActorScope::new("watermark", 1);
+        let mut scheduler = RenderScheduler::default();
+        let predictor = FramePredictor::new(16_666_667);
+        assert!(scheduler.register(scope.clone()));
+        assert!(scheduler.set_relevant_panes(&scope, [7, 8]));
+        assert!(scheduler.request_render(&scope));
+        assert!(scheduler.arm(&scope, 0, &predictor, 1_000_000));
+        let deadline = scheduler.next_deadline_ns().unwrap();
+        let token = scheduler.dispatch_due(deadline).pop().unwrap().1.token;
+        assert_eq!(validate_state_watermark(&state, 7, Some(20)), Ok(()));
+        assert_eq!(
+            validate_state_watermark(&state, 8, Some(41)),
+            Err(PresentationError::InvalidPacket)
+        );
+        assert!(scheduler.finish(token, deadline, &[7, 8]).is_ok());
     }
 
     #[test]
@@ -1481,6 +3261,251 @@ mod tests {
             referenced_resources(&state, 7, 11, &text_packet(&[1])),
             Err(PresentationError::HostFailure)
         ));
+    }
+
+    #[test]
+    fn generation_cancel_and_renderer_replay_do_not_accept_stale_tokens() {
+        let old = ActorScope::new("replay", 1);
+        let new = ActorScope::new("replay", 2);
+        let mut scheduler = RenderScheduler::default();
+        let predictor = FramePredictor::new(16_666_667);
+        assert!(scheduler.register(old.clone()));
+        assert!(scheduler.set_relevant_panes(&old, [7]));
+        assert!(scheduler.request_render(&old));
+        assert!(scheduler.arm(&old, 0, &predictor, 1_000_000));
+        let deadline = scheduler.next_deadline_ns().unwrap();
+        let stale = scheduler.dispatch_due(deadline).pop().unwrap().1.token;
+
+        let mut state = GraphicsState::default();
+        state.visible_panes.insert(7);
+        state.pending_actor_frames.insert(
+            1,
+            PendingGraphicsActorFrame {
+                actor: old.clone(),
+                token: stale.0,
+                revision: 1,
+                scenes: BTreeMap::from([(
+                    7,
+                    PaneScene {
+                        generation: 1,
+                        sequence: 1,
+                        resize_epoch: None,
+                        terminal_input_sequence: None,
+                        packet: Packet::default(),
+                    },
+                )]),
+                ready_notified: false,
+                required_panes: None,
+                blocker_epochs: BTreeSet::new(),
+            },
+        );
+        scheduler.cancel_generation(&old);
+        state
+            .pending_actor_frames
+            .retain(|_revision, frame| frame.actor.name != old.name);
+        assert!(scheduler.register(new.clone()));
+        assert!(scheduler.set_relevant_panes(&new, [7]));
+        assert_eq!(
+            scheduler.finish(stale, u64::MAX, &[7]),
+            Err(crate::render_scheduler::FinishError::InvalidToken)
+        );
+        assert!(state.pending_actor_frames.is_empty());
+
+        state.pending_actor_frames.insert(
+            2,
+            PendingGraphicsActorFrame {
+                actor: new,
+                token: 22,
+                revision: 2,
+                scenes: BTreeMap::from([(
+                    7,
+                    PaneScene {
+                        generation: 2,
+                        sequence: 2,
+                        resize_epoch: None,
+                        terminal_input_sequence: None,
+                        packet: Packet::default(),
+                    },
+                )]),
+                ready_notified: false,
+                required_panes: None,
+                blocker_epochs: BTreeSet::new(),
+            },
+        );
+        assert_eq!(ready_actor_frame_notifications(&mut state).len(), 1);
+        state
+            .pending_actor_frames
+            .get_mut(&2)
+            .unwrap()
+            .ready_notified = false;
+        assert_eq!(ready_actor_frame_notifications(&mut state).len(), 1);
+    }
+
+    #[test]
+    fn replayed_ready_notification_after_promotion_is_stale() -> Result<()> {
+        let mut state = GraphicsState::default();
+        state.pending_actor_frames.insert(
+            9,
+            PendingGraphicsActorFrame {
+                actor: ActorScope::new("replay", 2),
+                token: 22,
+                revision: 9,
+                scenes: BTreeMap::from([(
+                    7,
+                    PaneScene {
+                        generation: 2,
+                        sequence: 3,
+                        resize_epoch: None,
+                        terminal_input_sequence: None,
+                        packet: Packet::default(),
+                    },
+                )]),
+                ready_notified: true,
+                required_panes: None,
+                blocker_epochs: BTreeSet::new(),
+            },
+        );
+
+        anyhow::ensure!(
+            actor_frame_snapshots_from_state(&state, 9, [7])?.is_some(),
+            "pending revision was reported stale"
+        );
+        state.pending_actor_frames.remove(&9);
+        anyhow::ensure!(
+            actor_frame_snapshots_from_state(&state, 9, [7])?.is_none(),
+            "promoted revision remained available to its replayed notification"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn actor_frame_disappearance_during_deferred_preparation_is_stale_and_atomic() -> Result<()> {
+        let scene = |pane: u64| PaneScene {
+            generation: 2,
+            sequence: pane + 10,
+            resize_epoch: None,
+            terminal_input_sequence: None,
+            packet: Packet::default(),
+        };
+        let mut state = GraphicsState::default();
+        state.pending_actor_frames.insert(
+            9,
+            PendingGraphicsActorFrame {
+                actor: ActorScope::new("deferred-preparation", 2),
+                token: 22,
+                revision: 9,
+                scenes: BTreeMap::from([(7, scene(7)), (8, scene(8))]),
+                ready_notified: true,
+                required_panes: None,
+                blocker_epochs: BTreeSet::new(),
+            },
+        );
+
+        // The first ready event snapshots the complete frame and defers while
+        // asynchronous graphics preparation runs.
+        let prepared_snapshots = actor_frame_snapshots_from_state(&state, 9, [7, 8])?
+            .context("pending actor frame disappeared before preparation")?;
+        anyhow::ensure!(
+            prepared_snapshots
+                .iter()
+                .map(|snapshot| (snapshot.pane, snapshot.sequence))
+                .collect::<Vec<_>>()
+                == [(7, 17), (8, 18)],
+            "deferred preparation did not retain the complete actor frame"
+        );
+
+        // A replayed ready event consumes the revision before the deferred
+        // event resumes. The complete two-pane bridge frame promotes once.
+        anyhow::ensure!(
+            promote_actor_frame_in_state(&mut state, 9, &[7, 8])? == ActorFramePromotion::Claimed,
+            "replayed ready event did not claim the pending actor frame"
+        );
+        anyhow::ensure!(
+            state
+                .panes
+                .iter()
+                .map(|(pane, scene)| (*pane, scene.sequence))
+                .collect::<Vec<_>>()
+                == [(7, 17), (8, 18)],
+            "claimed actor frame was not promoted atomically"
+        );
+        let promoted_state = state
+            .panes
+            .iter()
+            .map(|(pane, scene)| (*pane, scene.sequence))
+            .collect::<Vec<_>>();
+
+        // Resuming with the prepared snapshots is expected staleness. It must
+        // neither partially promote nor mutate the already-promoted frame.
+        anyhow::ensure!(
+            promote_actor_frame_in_state(&mut state, 9, &[7, 8])? == ActorFramePromotion::Stale,
+            "resumed preparation did not report the disappeared revision as stale"
+        );
+        anyhow::ensure!(
+            state
+                .panes
+                .iter()
+                .map(|(pane, scene)| (*pane, scene.sequence))
+                .collect::<Vec<_>>()
+                == promoted_state,
+            "stale preparation mutated the promoted bridge frame"
+        );
+        anyhow::ensure!(state.actor_frames_promoted == 1);
+        anyhow::ensure!(state.actor_frames_promoted_multi_pane == 1);
+        anyhow::ensure!(state.actor_frame_partial_promotion_violations == 0);
+        Ok(())
+    }
+
+    #[test]
+    fn resize_retirement_discards_a_deferred_mixed_actor_frame_atomically() -> Result<()> {
+        let pending_state = || {
+            let scene = |pane: u64, resize_epoch| PaneScene {
+                generation: 2,
+                sequence: pane + 10,
+                resize_epoch,
+                terminal_input_sequence: None,
+                packet: Packet::default(),
+            };
+            let mut state = GraphicsState::default();
+            state.active_resize_epochs.insert(7, 41);
+            state.pending_actor_frames.insert(
+                9,
+                PendingGraphicsActorFrame {
+                    actor: ActorScope::new("deferred-resize", 2),
+                    token: 22,
+                    revision: 9,
+                    scenes: BTreeMap::from([(7, scene(7, Some(41))), (8, scene(8, None))]),
+                    ready_notified: true,
+                    required_panes: None,
+                    blocker_epochs: BTreeSet::new(),
+                },
+            );
+            state
+        };
+
+        for complete in [false, true] {
+            let mut state = pending_state();
+            let prepared = actor_frame_snapshots_from_state(&state, 9, [7, 8])?
+                .context("actor frame disappeared before asynchronous preparation")?;
+            anyhow::ensure!(prepared.len() == 2);
+
+            if complete {
+                complete_resize_epoch_state(&mut state, 41, true);
+            } else {
+                abort_resize_epoch_state(&mut state, 41);
+            }
+            anyhow::ensure!(
+                retire_pending_actor_frames_for_epoch(&mut state, 41) == [22],
+                "resize retirement did not cancel the complete actor token"
+            );
+            anyhow::ensure!(
+                actor_frame_snapshots_from_state(&state, 9, [7, 8])?.is_none(),
+                "late preparation resume retained part of the retired actor frame"
+            );
+            anyhow::ensure!(state.panes.is_empty());
+            anyhow::ensure!(state.pending_actor_frames.is_empty());
+        }
+        Ok(())
     }
 
     #[test]

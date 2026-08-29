@@ -11,7 +11,7 @@ use brood_plugin_sdk::{
         Command, Event, Guest, LifecycleEvent, PresentationEvent, SessionActorMessage, WorkerEvent,
         WorkerRequest,
     },
-    graphics::submit_encoded_packet_for_resize,
+    graphics::queue_encoded_packet_for_resize_with_state_watermark,
     input::{
         BUTTON_MIDDLE as MIDDLE_BUTTON, BUTTON_PRIMARY as LEFT_BUTTON, MOD_ALT, MOD_CTRL, MOD_SHIFT,
     },
@@ -33,6 +33,15 @@ const MOUSE_WHEEL_PIXELS_PER_CLICK: f32 = 15.0;
 const MAX_CACHED_LAYOUTS: usize = 512;
 const RESIZE_DEBOUNCE_MS: u64 = 24;
 const RESIZE_WORKER_PAYLOAD: &[u8] = b"terminal-resize-debounce";
+const PRESENTATION_BATCH_LIMIT: u8 = 16;
+// `focus_commands_for_mailbox` is not a presentation reducer. Every branch in
+// `handle_presentation` returns at most three commands, including clipboard
+// and resize paths, so one opted-in batch remains below the host's aggregate
+// 64-command dispatch ceiling.
+const MAX_PRESENTATION_COMMANDS_PER_EVENT: usize = 3;
+const MAX_PRESENTATION_BATCH_COMMANDS: usize =
+    PRESENTATION_BATCH_LIMIT as usize * MAX_PRESENTATION_COMMANDS_PER_EVENT;
+const _: () = assert!(MAX_PRESENTATION_BATCH_COMMANDS <= 64);
 const CLIENT_INIT_ID: &str = "brood.client-init";
 const INBOX_ID: &str = "inbox";
 const FOCUS_MESSAGE: &[u8] = br#"{"kind":"focus"}"#;
@@ -461,12 +470,19 @@ impl Guest for TerminalUi {
                 if let Ok(mut state) = STATE.lock() {
                     *state = Some(UiState::new(backend_id, session_id, &context.instance_id));
                 }
-                vec![Command::LifecycleComplete(Ok(()))]
+                vec![
+                    Command::SetPresentationBatchLimit(PRESENTATION_BATCH_LIMIT),
+                    Command::LifecycleComplete(Ok(())),
+                ]
             }
             Event::Lifecycle(LifecycleEvent::Stop(_)) => {
                 vec![Command::LifecycleComplete(Ok(()))]
             }
             Event::Presentation(event) => handle_presentation(event),
+            Event::PresentationBatch(events) => events
+                .into_iter()
+                .flat_map(handle_presentation)
+                .collect(),
             Event::Mailbox(message)
                 if message.sender.starts_with("session:")
                     && message.body.starts_with(SNAPSHOT_MAGIC) =>
@@ -567,9 +583,11 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
             state.pending_resize_epoch = resized.resize_epoch;
             let commands = state.schedule_resize().into_iter().collect();
             let redraw_epoch = resized.resize_epoch.filter(|_| state.latest.is_some());
-            drop(guard);
-            if redraw_epoch.is_some() {
-                let _ignored = render_latest_snapshot(redraw_epoch);
+            if let Some(resize_epoch) = redraw_epoch {
+                let _ignored = brood_plugin_sdk::graphics::request_render_for_resize(
+                    state.pane,
+                    Some(resize_epoch),
+                );
             }
             commands
         }
@@ -672,9 +690,8 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
                     selection.extent = point;
                     changed
                 });
-                drop(guard);
                 if changed {
-                    let _ignored = render_latest_snapshot(None);
+                    let _ignored = brood_plugin_sdk::graphics::request_render();
                 }
                 return Vec::new();
             }
@@ -721,8 +738,7 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
                     selection.dragging = false;
                     clipboard = selection_text(state.latest.as_deref(), *selection);
                 }
-                drop(guard);
-                let _ignored = render_latest_snapshot(None);
+                let _ignored = brood_plugin_sdk::graphics::request_render();
                 return clipboard
                     .and_then(set_clipboard_command)
                     .into_iter()
@@ -799,6 +815,21 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
                 state.requested_viewport = next;
                 vec![state.viewport_command(next)]
             }
+        }
+        PresentationEvent::RenderHint(hint) => {
+            drop(guard);
+            let Ok(metrics) = brood_plugin_sdk::graphics::render_with_hint(&hint, || {
+                render_latest_snapshot(None)
+            }) else {
+                return Vec::new();
+            };
+            let Ok(mut guard) = STATE.lock() else {
+                return Vec::new();
+            };
+            let Some(state) = guard.as_mut() else {
+                return Vec::new();
+            };
+            state.metrics_command_if_due(metrics).into_iter().collect()
         }
         _ => Vec::new(),
     }
@@ -1201,18 +1232,8 @@ fn handle_snapshot_chunk(body: &[u8]) -> Vec<Command> {
         .saturating_add(u64::from(header.full));
     state.requested_viewport = header.viewport_offset;
     let resize_epoch = state.pending_resize_epoch;
-    drop(guard);
-
-    let Ok(metrics) = render_latest_snapshot(resize_epoch) else {
-        return Vec::new();
-    };
-    let Ok(mut guard) = STATE.lock() else {
-        return Vec::new();
-    };
-    let Some(state) = guard.as_mut() else {
-        return Vec::new();
-    };
-    state.metrics_command_if_due(metrics).into_iter().collect()
+    let _ignored = brood_plugin_sdk::graphics::request_render_for_resize(state.pane, resize_epoch);
+    Vec::new()
 }
 
 fn render_latest_snapshot(resize_epoch: Option<u64>) -> Result<Vec<u8>, String> {
@@ -1386,8 +1407,14 @@ fn render_latest_snapshot(resize_epoch: Option<u64>) -> Result<Vec<u8>, String> 
     let bytes = packet
         .encode()
         .map_err(|error| format!("encode terminal draw packet: {error}"))?;
-    let submit_result = submit_encoded_packet_for_resize(pane, resize_epoch, &bytes)
-        .map_err(|error| format!("submit terminal draw packet: {error}"));
+    let packet_bytes = bytes.len();
+    let submit_result = queue_encoded_packet_for_resize_with_state_watermark(
+        pane,
+        resize_epoch,
+        Some(snapshot.input_sequence),
+        bytes,
+    )
+    .map_err(|error| format!("submit terminal draw packet: {error}"));
     if let Err(error) = submit_result {
         if let Ok(mut guard) = STATE.lock()
             && let Some(state) = guard.as_mut()
@@ -1440,7 +1467,7 @@ fn render_latest_snapshot(resize_epoch: Option<u64>) -> Result<Vec<u8>, String> 
         state.layouts_reused = state.layouts_reused.saturating_add(reused);
         state.layouts_dropped = state.layouts_dropped.saturating_add(dropped);
         state.packets = state.packets.saturating_add(1);
-        state.max_packet_bytes = state.max_packet_bytes.max(bytes.len());
+        state.max_packet_bytes = state.max_packet_bytes.max(packet_bytes);
         state.max_commands = state.max_commands.max(command_count);
         if resize_epoch.is_some() && state.pending_resize_epoch == resize_epoch {
             state.pending_resize_epoch = None;
@@ -1465,7 +1492,7 @@ fn render_latest_snapshot(resize_epoch: Option<u64>) -> Result<Vec<u8>, String> 
         snapshot.input_sequence,
         snapshot.rows,
         snapshot.cols,
-        bytes.len(),
+        packet_bytes,
         command_count,
         created,
         reused,
@@ -1672,10 +1699,10 @@ bindings::export!(TerminalUi with_types_in bindings);
 #[cfg(test)]
 mod tests {
     use super::{
-        Command, DEFAULT_BG, FOCUS_MESSAGE, SNAPSHOT_FULL, SNAPSHOT_MAGIC, SNAPSHOT_VERSION, STATE,
-        UiState, decode_chunk, focus_commands_for_mailbox, paste_bytes, row_cells,
-        terminal_focuses_on_create, terminal_ready_commands, terminal_session_actor,
-        terminal_text_clusters,
+        Command, DEFAULT_BG, FOCUS_MESSAGE, MAX_PRESENTATION_BATCH_COMMANDS, SNAPSHOT_FULL,
+        SNAPSHOT_MAGIC, SNAPSHOT_VERSION, STATE, UiState, decode_chunk,
+        focus_commands_for_mailbox, paste_bytes, row_cells, terminal_focuses_on_create,
+        terminal_ready_commands, terminal_session_actor, terminal_text_clusters,
     };
     use brood_graphics::theme::ashen;
 
@@ -1730,6 +1757,12 @@ mod tests {
 
         let invalid = one_row_snapshot(3, 4, "broken");
         assert!(decode_chunk(&invalid).is_err());
+    }
+
+    #[test]
+    fn opted_in_presentation_batch_stays_within_host_command_capacity() {
+        assert_eq!(MAX_PRESENTATION_BATCH_COMMANDS, 48);
+        assert!(MAX_PRESENTATION_BATCH_COMMANDS <= 64);
     }
 
     #[test]

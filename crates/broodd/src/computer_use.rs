@@ -738,8 +738,8 @@ pub fn begin_computer_use_script(
         return;
     }
 
-    let (limits, lease, windows, active_window) = match state.computer_use.task(&request.task) {
-        Some(task) => {
+    let (limits, lease, windows, active_window) =
+        if let Some(task) = state.computer_use.task(&request.task) {
             let Some(lease) = state
                 .computer_use
                 .lease()
@@ -766,12 +766,10 @@ pub fn begin_computer_use_script(
             windows.sort_by_key(|window| window.pane);
             let active_window = windows.iter().find(|window| window.active).cloned();
             (task.limits, lease, windows, active_window)
-        }
-        None => {
+        } else {
             drop(response.send(Err("computer-use task disappeared".to_string())));
             return;
-        }
-    };
+        };
 
     let execution = (|| -> Result<_, String> {
         if !state
@@ -893,13 +891,14 @@ fn script_runtime_config(limits: ComputerUseLimits) -> ComputerUseJsConfig {
 }
 
 fn computer_use_js_runtime_path() -> PathBuf {
-    std::env::var_os("BROOD_COMPUTER_USE_JS_RUNTIME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
+    std::env::var_os("BROOD_COMPUTER_USE_JS_RUNTIME").map_or_else(
+        || {
             PathBuf::from(
                 "runtimes/computer-use-js/target/wasm32-wasip1/release/brood_computer_use_js_runtime.wasm",
             )
-        })
+        },
+        PathBuf::from,
+    )
 }
 
 fn script_actions(
@@ -1228,7 +1227,7 @@ fn complete_action(state: &Brood, pending: &mut PendingBatch, started_at_ms: u64
     pending.next_action = pending.next_action.saturating_add(1);
 }
 
-fn schedule_next_action(state: &mut Brood, delay: Duration, execution_id: u64) {
+fn schedule_next_action(state: &Brood, delay: Duration, execution_id: u64) {
     drop(state.loop_handle.insert_source(
         smithay::reexports::calloop::timer::Timer::from_duration(delay),
         move |_, (), state| {
@@ -1251,7 +1250,10 @@ fn execute_atomic_action(state: &mut Brood, pane: u64, action: &ComputerAction) 
             pointer_click(state, pane, *button, time.saturating_add(1));
         }
         ComputerAction::Move { x, y } => pointer_move(state, pane, *x, *y, time),
-        ComputerAction::Drag { .. } | ComputerAction::Keypress { .. } => {}
+        ComputerAction::Drag { .. }
+        | ComputerAction::Keypress { .. }
+        | ComputerAction::Wait { .. }
+        | ComputerAction::Screenshot => {}
         ComputerAction::Scroll {
             x,
             y,
@@ -1263,7 +1265,6 @@ fn execute_atomic_action(state: &mut Brood, pane: u64, action: &ComputerAction) 
             state.forward_pointer_axis_to_pane(pane, frame);
         }
         ComputerAction::Type { text } => type_text(state, text, time),
-        ComputerAction::Wait { .. } | ComputerAction::Screenshot => {}
     }
 }
 
@@ -1476,7 +1477,7 @@ fn schedule_settle(state: &mut Brood, execution_id: u64) {
     schedule_settle_check(state, SETTLE_QUIET, execution_id);
 }
 
-fn schedule_settle_check(state: &mut Brood, delay: Duration, execution_id: u64) {
+fn schedule_settle_check(state: &Brood, delay: Duration, execution_id: u64) {
     drop(state.loop_handle.insert_source(
         smithay::reexports::calloop::timer::Timer::from_duration(delay),
         move |_, (), state| {
@@ -1942,6 +1943,12 @@ fn automation_output(size: Size<i32, Physical>) -> Output {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::expect_used,
+        clippy::unwrap_used,
+        reason = "automation unit-test fixtures fail fast on impossible setup and conversion failures"
+    )]
+
     use brood_computer_use::COMPUTER_USE_PROTOCOL_VERSION;
 
     use super::*;

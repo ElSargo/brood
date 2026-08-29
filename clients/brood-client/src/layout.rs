@@ -342,6 +342,10 @@ fn grid_columns(pane_count: usize, extent: LayoutSize) -> usize {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::panic,
+    reason = "layout contract tests stop immediately when a required geometry element is absent"
+)]
 mod tests {
     use super::*;
 

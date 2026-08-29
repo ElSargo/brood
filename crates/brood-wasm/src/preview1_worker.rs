@@ -51,7 +51,7 @@ use wasmtime_wasi::{
 use crate::actor_kernel::{ActorRuntimeKernel, allocate_generation};
 use crate::completion_io::{
     ActorCompletion, ActorCompletionKind, CompletionIo, CompletionIoConfig, CompletionIoError,
-    FilesystemGrant, OperationId, start_completion_io,
+    FilesystemGrant, OperationId, start_completion_io_on,
 };
 use crate::coordination::{
     ActorNotification, ActorWatchResult, CoordinationConfig, CoordinationHub, NotificationError,
@@ -133,12 +133,14 @@ pub struct Preview1FilesystemGrant {
 }
 
 /// Immutable capabilities used to derive every store-local WASI table.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default)]
 pub struct Preview1ActorCapabilities {
     /// Optional preopened directory shared as authority, not as descriptor state.
     pub filesystem: Option<Preview1FilesystemGrant>,
     /// Process, terminal, and loopback authority inherited by every worker.
     pub runtime_io: RuntimeIoCapabilities,
+    /// General-I/O executor used when actor dispatch has a dedicated runtime.
+    pub io_runtime: Option<tokio::runtime::Handle>,
 }
 
 /// Runtime limits for Preview 1 compatibility workers.
@@ -1729,13 +1731,18 @@ impl Preview1WorkerRuntime {
             config.max_filesystem_watch_events,
         )
         .map_err(|error| Preview1WorkerError::InvalidCapability(error.to_string()))?;
-        let runtime_io = RuntimeIoHub::new(
+        let io_runtime = capabilities
+            .io_runtime
+            .clone()
+            .unwrap_or_else(tokio::runtime::Handle::current);
+        let runtime_io = RuntimeIoHub::new_on(
             generation,
             RuntimeIoConfig {
                 capabilities: capabilities.runtime_io.clone(),
                 ..RuntimeIoConfig::default()
             },
             coordination.clone(),
+            io_runtime.clone(),
         )
         .map_err(|error| Preview1WorkerError::InvalidCapability(error.to_string()))?;
         let kernel = ActorRuntimeKernel::new(
@@ -1746,7 +1753,7 @@ impl Preview1WorkerRuntime {
             config.limits.generation_host_bytes,
         );
         let (completion_io, completion_rx, completion_task) =
-            start_completion_io(generation, &completion_config)
+            start_completion_io_on(generation, &completion_config, &io_runtime)
                 .map_err(|error| Preview1WorkerError::InvalidCapability(error.to_string()))?;
         let mut completion_supervisor =
             Preview1CompletionSupervisor::new(completion_io, completion_task);

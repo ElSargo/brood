@@ -5,9 +5,9 @@ harness. Load the same component directly under one of these presentation actor
 instance IDs; the lifecycle instance ID selects its deterministic behavior:
 
 - `resize-proof-fast` submits epoch-tagged content in the resize dispatch.
-- `resize-proof-slow` waits 120 ms in an SDK timer worker before submitting.
-  This leaves a reliable projected-frame capture window while remaining well
-  inside the harness's 250 ms transaction deadline.
+- `resize-proof-slow` waits 90 ms in an SDK timer worker before submitting.
+  The burst proof runs one obsolete cycle and one coalesced final cycle, leaving
+  70 ms of the harness's fixed 250 ms transaction deadline for host work.
 - `resize-proof-stall` withholds every tagged epoch until it observes the
   host's untagged degraded-recovery resize, then submits later epochs
   immediately to prove recovery. Superseding motion cannot accidentally bypass

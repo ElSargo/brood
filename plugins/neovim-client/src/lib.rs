@@ -11,7 +11,7 @@ use brood_plugin_sdk::{
         Command, Event, Guest, LifecycleEvent, LocalActorMessage, NotificationEvent,
         PresentationEvent, SessionActorMessage, StartContext, WorkerEvent, WorkerRequest,
     },
-    graphics::submit_packet_for_resize,
+    graphics::queue_packet_for_resize,
     input::{MOD_ALT, MOD_CTRL, MOD_SHIFT, MOD_SUPER},
 };
 use serde_json::{Map, Value, json};
@@ -566,6 +566,13 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
             {
                 state.record_error(error);
                 redraw_or_record_error(state);
+            }
+        }
+        PresentationEvent::RenderHint(hint) => {
+            if let Err(error) =
+                brood_plugin_sdk::graphics::render_with_hint(&hint, || redraw(state, None))
+            {
+                state.record_error(error);
             }
         }
         _ => {}
@@ -1458,7 +1465,12 @@ fn redraw_for_resize_or_record_error(state: &mut ClientState, resize_epoch: Opti
     if state.pane == 0 {
         return;
     }
-    match redraw(state, resize_epoch) {
+    let result = if brood_plugin_sdk::graphics::render_is_active() {
+        redraw(state, resize_epoch)
+    } else {
+        brood_plugin_sdk::graphics::request_render_for_resize(state.pane, resize_epoch)
+    };
+    match result {
         Ok(()) => {
             if resize_epoch.is_some() && state.pending_resize_epoch == resize_epoch {
                 state.pending_resize_epoch = None;
@@ -1607,7 +1619,7 @@ fn redraw_with_layouts(
             (state.width - PADDING * 2.0).max(40.0),
         )?;
     }
-    submit_packet_for_resize(state.pane, resize_epoch, &packet)
+    queue_packet_for_resize(state.pane, resize_epoch, &packet)
         .map_err(|error| format!("submit Neovim screen: {error}"))?;
 
     let stale = layouts

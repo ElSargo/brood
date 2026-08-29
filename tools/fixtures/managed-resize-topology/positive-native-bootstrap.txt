@@ -1,0 +1,29 @@
+started presentation WASM actor id=resize-proof-slow kind=wasm-component generation=6 pane=18446744073709551609 path=x
+started presentation WASM actor id=session-switcher kind=wasm-component generation=2 pane=18446744073709551615 path=x
+started presentation WASM actor id=status-bar kind=wasm-component generation=7 pane=18446744073709551611 path=x
+accepted ordinary managed frame backend=1 connection_generation=1 pane=1 backend_pane=1 sequence=1 resource=1
+accepted ordinary managed frame backend=1 connection_generation=1 pane=2 backend_pane=2 sequence=1 resource=2
+granted claimed root layout lease actor=session-switcher actor_generation=2 lease_generation=1
+granted rest layout lease parent=1 child=2 actor=workspace panes=2 pane_ids=[1,2]
+layout-state backend groups lease=1 actor=session-switcher backends=[1]
+layout-state backend groups lease=2 actor=workspace backends=[1]
+accepted leased actor layout items=3 panes=3 revision=2 pending_presented_layout_revision=1 pane_rects=[1:0:0:720:866,2:720:0:720:866,18446744073709551611:0:866:1440:34]
+presented committed layout revision=1
+render scheduling actor-frame promoted actor=resize-proof-slow generation=6 token=4 revision=1 pane_count=1 panes=[18446744073709551609]
+render scheduling actor-frame promoted actor=status-bar generation=7 token=6 revision=2 pane_count=1 panes=[18446744073709551611]
+resize-present interaction=0 event_sequence=0 epoch=0 divider_x=640 composition_size=1280x720 phase=settled wait_ready=0/0 staged_count=0 managed_expectations=0 managed_staged_resources=0 degraded=false superseded_epochs=0
+render scheduling actor-frame promoted actor=session-switcher generation=2 token=5 revision=6 pane_count=1 panes=[18446744073709551615]
+presented committed layout revision=2
+layout-region issued epoch=1 lease=2 lease_generation=1 holder=workspace holder_generation=2 source=0:0:1280:693 target=0:0:960:686 accepted_us=24
+layout-region pane-notified epoch=1 pane=18446744073709551611 owner_lease=1 wait=true accepted_us=100
+layout-region pane-notified epoch=1 pane=18446744073709551615 owner_lease=1 wait=true accepted_us=100
+accepted synchronized layout actor=session-switcher request=1 interaction=0 event_sequence=0 native_resize_revision=1 epoch=1 base_revision=2 target_revision=3 region_final=0/1 pane_ready=0/4 wait=4 affected=4 mode=ScaleThenAtomic actor_generation=2 focus=2 recovered_regions=[] wait_for_panes=[1,2,18446744073709551611,18446744073709551615] target_rects=[1:0:0:480:686,2:480:0:480:686,18446744073709551611:0:686:1280:34,18446744073709551615:960:0:320:686]
+admitted managed resize expectation backend=1 connection_generation=1 pane=1 backend_pane=1 epoch=1 wait=true logical_size=320x457 pixel_size=480x686 scale_120=180
+admitted managed resize expectation backend=1 connection_generation=1 pane=2 backend_pane=2 epoch=1 wait=true logical_size=320x457 pixel_size=480x686 scale_120=180
+layout-region pane-notified epoch=1 pane=1 owner_lease=2 wait=true accepted_us=515
+layout-region pane-notified epoch=1 pane=2 owner_lease=2 wait=true accepted_us=515
+degraded synchronized layout actor=session-switcher request=1 interaction=0 event_sequence=0 native_resize_revision=1 epoch=1 target_revision=3 region_final=1/1 pane_ready=4/4 recovered_regions=[] recovered_count=0 recovered_managed={1, 2} recovered_managed_content={1: "old-projected", 2: "old-projected"} missing=[] duration_us=250875
+window-resize-present native_resize_revision=1 configure_sequence=1 width=1280 height=720 epoch=1 phase=degraded wait_ready=4/4 staged_count=0 managed_expectations=0 managed_staged_resources=0 degraded=true
+layout-state backend groups lease=1 actor=session-switcher backends=[1]
+layout-state backend groups lease=2 actor=workspace backends=[1]
+setup layout quiescent presented_layout_revision=3 inventory_revision=2 native_resize_pending=false window_resize_pending=false synchronized_layout_active=false staged_layouts=0 pending_presented_layout_revision=none layout_state_dirty=false pending_terminal_notifications=0 deferred_actor_host_messages=0 runtime_outbound_host_messages=0 runtime_pending_actor_inputs=0 runtime_observer_output_backlog=false layout_publications_current=true

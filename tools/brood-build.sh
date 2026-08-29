@@ -13,6 +13,7 @@ Options:
   --host-only  Build only the host programs.
   --wasm-only  Build only the WASM modules.
   --jobs N     Limit the shared parallel jobserver (default: available CPUs).
+  --self-test  Check the build-script Preview 1 memory contract.
   -h, --help   Show this help.
 EOF
 }
@@ -86,12 +87,45 @@ assemble_local_client() {
   echo "build=package id=org.brood.default-client path=$package_dir status=finished"
 }
 
+preview1_memory_import_has_generation_ceiling() {
+  local memory_import="$1"
+  local expected='^[[:space:]]*\(import "env" "memory" \(memory \(;[0-9]+;\) [0-9]+ 8192 shared\)\)$'
+  [[ "$memory_import" =~ $expected ]]
+}
+
+verify_preview1_memory_ceiling() {
+  local module="$1"
+  local memory_import
+
+  memory_import="$(
+    wasm-tools print "$module" \
+      | awk '/^[[:space:]]*\(import "env" "memory" \(memory/ && !found { print; found = 1 }'
+  )"
+  if ! preview1_memory_import_has_generation_ceiling "$memory_import"; then
+    echo "ERR Preview 1 module must import shared env::memory with a 512 MiB maximum: $module" >&2
+    echo "ERR observed memory import: ${memory_import:-missing}" >&2
+    return 2
+  fi
+}
+
+build_script_self_test() {
+  preview1_memory_import_has_generation_ceiling \
+    '  (import "env" "memory" (memory (;0;) 17 8192 shared))'
+  if preview1_memory_import_has_generation_ceiling \
+    '  (import "env" "memory" (memory (;0;) 17 16384 shared))'; then
+    echo "ERR Preview 1 memory contract accepted a 1 GiB maximum" >&2
+    return 1
+  fi
+  echo "brood_build_self_test=passed"
+}
+
 build_wasm_one() {
   local crate_dir="$1"
   local wasm_target=wasm32-unknown-unknown
   local release_dir
   local core=
   local component=
+  local -a cargo_config_args=()
 
   case "$crate_dir" in
     examples/wasm-preview1-worker|plugins/workspace-file-log)
@@ -102,15 +136,28 @@ build_wasm_one() {
       ;;
   esac
 
+  if [[ -f "$crate_dir/.cargo/config.toml" ]]; then
+    cargo_config_args=(--config "$ROOT/$crate_dir/.cargo/config.toml")
+  fi
+
   echo "build=wasm module=$crate_dir target=$wasm_target status=checking"
   cargo build \
     --quiet \
+    "${cargo_config_args[@]}" \
     --manifest-path "$crate_dir/Cargo.toml" \
     --target "$wasm_target" \
     --release \
     --locked
 
   release_dir="$crate_dir/target/$wasm_target/release"
+  case "$crate_dir" in
+    examples/wasm-preview1-worker)
+      verify_preview1_memory_ceiling "$release_dir/brood_preview1_worker_example.wasm"
+      ;;
+    plugins/workspace-file-log)
+      verify_preview1_memory_ceiling "$release_dir/brood_workspace_file_log_plugin.wasm"
+      ;;
+  esac
   case "$crate_dir" in
     examples/wasm-component-actor)
       core="$release_dir/brood_component_actor_example.wasm"
@@ -197,6 +244,14 @@ if [[ "${1:-}" == "--build-wasm-one" ]]; then
 fi
 if [[ "${1:-}" == "--assemble-local-client" ]]; then
   assemble_local_client
+  exit
+fi
+if [[ "${1:-}" == "--self-test" ]]; then
+  if [[ $# != 1 ]]; then
+    echo "ERR --self-test does not accept arguments" >&2
+    exit 2
+  fi
+  build_script_self_test
   exit
 fi
 

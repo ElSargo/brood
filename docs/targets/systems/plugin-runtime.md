@@ -176,6 +176,18 @@ wait on I/O, a worker lock, a channel, a join, or another unbounded operation.
 It may submit completion operations, spawn workers, use bounded `try_*`
 operations, send messages, publish state, and request host actions.
 
+A presentation actor may explicitly opt into a bounded presentation batch of
+up to sixteen ordinary events. The default, including every new replacement
+generation, remains one event per dispatch. A batch is one actor event and one
+presentation-lane scheduling quantum: it is a FIFO prefix of reliable
+transitions, never crosses a render hint, and reports the maximum reduced
+watermark only after the whole dispatch returns within the aggregate 64-command
+ceiling. Render hints, paste payloads, and image payloads remain singleton
+events. Other actor lanes keep their round-robin opportunity after the one
+bounded batch rather than after each member. Opt-in changes delivery
+granularity, so an actor must preserve the same command ordering it would have
+produced from the singleton prefix.
+
 This rule is about scheduler responsiveness, not security. It keeps lifecycle,
 input, cancellation, and mailbox traffic moving while background work waits.
 The host enforces peer fairness by yielding CPU-bound guest execution.
@@ -339,6 +351,11 @@ lossless. A failed init-owned presentation actor is removed from pane routing
 before queued local messages are delivered, so one closed child mailbox cannot
 terminate the presentation client while the init actor replaces it.
 
+The batch event and opt-in command are a coordinated structural change to the
+experimental `brood:plugin@0.1.0` world. Brood currently rebuilds every bundled
+component atomically with its host; stale components are expected to fail
+component type matching rather than being treated as backward compatible.
+
 ## Resource Ceilings
 
 Every actor generation has two complementary forms of backpressure. Item
@@ -439,4 +456,5 @@ Related:
 - [[plugin-ui]]
 - [[terminal-plugin]]
 - [[plugin-graphics]]
+- [[render-scheduling]]
 - [[plugin-advanced-graphics]]

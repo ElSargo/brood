@@ -1,0 +1,4 @@
+started presentation WASM actor id=session-switcher kind=wasm-component generation=2 pane=15 path=x
+started presentation WASM actor id=terminal-ui kind=wasm-component generation=8 pane=10 path=x
+render scheduling actor-frame promoted actor=terminal-ui generation=8 token=23 revision=12 pane_count=1 panes=[10]
+render scheduling actor-frame promoted actor=session-switcher generation=2 token=20 revision=10 pane_count=1 panes=[15]

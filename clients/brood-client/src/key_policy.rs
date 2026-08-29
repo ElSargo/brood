@@ -323,6 +323,10 @@ fn load_wasm_key_policy(spec: &[String]) -> Result<WasmGlobalKeyPolicy> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::panic_in_result_fn,
+    reason = "the fallible persistence setup uses Result while contract comparisons remain assertions"
+)]
 mod tests {
     use super::*;
 
