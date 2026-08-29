@@ -34,6 +34,7 @@ design-level tensions in [[../frictions/README]].
 - [[systems/inbox-plugin]]
 - [[systems/computer-use]]
 - [[systems/ui-concurrency]]
+- [[systems/system-profiler]]
 
 ## Concepts and focused designs
 

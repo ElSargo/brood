@@ -28,3 +28,4 @@ When design work resolves a friction, update the applicable page in
 - [[package-resolution]]
 - [[terminal-plugin]]
 - [[ui-concurrency]]
+- [[system-profiler-coverage]]

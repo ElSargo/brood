@@ -11,6 +11,7 @@ members = [
     "crates/brood-layout",
     "crates/brood-plugin-sdk",
     "crates/brood-protocol",
+    "crates/brood-profiler",
     "crates/brood-remote",
     "crates/brood-transport",
     "crates/broodd",
@@ -41,7 +42,7 @@ postcard = { version = "1.1.3", features = ["use-std"] }
 quinn = { version = "0.11.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 raw-window-handle = "0.6.2"
 rustls = { version = "0.23.40", default-features = false, features = ["ring", "std"] }
-rustix = { version = "1.1.4", features = ["event", "net", "pipe", "process"] }
+rustix = { version = "1.1.4", features = ["event", "net", "pipe", "process", "time"] }
 brood-cli = { path = "crates/brood-cli" }
 brood-computer-use = { path = "crates/brood-computer-use" }
 brood-graphics = { path = "crates/brood-graphics" }
@@ -50,6 +51,7 @@ brood-keybindings = { path = "crates/brood-keybindings" }
 brood-layout = { path = "crates/brood-layout" }
 brood-plugin-sdk = { path = "crates/brood-plugin-sdk" }
 brood-protocol = { path = "crates/brood-protocol" }
+brood-profiler = { path = "crates/brood-profiler" }
 brood-transport = { path = "crates/brood-transport" }
 brood-wayland-drop = { path = "crates/brood-wayland-drop" }
 lyon_tessellation = "1.0.20"
@@ -86,6 +88,12 @@ wayland-protocols = { version = "0.32.12", features = ["client", "staging"] }
 wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
 zbus = { version = "5.13.2", default-features = false, features = ["blocking-api", "tokio"] }
 zstd = "0.13.3"
+
+[profile.profiling]
+inherits = "release"
+debug = 2
+strip = "none"
+split-debuginfo = "off"
 
 [workspace.lints.rust]
 warnings = { level = "deny", priority = -1 }

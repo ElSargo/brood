@@ -1669,6 +1669,8 @@ impl Brood {
             StartApp(SurfaceSessionId, String, Vec<String>),
         }
 
+        let _profile_span = brood_profiler::profile_span!("actor", "backend_event_drain");
+
         self.backend_actor_progress
             .retain_current(|actor_name, generation| {
                 self.wasm_io_actors

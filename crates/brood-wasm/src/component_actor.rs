@@ -2042,6 +2042,7 @@ enum RuntimeCommand {
         body: Vec<u8>,
         permit: OwnedSemaphorePermit,
         byte_permit: GenerationBytePermit,
+        profile_id: u64,
     },
     SpawnWorker {
         worker: WorkerId,
@@ -2586,17 +2587,43 @@ fn try_enqueue_mailbox(
         increment_saturating(mailbox_dropped);
         return Err(anyhow::anyhow!("component actor mailbox backlog is full"));
     };
+    let profile_id = if brood_profiler::enabled() {
+        let id = brood_profiler::next_id();
+        brood_profiler::flow(
+            brood_profiler::Kind::FlowStart,
+            "actor",
+            "mailbox_enqueued",
+            id,
+            vec![
+                ("sender".into(), sender.clone().into()),
+                ("bytes".into(), body.len().into()),
+            ],
+        );
+        id
+    } else {
+        0
+    };
     match commands.try_send(RuntimeCommand::Mailbox {
         sender,
         body,
         permit,
         byte_permit,
+        profile_id,
     }) {
         Ok(()) => {
             increment_saturating(mailbox_enqueued);
             Ok(())
         }
         Err(error) => {
+            if profile_id != 0 {
+                brood_profiler::flow(
+                    brood_profiler::Kind::FlowEnd,
+                    "actor",
+                    "mailbox_rejected",
+                    profile_id,
+                    Vec::new(),
+                );
+            }
             increment_saturating(mailbox_dropped);
             Err(anyhow::anyhow!(
                 "component actor mailbox rejected message: {error}"
@@ -2682,6 +2709,7 @@ struct DispatchContext {
     event_watermark: Option<u64>,
     render_token: Option<RenderToken>,
     presentation_events: u8,
+    profile_id: u64,
 }
 
 struct QueuedPresentationEvent {
@@ -2810,10 +2838,25 @@ async fn run_component_event_loop(
             )?;
             if let Some((event, mailbox_permit, byte_permit, context)) = event {
                 dispatcher_busy = true;
+                if context.profile_id != 0 {
+                    brood_profiler::flow(
+                        brood_profiler::Kind::FlowStep,
+                        "actor",
+                        "mailbox_dispatch",
+                        context.profile_id,
+                        Vec::new(),
+                    );
+                }
                 let call = accessor
                     .with(|mut access| dispatch.start_call_concurrent(&mut access, (event,)))?;
                 calls.push(
                     async move {
+                        let _profile_span = brood_profiler::Span::asynchronous(
+                            "wasm",
+                            "actor_dispatch",
+                            None,
+                            Vec::new(),
+                        );
                         // Admission remains held until the accepted mailbox
                         // message has reached its terminal dispatch result.
                         let _mailbox_permit = mailbox_permit;
@@ -2853,7 +2896,7 @@ async fn run_component_event_loop(
                 )
                 && system_queue.len() < component_system_capacity(config)
                 && mailbox_queue.len() < config.mailbox_backlog => match command {
-                Some(RuntimeCommand::Mailbox { sender, body, permit, byte_permit }) => {
+                Some(RuntimeCommand::Mailbox { sender, body, permit, byte_permit, profile_id }) => {
                     // The sender acquired one of exactly `mailbox_backlog`
                     // permits before the command was accepted, so this queue
                     // cannot overflow or silently discard the message.
@@ -2861,6 +2904,7 @@ async fn run_component_event_loop(
                         abi::Event::Mailbox(abi::MailboxMessage { sender, body }),
                         permit,
                         byte_permit,
+                        profile_id,
                     ));
                 }
                 Some(RuntimeCommand::SpawnWorker { worker, payload, byte_permit }) => {
@@ -2953,6 +2997,15 @@ async fn run_component_event_loop(
                 match outcome {
                     GuestCallOutcome::Dispatch { result, context } => {
                         dispatcher_busy = false;
+                        if context.profile_id != 0 {
+                            brood_profiler::flow(
+                                brood_profiler::Kind::FlowEnd,
+                                "actor",
+                                "mailbox_returned",
+                                context.profile_id,
+                                vec![("success".into(), result.is_ok().into())],
+                            );
+                        }
                         match result {
                             Ok(returned) => {
                                 ensure!(
@@ -3650,7 +3703,7 @@ fn pop_component_dispatch(
     notification_queue: &mut VecDeque<NotificationId>,
     system_queue: &mut VecDeque<QueuedGuestEvent>,
     presentation_queue: &mut VecDeque<QueuedPresentationEvent>,
-    mailbox_queue: &mut VecDeque<(GuestEvent, OwnedSemaphorePermit, GenerationBytePermit)>,
+    mailbox_queue: &mut VecDeque<(GuestEvent, OwnedSemaphorePermit, GenerationBytePermit, u64)>,
     presentation_batch_limit: usize,
     accessor: &wasmtime::component::Accessor<ActorStore>,
     event_observer: &ComponentActorEventObserver,
@@ -3706,12 +3759,15 @@ fn pop_component_dispatch(
                 .map(|(event, context)| (event, None, None, context)),
             _ => mailbox_queue
                 .pop_front()
-                .map(|(event, permit, byte_permit)| {
+                .map(|(event, permit, byte_permit, profile_id)| {
                     (
                         event,
                         Some(permit),
                         Some(byte_permit),
-                        DispatchContext::default(),
+                        DispatchContext {
+                            profile_id,
+                            ..DispatchContext::default()
+                        },
                     )
                 }),
         };
@@ -3816,6 +3872,7 @@ fn enqueue_presentation_dispatch_with_watermark(
             event_watermark,
             render_token,
             presentation_events: 1,
+            ..DispatchContext::default()
         },
     };
     match &queued_event.event {
@@ -4219,6 +4276,7 @@ mod tests {
                     event_watermark: Some(watermark),
                     render_token: None,
                     presentation_events: 1,
+                    ..DispatchContext::default()
                 },
             })
             .collect::<VecDeque<_>>();
@@ -4265,6 +4323,7 @@ mod tests {
                     event_watermark: Some(1),
                     render_token: None,
                     presentation_events: 1,
+                    ..DispatchContext::default()
                 },
             },
             QueuedPresentationEvent {
@@ -4276,6 +4335,7 @@ mod tests {
                     event_watermark: Some(2),
                     render_token: None,
                     presentation_events: 1,
+                    ..DispatchContext::default()
                 },
             },
         ]);
@@ -4644,6 +4704,7 @@ mod tests {
                     event_watermark: Some(1),
                     render_token: None,
                     presentation_events: 1,
+                    ..DispatchContext::default()
                 },
             },
             QueuedPresentationEvent {
@@ -4655,6 +4716,7 @@ mod tests {
                     event_watermark: Some(2),
                     render_token: None,
                     presentation_events: 1,
+                    ..DispatchContext::default()
                 },
             },
         ]);
@@ -4683,6 +4745,7 @@ mod tests {
                     event_watermark: Some(watermark),
                     render_token: None,
                     presentation_events: 1,
+                    ..DispatchContext::default()
                 },
             })
             .collect::<VecDeque<_>>();
@@ -4698,6 +4761,7 @@ mod tests {
                 event_watermark: Some(20),
                 render_token: Some(RenderToken(21)),
                 presentation_events: 1,
+                ..DispatchContext::default()
             },
         });
         queue.push_back(QueuedPresentationEvent {
@@ -4709,6 +4773,7 @@ mod tests {
                 event_watermark: Some(22),
                 render_token: None,
                 presentation_events: 1,
+                ..DispatchContext::default()
             },
         });
 

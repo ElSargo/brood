@@ -20,6 +20,16 @@ Run `./tools/brood-build.sh --help` for the build modes and concurrency control.
 
 ## Presentation Proofs
 
+## System profiling
+
+`profile-brood.sh` enables bounded cross-process profiling for a supplied real
+workload and produces both a structured report and a Chrome/Perfetto trace.
+Build binaries with Cargo's `profiling` profile before capture so native stack
+sampling and semantic events describe optimized code. See
+[[../docs/targets/systems/system-profiler]] for the measurement contract.
+
+Run the script without arguments for its exact invocation.
+
 `test-client-layout-actor.sh` starts a real `brood-client` under headless
 Weston, maps real managed applications, and verifies client-owned layout,
 managed-pane size convergence, and the presentation key-policy boundary.

@@ -43,6 +43,7 @@ brood-cli.workspace = true
 brood-computer-use.workspace = true
 brood-ipc.workspace = true
 brood-protocol.workspace = true
+brood-profiler.workspace = true
 brood-wasm = { path = "../brood-wasm" }
 num-traits.workspace = true
 serde.workspace = true

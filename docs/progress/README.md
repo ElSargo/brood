@@ -27,3 +27,4 @@ interpret evidence.
 - [[terminal-latency-spike-profile]]
 - [[terminal-plugin]]
 - [[structural-lint]]
+- [[system-profiler]]

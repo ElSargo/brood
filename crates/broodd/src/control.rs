@@ -3540,6 +3540,7 @@ fn automation_input_disposition(state: &Brood, input: &InputEvent) -> Automation
 }
 
 fn drain_fast_path_input(state: &mut Brood) {
+    let _profile_span = brood_profiler::profile_span!("input", "server_fast_path_drain");
     let started = std::time::Instant::now();
     let driver_before_micros = state.stats.smithay_driver_total_micros;
     let Some(mut fast_path) = state.dmabuf.fast_path.take() else {
@@ -3830,6 +3831,17 @@ fn drain_fast_path_input(state: &mut Brood) {
         .stats
         .smithay_input_events
         .record_batch(consumed, deferred);
+    if brood_profiler::enabled() {
+        brood_profiler::counter(
+            "input",
+            "server_fast_path_batch",
+            u64::try_from(consumed).unwrap_or(u64::MAX),
+            vec![(
+                "deferred".into(),
+                u64::try_from(deferred).unwrap_or(u64::MAX).into(),
+            )],
+        );
+    }
     if disconnected {
         state.dmabuf.fast_path_input_draining = false;
         state.set_presentation_window_focused(false);

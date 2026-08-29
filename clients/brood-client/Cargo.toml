@@ -16,6 +16,7 @@ brood-ipc.workspace = true
 brood-keybindings.workspace = true
 brood-layout.workspace = true
 brood-protocol.workspace = true
+brood-profiler.workspace = true
 brood-transport.workspace = true
 brood-wasm = { path = "../../crates/brood-wasm" }
 brood-wayland-drop.workspace = true

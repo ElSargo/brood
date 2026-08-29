@@ -408,6 +408,7 @@ dependencies = [
  "brood-ipc",
  "brood-keybindings",
  "brood-layout",
+ "brood-profiler",
  "brood-protocol",
  "brood-transport",
  "brood-wasm",
@@ -496,6 +497,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "brood-profiler"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "rustix 1.1.4",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "brood-protocol"
 version = "0.1.0"
 dependencies = [
@@ -542,6 +555,7 @@ name = "brood-wasm"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "brood-profiler",
  "brood-protocol",
  "cap-fs-ext",
  "cap-std",
@@ -580,6 +594,7 @@ dependencies = [
  "brood-cli",
  "brood-computer-use",
  "brood-ipc",
+ "brood-profiler",
  "brood-protocol",
  "brood-wasm",
  "calloop 0.14.4",

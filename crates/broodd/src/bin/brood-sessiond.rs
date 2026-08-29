@@ -1,3 +1,5 @@
 fn main() -> anyhow::Result<()> {
-    broodd::run_session_cli()
+    let result = broodd::run_session_cli();
+    brood_profiler::flush();
+    result
 }

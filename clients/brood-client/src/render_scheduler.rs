@@ -8,6 +8,43 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use serde::Serialize;
 
+fn start_input_profile(actor: &ActorScope, watermark: u64) -> u64 {
+    if !brood_profiler::enabled() {
+        return 0;
+    }
+    let profile_id = brood_profiler::next_id();
+    brood_profiler::flow(
+        brood_profiler::Kind::FlowStart,
+        "input",
+        "key_received",
+        profile_id,
+        vec![
+            ("actor".into(), actor.name.clone().into()),
+            ("generation".into(), actor.generation.into()),
+            ("watermark".into(), watermark.into()),
+        ],
+    );
+    profile_id
+}
+
+fn step_input_profile(
+    kind: brood_profiler::Kind,
+    name: &'static str,
+    profile_id: u64,
+    token: RenderToken,
+) {
+    if profile_id == 0 {
+        return;
+    }
+    brood_profiler::flow(
+        kind,
+        "input",
+        name,
+        profile_id,
+        vec![("render_token".into(), token.0.into())],
+    );
+}
+
 pub const MAX_RENDER_ACTORS: usize = 1_024;
 /// A render opportunity is actor-scoped, and the plugin ABI permits one actor
 /// frame to update at most sixteen panes atomically.
@@ -293,7 +330,7 @@ struct ActorRenderState {
     readiness_cost_ns: u64,
     abandonments: u8,
     backoff_until_ns: u64,
-    pending_inputs: VecDeque<(u64, u64)>,
+    pending_inputs: VecDeque<(u64, u64, u64)>,
     last_dispatch_ns: Option<u64>,
     dispatched_count: u64,
     accepted_count: u64,
@@ -379,7 +416,7 @@ pub struct CorrelationTrace {
     pub target_presented: Option<bool>,
     pub settlement: Option<Settlement>,
     expected_panes: BTreeSet<u64>,
-    input_correlations: Vec<(u64, u64)>,
+    input_correlations: Vec<(u64, u64, u64)>,
     measured_opportunity: bool,
     readiness_noted: bool,
     composition_released: bool,
@@ -588,7 +625,10 @@ impl RenderScheduler {
         if state.pending_inputs.len() == MAX_INPUT_CORRELATIONS {
             state.pending_inputs.pop_front();
         }
-        state.pending_inputs.push_back((watermark, at_ns));
+        let profile_id = start_input_profile(actor, watermark);
+        state
+            .pending_inputs
+            .push_back((watermark, at_ns, profile_id));
         true
     }
 
@@ -792,9 +832,12 @@ impl RenderScheduler {
                     settlement: None,
                     expected_panes: BTreeSet::new(),
                     input_correlations: {
-                        let split = state.pending_inputs.partition_point(|(watermark, _at)| {
-                            *watermark <= outstanding.event_watermark
-                        });
+                        let split =
+                            state
+                                .pending_inputs
+                                .partition_point(|(watermark, _at, _id)| {
+                                    *watermark <= outstanding.event_watermark
+                                });
                         state.pending_inputs.drain(..split).collect()
                     },
                     measured_opportunity: false,
@@ -815,6 +858,16 @@ impl RenderScheduler {
                 },
             ));
             self.last_dispatched = Some(actor);
+            if let Some(trace) = self.active_traces.get(&token) {
+                for (_, _, profile_id) in &trace.input_correlations {
+                    step_input_profile(
+                        brood_profiler::Kind::FlowStep,
+                        "actor_dispatch",
+                        *profile_id,
+                        token,
+                    );
+                }
+            }
         }
         hints
     }
@@ -896,6 +949,16 @@ impl RenderScheduler {
             trace.accepted_ns = Some(accepted_ns);
             trace.deadline_met = Some(deadline_met);
             trace.measured_opportunity = measured_opportunity;
+        }
+        if let Some(trace) = self.active_traces.get(&token) {
+            for (_, _, profile_id) in &trace.input_correlations {
+                step_input_profile(
+                    brood_profiler::Kind::FlowStep,
+                    "wasm_frame_accepted",
+                    *profile_id,
+                    token,
+                );
+            }
         }
         if changed_pane_limit_exceeded {
             self.metrics.protocol_errors = self.metrics.protocol_errors.saturating_add(1);
@@ -1042,16 +1105,32 @@ impl RenderScheduler {
                 .all(|pane| trace.graphics_ready_ns.contains_key(pane));
             if all_ready && !trace.readiness_noted {
                 trace.readiness_noted = true;
-                trace
-                    .accepted_ns
-                    .map(|accepted_ns| (trace.actor.clone(), at_ns.saturating_sub(accepted_ns)))
+                trace.accepted_ns.map(|accepted_ns| {
+                    (
+                        trace.actor.clone(),
+                        at_ns.saturating_sub(accepted_ns),
+                        trace
+                            .input_correlations
+                            .iter()
+                            .map(|(_, _, id)| *id)
+                            .collect::<Vec<_>>(),
+                    )
+                })
             } else {
                 None
             }
         };
-        if let Some((actor, measured_ns)) = readiness
+        if let Some((actor, measured_ns, profile_ids)) = readiness
             && let Some(state) = self.actors.get_mut(&actor)
         {
+            for profile_id in profile_ids {
+                step_input_profile(
+                    brood_profiler::Kind::FlowStep,
+                    "graphics_ready",
+                    profile_id,
+                    token,
+                );
+            }
             let measured_ns = measured_ns.clamp(1, MAX_HOST_COST_NS);
             state.readiness_cost_ns = if measured_ns > state.readiness_cost_ns {
                 measured_ns
@@ -1166,6 +1245,14 @@ impl RenderScheduler {
             return false;
         }
         trace.composition_ns = Some(at_ns);
+        for (_, _, profile_id) in &trace.input_correlations {
+            step_input_profile(
+                brood_profiler::Kind::FlowStep,
+                "composed",
+                *profile_id,
+                token,
+            );
+        }
         true
     }
 
@@ -1181,6 +1268,14 @@ impl RenderScheduler {
             return false;
         }
         trace.gpu_submission_ns = Some(at_ns);
+        for (_, _, profile_id) in &trace.input_correlations {
+            step_input_profile(
+                brood_profiler::Kind::FlowStep,
+                "gpu_submitted",
+                *profile_id,
+                token,
+            );
+        }
         true
     }
 
@@ -1235,7 +1330,15 @@ impl RenderScheduler {
             self.metrics.intended_target_misses =
                 self.metrics.intended_target_misses.saturating_add(1);
         }
-        for (_watermark, started_ns) in &trace.input_correlations {
+        if new_presentation_opportunity && brood_profiler::enabled() {
+            brood_profiler::instant(
+                "frame",
+                "presented",
+                Some(token.0),
+                vec![("estimated".into(), estimated.into())],
+            );
+        }
+        for (_watermark, started_ns, profile_id) in &trace.input_correlations {
             if self.key_to_present_ns.len() == MAX_INPUT_CORRELATIONS {
                 self.key_to_present_ns.pop_front();
             }
@@ -1250,6 +1353,12 @@ impl RenderScheduler {
             }
             self.metrics.key_to_present_samples =
                 self.metrics.key_to_present_samples.saturating_add(1);
+            step_input_profile(
+                brood_profiler::Kind::FlowEnd,
+                "presented",
+                *profile_id,
+                token,
+            );
         }
         if self.newest_unpresented.get(&trace.actor) == Some(&token) {
             self.newest_unpresented.remove(&trace.actor);
@@ -1444,18 +1553,18 @@ impl RenderScheduler {
 
     fn merge_correlations(
         target: &mut impl CorrelationCollection,
-        correlations: impl IntoIterator<Item = (u64, u64)>,
+        correlations: impl IntoIterator<Item = (u64, u64, u64)>,
     ) {
         target.extend_correlations(correlations);
     }
 }
 
 trait CorrelationCollection {
-    fn extend_correlations(&mut self, correlations: impl IntoIterator<Item = (u64, u64)>);
+    fn extend_correlations(&mut self, correlations: impl IntoIterator<Item = (u64, u64, u64)>);
 }
 
-impl CorrelationCollection for Vec<(u64, u64)> {
-    fn extend_correlations(&mut self, correlations: impl IntoIterator<Item = (u64, u64)>) {
+impl CorrelationCollection for Vec<(u64, u64, u64)> {
+    fn extend_correlations(&mut self, correlations: impl IntoIterator<Item = (u64, u64, u64)>) {
         self.extend(correlations);
         self.sort_unstable();
         self.dedup();
@@ -1465,8 +1574,8 @@ impl CorrelationCollection for Vec<(u64, u64)> {
     }
 }
 
-impl CorrelationCollection for VecDeque<(u64, u64)> {
-    fn extend_correlations(&mut self, correlations: impl IntoIterator<Item = (u64, u64)>) {
+impl CorrelationCollection for VecDeque<(u64, u64, u64)> {
+    fn extend_correlations(&mut self, correlations: impl IntoIterator<Item = (u64, u64, u64)>) {
         let mut merged = self.drain(..).chain(correlations).collect::<Vec<_>>();
         merged.sort_unstable();
         merged.dedup();

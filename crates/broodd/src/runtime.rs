@@ -231,6 +231,7 @@ fn print_session_environment(state: &Brood, target: &control::ControlTarget) {
 }
 
 fn service_runtime_tick(state: &mut Brood) {
+    let _profile_span = brood_profiler::profile_span!("server", "runtime_tick");
     let started = std::time::Instant::now();
     let driver_before_micros = state.stats.smithay_driver_total_micros;
     state.service_test_harness();

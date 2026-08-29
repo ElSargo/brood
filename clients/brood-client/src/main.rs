@@ -1210,6 +1210,7 @@ fn main() -> Result<()> {
         .context("stop dynamically deployed container backends");
     let error = application.error.take();
     drop(application);
+    brood_profiler::flush();
     run_result?;
     shutdown_result?;
     backend_shutdown_result?;
@@ -1430,6 +1431,7 @@ struct GpuSubmissionRequest {
     device: wgpu::Device,
     submission: wgpu::SubmissionIndex,
     frame_sequences: Vec<CompletedFrameSequence>,
+    profile_id: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -1673,6 +1675,7 @@ fn run_graphics_preparation_worker(
             items,
             resume,
         } = request;
+        let _profile_span = brood_profiler::profile_span!("graphics", "prepare_scene_batch");
         if worker_generation.load(Ordering::Acquire) != renderer_generation {
             if !publish(ClientEvent::GraphicsPreparationCapacityAvailable) {
                 break;
@@ -1837,6 +1840,15 @@ fn run_gpu_submission_completion_worker(
             break;
         };
         if worker_generation.load(Ordering::Acquire) != request.renderer_generation {
+            if request.profile_id != 0 {
+                brood_profiler::flow(
+                    brood_profiler::Kind::FlowEnd,
+                    "gpu",
+                    "submission_stale",
+                    request.profile_id,
+                    Vec::new(),
+                );
+            }
             if !publish(ClientEvent::GpuSubmissionCapacityAvailable {
                 completed_wait_ns: None,
             }) {
@@ -1844,6 +1856,7 @@ fn run_gpu_submission_completion_worker(
             }
             continue;
         }
+        let _profile_span = brood_profiler::profile_span!("gpu", "submission_completion_wait");
         let started = Instant::now();
         let result = request
             .device
@@ -1854,6 +1867,15 @@ fn run_gpu_submission_completion_worker(
             .map(|_status| ())
             .map_err(|error| format!("wait for composed frame consumption: {error}"));
         let wait_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        if request.profile_id != 0 {
+            brood_profiler::flow(
+                brood_profiler::Kind::FlowEnd,
+                "gpu",
+                "submission_completed",
+                request.profile_id,
+                vec![("wait_ns".into(), wait_ns.into())],
+            );
+        }
         if !worker_active.load(Ordering::Acquire) {
             break;
         }
@@ -12261,6 +12283,12 @@ impl ApplicationHandler<ClientEvent> for Application {
         window_id: WindowId,
         event: WindowEvent,
     ) {
+        let _profile_span = brood_profiler::Span::new(
+            "event_loop",
+            "window_event",
+            None,
+            vec![("kind".into(), window_event_callback_kind(&event).into())],
+        );
         let mut callback_guard = WinitCallbackGuard::new(
             Arc::clone(&self.winit_hot_path_metrics),
             self.render_scheduling_warmup_complete,
@@ -13285,11 +13313,28 @@ impl ApplicationHandler<ClientEvent> for Application {
                                 current_frame_sequences.iter().copied(),
                             );
                             if !frame_sequences.is_empty() {
+                                let profile_id = if brood_profiler::enabled() {
+                                    let id = brood_profiler::next_id();
+                                    brood_profiler::flow(
+                                        brood_profiler::Kind::FlowStart,
+                                        "gpu",
+                                        "queue_submitted",
+                                        id,
+                                        vec![(
+                                            "frame_sequences".into(),
+                                            frame_sequences.len().into(),
+                                        )],
+                                    );
+                                    id
+                                } else {
+                                    0
+                                };
                                 let request = GpuSubmissionRequest {
                                     renderer_generation: renderer.generation,
                                     device: renderer.device.clone(),
                                     submission,
                                     frame_sequences,
+                                    profile_id,
                                 };
                                 let enqueue_result = self
                                     .gpu_submission_completion
@@ -19401,6 +19446,7 @@ impl Renderer {
     }
 
     fn render(&mut self, on_composed: impl FnOnce(Instant)) -> RenderOutcome {
+        let _profile_span = brood_profiler::profile_span!("frame", "cpu_render_and_present");
         let started = Instant::now();
         let (frame, reconfigure) = match self.surface.get_current_texture() {
             CurrentSurfaceTexture::Success(frame) => (frame, false),
