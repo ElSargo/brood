@@ -128,13 +128,23 @@ mod tests {
 
         let mut reconstructed = Vec::new();
         for (index, response) in responses.iter().enumerate() {
-            assert!(postcard::to_stdvec(response).unwrap().len() <= LOCAL_CONTROL_MAX_BYTES);
-            let Ok(LocalControlValue::ControlChunk { bytes, complete }) = &response.result else {
-                panic!("large response was not chunked");
-            };
-            reconstructed.extend_from_slice(bytes);
-            assert_eq!(*complete, index + 1 == responses.len());
+            assert!(
+                postcard::to_stdvec(response)
+                    .is_ok_and(|encoded| encoded.len() <= LOCAL_CONTROL_MAX_BYTES)
+            );
+            if let Ok(LocalControlValue::ControlChunk { bytes, complete }) = &response.result {
+                reconstructed.extend_from_slice(bytes);
+                assert_eq!(*complete, index + 1 == responses.len());
+            } else {
+                assert!(
+                    matches!(&response.result, Ok(LocalControlValue::ControlChunk { .. })),
+                    "large response was not chunked"
+                );
+            }
         }
-        assert_eq!(String::from_utf8(reconstructed).unwrap(), output);
+        assert_eq!(
+            String::from_utf8(reconstructed).as_deref(),
+            Ok(output.as_str())
+        );
     }
 }
