@@ -64,9 +64,14 @@ The picker immediately allocates a monotonic ID and replies:
   "type": "picker-created",
   "request": 41,
   "picker": 7,
-  "queued": false
+  "queued": true,
+  "queue_position": 2
 }
 ```
+
+`queue_position` is present only for queued work and is its one-based position
+at admission time. The reliable queue is bounded; saturation returns
+`picker-error` without allocating an ID.
 
 The ID is stable while the request is active or queued. A caller streams more
 results without replacing existing entries:
@@ -114,13 +119,19 @@ items, and ownership violations return `picker-error`.
 ## Queueing and matching
 
 There is one active picker pane. Every create request received while it is
-active joins a FIFO queue, including additional requests from the current
-owner. Streaming updates address the stable ID and therefore update queued work
-without displaying it early.
+active joins a bounded FIFO queue, including additional requests from the
+current owner. Streaming updates address the stable ID and therefore update
+queued work without displaying it early. Promotion cancels animation work
+leased to the completed picker before starting work for the promoted picker, so
+a late worker event cannot mutate its replacement.
 
 Matching is case-insensitive subsequence matching with bonuses for contiguous
 characters and word boundaries. Ties retain append order. An empty query shows
-all items in append order.
+all items in append order. The matching characters are highlighted in each
+visible label. Query editing has a Unicode-safe insertion point with Left/Right,
+Home/End, Backspace, and Delete. Pointer hover moves the same selection used by
+the keyboard, while a click activates only after press and release on the same
+row. Pixel scroll deltas accumulate before changing rows.
 
 The default session-switcher and keybindings actors are consumers.
 `Ctrl+Alt+P` sends a normal `picker-create` message and activates the session

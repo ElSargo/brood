@@ -24,6 +24,8 @@ const SIDE_MARGIN: f32 = 14.0;
 const CONTAINER_RADIUS: f32 = 8.0;
 const QUERY_X: f32 = 150.0;
 const SPINNER_INTERVAL_MS: u64 = 90;
+const MAX_QUEUED_REQUESTS: usize = 64;
+const SCROLL_PIXELS_PER_ROW: f32 = 5.0;
 
 const BG: Color = ashen::BACKGROUND;
 const PANEL: Color = ashen::SURFACE;
@@ -127,6 +129,7 @@ struct PickerRequest {
     placeholder: String,
     items: Vec<PickerEntry>,
     query: String,
+    query_cursor: usize,
     selected: Option<usize>,
     scroll: usize,
     loading: bool,
@@ -152,6 +155,7 @@ impl PickerRequest {
             placeholder,
             items: entries,
             query: String::new(),
+            query_cursor: 0,
             selected,
             scroll: 0,
             loading,
@@ -232,6 +236,44 @@ impl PickerRequest {
             self.scroll = position;
         }
     }
+
+    fn insert_query_text(&mut self, text: &str) {
+        let byte = char_byte_offset(&self.query, self.query_cursor);
+        self.query.insert_str(byte, text);
+        self.query_cursor += text.chars().count();
+        self.scroll = 0;
+        self.ensure_selection();
+    }
+
+    fn delete_query_before_cursor(&mut self) {
+        if self.query_cursor == 0 {
+            return;
+        }
+        let start = char_byte_offset(&self.query, self.query_cursor - 1);
+        let end = char_byte_offset(&self.query, self.query_cursor);
+        self.query.replace_range(start..end, "");
+        self.query_cursor -= 1;
+        self.scroll = 0;
+        self.ensure_selection();
+    }
+
+    fn delete_query_at_cursor(&mut self) {
+        let character_count = self.query.chars().count();
+        if self.query_cursor >= character_count {
+            return;
+        }
+        let start = char_byte_offset(&self.query, self.query_cursor);
+        let end = char_byte_offset(&self.query, self.query_cursor + 1);
+        self.query.replace_range(start..end, "");
+        self.scroll = 0;
+        self.ensure_selection();
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SpinnerLease {
+    worker: u64,
+    picker: u64,
 }
 
 struct PickerState {
@@ -247,8 +289,9 @@ struct PickerState {
     hovered: Option<usize>,
     pressed: Option<usize>,
     spinner_phase: usize,
-    spinner_worker: Option<u64>,
+    spinner_worker: Option<SpinnerLease>,
     next_spinner_worker: u64,
+    scroll_accumulator: f32,
 }
 
 impl PickerState {
@@ -268,6 +311,7 @@ impl PickerState {
             spinner_phase: 0,
             spinner_worker: None,
             next_spinner_worker: 1,
+            scroll_accumulator: 0.0,
         }
     }
 
@@ -293,6 +337,16 @@ impl PickerState {
         self.queued.iter_mut().find(|picker| picker.id == id)
     }
 
+    fn next_queue_position(&self) -> Result<Option<usize>, String> {
+        if self.active.is_none() {
+            return Ok(None);
+        }
+        if self.queued.len() >= MAX_QUEUED_REQUESTS {
+            return Err("picker request queue reached its bounded capacity".to_string());
+        }
+        Ok(Some(self.queued.len() + 1))
+    }
+
     fn promote(&mut self) -> bool {
         self.active = self.queued.pop_front();
         self.status.clear();
@@ -300,6 +354,7 @@ impl PickerState {
         self.hovered = None;
         self.pressed = None;
         self.spinner_phase = 0;
+        self.scroll_accumulator = 0.0;
         self.active.is_some()
     }
 
@@ -309,13 +364,20 @@ impl PickerState {
         {
             return None;
         }
+        let picker = self.active.as_ref()?.id;
         let worker = self.next_spinner_worker;
         self.next_spinner_worker = self.next_spinner_worker.checked_add(1)?;
-        self.spinner_worker = Some(worker);
+        self.spinner_worker = Some(SpinnerLease { worker, picker });
         Some(ActorCommand::SpawnWorker(WorkerRequest {
             worker,
             payload: Vec::new(),
         }))
+    }
+
+    fn stop_spinner(&mut self) -> Option<ActorCommand> {
+        self.spinner_worker
+            .take()
+            .map(|lease| ActorCommand::CancelWorker(lease.worker))
     }
 }
 
@@ -406,6 +468,10 @@ fn create_picker(
     let Ok(mut state) = STATE.lock() else {
         return Vec::new();
     };
+    let queue_position = match state.next_queue_position() {
+        Ok(position) => position,
+        Err(message) => return vec![picker_error(sender, None, &message)],
+    };
     let id = match state.allocate_id() {
         Ok(id) => id,
         Err(message) => {
@@ -440,7 +506,7 @@ fn create_picker(
             )];
         }
     };
-    let queued = state.active.is_some();
+    let queued = queue_position.is_some();
     if queued {
         state.queued.push_back(picker);
     } else {
@@ -458,6 +524,7 @@ fn create_picker(
             request: correlation,
             picker: id,
             queued,
+            queue_position,
         },
     )];
     if !queued && state.pane != 0 {
@@ -527,11 +594,17 @@ fn update_picker(
             },
         )];
     }
+    let loading = state.active.as_ref().is_some_and(|request| request.loading);
+    let mut commands = Vec::new();
     if active {
         state.spinner_phase = 0;
         redraw_or_record_error(&mut state);
+        if !loading && let Some(cancel) = state.stop_spinner() {
+            commands.push(cancel);
+        }
     }
-    state.start_spinner().into_iter().collect()
+    commands.extend(state.start_spinner());
+    commands
 }
 
 fn handle_worker(event: WorkerEvent) -> Vec<ActorCommand> {
@@ -544,11 +617,19 @@ fn handle_worker(event: WorkerEvent) -> Vec<ActorCommand> {
     let Ok(mut state) = STATE.lock() else {
         return Vec::new();
     };
-    if state.spinner_worker != Some(worker) {
+    let Some(lease) = state.spinner_worker else {
+        return Vec::new();
+    };
+    if lease.worker != worker {
         return Vec::new();
     }
     state.spinner_worker = None;
-    if advance && state.active.as_ref().is_some_and(|picker| picker.loading) {
+    if advance
+        && state
+            .active
+            .as_ref()
+            .is_some_and(|picker| picker.id == lease.picker && picker.loading)
+    {
         state.spinner_phase = state.spinner_phase.wrapping_add(1) % 8;
         redraw_or_record_error(&mut state);
         return state.start_spinner().into_iter().collect();
@@ -632,13 +713,12 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
         }
         PresentationEvent::Text(text) if text.pane == state.pane => {
             if let Some(active) = state.active.as_mut() {
-                active.query.extend(
-                    text.text
-                        .chars()
-                        .filter(|character| !character.is_control()),
-                );
-                active.scroll = 0;
-                active.ensure_selection();
+                let inserted = text
+                    .text
+                    .chars()
+                    .filter(|character| !character.is_control())
+                    .collect::<String>();
+                active.insert_query_text(&inserted);
             }
             state.hovered = None;
             state.pressed = None;
@@ -647,8 +727,7 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
         }
         PresentationEvent::PointerMoved(moved) if moved.pane == state.pane => {
             let hovered = picker_target_at(&state, moved.y);
-            if state.hovered != hovered {
-                state.hovered = hovered;
+            if set_hovered_target(&mut state, hovered) {
                 redraw_or_record_error(&mut state);
             }
             Vec::new()
@@ -685,12 +764,21 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
         }
         PresentationEvent::PointerScroll(scroll) if scroll.pane == state.pane => {
             let visible_rows = state.visible_rows();
+            state.scroll_accumulator += scroll.vertical;
+            let rows = (state.scroll_accumulator / SCROLL_PIXELS_PER_ROW).trunc() as isize;
+            if rows == 0 {
+                return Vec::new();
+            }
+            state.scroll_accumulator -= rows as f32 * SCROLL_PIXELS_PER_ROW;
             if let Some(active) = state.active.as_mut() {
                 let max_scroll = active.filtered_indices().len().saturating_sub(visible_rows);
-                if scroll.vertical < 0.0 {
-                    active.scroll = (active.scroll + 1).min(max_scroll);
-                } else if scroll.vertical > 0.0 {
-                    active.scroll = active.scroll.saturating_sub(1);
+                if rows < 0 {
+                    active.scroll = active
+                        .scroll
+                        .saturating_add(rows.unsigned_abs())
+                        .min(max_scroll);
+                } else {
+                    active.scroll = active.scroll.saturating_sub(rows as usize);
                 }
             }
             state.hovered = None;
@@ -723,9 +811,37 @@ fn handle_key(state: &mut PickerState, key: &str) -> Vec<ActorCommand> {
         }
         "Backspace" => {
             if let Some(active) = state.active.as_mut() {
-                active.query.pop();
-                active.scroll = 0;
-                active.ensure_selection();
+                active.delete_query_before_cursor();
+            }
+            Vec::new()
+        }
+        "Delete" => {
+            if let Some(active) = state.active.as_mut() {
+                active.delete_query_at_cursor();
+            }
+            Vec::new()
+        }
+        "ArrowLeft" => {
+            if let Some(active) = state.active.as_mut() {
+                active.query_cursor = active.query_cursor.saturating_sub(1);
+            }
+            Vec::new()
+        }
+        "ArrowRight" => {
+            if let Some(active) = state.active.as_mut() {
+                active.query_cursor = (active.query_cursor + 1).min(active.query.chars().count());
+            }
+            Vec::new()
+        }
+        "Home" => {
+            if let Some(active) = state.active.as_mut() {
+                active.query_cursor = 0;
+            }
+            Vec::new()
+        }
+        "End" => {
+            if let Some(active) = state.active.as_mut() {
+                active.query_cursor = active.query.chars().count();
             }
             Vec::new()
         }
@@ -747,6 +863,17 @@ fn picker_target_at(state: &PickerState, y: f32) -> Option<usize> {
     let filtered = active.filtered_indices();
     let position = filtered.get(active.scroll + row).copied()?;
     Some(active.items[position].index)
+}
+
+fn set_hovered_target(state: &mut PickerState, target: Option<usize>) -> bool {
+    if state.hovered == target {
+        return false;
+    }
+    state.hovered = target;
+    if let (Some(target), Some(active)) = (target, state.active.as_mut()) {
+        active.selected = Some(target);
+    }
+    true
 }
 
 fn select_picker_target(state: &mut PickerState, target: usize) -> Vec<ActorCommand> {
@@ -821,7 +948,7 @@ fn finish_active(state: &mut PickerState, selected: bool) -> Vec<ActorCommand> {
     };
     state.hovered = None;
     state.pressed = None;
-    let mut commands = Vec::new();
+    let mut commands = state.stop_spinner().into_iter().collect::<Vec<_>>();
     if !selected {
         commands.push(reply(
             &finished.owner,
@@ -868,10 +995,30 @@ fn parse_entries(start: usize, items: Vec<Value>) -> Result<Vec<PickerEntry>, St
         .collect()
 }
 
-fn fuzzy_score(query: &str, candidate: &str) -> Option<i64> {
+fn char_byte_offset(text: &str, character: usize) -> usize {
+    text.char_indices()
+        .nth(character)
+        .map_or(text.len(), |(byte, _)| byte)
+}
+
+fn query_with_cursor(query: &str, cursor: usize) -> String {
+    let byte = char_byte_offset(query, cursor);
+    format!("{}▏{}", &query[..byte], &query[byte..])
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct FuzzyMatch {
+    score: i64,
+    positions: Vec<usize>,
+}
+
+fn fuzzy_match(query: &str, candidate: &str) -> Option<FuzzyMatch> {
     let query = query.trim();
     if query.is_empty() {
-        return Some(0);
+        return Some(FuzzyMatch {
+            score: 0,
+            positions: Vec::new(),
+        });
     }
     let query = query
         .chars()
@@ -879,12 +1026,18 @@ fn fuzzy_score(query: &str, candidate: &str) -> Option<i64> {
         .collect::<Vec<_>>();
     let candidate_lower = candidate
         .chars()
-        .flat_map(char::to_lowercase)
+        .enumerate()
+        .flat_map(|(original_position, character)| {
+            character
+                .to_lowercase()
+                .map(move |lowercase| (lowercase, original_position))
+        })
         .collect::<Vec<_>>();
     let mut query_position = 0;
     let mut last_match = None;
     let mut score = 0_i64;
-    for (position, character) in candidate_lower.iter().enumerate() {
+    let mut positions = Vec::with_capacity(query.len());
+    for (position, (character, original_position)) in candidate_lower.iter().enumerate() {
         if query.get(query_position) != Some(character) {
             continue;
         }
@@ -892,7 +1045,7 @@ fn fuzzy_score(query: &str, candidate: &str) -> Option<i64> {
         if position == 0
             || candidate_lower
                 .get(position.saturating_sub(1))
-                .is_some_and(|previous| !previous.is_alphanumeric())
+                .is_some_and(|(previous, _)| !previous.is_alphanumeric())
         {
             score += 18;
         }
@@ -903,15 +1056,22 @@ fn fuzzy_score(query: &str, candidate: &str) -> Option<i64> {
             score -= i64::try_from(position).unwrap_or(i64::MAX / 4).min(64);
         }
         last_match = Some(position);
+        if positions.last() != Some(original_position) {
+            positions.push(*original_position);
+        }
         query_position += 1;
         if query_position == query.len() {
             score -= i64::try_from(candidate_lower.len().saturating_sub(query.len()))
                 .unwrap_or(i64::MAX / 4)
                 .min(128);
-            return Some(score);
+            return Some(FuzzyMatch { score, positions });
         }
     }
     None
+}
+
+fn fuzzy_score(query: &str, candidate: &str) -> Option<i64> {
+    fuzzy_match(query, candidate).map(|matched| matched.score)
 }
 
 #[derive(Serialize)]
@@ -922,6 +1082,8 @@ struct CreatedReply {
     request: Option<Value>,
     picker: u64,
     queued: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    queue_position: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -1074,7 +1236,7 @@ fn redraw(state: &mut PickerState, resize_epoch: Option<u64>) -> Result<(), Stri
                 active.placeholder.clone()
             }
         } else {
-            format!("{}▏", active.query)
+            query_with_cursor(&active.query, active.query_cursor)
         };
         add_text(
             state,
@@ -1131,13 +1293,12 @@ fn redraw(state: &mut PickerState, resize_epoch: Option<u64>) -> Result<(), Stri
                 rect: Rect::new(0.0, y + ROW_HEIGHT - 1.0, state.width, 1.0),
                 color: Color::rgba(PANEL_LIGHT.r, PANEL_LIGHT.g, PANEL_LIGHT.b, 0.28),
             });
-            add_text(
-                state,
+            draw_highlighted_text(
                 &mut packet,
                 &mut frame,
-                &truncate_to_width(&item.label, state.width - SIDE_MARGIN * 2.0, 13.0),
+                &item.label,
+                &active.query,
                 13.0,
-                FG,
                 SIDE_MARGIN,
                 if item.detail.is_some() { y } else { y + 6.0 },
                 state.width - SIDE_MARGIN * 2.0,
@@ -1291,6 +1452,57 @@ fn add_text(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn draw_highlighted_text(
+    packet: &mut Packet,
+    frame: &mut UiFrame,
+    text: &str,
+    query: &str,
+    size: f32,
+    x: f32,
+    y: f32,
+    max_width: f32,
+) -> Result<(), String> {
+    let display = truncate_to_width(text, max_width, size);
+    let matched = fuzzy_match(query, text)
+        .map(|matched| matched.positions)
+        .unwrap_or_default();
+    let mut runs = Vec::<(bool, String)>::new();
+    for (position, character) in display.chars().enumerate() {
+        let highlighted = matched.binary_search(&position).is_ok();
+        if let Some((previous, run)) = runs.last_mut()
+            && *previous == highlighted
+        {
+            run.push(character);
+        } else {
+            runs.push((highlighted, character.to_string()));
+        }
+    }
+
+    let mut run_x = x;
+    let right = x + max_width;
+    for (highlighted, run) in runs {
+        let available = (right - run_x).max(1.0);
+        let layout = frame
+            .draw_text_clipped(
+                packet,
+                &run,
+                size,
+                available,
+                size + 4.0,
+                if highlighted { YELLOW } else { FG },
+                run_x,
+                y,
+            )
+            .map_err(|error| format!("layout highlighted picker text: {error}"))?;
+        run_x += layout.width;
+        if run_x >= right {
+            break;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1317,6 +1529,38 @@ mod tests {
             fuzzy_score("sw", "Session workspace").expect("boundary match")
                 > fuzzy_score("sw", "slow window").expect("sparse match")
         );
+        assert_eq!(
+            fuzzy_match("fb", "Find backend")
+                .expect("matched label")
+                .positions,
+            [0, 5]
+        );
+        assert_eq!(
+            fuzzy_match("åv", "Ångström View")
+                .expect("unicode case-insensitive match")
+                .positions,
+            [0, 9]
+        );
+    }
+
+    #[test]
+    fn query_cursor_edits_unicode_at_the_insertion_point() {
+        let mut picker = request(1, "caller", &["aλ界z"]);
+        picker.insert_query_text("a界");
+        picker.query_cursor = 1;
+        picker.insert_query_text("λ");
+        assert_eq!(picker.query, "aλ界");
+        assert_eq!(picker.query_cursor, 2);
+        assert_eq!(
+            query_with_cursor(&picker.query, picker.query_cursor),
+            "aλ▏界"
+        );
+
+        picker.delete_query_before_cursor();
+        assert_eq!(picker.query, "a界");
+        assert_eq!(picker.query_cursor, 1);
+        picker.delete_query_at_cursor();
+        assert_eq!(picker.query, "a");
     }
 
     #[test]
@@ -1348,11 +1592,74 @@ mod tests {
     }
 
     #[test]
+    fn reliable_picker_queue_has_a_release_build_bound_and_reports_position() {
+        let mut state = PickerState::new();
+        assert_eq!(state.next_queue_position(), Ok(None));
+        state.active = Some(request(1, "first", &["one"]));
+        for id in 0..MAX_QUEUED_REQUESTS {
+            assert_eq!(state.next_queue_position(), Ok(Some(id + 1)));
+            state
+                .queued
+                .push_back(request(id as u64 + 2, "queued", &["item"]));
+        }
+        assert_eq!(
+            state.next_queue_position(),
+            Err("picker request queue reached its bounded capacity".to_string())
+        );
+    }
+
+    #[test]
+    fn promoting_a_picker_cancels_the_old_spinner_and_leases_a_new_one() {
+        let mut state = PickerState::new();
+        let mut first = request(1, "first", &["one"]);
+        first.loading = true;
+        let mut second = request(2, "second", &["two"]);
+        second.loading = true;
+        state.active = Some(first);
+        state.queued.push_back(second);
+        let Some(ActorCommand::SpawnWorker(first_worker)) = state.start_spinner() else {
+            panic!("first picker did not start a spinner");
+        };
+
+        let commands = finish_active(&mut state, false);
+        assert!(matches!(
+            commands.first(),
+            Some(ActorCommand::CancelWorker(worker)) if *worker == first_worker.worker
+        ));
+        let Some(SpinnerLease {
+            worker: second_worker,
+            picker: 2,
+        }) = state.spinner_worker
+        else {
+            panic!("promoted picker did not receive its own spinner lease");
+        };
+        assert_ne!(second_worker, first_worker.worker);
+    }
+
+    #[test]
     fn filtering_preserves_original_item_index() {
         let mut picker = request(1, "caller", &["alpha", "beta", "alpine"]);
         picker.query = "bt".to_string();
         picker.ensure_selection();
         assert_eq!(picker.selected, Some(1));
+    }
+
+    #[test]
+    fn pointer_hover_tracks_the_row_and_keyboard_selection() {
+        let mut state = PickerState::new();
+        state.height = HEADER_HEIGHT + FOOTER_HEIGHT + ROW_HEIGHT * 2.0;
+        state.active = Some(request(1, "caller", &["alpha", "beta", "gamma"]));
+        assert_eq!(
+            picker_target_at(&state, HEADER_HEIGHT + ROW_HEIGHT + 1.0),
+            Some(1)
+        );
+        assert!(set_hovered_target(&mut state, Some(1)));
+        assert_eq!(state.hovered, Some(1));
+        assert_eq!(
+            state.active.as_ref().and_then(|picker| picker.selected),
+            Some(1)
+        );
+        assert!(!set_hovered_target(&mut state, Some(1)));
     }
 
     #[test]

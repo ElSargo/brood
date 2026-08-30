@@ -22,6 +22,7 @@ interpret evidence.
 - [[internal-ipc-refactor]]
 - [[network-carrier-latency]]
 - [[plugin-runtime-proofs]]
+- [[picker]]
 - [[render-scheduling]]
 - [[session-isolation]]
 - [[terminal-latency-spike-profile]]
