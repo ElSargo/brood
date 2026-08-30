@@ -1870,6 +1870,23 @@ fn restore_latest_submitted_or_durable_shell_layout(state: &mut SwitcherState) {
     }
 }
 
+fn restore_deferred_shell_layout(state: &mut SwitcherState) -> Option<(Option<u64>, &'static str)> {
+    if !state.pending_shell_layouts.is_empty() {
+        return None;
+    }
+    let deferred = state.deferred_shell_layout.take()?;
+    let focus = deferred.state.focus;
+    restore_shell_layout_state(state, &deferred.state);
+    Some((focus, deferred.reason))
+}
+
+fn publish_deferred_shell_layout(state: &mut SwitcherState) -> Vec<ActorCommand> {
+    let Some((focus, reason)) = restore_deferred_shell_layout(state) else {
+        return Vec::new();
+    };
+    publish_synchronized_layout_attempt(state, focus, reason, None, 0, None, None)
+}
+
 fn apply_layout_transaction_notification(
     state: &mut SwitcherState,
     notification: &LayoutTransactionNotification,
@@ -1886,21 +1903,7 @@ fn apply_layout_transaction_notification(
             {
                 layout.presented_layout_revision = target_layout_revision;
             }
-            if state.pending_shell_layouts.is_empty()
-                && let Some(deferred) = state.deferred_shell_layout.take()
-            {
-                let focus = deferred.state.focus;
-                restore_shell_layout_state(state, &deferred.state);
-                return publish_synchronized_layout_attempt(
-                    state,
-                    focus,
-                    deferred.reason,
-                    None,
-                    0,
-                    None,
-                    None,
-                );
-            }
+            return publish_deferred_shell_layout(state);
         }
         "rejected" | "aborted" => {
             let rejected = state.pending_shell_layouts.remove(&notification.request_id);
@@ -1917,6 +1920,10 @@ fn apply_layout_transaction_notification(
                 // republish against the new inventory instead of resurrecting
                 // the previous durable overlay and stealing focus.
                 restore_shell_layout_state(state, &rejected.state);
+                // A later user intent supersedes the rejected proposal. Fold
+                // it into the state that the already-queued fresh layout-state
+                // will publish, but do not resubmit against stale inventory.
+                restore_deferred_shell_layout(state);
                 return Vec::new();
             }
             restore_latest_submitted_or_durable_shell_layout(state);
@@ -1948,9 +1955,11 @@ fn apply_layout_transaction_notification(
                     state.native_resize_revision = None;
                 }
             }
+            return publish_deferred_shell_layout(state);
         }
         "superseded" => {
             state.pending_shell_layouts.remove(&notification.request_id);
+            return publish_deferred_shell_layout(state);
         }
         "accepted" => {}
         _ => unreachable!("notification kind was validated before dispatch"),
@@ -5000,6 +5009,88 @@ mod tests {
                 .expect("layout items")
                 .iter()
                 .all(|item| item["id"] != 1)
+        );
+        assert!(state.deferred_shell_layout.is_none());
+    }
+
+    #[test]
+    fn rejected_transition_cannot_replay_deferred_state_after_a_newer_action() {
+        let mut state = SwitcherState::new();
+        state.pane = 1;
+        state.picker_pane = Some(2);
+        state.keybindings_pane = Some(3);
+        state.inbox_pane = Some(4);
+        state.status_bar_pane = Some(5);
+        let workspace = 6;
+        let mut panes = serde_json_core::heapless::Vec::<u64, 64>::new();
+        assert!(panes.extend_from_slice(&[1, 2, 3, 4, 5, workspace]).is_ok());
+        state.layout = Some(LayoutContext {
+            revision: 9,
+            presented_layout_revision: 17,
+            lease: LayoutLeaseToken {
+                id: 4,
+                generation: 2,
+            },
+            waitable_panes: panes.clone(),
+            presented_panes: panes.clone(),
+            visible_panes: panes,
+            focused_pane: Some(workspace),
+            size: LayoutStateSize {
+                w: 1280,
+                height: 720,
+            },
+            rest: true,
+        });
+
+        let first = publish_synchronized_layout(&mut state, Some(1), "sidebar", None);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(host_command(
+                &first,
+                "submit-synchronized-layout"
+            ))
+            .expect("first transaction")["request_id"],
+            1
+        );
+
+        state.sidebar_visible = false;
+        assert!(
+            publish_synchronized_layout(&mut state, Some(workspace), "sidebar", None).is_empty()
+        );
+
+        let second = apply_layout_transaction_notification(
+            &mut state,
+            &super::decode_layout_transaction_notification(
+                br#"{"type":"rejected","request_id":1,"reason":"busy"}"#,
+            )
+            .expect("rejected first transaction"),
+        );
+        let second: serde_json::Value =
+            serde_json::from_slice(host_command(&second, "submit-synchronized-layout"))
+                .expect("deferred second transaction");
+        assert_eq!(second["request_id"], 2);
+        assert_eq!(second["base_layout_revision"], 17);
+
+        state.sidebar_visible = true;
+        assert!(publish_synchronized_layout(&mut state, Some(1), "sidebar", None).is_empty());
+
+        let third = apply_layout_transaction_notification(
+            &mut state,
+            &super::decode_layout_transaction_notification(
+                br#"{"type":"completed","request_id":2,"resize_epoch":{"id":31,"lease":4,"lease_generation":2,"base_layout_revision":17,"target_layout_revision":18}}"#,
+            )
+            .expect("completed second transaction"),
+        );
+        let third: serde_json::Value =
+            serde_json::from_slice(host_command(&third, "submit-synchronized-layout"))
+                .expect("newest third transaction");
+        assert_eq!(third["request_id"], 3);
+        assert_eq!(third["base_layout_revision"], 18);
+        assert!(
+            third["fragment"]["layout"]["items"]
+                .as_array()
+                .expect("layout items")
+                .iter()
+                .any(|item| item["id"] == 1)
         );
         assert!(state.deferred_shell_layout.is_none());
     }

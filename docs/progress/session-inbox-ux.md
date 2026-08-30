@@ -56,6 +56,14 @@ and completed backend-picker identities remain in a bounded retirement queue,
 covering a stale selection that arrives after the replacement itself has
 already completed and cleared its request token.
 
+Deferred shell intent is consumed on every terminal transaction path, not
+only completion and degraded recovery. When a request is rejected, aborted,
+or superseded and no other shell request remains, the newest deferred intent
+is immediately republished against the usable base revision. Stale-inventory
+recovery instead folds that intent into the state awaiting the host's fresh
+layout publication. This prevents an older deferred intent from surviving a
+rejection and replaying after an unrelated newer transition.
+
 The focused Nix-backed session-switcher suite now passes 35 tests, including
 regressions for a keyboard toggle during a synchronized transition and for a
 selection from a replaced backend picker. All-target Clippy passes with
