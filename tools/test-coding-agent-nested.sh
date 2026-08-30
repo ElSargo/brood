@@ -22,6 +22,13 @@ for tool in cargo cc grim jq magick pkg-config python3 sway swaymsg wasm-tools w
     exit 2
   fi
 done
+
+# Terminal actor protocol diagnostics can contain NUL bytes. Keep log matching
+# in text mode so readiness checks receive actual records and counts.
+rg() {
+  command rg --text "$@"
+}
+
 if [[ -n "$COMPUTER_USE" ]] && ! command -v speedcrunch > /dev/null 2>&1; then
   echo "ERR speedcrunch is required for the built-in computer-use proof" >&2
   exit 2
@@ -357,7 +364,7 @@ backend_ready() {
 STARTUP_ATTEMPTS=300
 [[ -z "$SSH_TARGET" ]] || STARTUP_ATTEMPTS=3600
 for _ in $(seq 1 "$STARTUP_ATTEMPTS"); do
-  if rg -q "accepted plugin draw packet" "$CLIENT_LOG" \
+  if rg -q "compiled plugin GPU scene" "$CLIENT_LOG" \
     && backend_ready; then
     break
   fi
@@ -367,7 +374,7 @@ for _ in $(seq 1 "$STARTUP_ATTEMPTS"); do
   }
   sleep 0.1
 done
-rg -q "accepted plugin draw packet" "$CLIENT_LOG"
+rg -q "compiled plugin GPU scene" "$CLIENT_LOG"
 if [[ -n "$SSH_TARGET" ]]; then
   rg -q 'backend actor message .*"id":"coding-agent-1"' "$CLIENT_LOG"
 else
