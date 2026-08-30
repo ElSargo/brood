@@ -495,29 +495,36 @@ INBOX_PANE="$(
 INBOX_REVEAL_BASELINE="$(
   rg -a -c 'sent key-policy actor message actor=inbox' "$CLIENT1_LOG" || true
 )"
-INBOX_FRAME_BASELINE="$(
-  rg -a -c 'render scheduling actor-frame promoted actor=inbox ' "$CLIENT1_LOG" || true
+# Showing the hidden inbox can compose its retained actor frame without a new
+# actor-frame promotion. The synchronized layout's pane-ready accounting is the
+# authoritative proof that the retained content is ready for presentation.
+INBOX_LAYOUT_READY_BASELINE="$(
+  rg -a -c \
+    'synchronized layout ready actor=session-switcher .* pane_ready=4/4 .* missing=\[\] degraded=false ' \
+    "$CLIENT1_LOG" || true
 )"
 ctrl_alt_i
 for _ in $(seq 1 100); do
   INBOX_REVEAL_COUNT="$(
     rg -a -c 'sent key-policy actor message actor=inbox' "$CLIENT1_LOG" || true
   )"
-  INBOX_FRAME_COUNT="$(
-    rg -a -c 'render scheduling actor-frame promoted actor=inbox ' "$CLIENT1_LOG" || true
+  INBOX_LAYOUT_READY_COUNT="$(
+    rg -a -c \
+      'synchronized layout ready actor=session-switcher .* pane_ready=4/4 .* missing=\[\] degraded=false ' \
+      "$CLIENT1_LOG" || true
   )"
   if ((INBOX_REVEAL_COUNT > INBOX_REVEAL_BASELINE)) \
-    && ((INBOX_FRAME_COUNT > INBOX_FRAME_BASELINE)) \
+    && ((INBOX_LAYOUT_READY_COUNT > INBOX_LAYOUT_READY_BASELINE)) \
     && rg -a -q "accepted synchronized layout actor=session-switcher .* target_rects=.*${INBOX_PANE}:960:0:320:686" "$CLIENT1_LOG" \
-    && rg -a -q 'synchronized layout ready actor=session-switcher .* missing=\[\] degraded=false ' "$CLIENT1_LOG"; then
+    && rg -a -q 'synchronized layout ready actor=session-switcher .* pane_ready=4/4 .* missing=\[\] degraded=false ' "$CLIENT1_LOG"; then
     break
   fi
   sleep 0.05
 done
 ((INBOX_REVEAL_COUNT > INBOX_REVEAL_BASELINE))
-((INBOX_FRAME_COUNT > INBOX_FRAME_BASELINE))
+((INBOX_LAYOUT_READY_COUNT > INBOX_LAYOUT_READY_BASELINE))
 rg -a -q "accepted synchronized layout actor=session-switcher .* target_rects=.*${INBOX_PANE}:960:0:320:686" "$CLIENT1_LOG"
-rg -a -q 'synchronized layout ready actor=session-switcher .* missing=\[\] degraded=false ' "$CLIENT1_LOG"
+rg -a -q 'synchronized layout ready actor=session-switcher .* pane_ready=4/4 .* missing=\[\] degraded=false ' "$CLIENT1_LOG"
 INBOX_CLICK_X=$((1280 - 320 / 2))
 wayland_env "$OUT/virtual-pointer-input" click "$INBOX_CLICK_X" 100 1280 720
 for _ in $(seq 1 100); do

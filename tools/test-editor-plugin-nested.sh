@@ -17,7 +17,7 @@ if [[ "${BROOD_EDITOR_PRIVATE_DBUS:-0}" != 1 ]]; then
     dbus-run-session -- "$0" "$@"
 fi
 
-for tool in cc git grim jq magick nix pkg-config ps python3 rg sway wtype; do
+for tool in cc git grim jq magick nix pkg-config ps python3 rg sway swaymsg wtype; do
   if ! command -v "$tool" > /dev/null 2>&1; then
     echo "ERR $tool is required for the editor plugin proof" >&2
     exit 2
@@ -272,6 +272,29 @@ for _ in {1..400}; do
 done
 rg -q 'started presentation WASM actor id=terminal-ui' "$CLIENT_LOG"
 rg -q 'accepted plugin draw packet' "$CLIENT_LOG"
+
+# A draw packet can be accepted before Sway has mapped and focused the
+# presentation surface. Virtual-keyboard input sent in that interval is valid
+# at the protocol level but has no focused surface to receive it. Wait for the
+# real Brood window to own compositor keyboard focus before exercising the
+# global Ctrl+Alt+E policy.
+for _ in {1..400}; do
+  if wayland_env swaymsg -t get_tree -r 2> /dev/null \
+    | jq -e \
+      '[.. | objects | select(.name? == "Brood" and .focused? == true)] | length > 0' \
+      > /dev/null; then
+    break
+  fi
+  kill -0 "$CLIENT_PID" 2> /dev/null || {
+    echo "ERR presentation client exited before its window received keyboard focus" >&2
+    exit 1
+  }
+  sleep 0.05
+done
+wayland_env swaymsg -t get_tree -r \
+  | jq -e \
+    '[.. | objects | select(.name? == "Brood" and .focused? == true)] | length > 0' \
+    > /dev/null
 
 capture() {
   wayland_env grim "$1"
