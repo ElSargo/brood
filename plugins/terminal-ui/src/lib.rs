@@ -96,7 +96,7 @@ struct UiState {
     pending_resize_epoch: Option<u64>,
     focused: bool,
     cursor_blink_on: bool,
-    cursor_blink_worker_pending: bool,
+    cursor_blink_worker: Option<u64>,
 }
 
 impl UiState {
@@ -149,7 +149,7 @@ impl UiState {
             // startup, before the compositor has selected a pane.
             focused: false,
             cursor_blink_on: true,
-            cursor_blink_worker_pending: false,
+            cursor_blink_worker: None,
         }
     }
 
@@ -228,23 +228,30 @@ impl UiState {
     }
 
     fn schedule_cursor_blink(&mut self) -> Option<Command> {
-        if self.cursor_blink_worker_pending || !self.focused {
+        if self.cursor_blink_worker.is_some() || !self.focused {
             return None;
         }
-        self.cursor_blink_worker_pending = true;
         let worker = self.next_worker;
         self.next_worker = self.next_worker.saturating_add(1).max(1);
+        self.cursor_blink_worker = Some(worker);
         Some(Command::SpawnWorker(WorkerRequest {
             worker,
             payload: CURSOR_BLINK_WORKER_PAYLOAD.to_vec(),
         }))
     }
 
-    fn wake_cursor(&mut self) {
+    fn cancel_cursor_blink(&mut self) -> Option<Command> {
+        self.cursor_blink_worker.take().map(Command::CancelWorker)
+    }
+
+    fn restart_cursor_blink(&mut self) -> Vec<Command> {
+        let mut commands = self.cancel_cursor_blink().into_iter().collect::<Vec<_>>();
         if !self.cursor_blink_on {
             self.cursor_blink_on = true;
             let _ignored = brood_plugin_sdk::graphics::request_render();
         }
+        commands.extend(self.schedule_cursor_blink());
+        commands
     }
 
     fn viewport_command(&self, offset: usize) -> Command {
@@ -510,10 +517,9 @@ impl Guest for TerminalUi {
                 vec![Command::LifecycleComplete(Ok(()))]
             }
             Event::Presentation(event) => handle_presentation(event),
-            Event::PresentationBatch(events) => events
-                .into_iter()
-                .flat_map(handle_presentation)
-                .collect(),
+            Event::PresentationBatch(events) => {
+                events.into_iter().flat_map(handle_presentation).collect()
+            }
             Event::Mailbox(message)
                 if message.sender.starts_with("session:")
                     && message.body.starts_with(SNAPSHOT_MAGIC) =>
@@ -534,13 +540,14 @@ impl Guest for TerminalUi {
             Event::Worker(WorkerEvent::Finished(finished))
                 if finished.output == CURSOR_BLINK_WORKER_PAYLOAD =>
             {
-                finish_cursor_blink()
+                finish_cursor_blink(finished.worker)
             }
             Event::Worker(WorkerEvent::Failed(failed))
                 if failed.message.starts_with("terminal cursor blink:") =>
             {
-                finish_cursor_blink()
+                finish_cursor_blink(failed.worker)
             }
+            Event::Worker(WorkerEvent::Cancelled(worker)) => cancel_cursor_blink_finished(worker),
             Event::Worker(WorkerEvent::Finished(_)) | Event::Worker(WorkerEvent::Failed(_)) => {
                 Vec::new()
             }
@@ -637,31 +644,35 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
             commands
         }
         PresentationEvent::PaneFocused(focused) if focused.pane == state.pane => {
+            let mut commands = state.cancel_cursor_blink().into_iter().collect::<Vec<_>>();
             state.focused = focused.focused;
             state.cursor_blink_on = true;
             let _ignored = brood_plugin_sdk::graphics::request_render();
-            state.schedule_cursor_blink().into_iter().collect()
+            commands.extend(state.schedule_cursor_blink());
+            commands
         }
         PresentationEvent::Key(key) if key.pane == state.pane && key.pressed => {
-            state.wake_cursor();
+            let mut commands = state.restart_cursor_blink();
             state.suppressed_text = ((key.modifiers & (MOD_CTRL | MOD_ALT)) != 0
                 && key.logical_key.chars().count() == 1)
                 .then(|| key.logical_key.clone());
             let copy_shortcut = key.modifiers & (MOD_CTRL | MOD_SHIFT) == (MOD_CTRL | MOD_SHIFT)
                 && key.logical_key.eq_ignore_ascii_case("c");
             if copy_shortcut {
-                return state
-                    .selection
-                    .and_then(|selection| selection_text(state.latest.as_deref(), selection))
-                    .and_then(set_clipboard_command)
-                    .into_iter()
-                    .collect();
+                commands.extend(
+                    state
+                        .selection
+                        .and_then(|selection| selection_text(state.latest.as_deref(), selection))
+                        .and_then(set_clipboard_command),
+                );
+                return commands;
             }
             let paste_shortcut = (key.modifiers & (MOD_CTRL | MOD_SHIFT) == (MOD_CTRL | MOD_SHIFT)
                 && key.logical_key.eq_ignore_ascii_case("v"))
                 || (key.modifiers & MOD_SHIFT != 0 && key.logical_key == "Insert");
             if paste_shortcut {
-                return vec![request_clipboard_paste_command(state.pane)];
+                commands.push(request_clipboard_paste_command(state.pane));
+                return commands;
             }
             let page = state
                 .latest
@@ -685,29 +696,30 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
             };
             if let Some(viewport) = viewport {
                 state.requested_viewport = viewport;
-                return vec![state.viewport_command(viewport)];
+                commands.push(state.viewport_command(viewport));
+                return commands;
             }
             let application_cursor = state
                 .latest
                 .as_ref()
                 .is_some_and(|snapshot| snapshot.application_cursor);
-            key_bytes(&key.logical_key, key.modifiers, application_cursor)
-                .map(|bytes| {
+            commands.extend(
+                key_bytes(&key.logical_key, key.modifiers, application_cursor).map(|bytes| {
                     state.selection = None;
                     state.requested_viewport = 0;
                     state.input_command(&bytes)
-                })
-                .into_iter()
-                .collect()
+                }),
+            );
+            commands
         }
         PresentationEvent::Text(text) if text.pane == state.pane && !text.text.is_empty() => {
-            state.wake_cursor();
+            let mut commands = state.restart_cursor_blink();
             if state
                 .suppressed_text
                 .take()
                 .is_some_and(|key| key.eq_ignore_ascii_case(&text.text))
             {
-                return Vec::new();
+                return commands;
             }
             let printable = text
                 .text
@@ -715,22 +727,24 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
                 .filter(|character| !character.is_control())
                 .collect::<String>();
             if printable.is_empty() {
-                Vec::new()
+                commands
             } else {
                 state.selection = None;
                 state.requested_viewport = 0;
-                vec![state.input_command(printable.as_bytes())]
+                commands.push(state.input_command(printable.as_bytes()));
+                commands
             }
         }
         PresentationEvent::Paste(paste) if paste.pane == state.pane && !paste.text.is_empty() => {
-            state.wake_cursor();
+            let mut commands = state.restart_cursor_blink();
             let bracketed = state
                 .latest
                 .as_ref()
                 .is_some_and(|snapshot| snapshot.bracketed_paste);
             state.selection = None;
             state.requested_viewport = 0;
-            vec![state.input_command(&paste_bytes(&paste.text, bracketed))]
+            commands.push(state.input_command(&paste_bytes(&paste.text, bracketed)));
+            commands
         }
         PresentationEvent::PointerMoved(moved) if moved.pane == state.pane => {
             if state
@@ -916,21 +930,45 @@ fn finish_resize_debounce() -> Vec<Command> {
     state.send_resize_if_changed().into_iter().collect()
 }
 
-fn finish_cursor_blink() -> Vec<Command> {
+fn finish_cursor_blink(worker: u64) -> Vec<Command> {
     let Ok(mut guard) = STATE.lock() else {
         return Vec::new();
     };
     let Some(state) = guard.as_mut() else {
         return Vec::new();
     };
-    state.cursor_blink_worker_pending = false;
+    let (redraw, commands) = finish_cursor_blink_for_state(state, worker);
+    if redraw {
+        let _ignored = brood_plugin_sdk::graphics::request_render();
+    }
+    commands
+}
+
+fn finish_cursor_blink_for_state(state: &mut UiState, worker: u64) -> (bool, Vec<Command>) {
+    if state.cursor_blink_worker != Some(worker) {
+        return (false, Vec::new());
+    }
+    state.cursor_blink_worker = None;
     if !state.focused {
+        let redraw = !state.cursor_blink_on;
         state.cursor_blink_on = true;
-        return Vec::new();
+        return (redraw, Vec::new());
     }
     state.cursor_blink_on = !state.cursor_blink_on;
-    let _ignored = brood_plugin_sdk::graphics::request_render();
-    state.schedule_cursor_blink().into_iter().collect()
+    (true, state.schedule_cursor_blink().into_iter().collect())
+}
+
+fn cancel_cursor_blink_finished(worker: u64) -> Vec<Command> {
+    let Ok(mut guard) = STATE.lock() else {
+        return Vec::new();
+    };
+    let Some(state) = guard.as_mut() else {
+        return Vec::new();
+    };
+    if state.cursor_blink_worker == Some(worker) {
+        state.cursor_blink_worker = None;
+    }
+    Vec::new()
 }
 
 fn set_clipboard_command(text: String) -> Option<Command> {
@@ -1364,8 +1402,8 @@ fn render_latest_snapshot(resize_epoch: Option<u64>) -> Result<Vec<u8>, String> 
                 });
             }
         }
-        if let Some((selection_start, selection_end)) = selection
-            .and_then(|selection| selection_columns(selection, row as u16, snapshot.cols))
+        if let Some((selection_start, selection_end)) =
+            selection.and_then(|selection| selection_columns(selection, row as u16, snapshot.cols))
             && selection_start < selection_end
         {
             packet.push(DrawCommand::FillRect {
@@ -1786,8 +1824,9 @@ mod tests {
     use super::{
         Command, DEFAULT_BG, FOCUS_MESSAGE, MAX_PRESENTATION_BATCH_COMMANDS, SNAPSHOT_FULL,
         SNAPSHOT_MAGIC, SNAPSHOT_VERSION, STATE, UiState, decode_chunk,
-        focus_commands_for_mailbox, paste_bytes, row_cells, terminal_focuses_on_create,
-        terminal_ready_commands, terminal_session_actor, terminal_text_clusters,
+        finish_cursor_blink_for_state, focus_commands_for_mailbox, paste_bytes, row_cells,
+        terminal_focuses_on_create, terminal_ready_commands, terminal_session_actor,
+        terminal_text_clusters,
     };
     use brood_graphics::theme::ashen;
 
@@ -1955,10 +1994,43 @@ mod tests {
         let mut state = UiState::new(2, 7, "terminal-ui-b2-s7");
         assert!(state.schedule_cursor_blink().is_none());
         state.focused = true;
-        assert!(matches!(state.schedule_cursor_blink(), Some(Command::SpawnWorker(_))));
+        assert!(matches!(
+            state.schedule_cursor_blink(),
+            Some(Command::SpawnWorker(_))
+        ));
         assert!(state.schedule_cursor_blink().is_none());
-        state.cursor_blink_worker_pending = false;
+        state.cursor_blink_worker = None;
         state.focused = false;
         assert!(state.schedule_cursor_blink().is_none());
+    }
+
+    #[test]
+    fn cursor_input_restarts_the_blink_deadline_and_ignores_the_stale_timer() {
+        let mut state = UiState::new(2, 7, "terminal-ui-b2-s7");
+        state.focused = true;
+        let Some(Command::SpawnWorker(first)) = state.schedule_cursor_blink() else {
+            panic!("focused cursor did not schedule its first blink deadline");
+        };
+        state.cursor_blink_on = true;
+
+        let commands = state.restart_cursor_blink();
+        assert!(
+            matches!(commands.first(), Some(Command::CancelWorker(worker)) if *worker == first.worker)
+        );
+        let Some(Command::SpawnWorker(second)) = commands.get(1) else {
+            panic!("cursor input did not schedule a fresh blink deadline");
+        };
+        assert_ne!(second.worker, first.worker);
+
+        let (stale_redraw, stale_commands) =
+            finish_cursor_blink_for_state(&mut state, first.worker);
+        assert!(!stale_redraw);
+        assert!(stale_commands.is_empty());
+        assert!(state.cursor_blink_on);
+        assert_eq!(state.cursor_blink_worker, Some(second.worker));
+        let (redraw, commands) = finish_cursor_blink_for_state(&mut state, second.worker);
+        assert!(redraw);
+        assert!(matches!(commands.as_slice(), [Command::SpawnWorker(_)]));
+        assert!(!state.cursor_blink_on);
     }
 }
