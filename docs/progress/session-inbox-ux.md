@@ -51,7 +51,10 @@ separate transaction paths.
 Repeated backend-picker requests now cancel an already-created picker before
 opening its replacement. Picker selections are also admitted only when their
 picker ID matches the current backend-picker intent, so a late selection from
-the cancelled surface cannot create or activate a session.
+the cancelled surface cannot create or activate a session. Recently cancelled
+and completed backend-picker identities remain in a bounded retirement queue,
+covering a stale selection that arrives after the replacement itself has
+already completed and cleared its request token.
 
 The focused Nix-backed session-switcher suite now passes 35 tests, including
 regressions for a keyboard toggle during a synchronized transition and for a

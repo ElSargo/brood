@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::Mutex,
 };
 
@@ -65,6 +65,7 @@ const DIVIDER_EVENT_MASK: u32 = 0b1111;
 const STATUS_BAR_HEIGHT: f64 = 34.0;
 const MAX_PENDING_LAYOUT_REQUESTS: usize = 64;
 const MAX_NATIVE_RESIZE_RETRIES: u8 = 2;
+const MAX_RETIRED_BACKEND_PICKERS: usize = 64;
 
 const BG: Color = ashen::BACKGROUND;
 const SURFACE: Color = ashen::SURFACE;
@@ -154,6 +155,7 @@ struct SwitcherState {
     awaiting_backend_catalogue: bool,
     backend_picker: Option<u64>,
     backend_picker_request: Option<String>,
+    retired_backend_pickers: VecDeque<u64>,
     next_picker_intent: u64,
     status: String,
     error: bool,
@@ -609,6 +611,7 @@ impl SwitcherState {
             awaiting_backend_catalogue: false,
             backend_picker: None,
             backend_picker_request: None,
+            retired_backend_pickers: VecDeque::new(),
             next_picker_intent: 0,
             status: String::new(),
             error: false,
@@ -2524,6 +2527,7 @@ fn handle_picker_message(bytes: &[u8]) -> Vec<ActorCommand> {
                 .is_some_and(|request| request.starts_with(BACKEND_PICKER_REQUEST_PREFIX))
             {
                 if !backend_picker_reply_is_current(&state, message.request.as_deref()) {
+                    retire_backend_picker(&mut state, message.picker);
                     return vec![cancel_picker(message.picker)];
                 }
                 state.backend_picker = Some(message.picker);
@@ -2566,6 +2570,7 @@ fn handle_picker_message(bytes: &[u8]) -> Vec<ActorCommand> {
                 && let Ok(mut state) = STATE.lock()
                 && state.backend_picker == Some(message.picker)
             {
+                retire_backend_picker(&mut state, message.picker);
                 state.backend_picker = None;
                 state.backend_picker_request = None;
                 state.awaiting_backend_catalogue = false;
@@ -2578,6 +2583,16 @@ fn handle_picker_message(bytes: &[u8]) -> Vec<ActorCommand> {
 
 fn backend_picker_reply_is_current(state: &SwitcherState, request: Option<&str>) -> bool {
     request.is_some_and(|request| state.backend_picker_request.as_deref() == Some(request))
+}
+
+fn retire_backend_picker(state: &mut SwitcherState, picker: u64) {
+    if picker == 0 || state.retired_backend_pickers.contains(&picker) {
+        return;
+    }
+    if state.retired_backend_pickers.len() == MAX_RETIRED_BACKEND_PICKERS {
+        state.retired_backend_pickers.pop_front();
+    }
+    state.retired_backend_pickers.push_back(picker);
 }
 
 fn handle_picker_layout_message(bytes: &[u8]) -> Vec<ActorCommand> {
@@ -2663,12 +2678,16 @@ fn apply_picker_selection(
     state: &mut SwitcherState,
     message: PickerSelection,
 ) -> Vec<ActorCommand> {
+    if state.retired_backend_pickers.contains(&message.picker) {
+        return Vec::new();
+    }
     if state.backend_picker_request.is_some() && state.backend_picker != Some(message.picker) {
         // Backend-picker intents are replaceable. A selection from the picker
         // replaced by a newer intent must not create or activate a session.
         return Vec::new();
     }
     if state.backend_picker == Some(message.picker) {
+        retire_backend_picker(state, message.picker);
         state.backend_picker = None;
         state.backend_picker_request = None;
         state.awaiting_backend_catalogue = false;
@@ -2975,6 +2994,9 @@ fn request_creation_backend_picker(state: &mut SwitcherState) -> Vec<ActorComman
     );
     state.awaiting_backend_catalogue = true;
     let replaced_picker = state.backend_picker.take();
+    if let Some(replaced_picker) = replaced_picker {
+        retire_backend_picker(state, replaced_picker);
+    }
     state.backend_picker_request = Some(request.clone());
     state.status = "Discovering backends…".to_string();
     redraw_or_record_error(state);
@@ -6233,6 +6255,41 @@ mod tests {
             Some("backend-discovery-2")
         );
         assert!(state.awaiting_backend_catalogue);
+
+        // Even after the replacement completes and clears its request token,
+        // a selection already queued by the cancelled picker stays retired.
+        state.backend_picker = Some(42);
+        let replacement_selection =
+            serde_json::from_value::<super::PickerSelection>(serde_json::json!({
+                "type": "picker-selected",
+                "picker": 42,
+                "result": {
+                    "label": "Local",
+                    "detail": "Create a local backend",
+                    "value": {"action": "create-local"}
+                }
+            }))
+            .expect("replacement picker selection");
+        assert_eq!(
+            apply_picker_selection(&mut state, replacement_selection).len(),
+            1
+        );
+        assert!(state.backend_picker_request.is_none());
+        assert!(!state.awaiting_backend_catalogue);
+
+        let late_retired_selection =
+            serde_json::from_value::<super::PickerSelection>(serde_json::json!({
+                "type": "picker-selected",
+                "picker": 41,
+                "result": {
+                    "label": "SSH",
+                    "detail": "Connect to a remote host",
+                    "value": {"action": "create-remote"}
+                }
+            }))
+            .expect("late retired picker selection");
+        assert!(apply_picker_selection(&mut state, late_retired_selection).is_empty());
+        assert!(state.mode == EditMode::Search);
     }
 
     #[test]
