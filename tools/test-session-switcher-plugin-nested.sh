@@ -21,6 +21,13 @@ for tool in cargo cc foot git grim magick pkg-config python3 sway wayland-scanne
   fi
 done
 
+# Terminal actor protocol diagnostics can contain NUL bytes. Keep every log
+# assertion in text mode so ripgrep returns the matching record rather than
+# the placeholder "binary file matches", which is not usable by counters.
+rg() {
+  command rg --text "$@"
+}
+
 OUT="${BROOD_SESSION_SWITCHER_OUT:-$(mktemp -d /tmp/brood-session-switcher.XXXXXX)}"
 PACKAGE="$OUT/package"
 RUNTIME_DIR="$OUT/runtime"
@@ -180,6 +187,14 @@ cargo run --quiet -p brood-wasm --example componentize -- \
   plugins/coding-agent/target/wasm32-unknown-unknown/release/brood_coding_agent_plugin.wasm \
   "$PACKAGE/brood_coding_agent_plugin.component.wasm"
 cargo build \
+  --manifest-path plugins/terminal-ui/Cargo.toml \
+  --target wasm32-unknown-unknown \
+  --release \
+  --locked
+cargo run --quiet -p brood-wasm --example componentize -- \
+  plugins/terminal-ui/target/wasm32-unknown-unknown/release/brood_terminal_ui_plugin.wasm \
+  "$PACKAGE/brood_terminal_ui_plugin.component.wasm"
+cargo build \
   --manifest-path plugins/diff-viewer/Cargo.toml \
   --target wasm32-unknown-unknown \
   --release \
@@ -312,7 +327,7 @@ env -u brood_session -u BROOD_SURFACE_SESSION_ID -u BROOD_PANE_ID \
 CLIENT_PID=$!
 
 for _ in $(seq 1 200); do
-  if rg -q "accepted plugin draw packet" "$CLIENT_LOG" \
+  if rg -q "compiled plugin GPU scene" "$CLIENT_LOG" \
     && rg -q "granted claimed root layout lease actor=session-switcher" "$CLIENT_LOG" \
     && rg -q "loaded presentation key policy provider=workspace" "$CLIENT_LOG"; then
     break
@@ -323,7 +338,7 @@ for _ in $(seq 1 200); do
   }
   sleep 0.1
 done
-rg -q "accepted plugin draw packet" "$CLIENT_LOG"
+rg -q "compiled plugin GPU scene" "$CLIENT_LOG"
 rg -q "granted claimed root layout lease actor=session-switcher" "$CLIENT_LOG"
 rg -q "loaded presentation key policy provider=workspace" "$CLIENT_LOG"
 
@@ -381,11 +396,11 @@ PY
       "$CLIENT_LOG" | tail -1
   )"
   [[ -n "$SWITCHER_PANE" && -n "$STATUS_PANE" && -n "$INBOX_PANE" ]]
-  rg -q "sent plugin pane resize pane=$STATUS_PANE logical_size=1280x34 " "$CLIENT_LOG"
-  rg -q "accepted plugin draw packet pane=$STATUS_PANE .* gpu_target=1280x34 " "$CLIENT_LOG"
-  rg -q "sent plugin pane resize pane=$SWITCHER_PANE logical_size=320x686 " "$CLIENT_LOG"
+  rg -q "accepted leased actor layout .* pane_rects=.*${STATUS_PANE}:0:686:1280:34" "$CLIENT_LOG"
+  rg -q "render scheduling actor-frame promoted actor=status-bar .* panes=\[$STATUS_PANE\]" "$CLIENT_LOG"
+  rg -q "accepted leased actor layout .* pane_rects=.*${SWITCHER_PANE}:960:0:320:686" "$CLIENT_LOG"
   rg -q 'accepted leased actor layout items=2 panes=2 ' "$CLIENT_LOG"
-  if rg -q "sent plugin pane resize pane=$INBOX_PANE logical_size=(320|480|640)x686 " "$CLIENT_LOG"; then
+  if rg -q "accepted leased actor layout .* pane_rects=.*${INBOX_PANE}:[0-9]+:0:(320|480|640):686" "$CLIENT_LOG"; then
     echo "ERR hidden inbox pane received a visible-width resize" >&2
     exit 1
   fi
@@ -611,28 +626,32 @@ STATUS_PANE="$(
   sed -n 's/.*started presentation WASM actor id=status-bar .* pane=\([0-9][0-9]*\) .*/\1/p' \
     "$CLIENT_LOG" | tail -1
 )"
+SWITCHER_PANE="$(
+  sed -n 's/.*started presentation WASM actor id=session-switcher .* pane=\([0-9][0-9]*\) .*/\1/p' \
+    "$CLIENT_LOG" | tail -1
+)"
 OUTPUT_WIDTH="${OUTPUT_MODE%x*}"
-[[ -n "$STATUS_PANE" ]]
+[[ -n "$STATUS_PANE" && -n "$SWITCHER_PANE" ]]
 for _ in $(seq 1 100); do
-  if rg -q "sent plugin pane resize pane=$STATUS_PANE logical_size=${OUTPUT_WIDTH}x34 " "$CLIENT_LOG" \
-    && rg -q "accepted plugin draw packet pane=$STATUS_PANE .* gpu_target=${OUTPUT_WIDTH}x34 " "$CLIENT_LOG"; then
+  if rg -q "accepted synchronized layout actor=session-switcher .* target_rects=.*${STATUS_PANE}:[0-9]+:${SIDEBAR_HEIGHT}:${OUTPUT_WIDTH}:34" "$CLIENT_LOG" \
+    && rg -q "render scheduling actor-frame promoted actor=status-bar .* panes=\[$STATUS_PANE\]" "$CLIENT_LOG"; then
     break
   fi
   sleep 0.05
 done
-rg -q "sent plugin pane resize pane=$STATUS_PANE logical_size=${OUTPUT_WIDTH}x34 " "$CLIENT_LOG"
-rg -q "accepted plugin draw packet pane=$STATUS_PANE .* gpu_target=${OUTPUT_WIDTH}x34 " "$CLIENT_LOG"
+rg -q "accepted synchronized layout actor=session-switcher .* target_rects=.*${STATUS_PANE}:[0-9]+:${SIDEBAR_HEIGHT}:${OUTPUT_WIDTH}:34" "$CLIENT_LOG"
+rg -q "render scheduling actor-frame promoted actor=status-bar .* panes=\[$STATUS_PANE\]" "$CLIENT_LOG"
 
 if [[ "$OUTPUT_MODE" == "1280x720" ]]; then
   for _ in $(seq 1 100); do
-    if rg -q "sent plugin pane resize .* logical_size=320x${SIDEBAR_HEIGHT}" "$CLIENT_LOG" \
-      && rg -q "accepted plugin draw packet .* gpu_target=320x${SIDEBAR_HEIGHT}" "$CLIENT_LOG"; then
+    if rg -q "accepted synchronized layout actor=session-switcher .* target_rects=.*${SWITCHER_PANE}:[0-9]+:0:320:${SIDEBAR_HEIGHT}" "$CLIENT_LOG" \
+      && rg -q "render scheduling actor-frame promoted actor=session-switcher .* panes=\[$SWITCHER_PANE\]" "$CLIENT_LOG"; then
       break
     fi
     sleep 0.05
   done
-  rg -q "sent plugin pane resize .* logical_size=320x${SIDEBAR_HEIGHT}" "$CLIENT_LOG"
-  rg -q "accepted plugin draw packet .* gpu_target=320x${SIDEBAR_HEIGHT}" "$CLIENT_LOG"
+  rg -q "accepted synchronized layout actor=session-switcher .* target_rects=.*${SWITCHER_PANE}:[0-9]+:0:320:${SIDEBAR_HEIGHT}" "$CLIENT_LOG"
+  rg -q "render scheduling actor-frame promoted actor=session-switcher .* panes=\[$SWITCHER_PANE\]" "$CLIENT_LOG"
 fi
 
 capture() {
@@ -644,7 +663,7 @@ capture() {
 }
 
 accepted_layout_count() {
-  rg -c "accepted leased actor layout" "$CLIENT_LOG" || true
+  rg -c "accepted (leased actor layout|synchronized layout actor=)" "$CLIENT_LOG" || true
 }
 
 send_toggle() {
@@ -727,32 +746,32 @@ rg -q "started presentation WASM actor id=keybindings" "$CLIENT_LOG"
 rg -q "sent key-policy actor message actor=keybindings" "$CLIENT_LOG"
 rg -q 'sender=keybindings recipient=picker body=.*"type":"picker-create"' "$CLIENT_LOG"
 ((KEYBINDINGS_LAYOUT_OPEN > KEYBINDINGS_LAYOUT_BEFORE))
-KEYBINDINGS_PANE="$(
-  sed -n 's/.*started presentation WASM actor id=keybindings .* pane=\([0-9][0-9]*\) .*/\1/p' \
+PICKER_PANE="$(
+  sed -n 's/.*started presentation WASM actor id=picker .* pane=\([0-9][0-9]*\) .*/\1/p' \
     "$CLIENT_LOG" \
     | tail -1
 )"
-[[ -n "$KEYBINDINGS_PANE" ]]
+[[ -n "$PICKER_PANE" ]]
 for _ in $(seq 1 100); do
-  KEYBINDINGS_RESIZE_LINE="$(
-    rg -n "sent plugin pane resize pane=${KEYBINDINGS_PANE} " "$CLIENT_LOG" \
+  KEYBINDINGS_LAYOUT_LINE="$(
+    rg -n "accepted synchronized layout actor=session-switcher .* target_rects=.*${PICKER_PANE}:" "$CLIENT_LOG" \
       | tail -1 \
       | cut -d: -f1 \
       || true
   )"
-  KEYBINDINGS_REDRAW_LINE="$(
-    rg -n "accepted plugin draw packet pane=${KEYBINDINGS_PANE} " "$CLIENT_LOG" \
+  KEYBINDINGS_PICKER_FRAME_LINE="$(
+    rg -n "render scheduling actor-frame promoted actor=picker .* panes=\[${PICKER_PANE}\]" "$CLIENT_LOG" \
       | tail -1 \
       | cut -d: -f1 \
       || true
   )"
-  if [[ -n "$KEYBINDINGS_RESIZE_LINE" && -n "$KEYBINDINGS_REDRAW_LINE" ]] \
-    && ((KEYBINDINGS_REDRAW_LINE > KEYBINDINGS_RESIZE_LINE)); then
+  if [[ -n "$KEYBINDINGS_LAYOUT_LINE" && -n "$KEYBINDINGS_PICKER_FRAME_LINE" ]] \
+    && ((KEYBINDINGS_PICKER_FRAME_LINE > KEYBINDINGS_LAYOUT_LINE)); then
     break
   fi
   sleep 0.05
 done
-((KEYBINDINGS_REDRAW_LINE > KEYBINDINGS_RESIZE_LINE))
+((KEYBINDINGS_PICKER_FRAME_LINE > KEYBINDINGS_LAYOUT_LINE))
 capture "$OUT/keybindings-visible.png"
 
 env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
@@ -905,7 +924,7 @@ if pressed < 0.005:
 print(f"new_button_hover_rmse={hover:.6f}")
 print(f"new_button_pressed_rmse={pressed:.6f}")
 PY
-  if rg -q "sent plugin pane resize .* logical_size=720x[0-9]+" "$CLIENT_LOG"; then
+  if (( $(accepted_layout_count) > KEYBINDINGS_LAYOUT_CLOSED + 2 )); then
     echo "ERR releasing away from New unexpectedly opened the picker" >&2
     exit 1
   fi
@@ -952,14 +971,14 @@ for _ in $(seq 1 100); do
   accepted_picker="$(accepted_layout_count)"
   if rg -q "started presentation WASM actor id=picker" "$CLIENT_LOG" \
     && ((accepted_picker > accepted_before)) \
-    && rg -q "sent plugin pane resize .* logical_size=720x[0-9]+" "$CLIENT_LOG"; then
+    && rg -q "accepted synchronized layout actor=session-switcher .* target_rects=.*:720:[0-9]+" "$CLIENT_LOG"; then
     break
   fi
   sleep 0.05
 done
 rg -q "started presentation WASM actor id=picker" "$CLIENT_LOG"
 ((accepted_picker > accepted_before))
-rg -q "sent plugin pane resize .* logical_size=720x[0-9]+" "$CLIENT_LOG"
+rg -q "accepted synchronized layout actor=session-switcher .* target_rects=.*:720:[0-9]+" "$CLIENT_LOG"
 capture "$OUT/picker-visible.png"
 PICKER_BOTTOM_LEFT="$(
   magick "$OUT/picker-visible.png" -format '%[pixel:p{280,599}]' info:
@@ -1084,11 +1103,11 @@ rg -q "total_windows=2" <<< "$(ctl status)"
 ((CATALOG_TWO_AFTER > CATALOG_TWO_BEFORE))
 ((LAYOUT_TWO_AFTER > LAYOUT_TWO_BEFORE))
 
-DIFF_PACKETS_BEFORE="$(rg -c "accepted plugin draw packet" "$CLIENT_LOG")"
+DIFF_PACKETS_BEFORE="$(rg -c "compiled plugin GPU scene" "$CLIENT_LOG")"
 DIFF_ACTOR="diff-viewer-sb1-s3"
 send_diff_toggle
 for _ in $(seq 1 200); do
-  DIFF_PACKETS_AFTER="$(rg -c "accepted plugin draw packet" "$CLIENT_LOG")"
+  DIFF_PACKETS_AFTER="$(rg -c "compiled plugin GPU scene" "$CLIENT_LOG")"
   if rg -q "started presentation WASM actor id=$DIFF_ACTOR" "$CLIENT_LOG" \
     && rg -q "sent key-policy actor message actor=brood.client-init" "$CLIENT_LOG" \
     && ((DIFF_PACKETS_AFTER > DIFF_PACKETS_BEFORE)) \
@@ -1108,14 +1127,14 @@ DIFF_PANE="$(
 [[ -n "$DIFF_PANE" ]]
 INITIAL_DIFF_SEQUENCE="$(
   sed -n "/started presentation WASM actor id=$DIFF_ACTOR/,\$p" "$CLIENT_LOG" \
-    | sed -n 's/.*accepted plugin draw packet pane='"$DIFF_PANE"' sequence=\([0-9][0-9]*\).*/\1/p' \
+    | sed -n 's/.*compiled plugin GPU scene pane='"$DIFF_PANE"' sequence=\([0-9][0-9]*\).*/\1/p' \
     | head -1
 )"
 [[ -n "$INITIAL_DIFF_SEQUENCE" ]]
 for _ in $(seq 1 400); do
   POPULATED_DIFF_SEQUENCE="$(
     sed -n "/presentation actor worker finished actor=$DIFF_ACTOR/,\$p" "$CLIENT_LOG" \
-      | sed -n 's/.*accepted plugin draw packet pane='"$DIFF_PANE"' sequence=\([0-9][0-9]*\) commands=\([2-9][0-9]\|[1-9][0-9][0-9][0-9]*\).*/\1/p' \
+      | sed -n 's/.*compiled plugin GPU scene pane='"$DIFF_PANE"' sequence=\([0-9][0-9]*\) commands=\([2-9][0-9]\|[1-9][0-9][0-9][0-9]*\).*/\1/p' \
       | tail -1
   )"
   if [[ -n "$POPULATED_DIFF_SEQUENCE" ]] \
@@ -1129,7 +1148,7 @@ capture "$OUT/diff-open.png"
 
 read -r DIFF_WIDTH DIFF_HEIGHT < <(
   sed -n "/started presentation WASM actor id=$DIFF_ACTOR/,\$p" "$CLIENT_LOG" \
-    | sed -n 's/.*sent plugin pane resize pane='"$DIFF_PANE"' logical_size=\([0-9][0-9]*\)x\([0-9][0-9]*\).*/\1 \2/p' \
+    | sed -n 's/.*target_rects=.*'"$DIFF_PANE"':[0-9][0-9]*:[0-9][0-9]*:\([0-9][0-9]*\):\([0-9][0-9]*\).*/\1 \2/p' \
     | tail -1
 )
 [[ -n "$DIFF_WIDTH" && -n "$DIFF_HEIGHT" ]]
@@ -1138,7 +1157,7 @@ read -r DIFF_WIDTH DIFF_HEIGHT < <(
 
 DRAG_LOG_LINE="$(wc -l < "$CLIENT_LOG")"
 DRAG_PACKETS_BEFORE="$(
-  rg -c "accepted plugin draw packet pane=${DIFF_PANE} " "$CLIENT_LOG"
+  rg -c "compiled plugin GPU scene pane=${DIFF_PANE} " "$CLIENT_LOG"
 )"
 DRAG_X=$((DIFF_WIDTH - 8))
 DRAG_START_Y=70
@@ -1146,7 +1165,7 @@ DRAG_END_Y=$((DIFF_HEIGHT * 2 / 3))
 send_pointer drag "$DRAG_X" "$DRAG_START_Y" "$DRAG_X" "$DRAG_END_Y" 12 1280 720
 for _ in $(seq 1 100); do
   DRAG_PACKETS_AFTER="$(
-    rg -c "accepted plugin draw packet pane=${DIFF_PANE} " "$CLIENT_LOG"
+    rg -c "compiled plugin GPU scene pane=${DIFF_PANE} " "$CLIENT_LOG"
   )"
   ((DRAG_PACKETS_AFTER >= DRAG_PACKETS_BEFORE + 3)) && break
   sleep 0.05
@@ -1162,7 +1181,7 @@ capture "$OUT/diff-dragged.png"
 
 TRACKPAD_LOG_LINE="$(wc -l < "$CLIENT_LOG")"
 TRACKPAD_PACKETS_BEFORE="$(
-  rg -c "accepted plugin draw packet pane=${DIFF_PANE} " "$CLIENT_LOG"
+  rg -c "compiled plugin GPU scene pane=${DIFF_PANE} " "$CLIENT_LOG"
 )"
 TRACKPAD_STARTED_MS="$(date +%s%3N)"
 send_pointer scroll 220 220 0.5 40 1280 720
@@ -1170,7 +1189,7 @@ stable_samples=0
 previous_packets="$TRACKPAD_PACKETS_BEFORE"
 for _ in $(seq 1 200); do
   TRACKPAD_PACKETS_AFTER="$(
-    rg -c "accepted plugin draw packet pane=${DIFF_PANE} " "$CLIENT_LOG"
+    rg -c "compiled plugin GPU scene pane=${DIFF_PANE} " "$CLIENT_LOG"
   )"
   if ((TRACKPAD_PACKETS_AFTER > TRACKPAD_PACKETS_BEFORE)) \
     && ((TRACKPAD_PACKETS_AFTER == previous_packets)); then
@@ -1305,13 +1324,13 @@ WORKTREE_DIFF_ACTOR="diff-viewer-sb1-s${WORKTREE_SESSION_ID}"
 WORKTREE_DIFF_STARTS_BEFORE="$(
   rg -c "started presentation WASM actor id=$WORKTREE_DIFF_ACTOR" "$CLIENT_LOG" || true
 )"
-WORKTREE_DIFF_PACKETS_BEFORE="$(rg -c "accepted plugin draw packet" "$CLIENT_LOG")"
+WORKTREE_DIFF_PACKETS_BEFORE="$(rg -c "compiled plugin GPU scene" "$CLIENT_LOG")"
 send_diff_toggle
 for _ in $(seq 1 200); do
   WORKTREE_DIFF_STARTS_AFTER="$(
     rg -c "started presentation WASM actor id=$WORKTREE_DIFF_ACTOR" "$CLIENT_LOG" || true
   )"
-  WORKTREE_DIFF_PACKETS_AFTER="$(rg -c "accepted plugin draw packet" "$CLIENT_LOG")"
+  WORKTREE_DIFF_PACKETS_AFTER="$(rg -c "compiled plugin GPU scene" "$CLIENT_LOG")"
   if ((WORKTREE_DIFF_STARTS_AFTER > WORKTREE_DIFF_STARTS_BEFORE)) \
     && ((WORKTREE_DIFF_PACKETS_AFTER > WORKTREE_DIFF_PACKETS_BEFORE)); then
     break
