@@ -8,6 +8,11 @@ use serde::{Deserialize, Serialize};
 
 /// Maximum encoded bootstrap request or response size.
 pub const LOCAL_CONTROL_MAX_BYTES: usize = 64 * 1024;
+/// Payload bytes carried by one chunk of a large control-command response.
+///
+/// This leaves bounded headroom for postcard's response envelope while keeping
+/// the underlying packet transport at its deliberately small 64-KiB limit.
+pub const LOCAL_CONTROL_CHUNK_BYTES: usize = 48 * 1024;
 /// Maximum descriptors in one bootstrap response.
 pub const LOCAL_CONTROL_MAX_FDS: usize = 16;
 
@@ -67,7 +72,33 @@ pub enum LocalControlValue {
     },
     Bool(bool),
     Control(String),
+    ControlChunk {
+        bytes: Vec<u8>,
+        complete: bool,
+    },
     RealmArtifactRequests(Vec<(u64, String)>),
+}
+
+/// Split a control result without discarding any output bytes.
+#[must_use]
+pub fn local_control_responses(output: String) -> Vec<LocalControlResponse> {
+    if output.len() <= LOCAL_CONTROL_CHUNK_BYTES {
+        return vec![LocalControlResponse {
+            result: Ok(LocalControlValue::Control(output)),
+        }];
+    }
+    let bytes = output.into_bytes();
+    let chunk_count = bytes.len().div_ceil(LOCAL_CONTROL_CHUNK_BYTES);
+    bytes
+        .chunks(LOCAL_CONTROL_CHUNK_BYTES)
+        .enumerate()
+        .map(|(index, chunk)| LocalControlResponse {
+            result: Ok(LocalControlValue::ControlChunk {
+                bytes: chunk.to_vec(),
+                complete: index + 1 == chunk_count,
+            }),
+        })
+        .collect()
 }
 
 /// Metadata accompanying one DMA-BUF plane descriptor.
@@ -83,4 +114,27 @@ pub struct LocalDmabufResource {
     pub stride: u32,
     pub offset: u32,
     pub y_inverted: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn large_control_responses_are_bounded_and_lossless() {
+        let output = "observation 🖥️\n".repeat(20_000);
+        let responses = local_control_responses(output.clone());
+        assert!(responses.len() > 1);
+
+        let mut reconstructed = Vec::new();
+        for (index, response) in responses.iter().enumerate() {
+            assert!(postcard::to_stdvec(response).unwrap().len() <= LOCAL_CONTROL_MAX_BYTES);
+            let Ok(LocalControlValue::ControlChunk { bytes, complete }) = &response.result else {
+                panic!("large response was not chunked");
+            };
+            reconstructed.extend_from_slice(bytes);
+            assert_eq!(*complete, index + 1 == responses.len());
+        }
+        assert_eq!(String::from_utf8(reconstructed).unwrap(), output);
+    }
 }

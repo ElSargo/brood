@@ -704,10 +704,41 @@ fn local_request(
         let result = (|| {
             transport.send(&request, &[])?;
             let response = transport.receive::<brood_ipc::LocalControlResponse>()?;
-            let message = response.message.result.map_err(anyhow::Error::msg)?;
+            let mut descriptors = response.descriptors;
+            let mut message = response.message.result.map_err(anyhow::Error::msg)?;
+            if let brood_ipc::LocalControlValue::ControlChunk { bytes, complete } = message {
+                ensure!(
+                    descriptors.is_empty(),
+                    "chunked control response included descriptors"
+                );
+                let mut output = bytes;
+                let mut complete = complete;
+                while !complete {
+                    let response = transport.receive::<brood_ipc::LocalControlResponse>()?;
+                    ensure!(
+                        response.descriptors.is_empty(),
+                        "chunked control response included descriptors"
+                    );
+                    match response.message.result.map_err(anyhow::Error::msg)? {
+                        brood_ipc::LocalControlValue::ControlChunk {
+                            bytes,
+                            complete: chunk_complete,
+                        } => {
+                            output.extend_from_slice(&bytes);
+                            complete = chunk_complete;
+                        }
+                        _ => bail!("private IPC interrupted a chunked control response"),
+                    }
+                }
+                message = brood_ipc::LocalControlValue::Control(
+                    String::from_utf8(output)
+                        .context("decode chunked private IPC control output")?,
+                );
+                descriptors = Vec::new();
+            }
             Ok(brood_ipc::ReceivedPacket {
                 message,
-                descriptors: response.descriptors,
+                descriptors,
             })
         })();
         if result.is_err() {

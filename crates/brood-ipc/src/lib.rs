@@ -26,8 +26,8 @@ pub use brood_protocol::{
     FrameColorSpace, FramePixelFormat, UnsupportedFrameColorSpace, UnsupportedFramePixelFormat,
 };
 pub use local_control::{
-    LOCAL_CONTROL_MAX_BYTES, LOCAL_CONTROL_MAX_FDS, LocalControlRequest, LocalControlResponse,
-    LocalControlValue, LocalDmabufResource,
+    LOCAL_CONTROL_CHUNK_BYTES, LOCAL_CONTROL_MAX_BYTES, LOCAL_CONTROL_MAX_FDS, LocalControlRequest,
+    LocalControlResponse, LocalControlValue, LocalDmabufResource, local_control_responses,
 };
 pub use local_protocol::{
     LocalProtocolError, LocalWindowFrame, decode_client_record,

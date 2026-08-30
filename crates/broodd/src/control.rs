@@ -1351,12 +1351,17 @@ fn serve_local_control_connection(
                     .iter()
                     .map(AsFd::as_fd)
                     .collect::<Vec<_>>();
-                connection.send(
-                    &brood_ipc::LocalControlResponse {
-                        result: Ok(reply.value),
-                    },
-                    &descriptors,
-                )?;
+                match reply.value {
+                    brood_ipc::LocalControlValue::Control(output) if descriptors.is_empty() => {
+                        for response in brood_ipc::local_control_responses(output) {
+                            connection.send(&response, &[])?;
+                        }
+                    }
+                    value => connection.send(
+                        &brood_ipc::LocalControlResponse { result: Ok(value) },
+                        &descriptors,
+                    )?,
+                }
             }
             Err(error) => {
                 connection.send(&brood_ipc::LocalControlResponse { result: Err(error) }, &[])?;
