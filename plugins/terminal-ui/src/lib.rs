@@ -144,7 +144,10 @@ impl UiState {
             last_sent_grid_size: None,
             next_input_sequence: 0,
             pending_resize_epoch: None,
-            focused: true,
+            // Focus authority arrives through PaneFocused. Assuming focus here
+            // makes every background terminal schedule blink renders during
+            // startup, before the compositor has selected a pane.
+            focused: false,
             cursor_blink_on: true,
             cursor_blink_worker_pending: false,
         }
@@ -1950,6 +1953,8 @@ mod tests {
     #[test]
     fn cursor_blink_worker_is_single_flight_and_stops_while_unfocused() {
         let mut state = UiState::new(2, 7, "terminal-ui-b2-s7");
+        assert!(state.schedule_cursor_blink().is_none());
+        state.focused = true;
         assert!(matches!(state.schedule_cursor_blink(), Some(Command::SpawnWorker(_))));
         assert!(state.schedule_cursor_blink().is_none());
         state.cursor_blink_worker_pending = false;
