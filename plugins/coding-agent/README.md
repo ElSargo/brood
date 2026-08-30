@@ -18,7 +18,9 @@ The UI supports:
 
 - a multiline prompt editor with a visible insertion cursor, Unicode-safe
   navigation and deletion, `Home`/`End`, selection with `Shift` or `Ctrl+A`,
-  paste, and `Shift+Enter` for a newline;
+  paste, `Shift+Enter` for a newline, and bounded submitted-prompt history;
+- `Up`/`Down` preserve normal multiline movement, then recall older prompts at
+  the first line and restore the exact unsent draft after the newest entry;
 - wheel, touchpad, keyboard, and draggable-scrollbar transcript navigation,
   with tail following that pauses while reading earlier output;
 - `Ctrl+F` conversation search with highlighted results and

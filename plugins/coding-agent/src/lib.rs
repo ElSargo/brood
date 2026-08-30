@@ -27,6 +27,7 @@ const WORKER_ID: u64 = 1;
 const UPDATE_NOTIFICATION_TOKEN: u64 = 0x434f_4445_5841_4745;
 const MAX_LOG_LINES: usize = 256;
 const MAX_IMAGES: usize = 4;
+const MAX_PROMPT_HISTORY: usize = 100;
 const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_TOTAL_IMAGE_BYTES: usize = 12 * 1024 * 1024;
 const IMAGE_CHUNK_BYTES: usize = 20 * 1024;
@@ -268,6 +269,9 @@ struct UiState {
     prompt: String,
     prompt_cursor: usize,
     prompt_selection: Option<(usize, usize)>,
+    prompt_history: VecDeque<String>,
+    prompt_history_cursor: Option<usize>,
+    prompt_history_draft: Option<String>,
     pane_focused: bool,
     transcript_scroll: f32,
     transcript_content_height: f32,
@@ -314,6 +318,9 @@ impl UiState {
             prompt: String::new(),
             prompt_cursor: 0,
             prompt_selection: None,
+            prompt_history: VecDeque::new(),
+            prompt_history_cursor: None,
+            prompt_history_draft: None,
             pane_focused: true,
             transcript_scroll: 0.0,
             transcript_content_height: 0.0,
@@ -1464,9 +1471,11 @@ fn handle_ui_key(ui: &mut UiState, key: &str, pressed: bool, modifiers: u32) -> 
                 ui.search_reveal_pending = true;
             }
             "Backspace" => {
-                if !delete_prompt_selection(ui)
-                    && !delete_before_cursor(&mut ui.prompt, &mut ui.prompt_cursor)
-                    && ui.prompt.is_empty()
+                let edited = delete_prompt_selection(ui)
+                    || delete_before_cursor(&mut ui.prompt, &mut ui.prompt_cursor);
+                if edited {
+                    reset_prompt_history_navigation(ui);
+                } else if ui.prompt.is_empty()
                     && let Some(image) = ui.images.pop()
                 {
                     retire_image_preview(ui, image.id);
@@ -1477,8 +1486,10 @@ fn handle_ui_key(ui: &mut UiState, key: &str, pressed: bool, modifiers: u32) -> 
                 ui.search_reveal_pending = true;
             }
             "Delete" => {
-                if !delete_prompt_selection(ui) {
-                    delete_after_cursor(&mut ui.prompt, ui.prompt_cursor);
+                let edited = delete_prompt_selection(ui)
+                    || delete_after_cursor(&mut ui.prompt, ui.prompt_cursor);
+                if edited {
+                    reset_prompt_history_navigation(ui);
                 }
             }
             "ArrowLeft" => move_editor_cursor(ui, false, modifiers & MOD_SHIFT != 0),
@@ -1487,8 +1498,16 @@ fn handle_ui_key(ui: &mut UiState, key: &str, pressed: bool, modifiers: u32) -> 
             "End" if ui.search_active => ui.search_cursor = ui.search_query.len(),
             "Home" => set_prompt_cursor(ui, line_start(&ui.prompt, ui.prompt_cursor), false),
             "End" => set_prompt_cursor(ui, line_end(&ui.prompt, ui.prompt_cursor), false),
-            "ArrowUp" if !ui.search_active => move_prompt_line(ui, false),
-            "ArrowDown" if !ui.search_active => move_prompt_line(ui, true),
+            "ArrowUp" if !ui.search_active => {
+                if !move_prompt_line(ui, false) && modifiers & MOD_SHIFT == 0 {
+                    navigate_prompt_history(ui, false);
+                }
+            }
+            "ArrowDown" if !ui.search_active => {
+                if !move_prompt_line(ui, true) && modifiers & MOD_SHIFT == 0 {
+                    navigate_prompt_history(ui, true);
+                }
+            }
             "PageUp" => {
                 let amount = -ui.transcript_viewport_height * 0.82;
                 scroll_transcript(ui, amount);
@@ -1553,6 +1572,7 @@ fn insert_ui_text(ui: &mut UiState, text: &str) {
         delete_prompt_selection(ui);
         ui.prompt.insert_str(ui.prompt_cursor, &filtered);
         ui.prompt_cursor += filtered.len();
+        reset_prompt_history_navigation(ui);
     }
 }
 
@@ -1647,7 +1667,7 @@ fn line_end(text: &str, cursor: usize) -> usize {
         .map_or(text.len(), |offset| cursor + offset)
 }
 
-fn move_prompt_line(ui: &mut UiState, down: bool) {
+fn move_prompt_line(ui: &mut UiState, down: bool) -> bool {
     let start = line_start(&ui.prompt, ui.prompt_cursor);
     let column = ui.prompt[start..ui.prompt_cursor].chars().count();
     let target_start = if down {
@@ -1659,7 +1679,7 @@ fn move_prompt_line(ui: &mut UiState, down: bool) {
         None
     };
     let Some(target_start) = target_start else {
-        return;
+        return false;
     };
     let target_end = line_end(&ui.prompt, target_start);
     let target = ui.prompt[target_start..target_end]
@@ -1667,6 +1687,56 @@ fn move_prompt_line(ui: &mut UiState, down: bool) {
         .nth(column)
         .map_or(target_end, |(offset, _)| target_start + offset);
     set_prompt_cursor(ui, target, false);
+    true
+}
+
+fn reset_prompt_history_navigation(ui: &mut UiState) {
+    ui.prompt_history_cursor = None;
+    ui.prompt_history_draft = None;
+}
+
+fn navigate_prompt_history(ui: &mut UiState, forward: bool) -> bool {
+    if ui.prompt_history.is_empty() || ui.prompt_selection.is_some() {
+        return false;
+    }
+    let next = match (ui.prompt_history_cursor, forward) {
+        (None, true) => return false,
+        (None, false) => {
+            ui.prompt_history_draft = Some(ui.prompt.clone());
+            ui.prompt_history.len() - 1
+        }
+        (Some(current), false) => current.saturating_sub(1),
+        (Some(current), true) if current + 1 < ui.prompt_history.len() => current + 1,
+        (Some(_), true) => {
+            ui.prompt = ui.prompt_history_draft.take().unwrap_or_default();
+            ui.prompt_cursor = ui.prompt.len();
+            ui.prompt_selection = None;
+            ui.prompt_history_cursor = None;
+            return true;
+        }
+    };
+    ui.prompt = ui.prompt_history[next].clone();
+    ui.prompt_cursor = ui.prompt.len();
+    ui.prompt_selection = None;
+    ui.prompt_history_cursor = Some(next);
+    true
+}
+
+fn record_prompt_history(ui: &mut UiState, prompt: &str) {
+    if prompt.trim().is_empty() {
+        return;
+    }
+    if ui
+        .prompt_history
+        .back()
+        .is_none_or(|previous| previous != prompt)
+    {
+        if ui.prompt_history.len() == MAX_PROMPT_HISTORY {
+            ui.prompt_history.pop_front();
+        }
+        ui.prompt_history.push_back(prompt.to_string());
+    }
+    reset_prompt_history_navigation(ui);
 }
 
 fn set_prompt_cursor_from_pointer(ui: &mut UiState, x: f32, y: f32) {
@@ -2136,11 +2206,15 @@ fn submit_prompt(ui: &mut UiState) -> Vec<ActorCommand> {
     };
     let model = view.model.clone();
     let reasoning = view.reasoning.clone();
-    let prompt = if ui.prompt.trim().is_empty() {
+    let has_typed_prompt = !ui.prompt.trim().is_empty();
+    let prompt = if !has_typed_prompt {
         "Describe the attached image(s).".to_string()
     } else {
         std::mem::take(&mut ui.prompt)
     };
+    if has_typed_prompt {
+        record_prompt_history(ui, &prompt);
+    }
     ui.prompt_cursor = 0;
     ui.prompt_selection = None;
     let images = std::mem::take(&mut ui.images);
@@ -3858,6 +3932,62 @@ mod tests {
         assert_eq!(ui.prompt_cursor, "alpha beta ".len());
         assert!(delete_before_cursor(&mut ui.prompt, &mut ui.prompt_cursor));
         assert_eq!(ui.prompt, "alpha betaγ");
+    }
+
+    #[test]
+    fn prompt_history_recalls_turns_and_restores_the_unsent_draft() {
+        let mut ui = UiState::new();
+        record_prompt_history(&mut ui, "first prompt");
+        record_prompt_history(&mut ui, "second\nprompt");
+        ui.prompt = "unsent λ draft".to_string();
+        ui.prompt_cursor = 0;
+
+        assert!(navigate_prompt_history(&mut ui, false));
+        assert_eq!(ui.prompt, "second\nprompt");
+        assert!(navigate_prompt_history(&mut ui, false));
+        assert_eq!(ui.prompt, "first prompt");
+        assert!(navigate_prompt_history(&mut ui, true));
+        assert_eq!(ui.prompt, "second\nprompt");
+        assert!(navigate_prompt_history(&mut ui, true));
+        assert_eq!(ui.prompt, "unsent λ draft");
+        assert_eq!(ui.prompt_cursor, ui.prompt.len());
+        assert_eq!(ui.prompt_history_cursor, None);
+    }
+
+    #[test]
+    fn prompt_history_only_takes_over_at_multiline_boundaries() {
+        let mut ui = UiState::new();
+        record_prompt_history(&mut ui, "older");
+        ui.prompt = "top\nbottom".to_string();
+        ui.prompt_cursor = ui.prompt.len();
+
+        handle_ui_key(&mut ui, "ArrowUp", true, 0);
+        assert_eq!(ui.prompt, "top\nbottom");
+        assert_eq!(ui.prompt_cursor, 3);
+        assert_eq!(ui.prompt_history_cursor, None);
+
+        handle_ui_key(&mut ui, "ArrowUp", true, 0);
+        assert_eq!(ui.prompt, "older");
+        handle_ui_key(&mut ui, "ArrowDown", true, 0);
+        assert_eq!(ui.prompt, "top\nbottom");
+    }
+
+    #[test]
+    fn prompt_history_is_bounded_and_deduplicates_adjacent_turns() {
+        let mut ui = UiState::new();
+        for index in 0..=MAX_PROMPT_HISTORY {
+            record_prompt_history(&mut ui, &format!("prompt {index}"));
+        }
+        record_prompt_history(&mut ui, "prompt 100");
+        assert_eq!(ui.prompt_history.len(), MAX_PROMPT_HISTORY);
+        assert_eq!(
+            ui.prompt_history.front().map(String::as_str),
+            Some("prompt 1")
+        );
+        assert_eq!(
+            ui.prompt_history.back().map(String::as_str),
+            Some("prompt 100")
+        );
     }
 
     #[test]

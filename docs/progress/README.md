@@ -19,6 +19,7 @@ interpret evidence.
 ## Current records
 
 - [[computer-use]]
+- [[coding-agent]]
 - [[internal-ipc-refactor]]
 - [[network-carrier-latency]]
 - [[plugin-runtime-proofs]]
