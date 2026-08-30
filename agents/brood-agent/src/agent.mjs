@@ -374,19 +374,18 @@ function commandCapture(maximum) {
   return {
     push(chunk) {
       total += chunk.length;
-      if (head.length < headLimit) {
-        const consumed = Math.min(chunk.length, headLimit - head.length);
+      if (head.length < maximum) {
+        const consumed = Math.min(chunk.length, maximum - head.length);
         head = Buffer.concat([head, chunk.subarray(0, consumed)]);
-        chunk = chunk.subarray(consumed);
       }
-      if (chunk.length > 0 && tailLimit > 0) {
+      if (tailLimit > 0) {
         tail = Buffer.concat([tail, chunk]);
         if (tail.length > tailLimit) tail = tail.subarray(tail.length - tailLimit);
       }
     },
     result() {
-      if (total <= maximum) return { text: Buffer.concat([head, tail]).toString("utf8"), truncated: false };
-      return { text: Buffer.concat([head, marker, tail]).toString("utf8"), truncated: true };
+      if (total <= maximum) return { text: head.toString("utf8"), truncated: false };
+      return { text: Buffer.concat([head.subarray(0, headLimit), marker, tail]).toString("utf8"), truncated: true };
     },
   };
 }

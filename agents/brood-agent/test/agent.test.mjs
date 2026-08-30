@@ -73,6 +73,13 @@ test("exec_command confines workdirs and bounds noisy output with useful tail", 
     runExecCommand({ command: "pwd", workdir: "escape" }, undefined, root),
     /inside the session workspace/,
   );
+  const exact = await runExecCommand({
+    command: "head -c 1024 /dev/zero | tr '\\0' x",
+    max_output_bytes: 1024,
+  }, undefined, root);
+  const exactOutput = JSON.parse(exact.content);
+  assert.equal(exactOutput.stdout, "x".repeat(1024));
+  assert.equal(exactOutput.truncated, false);
   const result = await runExecCommand({
     command: "printf begin; head -c 3000 /dev/zero | tr '\\0' x; printf end",
     max_output_bytes: 1024,
