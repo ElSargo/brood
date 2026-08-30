@@ -816,7 +816,9 @@ if not (
     and not projected["degraded"]
     and not promoted["degraded"]
     and promoted["staged_count"] == 0
-    and projected["divider_x"] == promoted["divider_x"]
+    # Staging is private: an intervening presentation keeps the previous
+    # complete splitter/content geometry until the cohort is promotable.
+    and projected["divider_x"] == start_divider_x
     and projected["interaction"] != 0
     and projected["interaction"] == promoted["interaction"]
 ):
@@ -938,7 +940,7 @@ result = {
         "completed_line": completed_line,
         "phase": promoted["phase"],
         "staged_count": promoted["staged_count"],
-        "matches_projected_target": True,
+        "projected_kept_previous_visible_geometry": True,
         "matches_pointer_coordinate": True,
     },
 }

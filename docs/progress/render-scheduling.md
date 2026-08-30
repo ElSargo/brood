@@ -2,7 +2,7 @@
 status: active
 type: progress
 authority: implementation
-last-updated: 2026-08-29
+last-updated: 2026-08-30
 ---
 
 # Render Scheduling Implementation
@@ -402,3 +402,47 @@ unsaturated latency at 10.855/18.150 ms but likewise exceeded the miss-rate
 gate. No threshold was relaxed. Per-frame GPU-completion pacing was tested and
 removed after it left unsaturated p50 at approximately 25.3 ms and introduced a
 roughly 10.5 ms GPU wait.
+
+### Atomic interactive-resize presentation
+
+Interactive layout targets now remain private while their resize epoch is in
+flight. Staging no longer changes the visible pane rectangles or dividers and
+does not request an intermediate redraw. Epoch-tagged plugin frames are also
+prepared without independently requesting presentation. Once the complete
+wait set is ready, the renderer installs the target layout, plugin content,
+managed content, and dividers in the same Winit promotion frame. When the
+cohort misses the current frame, the previous complete presentation remains
+visible until that promotion instead of exposing a mixture of generations.
+
+Plugin resize events obtain their target sizes from the staged layout rather
+than the still-visible layout. Ordinary resize reconciliation is held while a
+staged transaction exists; this prevents an old-size untagged event from
+racing and cancelling epoch-tagged guest work. The trace now correlates each
+plugin's resize-event enqueue and render-hint dispatch with host-side per-pane
+readiness, cohort promotion, and the promoted actor-frame resize epochs.
+
+The release burst proof at `/tmp/brood-resize-smooth-20260830-r4` accepted nine
+requests and superseded eight during one drag while keeping at most one staged
+layout. All ten pointer acknowledgements were ordered with a measured maximum
+round trip of 0 ms. The release promoted both proof panes together, kept the
+previous complete divider visible while staged, and finished within one device
+pixel of the pointer target without degradation.
+
+The retained window/sidebar proof at
+`/tmp/brood-resize-smooth-20260830-r5/window-shell` passed the updated strict
+pixel/trace analyzer across 11 native-window captures and 19 sidebar/inbox
+captures. A representative sidebar divider epoch waited for five panes:
+inbox reuse was ready at 1.878 ms, the fast proof, session switcher, and status
+bar at 20.132--21.594 ms, and the deliberately delayed proof pane at 198.770
+ms. The visible divider remained at 320 while staged and changed to 272 only in
+the single 5/5 promoted frame. Its release epoch repeated the 5/5 atomic
+promotion at 195.792 ms.
+
+The focused client suite passes 279 tests, the plugin SDK passes 12 tests plus
+its doctest, shell/Python harness parser checks pass, and the complete host and
+component build passes. Repeated full nested invocations also exposed a
+pre-existing startup-ordering flake: the proof panes can enter inventory after
+an empty native-bootstrap transaction has already settled, causing the harness
+to reject the run before interactive input. Successful lanes and their strict
+analyzers were retained as evidence; that bootstrap race is not treated as an
+interactive-resize failure or hidden by weakening the gate.

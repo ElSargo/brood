@@ -1941,6 +1941,23 @@ impl PresentationWasmRuntime {
                 key_input,
             )
         });
+        if std::env::var_os("BROOD_TRACE_RESIZE").is_some()
+            && let PresentationEvent::PaneResized {
+                pane,
+                width,
+                height,
+                resize_epoch,
+                ..
+            } = &event
+        {
+            eprintln!(
+                "resize-plugin event-enqueued actor={} generation={} pane={} resize_epoch={resize_epoch:?} logical_size={width:.2}x{height:.2} event_watermark={}",
+                actor_name,
+                hosted.actor.generation(),
+                pane,
+                watermark.unwrap_or(0),
+            );
+        }
         match &hosted.actor {
             HostedWasmActor::Component(actor) => {
                 self.send_ordered_presentation_event(actor_name, actor, event, watermark)

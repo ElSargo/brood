@@ -5261,6 +5261,31 @@ impl Application {
         };
         let service = graphics.service_render_scheduler(&mut self.render_predictor)?;
         for (actor, hint) in service.hints {
+            if std::env::var_os("BROOD_TRACE_RESIZE").is_some()
+                && let Some(active) = self.active_synchronized_resize.as_ref()
+            {
+                let cohort_panes = hint
+                    .relevant_panes
+                    .iter()
+                    .copied()
+                    .filter(|pane| {
+                        active.wait_panes.contains(pane) || active.affected_panes.contains(pane)
+                    })
+                    .collect::<Vec<_>>();
+                if !cohort_panes.is_empty() {
+                    eprintln!(
+                        "resize-plugin render-hint actor={} generation={} epoch={} token={} panes={cohort_panes:?} target_ns={} deadline_ns={} event_watermark={} dispatch_us={}",
+                        actor.name,
+                        actor.generation,
+                        active.epoch.id,
+                        hint.token.0,
+                        hint.target_presentation_time_ns,
+                        hint.submission_deadline_ns,
+                        hint.event_watermark,
+                        active.started.elapsed().as_micros(),
+                    );
+                }
+            }
             let identity = ActorIdentity {
                 name: actor.name,
                 generation: actor.generation,
@@ -8648,7 +8673,12 @@ impl Application {
                 )
             });
         let target_rects = self.renderer.as_ref().map_or_else(String::new, |renderer| {
-            trace_layout_pane_rects(&renderer.accepted_layout, renderer.layout_extent())
+            renderer
+                .staged_layouts
+                .get(&epoch.id)
+                .map_or_else(String::new, |target| {
+                    trace_layout_pane_rects(&target.layout, renderer.layout_extent())
+                })
         });
         eprintln!(
             "accepted synchronized layout actor={} request={} interaction={} event_sequence={} native_resize_revision={} epoch={} base_revision={} target_revision={} region_final=0/{} pane_ready=0/{} wait={} affected={} mode={:?} actor_generation={} focus={} recovered_regions=[] wait_for_panes=[{}] target_rects=[{}]",
@@ -9251,6 +9281,7 @@ impl Application {
             renderer,
             &tagged,
             Some(epoch),
+            Some(epoch),
             "synchronized barrier",
         );
         send_plugin_pane_resize_events_best_effort(
@@ -9258,6 +9289,7 @@ impl Application {
             renderer,
             &ordinary,
             None,
+            Some(epoch),
             "synchronized non-wait pane",
         );
         let mut failed_managed = Vec::new();
@@ -9332,8 +9364,16 @@ impl Application {
         if !matches!(active.presentation, SynchronizedResizePresentation::Waiting) {
             return Ok(None);
         }
-        active.ready_panes.insert(pane);
+        let newly_ready = active.ready_panes.insert(pane);
         self.resize_presentation_trace.wait_ready = active.ready_panes.len();
+        if newly_ready && std::env::var_os("BROOD_TRACE_RESIZE").is_some() {
+            eprintln!(
+                "resize-host pane-ready epoch={resize_epoch} pane={pane} ready={}/{} ready_us={}",
+                active.ready_panes.len(),
+                active.wait_panes.len(),
+                active.started.elapsed().as_micros(),
+            );
+        }
         if active.native_resize_revision.is_some() {
             self.native_resize_presentation_trace.wait_ready = active.ready_panes.len();
             self.native_resize_presentation_trace.pending_emit = true;
@@ -9465,6 +9505,7 @@ impl Application {
                 self.wasm_runtime.as_ref(),
                 renderer,
                 &recovery_panes,
+                None,
                 None,
                 "post-degraded recovery",
             );
@@ -14658,7 +14699,7 @@ fn flush_renderer_plugin_resize_events_best_effort(
         .into_iter()
         .map(|(pane, _size)| pane)
         .collect::<Vec<_>>();
-    send_plugin_pane_resize_events_best_effort(runtime, renderer, &panes, None, context)
+    send_plugin_pane_resize_events_best_effort(runtime, renderer, &panes, None, None, context)
 }
 
 fn send_plugin_pane_resize_events(
@@ -14666,14 +14707,29 @@ fn send_plugin_pane_resize_events(
     renderer: &mut Renderer,
     panes: &[u64],
     resize_epoch: Option<u64>,
+    target_layout_epoch: Option<u64>,
 ) -> Result<()> {
     let scale = renderer.window.scale_factor() as f32;
     let extent = renderer.layout_extent();
     for pane in panes {
-        let Some(item) = renderer.accepted_layout.pane_item(*pane) else {
-            continue;
+        let rect = {
+            let target_layout = match target_layout_epoch {
+                Some(epoch) => {
+                    &renderer
+                        .staged_layouts
+                        .get(&epoch)
+                        .with_context(|| {
+                            format!("resize epoch {epoch} has no staged target layout")
+                        })?
+                        .layout
+                }
+                None => &renderer.accepted_layout,
+            };
+            let Some(item) = target_layout.pane_item(*pane) else {
+                continue;
+            };
+            item.pixel_rect(extent)
         };
-        let rect = item.pixel_rect(extent);
         let Some((width, height)) = positive_rect_extent([rect.x, rect.y, rect.w, rect.h]) else {
             continue;
         };
@@ -14702,13 +14758,18 @@ fn send_plugin_pane_resize_events_best_effort(
     renderer: &mut Renderer,
     panes: &[u64],
     resize_epoch: Option<u64>,
+    target_layout_epoch: Option<u64>,
     context: &str,
 ) -> bool {
     let mut all_sent = true;
     for pane in panes {
-        if let Err(error) =
-            send_plugin_pane_resize_events(runtime, renderer, &[*pane], resize_epoch)
-        {
+        if let Err(error) = send_plugin_pane_resize_events(
+            runtime,
+            renderer,
+            &[*pane],
+            resize_epoch,
+            target_layout_epoch,
+        ) {
             all_sent = false;
             eprintln!(
                 "could not notify plugin pane resize pane={pane} resize_epoch={resize_epoch:?} context={context}: {error:#}"
@@ -18380,15 +18441,15 @@ impl Renderer {
         }
         self.staged_layouts.clear();
         self.retired_staged_layout_epochs.remove(&resize_epoch);
-        self.staged_layouts.insert(resize_epoch, composed.clone());
+        self.staged_layouts.insert(resize_epoch, composed);
         self.staged_plugin_panes
             .retain(|(_pane, epoch), _scene| *epoch == resize_epoch);
-        self.accepted_layout = composed.layout;
-        self.accepted_zones = composed.zones;
-        self.accepted_dividers = composed.dividers;
-        let change = self.project_accepted_layout(None);
-        self.window.request_redraw();
-        change
+        // Keep the target entirely private until every fixed dependency is
+        // ready.  Mutating accepted geometry here lets any unrelated redraw
+        // expose the new splitter and pane rectangles with old content before
+        // the tagged render-hint responses arrive.  Promotion below installs
+        // geometry, chrome, hit testing, and pane content as one Winit frame.
+        None
     }
 
     fn abort_staged_layout(
@@ -19141,6 +19202,7 @@ impl Renderer {
         }
         // No visible renderer state changes until the complete claimed frame
         // has compiled.
+        let has_visible_changes = !compiled.is_empty();
         let changes_layout_inventory = actor_frame_adds_plugin_pane(
             |pane| self.plugin_panes.contains_key(&pane),
             compiled.iter().map(|(pane, _sequence, _texture)| *pane),
@@ -19156,7 +19218,9 @@ impl Renderer {
         for (pane, epoch, scene) in staged {
             self.staged_plugin_panes.insert((pane, epoch), scene);
         }
-        self.window.request_redraw();
+        if has_visible_changes {
+            self.window.request_redraw();
+        }
         Ok(GraphicsRefresh::Applied(focus_change))
     }
 
@@ -19344,7 +19408,6 @@ impl Renderer {
         eprintln!(
             "staged plugin draw pane={pane} sequence={snapshot_sequence} resize_epoch={resize_epoch} gpu_target={width}x{height} scale={scale:.2}"
         );
-        self.window.request_redraw();
         Ok(GraphicsRefresh::Applied(None))
     }
 
@@ -19428,7 +19491,15 @@ impl Renderer {
     }
 
     fn pending_plugin_resize_events(&self) -> Vec<(u64, PluginPaneSize)> {
-        if self.window_resize_in_progress {
+        if !ordinary_plugin_resize_allowed(
+            self.window_resize_in_progress,
+            !self.staged_layouts.is_empty(),
+        ) {
+            // A synchronized transaction owns pane sizing until promotion or
+            // rollback. Comparing the private target size cache with the
+            // still-visible layout here would immediately enqueue an ordinary
+            // resize back to the old extent, racing and often cancelling the
+            // plugin's epoch-tagged render-hint work.
             return Vec::new();
         }
         let scale = self.window.scale_factor() as f32;
@@ -19842,7 +19913,10 @@ impl Renderer {
             "server owns the managed pane size during computer use"
         );
         let item = self
-            .accepted_layout
+            .staged_layouts
+            .get(&epoch)
+            .context("managed resize epoch has no staged target layout")?
+            .layout
             .pane_item(route.view_pane)
             .context("managed pane is absent from the synchronized target layout")?;
         let rect = item.pixel_rect(self.layout_extent());
@@ -20797,6 +20871,13 @@ const fn managed_resize_request_allowed(
     resize_epoch: Option<u64>,
 ) -> bool {
     resize_epoch.is_some() || (!window_resize_in_progress && !synchronized_layout_staged)
+}
+
+const fn ordinary_plugin_resize_allowed(
+    window_resize_in_progress: bool,
+    synchronized_layout_staged: bool,
+) -> bool {
+    !window_resize_in_progress && !synchronized_layout_staged
 }
 
 fn reduce_pending_managed_resize_requests(
@@ -22017,6 +22098,9 @@ mod tests {
         assert!(managed_resize_request_allowed(false, false, None));
         assert!(managed_resize_request_allowed(false, true, Some(41)));
         assert!(!managed_resize_request_allowed(false, true, None));
+        assert!(ordinary_plugin_resize_allowed(false, false));
+        assert!(!ordinary_plugin_resize_allowed(true, false));
+        assert!(!ordinary_plugin_resize_allowed(false, true));
     }
 
     #[test]

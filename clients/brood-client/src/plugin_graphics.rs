@@ -480,6 +480,10 @@ fn promote_actor_frame_in_state(
     }
     let actor = frame.actor.clone();
     let token = frame.token;
+    let resize_epochs = panes
+        .iter()
+        .filter_map(|pane| frame.scenes.get(pane).and_then(|scene| scene.resize_epoch))
+        .collect::<BTreeSet<_>>();
     for pane in panes {
         let scene = frame
             .scenes
@@ -504,7 +508,7 @@ fn promote_actor_frame_in_state(
             state.actor_frames_promoted_multi_pane.saturating_add(1);
     }
     eprintln!(
-        "render scheduling actor-frame promoted actor={} generation={} token={} revision={} pane_count={} panes={panes:?}",
+        "render scheduling actor-frame promoted actor={} generation={} token={} revision={} pane_count={} panes={panes:?} resize_epochs={resize_epochs:?}",
         actor.name,
         actor.generation,
         token,

@@ -582,11 +582,8 @@ for record in records:
             raise SystemExit(f"fractional-scale barcode mismatch in {record['label']}: {pane}")
     event = event_by_input.get(record["input_index"])
     geometry = None
-    live_native_projection = (
-        record["trace"]["kind"] == "window-resize-present"
-        and record["presentation"]["phase"] == "projected"
-    )
-    if event is not None and not live_native_projection:
+    private_projection = record["presentation"]["phase"] == "projected"
+    if event is not None and not private_projection:
         diagnostic = event["diagnostic"]
         direct_error = abs(diagnostic["rest_width"] - rest_right)
         scaled_error = abs(diagnostic["rest_width"] * output_scale - rest_right)
@@ -743,13 +740,9 @@ expected_sidebar_states = {
     "inbox-show-promoted": (True, True),
     "sidebar-hide-with-inbox-promoted": (False, True),
     "sidebar-show-with-inbox-promoted": (True, True),
-    "sidebar-divider-motion-projected": (True, True),
     "sidebar-divider-motion-promoted": (True, True),
-    "sidebar-divider-release-projected": (True, True),
     "sidebar-divider-release-promoted": (True, True),
-    "inbox-divider-motion-projected": (True, True),
     "inbox-divider-motion-promoted": (True, True),
-    "inbox-divider-release-projected": (True, True),
     "inbox-divider-release-promoted": (True, True),
 }
 chrome = {}
