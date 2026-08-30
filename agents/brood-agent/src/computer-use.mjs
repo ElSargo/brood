@@ -66,7 +66,7 @@ export function computerUseTools(session) {
         window_timeout_ms: { type: "integer", minimum: 1, maximum: MAX_LAUNCH_TIMEOUT_MS },
       },
     }),
-    functionTool("computer_start", `Start a computer-use task bound to this agent's Brood session ${session}`, {
+    functionTool("computer_start", `Start one computer-use task bound to this agent's Brood session ${session}. The tool remembers lease and sequence bookkeeping for later calls`, {
       type: "object",
       properties: {
         task: { type: "string" },
@@ -77,9 +77,9 @@ export function computerUseTools(session) {
         limits: { type: "object" },
       },
     }),
-    functionTool("computer_action", "Execute ordered direct actions and return a causally newer screenshot. Inspect that screenshot as authoritative evidence and continue correcting the UI until the requested outcome is visibly present", {
+    functionTool("computer_action", "Execute a short ordered batch of direct actions and return a causally newer screenshot. Lease and sequence fields are filled automatically. Treat the screenshot as authoritative evidence and correct the UI until the requested outcome is visibly present", {
       type: "object",
-      required: ["protocol_version", "task", "lease_generation", "expected_sequence", "actions"],
+      required: ["task", "actions"],
       properties: {
         protocol_version: { const: PROTOCOL_VERSION },
         task: { type: "string" },
@@ -90,9 +90,9 @@ export function computerUseTools(session) {
         approval_proof: { type: ["string", "null"] },
       },
     }),
-    functionTool("computer_exec_js", "Evaluate persistent capability-empty JavaScript against this session's computer", {
+    functionTool("computer_exec_js", "Run JavaScript in this task's persistent capability-empty computer runtime. Prefer this for multi-step interaction, repeated actions, and screenshot checks. Use computer.perform([...]) to batch actions, computer.screenshot() plus display(...) to inspect, and globalThis to retain helpers and state across calls. Lease and sequence fields are filled automatically", {
       type: "object",
-      required: ["protocol_version", "task", "lease_generation", "expected_sequence", "source"],
+      required: ["task", "source"],
       properties: {
         protocol_version: { const: PROTOCOL_VERSION },
         task: { type: "string" },
@@ -102,9 +102,9 @@ export function computerUseTools(session) {
         approval_proof: { type: ["string", "null"] },
       },
     }),
-    functionTool("computer_observe", "Read task events, approvals, and observations newer than the supplied cursors", {
+    functionTool("computer_observe", "Read new task events, approvals, and observations. Omitted cursors continue from this agent's last observation", {
       type: "object",
-      required: ["task", "event_cursor", "observation_sequence"],
+      required: ["task"],
       properties: {
         task: { type: "string" },
         event_cursor: { type: "integer" },
@@ -125,12 +125,12 @@ export function computerUseTools(session) {
   tools.push(
     functionTool("computer_resume", "Resume a task with a new daemon-wide lease", {
       type: "object",
-      required: ["task", "lease_duration_ms"],
+      required: ["task"],
       properties: { task: { type: "string" }, lease_duration_ms: { type: "integer", minimum: 1 } },
     }),
     functionTool("computer_renew", "Renew the current lease before it expires", {
       type: "object",
-      required: ["task", "lease_generation", "lease_duration_ms"],
+      required: ["task"],
       properties: {
         task: { type: "string" },
         lease_generation: { type: "integer" },
@@ -195,12 +195,6 @@ function requiredString(arguments_, name) {
   return value;
 }
 
-function requiredInteger(arguments_, name) {
-  const value = arguments_?.[name];
-  if (!Number.isSafeInteger(value) || value < 0) throw new Error(`${name} must be an unsigned integer`);
-  return String(value);
-}
-
 function sleep(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
@@ -243,12 +237,34 @@ export function nativeToolResult(response) {
   return { output, text, isError: false };
 }
 
+function computerResultSummary(name, response) {
+  let value;
+  try { value = JSON.parse(response.trim()); } catch { return undefined; }
+  if (name === "computer_windows") return `${Array.isArray(value.windows) ? value.windows.length : 0} managed window(s)`;
+  if (name === "computer_launch") return value.visible ? `Opened pane ${value.pane}` : "Application launch completed";
+  if (name === "computer_start") return `Computer task started · lease ${value.generation ?? "ready"}`;
+  if (name === "computer_action") return `Computer updated · sequence ${value.sequence ?? "ready"}`;
+  if (name === "computer_exec_js") {
+    const calls = value.metrics?.host_calls;
+    return `Computer script completed · sequence ${value.sequence ?? "ready"}${Number.isFinite(calls) ? ` · ${calls} host call(s)` : ""}`;
+  }
+  if (name === "computer_observe") return `${Array.isArray(value.events) ? value.events.length : 0} new event(s)`;
+  return name.replace("computer_", "Computer task ").replaceAll("_", " ");
+}
+
+function resultWithSummary(name, response) {
+  const result = nativeToolResult(response);
+  result.summary = computerResultSummary(name, response);
+  return result;
+}
+
 export class NativeComputerUseClient {
   constructor({ socketPath = process.env[SOCKET_ENV], session, principal }) {
     this.socketPath = socketPath;
     this.session = Number(session);
     this.principal = String(principal || "brood-agent");
     this.ownedTasks = new Set();
+    this.taskState = new Map();
     this.nextTask = 1;
     if (!Number.isSafeInteger(this.session) || this.session <= 0) throw new Error("computer-use session must be a positive integer");
     if (!this.principal.trim()) throw new Error("computer-use principal must not be empty");
@@ -267,15 +283,41 @@ export class NativeComputerUseClient {
     if (!this.ownedTasks.has(task)) throw new Error("task is not owned by this Brood agent turn");
   }
 
+  stateFor(task) {
+    this.ensureOwned(task);
+    return this.taskState.get(task) ?? { generation: undefined, nextSequence: 1, eventCursor: 0, observationSequence: 0 };
+  }
+
+  updateState(task, response, updates = {}) {
+    let value = {};
+    try { value = JSON.parse(response.trim()); } catch {}
+    const previous = this.taskState.get(task) ?? { nextSequence: 1, eventCursor: 0, observationSequence: 0 };
+    const eventCursor = Array.isArray(value.events)
+      ? value.events.reduce((cursor, event) => Math.max(cursor, Number(event?.cursor) || 0), previous.eventCursor || 0)
+      : previous.eventCursor || 0;
+    this.taskState.set(task, {
+      ...previous,
+      ...updates,
+      generation: Number(value.generation) || updates.generation || previous.generation,
+      nextSequence: Number.isSafeInteger(Number(value.sequence)) ? Number(value.sequence) + 1 : (updates.nextSequence ?? previous.nextSequence ?? 1),
+      eventCursor,
+      observationSequence: Number(value.observation?.sequence) || Number(value.observation_sequence) || previous.observationSequence || 0,
+    });
+  }
+
   command(command) {
     return requestNativeTool(this.socketPath, command);
   }
 
   async call(name, arguments_ = {}, callId = "computer-call") {
     if (name === "computer_windows") {
-      return nativeToolResult(await this.command(["computer-use", "windows", String(this.session)]));
+      const response = await this.command(["computer-use", "windows", String(this.session)]);
+      return resultWithSummary(name, response);
     }
-    if (name === "computer_launch") return nativeToolResult(await this.launch(arguments_));
+    if (name === "computer_launch") {
+      const response = await this.launch(arguments_);
+      return resultWithSummary(name, response);
+    }
     let command;
     let startedTask;
     let stoppedTask;
@@ -297,18 +339,32 @@ export class NativeComputerUseClient {
       startedTask = task;
     } else if (name === "computer_action") {
       const task = requiredString(arguments_, "task");
-      this.ensureOwned(task);
+      const state = this.stateFor(task);
       command = ["computer-use", "native-call", JSON.stringify({
         tool_call_id: callId,
-        arguments: { ...arguments_, task, target_session: this.session, call_id: callId },
+        arguments: {
+          ...arguments_,
+          protocol_version: PROTOCOL_VERSION,
+          task,
+          lease_generation: arguments_.lease_generation ?? state.generation,
+          expected_sequence: arguments_.expected_sequence ?? state.nextSequence,
+          target_session: this.session,
+          call_id: callId,
+        },
       })];
     } else if (name === "computer_exec_js") {
-      this.ensureOwned(requiredString(arguments_, "task"));
-      command = ["computer-use", "exec-js", JSON.stringify(arguments_)];
+      const task = requiredString(arguments_, "task");
+      const state = this.stateFor(task);
+      command = ["computer-use", "exec-js", JSON.stringify({
+        ...arguments_,
+        protocol_version: PROTOCOL_VERSION,
+        lease_generation: arguments_.lease_generation ?? state.generation,
+        expected_sequence: arguments_.expected_sequence ?? state.nextSequence,
+      })];
     } else if (name === "computer_observe") {
       const task = requiredString(arguments_, "task");
-      this.ensureOwned(task);
-      command = ["computer-use", "observe", task, requiredInteger(arguments_, "event_cursor"), requiredInteger(arguments_, "observation_sequence")];
+      const state = this.stateFor(task);
+      command = ["computer-use", "observe", task, String(arguments_.event_cursor ?? state.eventCursor), String(arguments_.observation_sequence ?? state.observationSequence)];
     } else if (name === "computer_pause" || name === "computer_stop") {
       const task = requiredString(arguments_, "task");
       this.ensureOwned(task);
@@ -317,11 +373,11 @@ export class NativeComputerUseClient {
     } else if (name === "computer_resume") {
       const task = requiredString(arguments_, "task");
       this.ensureOwned(task);
-      command = ["computer-use", "resume", task, requiredInteger(arguments_, "lease_duration_ms")];
+      command = ["computer-use", "resume", task, String(arguments_.lease_duration_ms ?? DEFAULT_LEASE_DURATION_MS)];
     } else if (name === "computer_renew") {
       const task = requiredString(arguments_, "task");
-      this.ensureOwned(task);
-      command = ["computer-use", "renew", task, requiredInteger(arguments_, "lease_generation"), requiredInteger(arguments_, "lease_duration_ms")];
+      const state = this.stateFor(task);
+      command = ["computer-use", "renew", task, String(arguments_.lease_generation ?? state.generation), String(arguments_.lease_duration_ms ?? DEFAULT_LEASE_DURATION_MS)];
     } else if (name === "computer_approve") {
       const task = requiredString(arguments_, "task");
       this.ensureOwned(task);
@@ -330,9 +386,17 @@ export class NativeComputerUseClient {
       throw new Error(`unknown native computer tool ${name}`);
     }
     const response = await this.command(command);
-    if (startedTask) this.ownedTasks.add(startedTask);
-    if (stoppedTask) this.ownedTasks.delete(stoppedTask);
-    return nativeToolResult(response);
+    if (startedTask) {
+      this.ownedTasks.add(startedTask);
+      this.updateState(startedTask, response, { nextSequence: 1 });
+    } else if (name === "computer_action" || name === "computer_exec_js" || name === "computer_observe" || name === "computer_resume" || name === "computer_renew") {
+      this.updateState(requiredString(arguments_, "task"), response);
+    }
+    if (stoppedTask) {
+      this.ownedTasks.delete(stoppedTask);
+      this.taskState.delete(stoppedTask);
+    }
+    return resultWithSummary(name, response);
   }
 
   async launch(arguments_) {
@@ -360,6 +424,7 @@ export class NativeComputerUseClient {
   async close() {
     const tasks = [...this.ownedTasks];
     this.ownedTasks.clear();
+    this.taskState.clear();
     await Promise.allSettled(tasks.map((task) => this.command(["computer-use", "stop", task])));
   }
 }

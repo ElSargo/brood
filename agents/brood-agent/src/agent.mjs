@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
-import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, realpath, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { NativeComputerUseClient } from "./computer-use.mjs";
 
@@ -12,9 +12,9 @@ const CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token";
 const CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses";
 const OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
-const COMPUTER_USE_INSTRUCTIONS = "You are operating inside a Brood session. Computer use is provided as native computer_* tools scoped to this session. For requests involving a graphical application, call computer_windows first and reuse a suitable existing window. Call computer_launch only when no suitable window exists. Never launch a graphical application through the shell: a shell process is not a Brood-managed application and cannot reliably connect to the session display. Do not claim that a new application opened unless computer_launch returned visible=true. Inspect every returned screenshot as authoritative evidence of the action's actual effect. To replace text in an application entry, click the intended entry, use Ctrl+A, and type the replacement; do not guess application-specific shortcuts. If an unexpected window or dialog appears, recover and observe again. Do not stop automation or report success until a screenshot visibly shows the requested outcome.";
+const COMPUTER_USE_INSTRUCTIONS = "You are operating inside a Brood session. Computer use is provided as native computer_* tools scoped to this session. For requests involving a graphical application, call computer_windows first and reuse a suitable existing window. Call computer_launch only when no suitable window exists. Never launch a graphical application through exec_command: a shell process is not a Brood-managed application and cannot reliably connect to the session display. Start one task, then prefer computer_exec_js for multi-step interaction, repeated actions, waits, and screenshot checks; its JavaScript global state persists across calls. Use computer_action for short corrective actions. Batch actions that do not require an intervening observation, but never guess after the UI changes. Do not claim that a new application opened unless computer_launch returned visible=true. Treat every returned screenshot as authoritative evidence of the action's actual effect. To replace text in an application entry, click the intended entry, use Ctrl+A, and type the replacement; do not guess application-specific shortcuts. If an unexpected window or dialog appears, recover and observe again. Do not stop automation or report success until a screenshot visibly shows the requested outcome.";
 
-const BASE_INSTRUCTIONS = `You are Brood's independent session agent. Work directly toward the user's requested outcome. You have a shell for files and commands in the session workspace and session-scoped computer-use tools for graphical applications. Inspect relevant state before changing it, preserve unrelated work, and verify changes with the real workload when practical. Keep user-facing prose concise.\n\n${COMPUTER_USE_INSTRUCTIONS}`;
+const BASE_INSTRUCTIONS = `You are Brood's independent session agent. Work directly toward the user's requested outcome. You have exec_command for files, builds, tests, and repository inspection plus session-scoped computer-use tools for graphical applications. Use plan_update for work with several dependent steps and keep it current. Inspect relevant state before changing it, use rg or rg --files for search, preserve unrelated work, and verify changes with the real workload when practical. Prefer a small number of purposeful exec_command calls with explicit workdirs over repeated tiny probes. Use apply_patch through exec_command for edits instead of shell redirection. Keep user-facing prose concise.\n\n${COMPUTER_USE_INSTRUCTIONS}`;
 
 function emit(type, fields = {}) {
   process.stdout.write(`${JSON.stringify({ type, ...fields })}\n`);
@@ -306,15 +306,17 @@ export async function resolveModelBackend(env = process.env, fetchImpl = fetch) 
   };
 }
 
-const SHELL_TOOL = {
+const EXEC_COMMAND_TOOL = {
   type: "function",
-  name: "shell",
-  description: "Run one shell command in the session workspace and return its combined output and exit status.",
+  name: "exec_command",
+  description: "Run a non-interactive shell command in the session workspace. Returns bounded stdout and stderr, exit status, duration, and whether output was truncated. Prefer rg for search and apply_patch for edits.",
   parameters: {
     type: "object",
     properties: {
       command: { type: "string", description: "Shell command to run." },
+      workdir: { type: "string", description: "Workspace-relative or absolute working directory. Must remain inside the session workspace." },
       timeout_ms: { type: "integer", minimum: 1, maximum: 120000 },
+      max_output_bytes: { type: "integer", minimum: 1024, maximum: MAX_TOOL_OUTPUT_BYTES },
     },
     required: ["command"],
     additionalProperties: false,
@@ -322,33 +324,135 @@ const SHELL_TOOL = {
   strict: false,
 };
 
-async function runShell(args, signal) {
+const PLAN_UPDATE_TOOL = {
+  type: "function",
+  name: "plan_update",
+  description: "Publish or update the concise execution plan shown to the user. Use only for multi-step work and keep exactly one step in_progress until all work is completed.",
+  parameters: {
+    type: "object",
+    required: ["steps"],
+    properties: {
+      explanation: { type: "string" },
+      steps: {
+        type: "array",
+        minItems: 1,
+        maxItems: 12,
+        items: {
+          type: "object",
+          required: ["step", "status"],
+          properties: {
+            step: { type: "string", minLength: 1, maxLength: 200 },
+            status: { enum: ["pending", "in_progress", "completed"] },
+          },
+          additionalProperties: false,
+        },
+      },
+    },
+    additionalProperties: false,
+  },
+  strict: false,
+};
+
+async function commandWorkdir(value, workspace = process.cwd()) {
+  const root = await realpath(resolve(workspace));
+  const candidate = await realpath(resolve(root, String(value || ".")));
+  const offset = relative(root, candidate);
+  if (offset === ".." || offset.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`) || isAbsolute(offset)) {
+    throw new Error("workdir must remain inside the session workspace");
+  }
+  return candidate;
+}
+
+function commandCapture(maximum) {
+  const marker = Buffer.from("\n… output truncated; showing beginning and end …\n");
+  const remaining = Math.max(0, maximum - marker.length);
+  const headLimit = Math.ceil(remaining / 2);
+  const tailLimit = Math.floor(remaining / 2);
+  let head = Buffer.alloc(0);
+  let tail = Buffer.alloc(0);
+  let total = 0;
+  return {
+    push(chunk) {
+      total += chunk.length;
+      if (head.length < headLimit) {
+        const consumed = Math.min(chunk.length, headLimit - head.length);
+        head = Buffer.concat([head, chunk.subarray(0, consumed)]);
+        chunk = chunk.subarray(consumed);
+      }
+      if (chunk.length > 0 && tailLimit > 0) {
+        tail = Buffer.concat([tail, chunk]);
+        if (tail.length > tailLimit) tail = tail.subarray(tail.length - tailLimit);
+      }
+    },
+    result() {
+      if (total <= maximum) return { text: Buffer.concat([head, tail]).toString("utf8"), truncated: false };
+      return { text: Buffer.concat([head, marker, tail]).toString("utf8"), truncated: true };
+    },
+  };
+}
+
+export async function runExecCommand(args, signal, workspace = process.cwd()) {
   const timeout = Math.min(Math.max(Number(args.timeout_ms) || 30_000, 1), 120_000);
-  return new Promise((resolve) => {
+  const maximum = Math.min(Math.max(Number(args.max_output_bytes) || MAX_TOOL_OUTPUT_BYTES, 1024), MAX_TOOL_OUTPUT_BYTES);
+  const cwd = await commandWorkdir(args.workdir, workspace);
+  const startedAt = performance.now();
+  return new Promise((resolveResult) => {
     const child = spawn("bash", ["-lc", String(args.command ?? "")], {
-      cwd: process.cwd(),
+      cwd,
       env: process.env,
       stdio: ["ignore", "pipe", "pipe"],
+      detached: process.platform !== "win32",
     });
-    let output = "";
-    const collect = (chunk) => {
-      if (Buffer.byteLength(output) < MAX_TOOL_OUTPUT_BYTES) output += chunk.toString("utf8");
-    };
-    child.stdout.on("data", collect);
-    child.stderr.on("data", collect);
+    const stdout = commandCapture(maximum);
+    const stderr = commandCapture(maximum);
+    child.stdout.on("data", (chunk) => stdout.push(chunk));
+    child.stderr.on("data", (chunk) => stderr.push(chunk));
     let timedOut = false;
+    let aborted = false;
+    let forceTimer;
+    const terminate = () => {
+      if (child.exitCode !== null || child.signalCode !== null) return;
+      try {
+        if (process.platform !== "win32" && child.pid) process.kill(-child.pid, "SIGTERM");
+        else child.kill("SIGTERM");
+      } catch {}
+      forceTimer ??= setTimeout(() => {
+        try {
+          if (process.platform !== "win32" && child.pid) process.kill(-child.pid, "SIGKILL");
+          else child.kill("SIGKILL");
+        } catch {}
+      }, 250);
+    };
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill("SIGTERM");
+      terminate();
     }, timeout);
-    const abort = () => child.kill("SIGTERM");
+    const abort = () => {
+      aborted = true;
+      terminate();
+    };
     signal?.addEventListener("abort", abort, { once: true });
     child.once("exit", (code, killedBy) => {
       clearTimeout(timer);
+      clearTimeout(forceTimer);
       signal?.removeEventListener("abort", abort);
-      resolve({
-        content: bytePrefix(`${output}\n[exit ${code ?? killedBy ?? "unknown"}${timedOut ? "; timed out" : ""}]`),
-        isError: timedOut || code !== 0,
+      const stdoutResult = stdout.result();
+      const stderrResult = stderr.result();
+      const result = {
+        stdout: stdoutResult.text,
+        stderr: stderrResult.text,
+        exit_code: code,
+        signal: killedBy,
+        timed_out: timedOut,
+        aborted,
+        duration_ms: Math.round(performance.now() - startedAt),
+        workdir: cwd,
+        truncated: stdoutResult.truncated || stderrResult.truncated,
+      };
+      resolveResult({
+        content: JSON.stringify(result),
+        isError: timedOut || aborted || code !== 0,
+        summary: `${timedOut ? "timed out" : aborted ? "cancelled" : `exit ${code ?? killedBy ?? "unknown"}`} · ${result.duration_ms} ms${result.truncated ? " · output truncated" : ""}`,
       });
     });
   });
@@ -364,13 +468,27 @@ function parseArguments(call) {
 
 async function callTool(call, computerUse, signal) {
   const args = parseArguments(call);
-  emit("tool_start", { tool: call.name, arguments: args });
+  const detail = call.name === "exec_command"
+    ? `$ ${String(args.command ?? "").replaceAll(/\s+/g, " ").slice(0, 180)}`
+    : call.name === "computer_exec_js"
+      ? "Running persistent computer script"
+      : call.name === "computer_action"
+        ? `Executing ${Array.isArray(args.actions) ? args.actions.length : 0} computer action(s)`
+        : "";
+  emit("tool_start", { tool: call.name, text: detail, arguments: args });
   try {
     let result;
-    if (call.name === "shell") {
-      result = await runShell(args, signal);
+    if (call.name === "exec_command") {
+      result = await runExecCommand(args, signal);
       result.output = [{ type: "input_text", text: result.content }];
       result.text = result.content;
+    } else if (call.name === "plan_update") {
+      const active = args.steps.filter((step) => step.status === "in_progress").length;
+      if (active > 1) throw new Error("plan may contain at most one in_progress step");
+      const summary = args.steps.map((step) => `${step.status}: ${step.step}`).join("\n");
+      emit("plan", { text: args.explanation || "Plan updated", steps: args.steps });
+      result = { content: summary, text: summary, isError: false };
+      result.output = [{ type: "input_text", text: summary }];
     } else if (call.name.startsWith("computer_")) {
       result = await computerUse.call(call.name, args, call.call_id);
     } else {
@@ -378,7 +496,7 @@ async function callTool(call, computerUse, signal) {
     }
     emit("tool_end", {
       tool: call.name,
-      text: bytePrefix(result.text, 4000),
+      text: bytePrefix(result.summary ?? result.text, 4000),
       is_error: result.isError,
     });
     return { type: "function_call_output", call_id: call.call_id, output: result.output };
@@ -418,7 +536,7 @@ export async function runAgent(request, options = {}) {
     principal: request.agent,
   });
   try {
-    const tools = [SHELL_TOOL, ...computerUse.tools()];
+    const tools = [EXEC_COMMAND_TOOL, PLAN_UPDATE_TOOL, ...computerUse.tools()];
     const currentUserContent = [{ type: "input_text", text: request.prompt }];
     for (const image of request.images ?? []) currentUserContent.push(await imageInput(image));
     const input = [

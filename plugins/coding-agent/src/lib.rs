@@ -3595,9 +3595,19 @@ fn summarize_agent_line(
         "assistant" => ("agent", event_text(&value), None),
         "reasoning" => ("status", event_text(&value), None),
         "status" => ("status", event_text(&value), None),
+        "plan" => ("status", plan_event_text(&value), None),
         "tool_start" => {
             let tool = display_tool_name(&value);
-            ("tool", format!("{tool} in progress"), None)
+            let detail = event_text(&value);
+            (
+                "tool",
+                if detail.is_empty() {
+                    format!("{tool} in progress")
+                } else {
+                    format!("{tool} · {}", one_line(&detail, 240))
+                },
+                None,
+            )
         }
         "tool_end" => {
             let tool = display_tool_name(&value);
@@ -3645,6 +3655,36 @@ fn event_text(value: &serde_json::Value) -> String {
         .and_then(serde_json::Value::as_str)
         .unwrap_or("")
         .to_string()
+}
+
+fn plan_event_text(value: &serde_json::Value) -> String {
+    let mut lines = Vec::new();
+    if let Some(text) = value.get("text").and_then(serde_json::Value::as_str)
+        && !text.is_empty()
+    {
+        lines.push(text.to_string());
+    }
+    if let Some(steps) = value.get("steps").and_then(serde_json::Value::as_array) {
+        for step in steps.iter().take(12) {
+            let status = step
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("pending");
+            let label = step
+                .get("step")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let marker = match status {
+                "completed" => "✓",
+                "in_progress" => "→",
+                _ => "○",
+            };
+            if !label.is_empty() {
+                lines.push(format!("{marker} {label}"));
+            }
+        }
+    }
+    bounded_text(&lines.join("\n"), 3000)
 }
 
 fn display_tool_name(value: &serde_json::Value) -> &str {
@@ -3761,12 +3801,34 @@ mod tests {
         );
         assert_eq!(
             summarize_agent_line(
+                r#"{"type":"tool_start","tool":"exec_command","text":"$ cargo test"}"#,
+                "agent"
+            ),
+            ("tool", "exec_command · $ cargo test".to_string(), None)
+        );
+        assert_eq!(
+            summarize_agent_line(
                 r#"{"type":"tool_end","tool":"brood_computer_use__computer_launch","text":"{\"pane\":3,\"visible\":true}","is_error":false}"#,
                 "agent"
             ),
             (
                 "tool",
                 "computer_launch completed: {\"pane\":3,\"visible\":true}".to_string(),
+                None
+            )
+        );
+    }
+
+    #[test]
+    fn brood_agent_plan_events_render_progress_markers() {
+        assert_eq!(
+            summarize_agent_line(
+                r#"{"type":"plan","text":"Implementation plan","steps":[{"step":"Inspect","status":"completed"},{"step":"Fix","status":"in_progress"},{"step":"Verify","status":"pending"}]}"#,
+                "agent"
+            ),
+            (
+                "status",
+                "Implementation plan\n✓ Inspect\n→ Fix\n○ Verify".to_string(),
                 None
             )
         );

@@ -145,6 +145,13 @@ while adversarial scripts demonstrate every denied capability and limit.
 - [x] Keep conversation state and streamed model/tool events in the existing agent actor.
 - [x] Migrate an existing Codex ChatGPT login once into Brood-owned private OAuth state.
 - [x] Prove the real picker, agent pane, model, MCP, compositor input, and capture path.
+- [x] Hide protocol, lease-generation, action-sequence, and observation-cursor
+  bookkeeping from built-in model calls while preserving explicit override fields
+  for diagnostics.
+- [x] Prefer persistent `computer_exec_js` for long or repeated GUI sequences and
+  keep direct actions available for short corrections.
+- [x] Give the independent agent bounded structured command results and visible
+  multi-step plan updates.
 
 Integration gate: a user opens the built-in agent pane normally and asks it to
 operate an application in that session without manual MCP configuration. The
@@ -240,6 +247,7 @@ design or test workload.
 | 2026-08-18 | Resize authority | working tree | Server-preferred automation size and human takeover | `/tmp/brood-computer-use-size-authority-verified-20260818/proof.md`; changing SHM and DMA-BUF captures; real client log has one normal resize before automation, no additional resize during the held automation drag, a paused observer update at event cursor 29, then a new current-layout resize; `human-status.json` retains an attached presentation with no lease | Passed: a live lease makes the server authoritative independently of screenshot delivery, synchronized presentation resize degrades to scaling without configuring the managed app, and primary human input restores client sizing after the fast-path input drain completes |
 | 2026-08-19 | Agent integration | working tree | Independent built-in agent drives SpeedCrunch from an empty session | `/tmp/brood-independent-agent-h/proof.md`; task `coding-agent-1-computer-4154898-1`; observation sequences 1-2; settle frames 12-13; final 1440x900 observation shows `82822551`; task stopped with lease released | Passed: Brood's packaged headless agent, existing actor UI, direct model stream, session MCP adapter, real compositor input, visual observation, actor-idle transition, and clean presentation close all completed without a Codex process |
 | 2026-08-19 | Agent integration | working tree | Existing Codex ChatGPT OAuth login migration and independent packaged reuse | Five isolated auth/backend tests; live markers `BROOD_OAUTH_OK`, `BROOD_PACKAGED_OAUTH_OK`, and `BROOD_OAUTH_INDEPENDENT_OK`; Brood auth directory/file modes `0700`/`0600`; exact-token scan found zero matches in 418 repository files | Passed: the first live turn copied the existing login outside the repository, the packaged runner used it successfully, and a later turn succeeded with the Codex migration source deliberately unavailable |
+| 2026-08-31 | Agent UX | working tree | Adapter and actor unit workloads | `agents/brood-agent`: 15 tests passed, including automatic lease/sequence/cursor continuation and noisy/timeout command execution; `plugins/coding-agent`: 13 tests passed through Nix, including visible plan rendering | Partial pass: model-facing bookkeeping and command lifecycle are simpler and bounded; a packaged nested GUI workload remains required after the wider UI integration |
 
 ## Immediate next actions
 

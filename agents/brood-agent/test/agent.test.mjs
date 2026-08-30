@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { createServer } from "node:net";
 import { join } from "node:path";
@@ -9,6 +9,7 @@ import {
   parseSsePayloads,
   resolveModelBackend,
   runAgent,
+  runExecCommand,
 } from "../src/agent.mjs";
 import {
   NativeComputerUseClient,
@@ -39,6 +40,58 @@ test("parses response SSE blocks and ignores DONE", () => {
     ),
     [{ type: "response.completed", response: { output: [] } }],
   );
+});
+
+test("exec_command returns structured stdout, stderr, status, and workdir", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "brood-agent-exec-test."));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await mkdir(join(root, "nested"));
+  const result = await runExecCommand({
+    command: "printf output; printf problem >&2",
+    workdir: "nested",
+  }, undefined, root);
+  const output = JSON.parse(result.content);
+  assert.equal(output.stdout, "output");
+  assert.equal(output.stderr, "problem");
+  assert.equal(output.exit_code, 0);
+  assert.equal(output.workdir, join(root, "nested"));
+  assert.equal(output.truncated, false);
+  assert.equal(result.isError, false);
+});
+
+test("exec_command confines workdirs and bounds noisy output with useful tail", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "brood-agent-exec-bounds."));
+  const outside = await mkdtemp(join(tmpdir(), "brood-agent-exec-outside."));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  t.after(() => rm(outside, { recursive: true, force: true }));
+  await assert.rejects(
+    runExecCommand({ command: "pwd", workdir: ".." }, undefined, root),
+    /inside the session workspace/,
+  );
+  await symlink(outside, join(root, "escape"));
+  await assert.rejects(
+    runExecCommand({ command: "pwd", workdir: "escape" }, undefined, root),
+    /inside the session workspace/,
+  );
+  const result = await runExecCommand({
+    command: "printf begin; head -c 3000 /dev/zero | tr '\\0' x; printf end",
+    max_output_bytes: 1024,
+  }, undefined, root);
+  const output = JSON.parse(result.content);
+  assert.equal(output.truncated, true);
+  assert(output.stdout.startsWith("begin"));
+  assert(output.stdout.endsWith("end"));
+  assert(output.stdout.includes("output truncated"));
+});
+
+test("exec_command terminates a timed out process group", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "brood-agent-exec-timeout."));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const result = await runExecCommand({ command: "sleep 10", timeout_ms: 20 }, undefined, root);
+  const output = JSON.parse(result.content);
+  assert.equal(output.timed_out, true);
+  assert.equal(result.isError, true);
+  assert(output.duration_ms < 2000);
 });
 
 test("API key selects the public Responses backend", async () => {
@@ -144,6 +197,44 @@ test("computer actions are native model tools with a hidden host envelope", asyn
   assert.equal(envelope.tool_call_id, "model-call-7");
   assert.equal(envelope.arguments.target_session, 7);
   assert.equal(envelope.arguments.call_id, "model-call-7");
+});
+
+test("computer client hides lease, action sequence, and observation cursors", async () => {
+  const commands = [];
+  const replies = [
+    '{"generation":7}',
+    '{"sequence":1,"observation":{"sequence":3}}',
+    '{"sequence":2}',
+    '{"events":[],"observation":null}',
+  ];
+  const client = new NativeComputerUseClient({ socketPath: "/unused", session: 7, principal: "agent-1" });
+  client.command = async (command) => {
+    commands.push(command);
+    return replies.shift();
+  };
+  await client.call("computer_start", { task: "task-auto" }, "start-auto");
+  const actionResult = await client.call("computer_action", {
+    task: "task-auto",
+    actions: [{ type: "screenshot" }],
+  }, "action-auto");
+  await client.call("computer_exec_js", {
+    task: "task-auto",
+    source: "display(computer.screenshot())",
+  }, "script-auto");
+  await client.call("computer_observe", { task: "task-auto" }, "observe-auto");
+
+  const action = JSON.parse(commands[1][2]).arguments;
+  assert.equal(action.protocol_version, 1);
+  assert.equal(action.lease_generation, 7);
+  assert.equal(action.expected_sequence, 1);
+  assert.equal(actionResult.summary, "Computer updated · sequence 1");
+  const script = JSON.parse(commands[2][2]);
+  assert.equal(script.lease_generation, 7);
+  assert.equal(script.expected_sequence, 2);
+  assert.deepEqual(commands[3], ["computer-use", "observe", "task-auto", "0", "3"]);
+  const definition = computerUseTools(7).find((tool) => tool.name === "computer_exec_js");
+  assert.deepEqual(definition.parameters.required, ["task", "source"]);
+  assert(definition.description.includes("Prefer this"));
 });
 
 test("computer window discovery is session scoped and recommended before launch", async () => {
