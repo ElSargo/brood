@@ -20,7 +20,9 @@ const ITEM_HEIGHT: f32 = 72.0;
 const MAX_ITEMS: usize = 32;
 const MAX_TITLE_CHARS: usize = 96;
 const MAX_DETAIL_CHARS: usize = 160;
+const CLOSE_TARGET: usize = usize::MAX;
 const SHOW_MESSAGE: &[u8] = br#"{"kind":"inbox-action","action":"show"}"#;
+const TOGGLE_MESSAGE: &[u8] = br#"{"kind":"inbox-action","action":"toggle"}"#;
 
 const BG: Color = ashen::BACKGROUND;
 const SURFACE: Color = ashen::SURFACE;
@@ -66,6 +68,7 @@ struct InboxState {
     error: String,
     hovered: Option<usize>,
     pressed: Option<usize>,
+    selected: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -88,6 +91,7 @@ impl InboxState {
             error: String::new(),
             hovered: None,
             pressed: None,
+            selected: None,
         }
     }
 }
@@ -125,11 +129,11 @@ impl Guest for InboxPlugin {
 }
 
 fn handle_mailbox(sender: &str, body: &[u8]) -> Vec<Command> {
-    if sender == "key-policy" && body == SHOW_MESSAGE {
+    if sender == "key-policy" && (body == SHOW_MESSAGE || body == TOGGLE_MESSAGE) {
         let Ok(state) = STATE.lock() else {
             return Vec::new();
         };
-        return show_pane_commands(state.pane);
+        return toggle_pane_commands(state.pane);
     }
     let Some(item) = parse_item(sender, body) else {
         return Vec::new();
@@ -141,18 +145,31 @@ fn handle_mailbox(sender: &str, body: &[u8]) -> Vec<Command> {
     state.scroll = 0;
     state.hovered = None;
     state.pressed = None;
+    state.selected = (!state.items.is_empty()).then_some(0);
     redraw_or_record_error(&mut state);
     Vec::new()
 }
 
-fn show_pane_commands(pane: u64) -> Vec<Command> {
+fn toggle_pane_commands(pane: u64) -> Vec<Command> {
     if pane == 0 {
         return Vec::new();
     }
     vec![Command::SendLocalMessage(LocalActorMessage {
         actor: SHELL_ACTOR_ID.to_string(),
-        body: format!(r#"{{"kind":"inbox-show","pane":{pane}}}"#).into_bytes(),
+        body: format!(r#"{{"kind":"inbox-toggle","pane":{pane}}}"#).into_bytes(),
     })]
+}
+
+fn hide_pane_commands(pane: u64) -> Vec<Command> {
+    (pane != 0)
+        .then(|| {
+            Command::SendLocalMessage(LocalActorMessage {
+                actor: SHELL_ACTOR_ID.to_string(),
+                body: format!(r#"{{"kind":"inbox-hide","pane":{pane}}}"#).into_bytes(),
+            })
+        })
+        .into_iter()
+        .collect()
 }
 
 fn parse_item(sender: &str, body: &[u8]) -> Option<InboxItem> {
@@ -206,12 +223,17 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
             state.resize_extent = target_extent;
             state.hovered = None;
             state.pressed = None;
+            clamp_selection(&mut state);
             clamp_scroll(&mut state);
             paint_for_resize_or_record_error(&mut state, paint);
             Vec::new()
         }
         PresentationEvent::PointerMoved(moved) if moved.pane == state.pane => {
-            let hovered = inbox_target_at(&state, moved.y);
+            let hovered = if close_target_at(&state, moved.x, moved.y) {
+                Some(CLOSE_TARGET)
+            } else {
+                inbox_target_at(&state, moved.y)
+            };
             if state.hovered != hovered {
                 state.hovered = hovered;
                 redraw_or_record_error(&mut state);
@@ -227,6 +249,19 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
         PresentationEvent::PointerButton(button)
             if button.pane == state.pane && button.button == LEFT_BUTTON =>
         {
+            if close_target_at(&state, button.x, button.y) {
+                state.hovered = Some(CLOSE_TARGET);
+                let activate = !button.pressed && state.pressed == Some(CLOSE_TARGET);
+                state.pressed = button.pressed.then_some(CLOSE_TARGET);
+                redraw_or_record_error(&mut state);
+                return if button.pressed {
+                    Vec::new()
+                } else if activate {
+                    hide_pane_commands(state.pane)
+                } else {
+                    Vec::new()
+                };
+            }
             let target = inbox_target_at(&state, button.y);
             if button.pressed {
                 state.hovered = target;
@@ -241,6 +276,7 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
                     let Some(item) = state.items.remove(pressed) else {
                         return Vec::new();
                     };
+                    clamp_selection(&mut state);
                     clamp_scroll(&mut state);
                     vec![Command::SendLocalMessage(LocalActorMessage {
                         actor: item.target_actor,
@@ -263,6 +299,45 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
             state.pressed = None;
             redraw_or_record_error(&mut state);
             Vec::new()
+        }
+        PresentationEvent::Key(key) if key.pane == state.pane && key.pressed => {
+            let commands = match key.logical_key.as_str() {
+                "Escape" => hide_pane_commands(state.pane),
+                "ArrowDown" | "j" => {
+                    if !state.items.is_empty() {
+                        state.selected = Some(
+                            state
+                                .selected
+                                .unwrap_or(0)
+                                .saturating_add(1)
+                                .min(state.items.len() - 1),
+                        );
+                        reveal_selection(&mut state);
+                    }
+                    Vec::new()
+                }
+                "ArrowUp" | "k" => {
+                    if !state.items.is_empty() {
+                        state.selected = Some(state.selected.unwrap_or(0).saturating_sub(1));
+                        reveal_selection(&mut state);
+                    }
+                    Vec::new()
+                }
+                "Enter" => activate_selected(&mut state),
+                "Delete" | "Backspace" => {
+                    if let Some(selected) = state.selected
+                        && selected < state.items.len()
+                    {
+                        state.items.remove(selected);
+                        clamp_selection(&mut state);
+                        clamp_scroll(&mut state);
+                    }
+                    Vec::new()
+                }
+                _ => Vec::new(),
+            };
+            redraw_or_record_error(&mut state);
+            commands
         }
         PresentationEvent::RenderHint(hint) => {
             if let Err(error) =
@@ -292,10 +367,53 @@ fn inbox_target_at(state: &InboxState, y: f32) -> Option<usize> {
         .filter(|index| *index < state.items.len())
 }
 
+fn close_target_at(state: &InboxState, x: f32, y: f32) -> bool {
+    x.is_finite()
+        && y.is_finite()
+        && x >= state.width - 42.0
+        && x < state.width
+        && (0.0..HEADER_HEIGHT).contains(&y)
+}
+
 fn clamp_scroll(state: &mut InboxState) {
     state.scroll = state
         .scroll
         .min(state.items.len().saturating_sub(visible_item_count(state)));
+}
+
+fn clamp_selection(state: &mut InboxState) {
+    state.selected = if state.items.is_empty() {
+        None
+    } else {
+        Some(state.selected.unwrap_or(0).min(state.items.len() - 1))
+    };
+}
+
+fn reveal_selection(state: &mut InboxState) {
+    let Some(selected) = state.selected else {
+        return;
+    };
+    let visible = visible_item_count(state);
+    if selected < state.scroll {
+        state.scroll = selected;
+    } else if selected >= state.scroll + visible {
+        state.scroll = selected + 1 - visible;
+    }
+}
+
+fn activate_selected(state: &mut InboxState) -> Vec<Command> {
+    let Some(selected) = state.selected else {
+        return Vec::new();
+    };
+    let Some(item) = state.items.remove(selected) else {
+        return Vec::new();
+    };
+    clamp_selection(state);
+    clamp_scroll(state);
+    vec![Command::SendLocalMessage(LocalActorMessage {
+        actor: item.target_actor,
+        body: br#"{"kind":"focus"}"#.to_vec(),
+    })]
 }
 
 fn redraw_or_record_error(state: &mut InboxState) {
@@ -389,9 +507,26 @@ fn redraw(state: &mut InboxState, resize_epoch: Option<u64>) -> Result<(), Strin
         &state.items.len().to_string(),
         12.0,
         ACCENT,
-        state.width - 42.0,
+        state.width - 70.0,
         15.0,
         28.0,
+    )?;
+    add_text(
+        state.pane,
+        &mut packet,
+        &mut frame,
+        "×",
+        18.0,
+        if state.pressed == Some(CLOSE_TARGET) {
+            TEXT
+        } else if state.hovered == Some(CLOSE_TARGET) {
+            ACCENT
+        } else {
+            MUTED
+        },
+        state.width - 30.0,
+        11.0,
+        18.0,
     )?;
 
     if state.items.is_empty() {
@@ -419,12 +554,13 @@ fn redraw(state: &mut InboxState, resize_epoch: Option<u64>) -> Result<(), Strin
             let absolute_index = state.scroll + index;
             let pressed = state.pressed == Some(absolute_index);
             let hovered = state.hovered == Some(absolute_index);
+            let selected = state.selected == Some(absolute_index);
             packet.push(DrawCommand::FillRoundedRect {
                 rect: Rect::new(8.0, y + 7.0, state.width - 16.0, ITEM_HEIGHT - 12.0),
                 radius: 5.0,
                 color: if pressed {
                     PRESSED
-                } else if hovered {
+                } else if hovered || selected {
                     HOVER
                 } else {
                     SURFACE_RAISED
@@ -450,7 +586,7 @@ fn redraw(state: &mut InboxState, resize_epoch: Option<u64>) -> Result<(), Strin
                 y + 11.0,
                 state.width - 36.0,
             )?;
-            if hovered || pressed {
+            if hovered || pressed || selected {
                 add_text(
                     state.pane,
                     &mut packet,
@@ -591,15 +727,48 @@ mod tests {
     }
 
     #[test]
-    fn show_action_asks_the_root_shell_to_reveal_the_global_inbox_pane() {
-        assert!(show_pane_commands(0).is_empty());
-        let commands = show_pane_commands(42);
+    fn toggle_action_asks_the_root_shell_to_toggle_the_global_inbox_pane() {
+        assert!(toggle_pane_commands(0).is_empty());
+        let commands = toggle_pane_commands(42);
         assert!(matches!(
             commands.as_slice(),
             [Command::SendLocalMessage(LocalActorMessage { actor, body })]
                 if actor == SHELL_ACTOR_ID
-                    && body == br#"{"kind":"inbox-show","pane":42}"#
+                    && body == br#"{"kind":"inbox-toggle","pane":42}"#
         ));
+    }
+
+    #[test]
+    fn keyboard_activation_removes_the_selected_item_and_focuses_its_actor() {
+        let mut state = InboxState::new();
+        push_item(
+            &mut state.items,
+            InboxItem {
+                category: "agent".into(),
+                title: "Done".into(),
+                detail: String::new(),
+                target_actor: "agent-ui".into(),
+                failed: false,
+            },
+        );
+        state.selected = Some(0);
+        let commands = activate_selected(&mut state);
+        assert!(state.items.is_empty());
+        assert_eq!(state.selected, None);
+        assert!(matches!(
+            commands.as_slice(),
+            [Command::SendLocalMessage(LocalActorMessage { actor, body })]
+                if actor == "agent-ui" && body == br#"{"kind":"focus"}"#
+        ));
+    }
+
+    #[test]
+    fn close_target_is_bounded_to_the_header_control() {
+        let state = InboxState::new();
+        assert!(close_target_at(&state, 300.0, 20.0));
+        assert!(!close_target_at(&state, 277.0, 20.0));
+        assert!(!close_target_at(&state, 300.0, HEADER_HEIGHT));
+        assert!(!close_target_at(&state, f32::NAN, 20.0));
     }
 
     #[test]

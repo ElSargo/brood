@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 const INIT_ACTOR_ID: &str = "brood.client-init";
 const CHILD_ACTOR_ID: &str = "session-switcher";
 const PICKER_ACTOR_ID: &str = "picker";
-const BACKEND_PICKER_REQUEST: &str = "backend-discovery";
+const BACKEND_PICKER_REQUEST_PREFIX: &str = "backend-discovery-";
 const KEYBINDINGS_ACTOR_ID: &str = "keybindings";
 const INBOX_ACTOR_ID: &str = "inbox";
 const STATUS_BAR_ACTOR_ID: &str = "status-bar";
@@ -153,6 +153,8 @@ struct SwitcherState {
     pending_directory_backend: Option<u64>,
     awaiting_backend_catalogue: bool,
     backend_picker: Option<u64>,
+    backend_picker_request: Option<String>,
+    next_picker_intent: u64,
     status: String,
     error: bool,
     next_coding_agent_ui: u64,
@@ -516,7 +518,7 @@ struct SessionPickerRequest {
     #[serde(rename = "type")]
     message_type: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    request: Option<&'static str>,
+    request: Option<String>,
     title: &'static str,
     placeholder: &'static str,
     items: Vec<SessionPickerItem>,
@@ -606,6 +608,8 @@ impl SwitcherState {
             pending_directory_backend: None,
             awaiting_backend_catalogue: false,
             backend_picker: None,
+            backend_picker_request: None,
+            next_picker_intent: 0,
             status: String::new(),
             error: false,
             next_coding_agent_ui: 2,
@@ -1065,6 +1069,22 @@ fn handle_inbox_message(bytes: &[u8]) -> Vec<ActorCommand> {
         "inbox-show" if state.inbox_pane == Some(message.pane) => {
             state.inbox_visible = true;
             publish_synchronized_layout(&mut state, Some(message.pane), "inbox", None)
+        }
+        "inbox-toggle" if state.inbox_pane == Some(message.pane) => {
+            state.inbox_visible = !state.inbox_visible;
+            let focus = if state.inbox_visible {
+                Some(message.pane)
+            } else {
+                remembered_workspace_focus(&state, state.workspace_focus)
+                    .or_else(|| state.sidebar_visible.then_some(state.pane))
+            };
+            publish_synchronized_layout(&mut state, focus, "inbox", None)
+        }
+        "inbox-hide" if state.inbox_pane == Some(message.pane) && state.inbox_visible => {
+            state.inbox_visible = false;
+            let focus = remembered_workspace_focus(&state, state.workspace_focus)
+                .or_else(|| state.sidebar_visible.then_some(state.pane));
+            publish_synchronized_layout(&mut state, focus, "inbox", None)
         }
         _ => Vec::new(),
     }
@@ -1533,11 +1553,9 @@ fn handle_layout_message(bytes: &[u8]) -> Vec<ActorCommand> {
     if state.pane == 0 {
         return Vec::new();
     }
-    if message.focused_pane != Some(state.pane)
-        && message.focused_pane != state.picker_pane
-        && message.focused_pane != state.keybindings_pane
-    {
-        state.workspace_focus = message.focused_pane;
+    let workspace_focus = remembered_workspace_focus(&state, message.focused_pane);
+    if message.focused_pane.is_none() || workspace_focus.is_some() {
+        state.workspace_focus = workspace_focus;
     }
     let focused_realm = message.focused_pane.and_then(|focused| {
         message
@@ -1944,6 +1962,15 @@ fn shell_requested_focus(state: &SwitcherState, fallback: Option<u64>) -> Option
         .flatten()
         .or_else(|| state.picker_visible.then_some(state.picker_pane).flatten())
         .or(fallback)
+}
+
+fn remembered_workspace_focus(state: &SwitcherState, candidate: Option<u64>) -> Option<u64> {
+    candidate.filter(|pane| {
+        Some(*pane) != Some(state.pane)
+            && Some(*pane) != state.picker_pane
+            && Some(*pane) != state.keybindings_pane
+            && Some(*pane) != state.inbox_pane
+    })
 }
 
 fn handle_key_policy_action(bytes: &[u8]) -> Vec<ActorCommand> {
@@ -2491,7 +2518,14 @@ fn handle_picker_message(bytes: &[u8]) -> Vec<ActorCommand> {
             let Ok(mut state) = STATE.lock() else {
                 return Vec::new();
             };
-            if message.request.as_deref() == Some(BACKEND_PICKER_REQUEST) {
+            if message
+                .request
+                .as_deref()
+                .is_some_and(|request| request.starts_with(BACKEND_PICKER_REQUEST_PREFIX))
+            {
+                if !backend_picker_reply_is_current(&state, message.request.as_deref()) {
+                    return vec![cancel_picker(message.picker)];
+                }
                 state.backend_picker = Some(message.picker);
                 state.status = if state.awaiting_backend_catalogue {
                     "Discovering backends…".to_string()
@@ -2533,12 +2567,17 @@ fn handle_picker_message(bytes: &[u8]) -> Vec<ActorCommand> {
                 && state.backend_picker == Some(message.picker)
             {
                 state.backend_picker = None;
+                state.backend_picker_request = None;
                 state.awaiting_backend_catalogue = false;
             }
             Vec::new()
         }
         _ => Vec::new(),
     }
+}
+
+fn backend_picker_reply_is_current(state: &SwitcherState, request: Option<&str>) -> bool {
+    request.is_some_and(|request| state.backend_picker_request.as_deref() == Some(request))
 }
 
 fn handle_picker_layout_message(bytes: &[u8]) -> Vec<ActorCommand> {
@@ -2619,6 +2658,7 @@ fn handle_picker_selection(bytes: &[u8]) -> Vec<ActorCommand> {
     };
     if state.backend_picker == Some(message.picker) {
         state.backend_picker = None;
+        state.backend_picker_request = None;
         state.awaiting_backend_catalogue = false;
     }
     if let Some(action) = message.result.value.action {
@@ -2865,10 +2905,11 @@ fn creation_backend_items(state: &SwitcherState) -> Vec<SessionPickerItem> {
 fn creation_backend_picker_command(
     state: &mut SwitcherState,
     loading: bool,
+    request: Option<String>,
 ) -> Option<ActorCommand> {
     let request = SessionPickerRequest {
         message_type: "picker-create",
-        request: loading.then_some(BACKEND_PICKER_REQUEST),
+        request,
         title: "Create session",
         placeholder: "Choose a worktree, directory, or backend…",
         items: creation_backend_items(state),
@@ -2893,7 +2934,7 @@ fn creation_backend_picker_command(
 
 #[cfg(test)]
 fn open_creation_backend_picker(state: &mut SwitcherState) -> Vec<ActorCommand> {
-    creation_backend_picker_command(state, false)
+    creation_backend_picker_command(state, false, None)
         .into_iter()
         .collect()
 }
@@ -2915,17 +2956,30 @@ fn update_creation_backend_picker(state: &SwitcherState) -> Option<ActorCommand>
 }
 
 fn request_creation_backend_picker(state: &mut SwitcherState) -> Vec<ActorCommand> {
+    state.next_picker_intent = state.next_picker_intent.saturating_add(1).max(1);
+    let request = format!(
+        "{BACKEND_PICKER_REQUEST_PREFIX}{}",
+        state.next_picker_intent
+    );
     state.awaiting_backend_catalogue = true;
     state.backend_picker = None;
+    state.backend_picker_request = Some(request.clone());
     state.status = "Discovering backends…".to_string();
     redraw_or_record_error(state);
-    let mut commands = creation_backend_picker_command(state, true)
+    let mut commands = creation_backend_picker_command(state, true, Some(request))
         .into_iter()
         .collect::<Vec<_>>();
     commands.push(ActorCommand::SendHostMessage(
         br#"{"type":"request-backend-catalogue"}"#.to_vec(),
     ));
     commands
+}
+
+fn cancel_picker(picker: u64) -> ActorCommand {
+    ActorCommand::SendLocalMessage(LocalActorMessage {
+        actor: PICKER_ACTOR_ID.to_string(),
+        body: format!(r#"{{"type":"picker-cancel","picker":{picker}}}"#).into_bytes(),
+    })
 }
 
 fn open_directory_picker(state: &mut SwitcherState, backend: u64) -> Vec<ActorCommand> {
@@ -4664,13 +4718,13 @@ mod tests {
         LayoutStateSize, ResizePaintPlan, SwitcherState, ViewSession, actor_realm,
         apply_backend_sessions, apply_layout_pointer_message,
         apply_layout_transaction_notification, apply_worktree_completion,
-        authenticated_neovim_client, begin_worktree_for_source, creation_backend_items,
-        ensure_default_terminal_ui, header_geometry, neovim_client_realm, neovim_ui_id,
-        open_creation_backend_picker, publish_layout, publish_layout_region_response,
-        publish_synchronized_layout, request_creation_backend_picker, request_editor,
-        resize_paint_plan, sender_actor_is, shell_layout_state, shell_requested_focus,
-        start_neovim_client, submit, toggle_diff, truncate_to_width,
-        update_creation_backend_picker, valid_editor_actor_target,
+        authenticated_neovim_client, backend_picker_reply_is_current, begin_worktree_for_source,
+        cancel_picker, creation_backend_items, ensure_default_terminal_ui, header_geometry,
+        neovim_client_realm, neovim_ui_id, open_creation_backend_picker, publish_layout,
+        publish_layout_region_response, publish_synchronized_layout, remembered_workspace_focus,
+        request_creation_backend_picker, request_editor, resize_paint_plan, sender_actor_is,
+        shell_layout_state, shell_requested_focus, start_neovim_client, submit, toggle_diff,
+        truncate_to_width, update_creation_backend_picker, valid_editor_actor_target,
     };
 
     fn host_command<'a>(commands: &'a [ActorCommand], message_type: &str) -> &'a [u8] {
@@ -5584,6 +5638,21 @@ mod tests {
     }
 
     #[test]
+    fn inbox_focus_is_never_remembered_as_workspace_focus() {
+        let mut state = SwitcherState::new();
+        state.pane = 1;
+        state.picker_pane = Some(2);
+        state.keybindings_pane = Some(3);
+        state.inbox_pane = Some(4);
+
+        assert_eq!(remembered_workspace_focus(&state, Some(9)), Some(9));
+        assert_eq!(remembered_workspace_focus(&state, Some(1)), None);
+        assert_eq!(remembered_workspace_focus(&state, Some(2)), None);
+        assert_eq!(remembered_workspace_focus(&state, Some(3)), None);
+        assert_eq!(remembered_workspace_focus(&state, Some(4)), None);
+    }
+
+    #[test]
     fn narrow_header_geometry_never_overlaps_the_action_button() {
         for width in [180.0, 220.0, 252.0, 320.0] {
             let header = header_geometry(width);
@@ -6001,10 +6070,35 @@ mod tests {
             serde_json::from_slice(&open.body).unwrap_or(serde_json::Value::Null);
         assert_eq!(open.actor, "picker");
         assert_eq!(value["type"], "picker-create");
-        assert_eq!(value["request"], "backend-discovery");
+        assert_eq!(value["request"], "backend-discovery-1");
         assert_eq!(value["loading"], true);
         assert_eq!(value["loading_label"], "Discovering backends…");
         assert_eq!(discover, br#"{"type":"request-backend-catalogue"}"#);
+
+        let next = request_creation_backend_picker(&mut state);
+        let ActorCommand::SendLocalMessage(next_open) = &next[0] else {
+            panic!("repeated request did not open a picker");
+        };
+        let next_value: serde_json::Value =
+            serde_json::from_slice(&next_open.body).unwrap_or(serde_json::Value::Null);
+        assert_eq!(next_value["request"], "backend-discovery-2");
+        assert_eq!(
+            state.backend_picker_request.as_deref(),
+            Some("backend-discovery-2")
+        );
+        assert!(!backend_picker_reply_is_current(
+            &state,
+            Some("backend-discovery-1")
+        ));
+        assert!(backend_picker_reply_is_current(
+            &state,
+            Some("backend-discovery-2")
+        ));
+        let ActorCommand::SendLocalMessage(cancel) = cancel_picker(41) else {
+            panic!("stale picker cancellation did not target the picker actor");
+        };
+        assert_eq!(cancel.actor, "picker");
+        assert_eq!(cancel.body, br#"{"type":"picker-cancel","picker":41}"#);
     }
 
     #[test]

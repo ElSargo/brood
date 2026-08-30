@@ -52,3 +52,20 @@ The workload exposed two narrower platform needs:
 Neither need requires a host component tree. The canvas, text, input, actor
 lifecycle, and typed session-command boundaries were sufficient for the usable
 switcher.
+
+## 2026-08-31 Interaction And Concurrency Pass
+
+The shell now excludes every shell-owned overlay and rail, including the
+inbox, when remembering workspace focus. Repeated backend-discovery pickers
+carry distinct intent correlations; a superseded creation reply is cancelled
+instead of being admitted as the current picker. The inbox remains guest-owned
+canvas UI and adds keyboard selection, activation and dismissal plus pointer
+and keyboard hide controls. These changes required no host component knowledge
+or new canvas primitives.
+
+Focused Rust tests drive reducer-level intent permutations and queue
+interactions. The reusable picker protocol still reports pane visibility
+without the creating picker or intent identity; proving that a delayed hide
+notification cannot transiently affect a newer queued picker will require that
+causal identity at the protocol boundary rather than more switcher-side
+component state.
