@@ -1159,10 +1159,10 @@ impl SceneCompiler {
                         };
                         let geometry = self.quad_geometry_with_uv(
                             Rect::new(
-                                *x + glyph.x as f32,
-                                *y + glyph.y as f32,
-                                image.width as f32,
-                                image.height as f32,
+                                *x + glyph.x,
+                                *y + glyph.y,
+                                image.width as f32 / resource.raster_scale,
+                                image.height as f32 / resource.raster_scale,
                             ),
                             state.transform,
                             [state.opacity; 4],

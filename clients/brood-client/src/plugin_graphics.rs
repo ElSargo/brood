@@ -44,12 +44,13 @@ const MAX_RESOURCE_BYTES_PER_PANE: usize = 64 * 1024 * 1024;
 const GLYPH_RASTER_QUEUE_CAPACITY: usize = 128;
 const COLD_WINIT_REDRAW_HOP_NS: u64 = 1_000_000;
 const MAX_WINIT_REDRAW_HOP_NS: u64 = 50_000_000;
+const DEFAULT_RASTER_SCALE: f32 = 1.0;
 
 #[derive(Clone)]
 pub struct PluginGraphicsBridge {
     shared: Arc<Mutex<GraphicsState>>,
     text_system: Arc<Mutex<TextSystem>>,
-    glyph_raster_tx: SyncSender<GlyphRasterRequest>,
+    glyph_raster_tx: SyncSender<GlyphRasterWork>,
     proxy: EventLoopProxy<ClientEvent>,
     render_scheduler: Arc<Mutex<RenderScheduler>>,
     render_clock_origin: Instant,
@@ -194,6 +195,13 @@ struct GlyphRasterRequest {
     generation: u64,
     options: TextLayoutOptions,
     plan: TextLayoutPlan,
+    raster_scale: f32,
+}
+
+#[derive(Debug)]
+enum GlyphRasterWork {
+    Layout(Box<GlyphRasterRequest>),
+    ScaleChanged(f32),
 }
 
 #[derive(Clone, Debug)]
@@ -202,6 +210,7 @@ pub struct TextLayoutResource {
     pub height: u32,
     pub glyphs: Arc<[GlyphSprite]>,
     pub glyph_images: BTreeMap<GlyphCacheKey, GlyphImageResource>,
+    pub raster_scale: f32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -222,8 +231,8 @@ pub struct GlyphImageResource {
 #[derive(Clone, Copy, Debug)]
 pub struct GlyphSprite {
     pub key: GlyphCacheKey,
-    pub x: i32,
-    pub y: i32,
+    pub x: f32,
+    pub y: f32,
 }
 
 #[derive(Debug)]
@@ -233,6 +242,9 @@ struct TextLayoutEntry {
     width: u32,
     height: u32,
     byte_len: usize,
+    text: Arc<str>,
+    options: TextLayoutOptions,
+    raster_scale: f32,
     state: TextLayoutState,
 }
 
@@ -273,6 +285,7 @@ struct GraphicsState {
     actor_frame_partial_promotion_violations: u64,
     visibility_changes: u64,
     max_visible_panes: usize,
+    raster_scale: f32,
 }
 
 #[derive(Debug)]
@@ -880,7 +893,10 @@ fn complete_resize_epoch_state(
 
 impl PluginGraphicsBridge {
     pub fn new(proxy: EventLoopProxy<ClientEvent>) -> Self {
-        let shared = Arc::new(Mutex::new(GraphicsState::default()));
+        let shared = Arc::new(Mutex::new(GraphicsState {
+            raster_scale: DEFAULT_RASTER_SCALE,
+            ..GraphicsState::default()
+        }));
         let text_system = Arc::new(Mutex::new(TextSystem {
             fonts: FontSystem::new(),
             swash: SwashCache::new(),
@@ -897,6 +913,31 @@ impl PluginGraphicsBridge {
             render_clock_origin: Instant::now(),
             host_tail_ns: Arc::new(AtomicU64::new(COLD_HOST_COST_NS)),
             winit_redraw_hop_ns: Arc::new(AtomicU64::new(COLD_WINIT_REDRAW_HOP_NS)),
+        }
+    }
+
+    /// Keep glyph bitmaps in device pixels. Canvas geometry remains logical,
+    /// so changing output scale only requires replacing the raster resources
+    /// behind the existing layout handles.
+    pub fn set_raster_scale(&self, scale: f32) {
+        let scale = sanitize_raster_scale(scale);
+        let changed = self.shared.lock().is_ok_and(|mut state| {
+            if state.raster_scale.to_bits() == scale.to_bits() {
+                return false;
+            }
+            state.raster_scale = scale;
+            for entry in state.text_layouts.values_mut() {
+                entry.raster_scale = scale;
+            }
+            true
+        });
+        if changed
+            && self
+                .glyph_raster_tx
+                .send(GlyphRasterWork::ScaleChanged(scale))
+                .is_err()
+        {
+            eprintln!("could not queue glyph reraster for output scale {scale:.3}");
         }
     }
 
@@ -1627,12 +1668,19 @@ fn start_glyph_raster_worker(
     shared: Arc<Mutex<GraphicsState>>,
     text_system: Arc<Mutex<TextSystem>>,
     proxy: EventLoopProxy<ClientEvent>,
-) -> SyncSender<GlyphRasterRequest> {
-    let (sender, receiver) = mpsc::sync_channel::<GlyphRasterRequest>(GLYPH_RASTER_QUEUE_CAPACITY);
+) -> SyncSender<GlyphRasterWork> {
+    let (sender, receiver) = mpsc::sync_channel::<GlyphRasterWork>(GLYPH_RASTER_QUEUE_CAPACITY);
     let spawn_result = thread::Builder::new()
         .name("brood-glyph-raster".to_owned())
         .spawn(move || {
-            while let Ok(request) = receiver.recv() {
+            while let Ok(work) = receiver.recv() {
+                if let GlyphRasterWork::ScaleChanged(scale) = work {
+                    rerasterize_text_layouts_for_scale(&shared, &text_system, &proxy, scale);
+                    continue;
+                }
+                let GlyphRasterWork::Layout(request) = work else {
+                    continue;
+                };
                 let started = Instant::now();
                 let pane = request.pane;
                 let handle = request.handle;
@@ -1640,7 +1688,12 @@ fn start_glyph_raster_worker(
                     .lock()
                     .map_err(|_poisoned| PresentationError::HostFailure)
                     .map(|mut text_system| {
-                        rasterize_text_layout(&mut text_system, &request.plan, request.options)
+                        rasterize_text_layout(
+                            &mut text_system,
+                            &request.plan,
+                            request.options,
+                            request.raster_scale,
+                        )
                     });
                 let elapsed = started.elapsed();
                 finish_glyph_raster(&shared, &proxy, &request, result);
@@ -1659,6 +1712,65 @@ fn start_glyph_raster_worker(
     sender
 }
 
+fn rerasterize_text_layouts_for_scale(
+    shared: &Mutex<GraphicsState>,
+    text_system: &Mutex<TextSystem>,
+    proxy: &EventLoopProxy<ClientEvent>,
+    scale: f32,
+) {
+    let requests = {
+        let Ok(state) = shared.lock() else {
+            return;
+        };
+        if state.raster_scale.to_bits() != scale.to_bits() {
+            return;
+        }
+        state
+            .text_layouts
+            .iter()
+            .map(|(handle, entry)| {
+                (
+                    *handle,
+                    entry.pane,
+                    entry.generation,
+                    Arc::clone(&entry.text),
+                    entry.options,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    for (handle, pane, generation, text, options) in requests {
+        let request = {
+            let Ok(mut text_system) = text_system.lock() else {
+                return;
+            };
+            let Ok(plan) = create_text_layout_plan(&mut text_system.fonts, &text, options) else {
+                continue;
+            };
+            GlyphRasterRequest {
+                handle,
+                pane,
+                generation,
+                options,
+                plan,
+                raster_scale: scale,
+            }
+        };
+        let result = text_system
+            .lock()
+            .map_err(|_poisoned| PresentationError::HostFailure)
+            .map(|mut text_system| {
+                rasterize_text_layout(
+                    &mut text_system,
+                    &request.plan,
+                    request.options,
+                    request.raster_scale,
+                )
+            });
+        finish_glyph_raster(shared, proxy, &request, result);
+    }
+}
+
 fn finish_glyph_raster(
     shared: &Mutex<GraphicsState>,
     proxy: &EventLoopProxy<ClientEvent>,
@@ -1673,6 +1785,9 @@ fn finish_glyph_raster(
             return;
         };
         if entry.pane != request.pane || entry.generation != request.generation {
+            return;
+        }
+        if entry.raster_scale.to_bits() != request.raster_scale.to_bits() {
             return;
         }
         match result {
@@ -2113,6 +2228,7 @@ impl PresentationHost for ActorPresentationHost {
         };
         let metrics = plan.metrics;
         let byte_len = plan.byte_len;
+        let text: Arc<str> = text.into();
         let mut state = self
             .bridge
             .shared
@@ -2121,6 +2237,7 @@ impl PresentationHost for ActorPresentationHost {
         if actor_generation != self.generation.load(Ordering::Acquire) {
             return Err(PresentationError::InvalidPane);
         }
+        let raster_scale = sanitize_raster_scale(state.raster_scale);
         let handle = allocate_resource_handle(&mut state, pane, actor_generation, byte_len)?;
         state.text_layouts.insert(
             handle,
@@ -2130,6 +2247,9 @@ impl PresentationHost for ActorPresentationHost {
                 width: plan.width,
                 height: plan.height,
                 byte_len,
+                text,
+                options,
+                raster_scale,
                 state: TextLayoutState::Pending,
             },
         );
@@ -2142,8 +2262,14 @@ impl PresentationHost for ActorPresentationHost {
             generation: actor_generation,
             options,
             plan,
+            raster_scale,
         };
-        if self.bridge.glyph_raster_tx.try_send(request).is_err() {
+        if self
+            .bridge
+            .glyph_raster_tx
+            .try_send(GlyphRasterWork::Layout(Box::new(request)))
+            .is_err()
+        {
             if let Ok(mut state) = self.bridge.shared.lock() {
                 state.text_layouts.remove(&handle);
                 state.glyph_raster_backpressure = state.glyph_raster_backpressure.saturating_add(1);
@@ -2244,6 +2370,7 @@ fn referenced_resources(
                             height: entry.height,
                             glyphs: Arc::from([]),
                             glyph_images: BTreeMap::new(),
+                            raster_scale: entry.raster_scale,
                         }
                     }
                     TextLayoutState::Ready(resource) => {
@@ -2430,18 +2557,28 @@ fn create_text_layout_plan(
     })
 }
 
+fn sanitize_raster_scale(scale: f32) -> f32 {
+    if scale.is_finite() && scale > 0.0 {
+        scale.clamp(0.5, 8.0)
+    } else {
+        DEFAULT_RASTER_SCALE
+    }
+}
+
 fn rasterize_text_layout(
     text_system: &mut TextSystem,
     plan: &TextLayoutPlan,
     options: TextLayoutOptions,
+    raster_scale: f32,
 ) -> TextLayoutResource {
+    let raster_scale = sanitize_raster_scale(raster_scale);
     let requested_color = options.color.map(unit_to_u8);
     let positioned = plan
         .buffer
         .layout_runs()
         .flat_map(|run| {
             run.glyphs.iter().map(move |glyph| {
-                let physical = glyph.physical((0.0, run.line_y), 1.0);
+                let physical = glyph.physical((0.0, run.line_y), raster_scale);
                 (physical.cache_key, physical.x, physical.y)
             })
         })
@@ -2466,8 +2603,8 @@ fn rasterize_text_layout(
         };
         sprites.push(GlyphSprite {
             key,
-            x: x.saturating_add(image.left),
-            y: y.saturating_sub(image.top),
+            x: x.saturating_add(image.left) as f32 / raster_scale,
+            y: y.saturating_sub(image.top) as f32 / raster_scale,
         });
         glyph_images.insert(key, image);
     }
@@ -2476,6 +2613,7 @@ fn rasterize_text_layout(
         height: plan.height,
         glyphs: sprites.into(),
         glyph_images,
+        raster_scale,
     }
 }
 
@@ -2569,6 +2707,45 @@ fn linear_premultiplied_srgba8([red, green, blue, alpha]: [u8; 4]) -> [u8; 4] {
 mod tests {
     use super::*;
 
+    fn test_text_options() -> TextLayoutOptions {
+        TextLayoutOptions {
+            font_intent: FontIntent::Ui,
+            font_weight: FontWeight::Normal,
+            font_style: FontStyle::Normal,
+            font_size: 16.0,
+            max_width: 256.0,
+            line_height: 20.0,
+            color: [1.0; 4],
+        }
+    }
+
+    #[test]
+    fn glyph_rasterization_tracks_fractional_device_scale() -> Result<()> {
+        let mut text_system = TextSystem {
+            fonts: FontSystem::new(),
+            swash: SwashCache::new(),
+            glyphs: BTreeMap::new(),
+        };
+        let options = test_text_options();
+        let plan = create_text_layout_plan(&mut text_system.fonts, "Brood", options)?;
+        let one_x = rasterize_text_layout(&mut text_system, &plan, options, 1.0);
+        let plan = create_text_layout_plan(&mut text_system.fonts, "Brood", options)?;
+        let fractional = rasterize_text_layout(&mut text_system, &plan, options, 1.5);
+        let raster_area = |resource: &TextLayoutResource| {
+            resource
+                .glyph_images
+                .values()
+                .map(|glyph| u64::from(glyph.width) * u64::from(glyph.height))
+                .sum::<u64>()
+        };
+
+        anyhow::ensure!(one_x.raster_scale.to_bits() == 1.0_f32.to_bits());
+        anyhow::ensure!(fractional.raster_scale.to_bits() == 1.5_f32.to_bits());
+        anyhow::ensure!(raster_area(&one_x) > 0);
+        anyhow::ensure!(raster_area(&fractional) > raster_area(&one_x));
+        Ok(())
+    }
+
     fn text_packet(handles: &[u64]) -> Packet {
         let mut packet = Packet::new();
         for handle in handles {
@@ -2588,6 +2765,9 @@ mod tests {
             width: 1,
             height: 1,
             byte_len: 4,
+            text: Arc::from("x"),
+            options: test_text_options(),
+            raster_scale: 1.0,
             state: TextLayoutState::Pending,
         }
     }
@@ -2598,6 +2778,7 @@ mod tests {
             height: 1,
             glyphs: Arc::from([]),
             glyph_images: BTreeMap::new(),
+            raster_scale: 1.0,
         }
     }
 

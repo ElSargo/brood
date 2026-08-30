@@ -10597,6 +10597,11 @@ impl Application {
         else {
             return;
         };
+        if let Some(graphics) = self.plugin_graphics.as_ref()
+            && let Some(renderer) = self.renderer.as_ref()
+        {
+            graphics.set_raster_scale(renderer.window.scale_factor() as f32);
+        }
         if self.window_resize.is_none() && previous_size == (size.width, size.height) {
             return;
         }
@@ -10658,6 +10663,33 @@ impl Application {
                 self.fail(event_loop, error);
                 return;
             }
+        }
+    }
+
+    fn handle_scale_factor_changed(&mut self, event_loop: &ActiveEventLoop, scale_factor: f64) {
+        let result = (|| -> Result<()> {
+            let renderer = self
+                .renderer
+                .as_mut()
+                .context("renderer disappeared during output scale change")?;
+            renderer
+                .plugin_graphics
+                .set_raster_scale(scale_factor as f32);
+            renderer.sync_plugin_graphics_extents()?;
+            if let Some(sender) = self.input_sender.as_mut() {
+                send_presentation_configuration(sender, renderer);
+            }
+            flush_renderer_managed_resize_requests(self.input_sender.as_mut(), renderer);
+            flush_renderer_plugin_resize_events_best_effort(
+                self.wasm_runtime.as_ref(),
+                renderer,
+                "output scale change",
+            );
+            renderer.window.request_redraw();
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.fail(event_loop, error);
         }
     }
 
@@ -12313,6 +12345,10 @@ impl ApplicationHandler<ClientEvent> for Application {
 
         if let WindowEvent::Resized(size) = &event {
             self.handle_window_resized(event_loop, *size);
+            return;
+        }
+        if let WindowEvent::ScaleFactorChanged { scale_factor, .. } = &event {
+            self.handle_scale_factor_changed(event_loop, *scale_factor);
             return;
         }
         let mut composition_revealed_deadline = false;
@@ -17067,6 +17103,7 @@ impl Renderer {
         )?;
         let plugin_canvas =
             GpuCanvasRenderer::new(&device, &queue, &frame_bind_group_layout, &frame_sampler);
+        plugin_graphics.set_raster_scale(window.scale_factor() as f32);
         surface.configure(&device, &config);
         eprintln!(
             "configured presentation surface format={:?} color_space={:?} \
