@@ -24,5 +24,8 @@ from the same process. It also records time from runner spawn to the ready
 message so startup regressions have a directly comparable measurement.
 
 The focused Neovim client suite passed 15 tests and Clippy with warnings denied.
-The runner and smoke scripts pass Node syntax checks. The packaged Wasm smoke
-and nested editor proof remain the end-to-end acceptance gates.
+The runner and smoke scripts pass Node syntax checks. The real packaged Wasm
+runtime smoke passed with `startup_ms=9675`, eight malformed-transfer
+recoveries, remote open/save lifecycle coverage, Tree-sitter parsing,
+backpressure, escape-heavy screen state, and a clean shutdown. The nested
+editor proof remains the full graphical acceptance gate.

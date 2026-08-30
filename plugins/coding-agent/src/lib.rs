@@ -354,8 +354,8 @@ impl UiState {
 enum RoleState {
     Unknown,
     Root(RootState),
-    Agent(AgentState),
-    Ui(UiState),
+    Agent(Box<AgentState>),
+    Ui(Box<UiState>),
 }
 
 static STATE: Mutex<RoleState> = Mutex::new(RoleState::Unknown);
@@ -415,13 +415,15 @@ fn handle_lifecycle(event: LifecycleEvent) -> Vec<ActorCommand> {
             ui.backend_id = context.backend_id.unwrap_or_default();
             ui.session_id = context.session_id.unwrap_or_default();
             if let Ok(mut state) = STATE.lock() {
-                *state = RoleState::Ui(ui);
+                *state = RoleState::Ui(Box::new(ui));
             }
             vec![ActorCommand::LifecycleComplete(Ok(()))]
         }
         LifecycleEvent::Start(context) if context.instance_id.contains(".coding-agent-") => {
             if let Ok(mut state) = STATE.lock() {
-                *state = RoleState::Agent(AgentState::new(context.session_id.unwrap_or_default()));
+                *state = RoleState::Agent(Box::new(AgentState::new(
+                    context.session_id.unwrap_or_default(),
+                )));
             }
             vec![ActorCommand::LifecycleComplete(Ok(()))]
         }
@@ -557,7 +559,7 @@ fn handle_mailbox(sender: &str, body: &[u8]) -> Vec<ActorCommand> {
         RoleState::Unknown => {
             let mut agent = AgentState::new(message.session_id);
             let commands = handle_agent_message(&mut agent, sender, message);
-            *state = RoleState::Agent(agent);
+            *state = RoleState::Agent(Box::new(agent));
             commands
         }
     }
@@ -1081,7 +1083,7 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
         return Vec::new();
     };
     if matches!(*state, RoleState::Unknown) {
-        *state = RoleState::Ui(UiState::new());
+        *state = RoleState::Ui(Box::new(UiState::new()));
     }
     let RoleState::Ui(ui) = &mut *state else {
         return Vec::new();
