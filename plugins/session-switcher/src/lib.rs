@@ -182,7 +182,7 @@ struct SwitcherState {
     native_resize_revision: Option<u64>,
     durable_shell_layout: Option<ShellLayoutState>,
     pending_shell_layouts: BTreeMap<u64, PendingShellLayout>,
-    deferred_overlay_layout: Option<DeferredOverlayLayout>,
+    deferred_shell_layout: Option<DeferredShellLayout>,
     pointer_drag: Option<ShellDividerDrag>,
     hovered: Option<SwitcherTarget>,
     pressed: Option<SwitcherTarget>,
@@ -295,7 +295,7 @@ struct PendingShellLayout {
 }
 
 #[derive(Clone)]
-struct DeferredOverlayLayout {
+struct DeferredShellLayout {
     state: ShellLayoutState,
     reason: &'static str,
 }
@@ -637,7 +637,7 @@ impl SwitcherState {
             native_resize_revision: None,
             durable_shell_layout: None,
             pending_shell_layouts: BTreeMap::new(),
-            deferred_overlay_layout: None,
+            deferred_shell_layout: None,
             pointer_drag: None,
             hovered: None,
             pressed: None,
@@ -1884,7 +1884,7 @@ fn apply_layout_transaction_notification(
                 layout.presented_layout_revision = target_layout_revision;
             }
             if state.pending_shell_layouts.is_empty()
-                && let Some(deferred) = state.deferred_overlay_layout.take()
+                && let Some(deferred) = state.deferred_shell_layout.take()
             {
                 let focus = deferred.state.focus;
                 restore_shell_layout_state(state, &deferred.state);
@@ -2656,6 +2656,18 @@ fn handle_picker_selection(bytes: &[u8]) -> Vec<ActorCommand> {
     let Ok(mut state) = STATE.lock() else {
         return Vec::new();
     };
+    apply_picker_selection(&mut state, message)
+}
+
+fn apply_picker_selection(
+    state: &mut SwitcherState,
+    message: PickerSelection,
+) -> Vec<ActorCommand> {
+    if state.backend_picker_request.is_some() && state.backend_picker != Some(message.picker) {
+        // Backend-picker intents are replaceable. A selection from the picker
+        // replaced by a newer intent must not create or activate a session.
+        return Vec::new();
+    }
     if state.backend_picker == Some(message.picker) {
         state.backend_picker = None;
         state.backend_picker_request = None;
@@ -2670,16 +2682,16 @@ fn handle_picker_selection(bytes: &[u8]) -> Vec<ActorCommand> {
                 let Some(source_session) = message.result.value.session else {
                     return Vec::new();
                 };
-                if !begin_worktree_for_source(&mut state, backend, source_session) {
+                if !begin_worktree_for_source(state, backend, source_session) {
                     state.error = true;
                     state.status = "The selected Git project is no longer available".to_string();
                 }
-                redraw_or_record_error(&mut state);
+                redraw_or_record_error(state);
                 return Vec::new();
             }
             "choose-directory" => {
                 if let Some(backend) = message.result.value.backend {
-                    return open_directory_picker(&mut state, backend);
+                    return open_directory_picker(state, backend);
                 }
             }
             "create-directory" => {
@@ -2715,21 +2727,21 @@ fn handle_picker_selection(bytes: &[u8]) -> Vec<ActorCommand> {
                 state.query.clear();
                 state.mode = EditMode::ConnectRemote;
                 state.status = "SSH target (user@host): Enter to deploy and connect".to_string();
-                redraw_or_record_error(&mut state);
+                redraw_or_record_error(state);
                 return Vec::new();
             }
             "create-container-local" => {
                 state.query.clear();
                 state.mode = EditMode::CreateLocalContainer;
                 state.status = "OCI image: Enter to create and connect".to_string();
-                redraw_or_record_error(&mut state);
+                redraw_or_record_error(state);
                 return Vec::new();
             }
             "create-container-remote" => {
                 state.query.clear();
                 state.mode = EditMode::CreateRemoteContainer;
                 state.status = "Podman connection::OCI image".to_string();
-                redraw_or_record_error(&mut state);
+                redraw_or_record_error(state);
                 return Vec::new();
             }
             _ => {}
@@ -2755,7 +2767,7 @@ fn handle_picker_selection(bytes: &[u8]) -> Vec<ActorCommand> {
         state.status = "The selected agent is no longer available".to_string();
         return Vec::new();
     }
-    open_coding_agent_ui(&mut state, agent)
+    open_coding_agent_ui(state, agent)
 }
 
 fn open_coding_agent_ui(state: &mut SwitcherState, agent: String) -> Vec<ActorCommand> {
@@ -2962,12 +2974,14 @@ fn request_creation_backend_picker(state: &mut SwitcherState) -> Vec<ActorComman
         state.next_picker_intent
     );
     state.awaiting_backend_catalogue = true;
-    state.backend_picker = None;
+    let replaced_picker = state.backend_picker.take();
     state.backend_picker_request = Some(request.clone());
     state.status = "Discovering backends…".to_string();
     redraw_or_record_error(state);
-    let mut commands = creation_backend_picker_command(state, true, Some(request))
+    let mut commands = replaced_picker
+        .map(cancel_picker)
         .into_iter()
+        .chain(creation_backend_picker_command(state, true, Some(request)))
         .collect::<Vec<_>>();
     commands.push(ActorCommand::SendHostMessage(
         br#"{"type":"request-backend-catalogue"}"#.to_vec(),
@@ -3617,8 +3631,15 @@ fn publish_synchronized_layout(
     reason: &'static str,
     native_resize_revision: Option<u64>,
 ) -> Vec<ActorCommand> {
-    if matches!(reason, "picker" | "keybindings") && !state.pending_shell_layouts.is_empty() {
-        state.deferred_overlay_layout = Some(DeferredOverlayLayout {
+    if native_resize_revision.is_none() && !state.pending_shell_layouts.is_empty() {
+        // Ordinary keyboard and mailbox actions can arrive while an earlier
+        // synchronized transition is still settling. Its target revision is
+        // already reserved by the host, but the actor does not learn that
+        // revision until completion. Keep only the latest desired shell state
+        // and publish it once the in-flight transition reports its target;
+        // submitting immediately would use the old base revision and drop the
+        // user's action as stale.
+        state.deferred_shell_layout = Some(DeferredShellLayout {
             state: shell_layout_state(state, requested_focus),
             reason,
         });
@@ -4717,14 +4738,15 @@ mod tests {
         ActorCommand, EditMode, LayoutContext, LayoutLeaseToken, LayoutRegionResizeMessage,
         LayoutStateSize, ResizePaintPlan, SwitcherState, ViewSession, actor_realm,
         apply_backend_sessions, apply_layout_pointer_message,
-        apply_layout_transaction_notification, apply_worktree_completion,
+        apply_layout_transaction_notification, apply_picker_selection, apply_worktree_completion,
         authenticated_neovim_client, backend_picker_reply_is_current, begin_worktree_for_source,
-        cancel_picker, creation_backend_items, ensure_default_terminal_ui, header_geometry,
-        neovim_client_realm, neovim_ui_id, open_creation_backend_picker, publish_layout,
-        publish_layout_region_response, publish_synchronized_layout, remembered_workspace_focus,
-        request_creation_backend_picker, request_editor, resize_paint_plan, sender_actor_is,
-        shell_layout_state, shell_requested_focus, start_neovim_client, submit, toggle_diff,
-        truncate_to_width, update_creation_backend_picker, valid_editor_actor_target,
+        creation_backend_items, ensure_default_terminal_ui, header_geometry, neovim_client_realm,
+        neovim_ui_id, open_creation_backend_picker, publish_layout, publish_layout_region_response,
+        publish_synchronized_layout, publish_synchronized_layout_attempt,
+        remembered_workspace_focus, request_creation_backend_picker, request_editor,
+        resize_paint_plan, sender_actor_is, shell_layout_state, shell_requested_focus,
+        start_neovim_client, submit, toggle_diff, truncate_to_width,
+        update_creation_backend_picker, valid_editor_actor_target,
     };
 
     fn host_command<'a>(commands: &'a [ActorCommand], message_type: &str) -> &'a [u8] {
@@ -4835,7 +4857,7 @@ mod tests {
             rest: true,
         });
 
-        for sidebar_visible in [false, true] {
+        for (index, sidebar_visible) in [false, true].into_iter().enumerate() {
             state.sidebar_visible = sidebar_visible;
             let commands =
                 publish_synchronized_layout(&mut state, Some(workspace), "sidebar", None);
@@ -4872,7 +4894,92 @@ mod tests {
                     + status["transform"]["size"]["v"].as_f64().unwrap(),
                 1.0
             );
+            let request_id = index as u64 + 1;
+            let base_layout_revision = index as u64 + 22;
+            let target_layout_revision = base_layout_revision + 1;
+            let completed = format!(
+                r#"{{"type":"completed","request_id":{request_id},"resize_epoch":{{"id":{request_id},"lease":4,"lease_generation":2,"base_layout_revision":{base_layout_revision},"target_layout_revision":{target_layout_revision}}}}}"#
+            );
+            assert!(
+                apply_layout_transaction_notification(
+                    &mut state,
+                    &super::decode_layout_transaction_notification(completed.as_bytes())
+                        .expect("completed shell toggle notification"),
+                )
+                .is_empty()
+            );
         }
+    }
+
+    #[test]
+    fn shell_toggle_during_transition_waits_for_the_reserved_target_revision() {
+        let mut state = SwitcherState::new();
+        state.pane = 1;
+        state.picker_pane = Some(2);
+        state.keybindings_pane = Some(3);
+        state.inbox_pane = Some(4);
+        state.status_bar_pane = Some(5);
+        let workspace = 6;
+        let mut panes = serde_json_core::heapless::Vec::<u64, 64>::new();
+        assert!(panes.extend_from_slice(&[1, 2, 3, 4, 5, workspace]).is_ok());
+        state.layout = Some(LayoutContext {
+            revision: 9,
+            presented_layout_revision: 17,
+            lease: LayoutLeaseToken {
+                id: 4,
+                generation: 2,
+            },
+            waitable_panes: panes.clone(),
+            presented_panes: panes.clone(),
+            visible_panes: panes,
+            focused_pane: Some(workspace),
+            size: LayoutStateSize {
+                w: 1280,
+                height: 720,
+            },
+            rest: true,
+        });
+
+        let first = publish_synchronized_layout(&mut state, Some(1), "sidebar", None);
+        let first: serde_json::Value =
+            serde_json::from_slice(host_command(&first, "submit-synchronized-layout"))
+                .expect("first toggle transaction");
+        assert_eq!(first["request_id"], 1);
+        assert_eq!(first["base_layout_revision"], 17);
+
+        state.sidebar_visible = false;
+        let deferred = publish_synchronized_layout(&mut state, Some(workspace), "sidebar", None);
+        assert!(deferred.is_empty());
+        assert_eq!(state.pending_shell_layouts.len(), 1);
+        assert_eq!(
+            state
+                .deferred_shell_layout
+                .as_ref()
+                .map(|layout| layout.state.sidebar_visible),
+            Some(false)
+        );
+
+        let follow_up = apply_layout_transaction_notification(
+            &mut state,
+            &super::decode_layout_transaction_notification(
+                br#"{"type":"completed","request_id":1,"resize_epoch":{"id":31,"lease":4,"lease_generation":2,"base_layout_revision":17,"target_layout_revision":18}}"#,
+            )
+            .expect("completed first toggle"),
+        );
+        let follow_up: serde_json::Value =
+            serde_json::from_slice(host_command(&follow_up, "submit-synchronized-layout"))
+                .expect("deferred toggle transaction");
+        assert_eq!(follow_up["request_id"], 2);
+        assert_eq!(follow_up["base_layout_revision"], 18);
+        assert_eq!(follow_up["focus"], workspace);
+        assert!(
+            follow_up["fragment"]["layout"]["items"]
+                .as_array()
+                .expect("layout items")
+                .iter()
+                .all(|item| item["id"] != 1)
+        );
+        assert!(state.deferred_shell_layout.is_none());
     }
 
     #[test]
@@ -5418,7 +5525,15 @@ mod tests {
         if let Some(layout) = state.layout.as_mut() {
             layout.focused_pane = Some(1);
         }
-        let commands = publish_synchronized_layout(&mut state, Some(1), "sidebar", None);
+        let commands = publish_synchronized_layout_attempt(
+            &mut state,
+            Some(1),
+            "sidebar",
+            None,
+            0,
+            None,
+            None,
+        );
 
         assert!(commands.is_empty());
         assert_eq!(
@@ -6075,8 +6190,14 @@ mod tests {
         assert_eq!(value["loading_label"], "Discovering backends…");
         assert_eq!(discover, br#"{"type":"request-backend-catalogue"}"#);
 
+        state.backend_picker = Some(41);
         let next = request_creation_backend_picker(&mut state);
-        let ActorCommand::SendLocalMessage(next_open) = &next[0] else {
+        let ActorCommand::SendLocalMessage(cancel) = &next[0] else {
+            panic!("repeated request did not cancel its active picker first");
+        };
+        assert_eq!(cancel.actor, "picker");
+        assert_eq!(cancel.body, br#"{"type":"picker-cancel","picker":41}"#);
+        let ActorCommand::SendLocalMessage(next_open) = &next[1] else {
             panic!("repeated request did not open a picker");
         };
         let next_value: serde_json::Value =
@@ -6094,11 +6215,24 @@ mod tests {
             &state,
             Some("backend-discovery-2")
         ));
-        let ActorCommand::SendLocalMessage(cancel) = cancel_picker(41) else {
-            panic!("stale picker cancellation did not target the picker actor");
-        };
-        assert_eq!(cancel.actor, "picker");
-        assert_eq!(cancel.body, br#"{"type":"picker-cancel","picker":41}"#);
+
+        let stale_selection = serde_json::from_value::<super::PickerSelection>(serde_json::json!({
+            "type": "picker-selected",
+            "picker": 41,
+            "result": {
+                "label": "SSH",
+                "detail": "Connect to a remote host",
+                "value": {"action": "create-remote"}
+            }
+        }))
+        .expect("stale picker selection");
+        assert!(apply_picker_selection(&mut state, stale_selection).is_empty());
+        assert!(state.mode == EditMode::Search);
+        assert_eq!(
+            state.backend_picker_request.as_deref(),
+            Some("backend-discovery-2")
+        );
+        assert!(state.awaiting_backend_catalogue);
     }
 
     #[test]

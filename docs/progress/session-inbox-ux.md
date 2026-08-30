@@ -33,3 +33,28 @@ No nested presentation run was added to this focused pass. Existing nested
 workloads cover hidden inbox composition, shortcut focus, notification click
 activation, and session-switcher pointer states, but do not yet exercise the
 new second shortcut press or inbox keyboard dismissal as acceptance steps.
+
+## Transition race follow-up
+
+The retained nested artifact
+`/tmp/brood-integration-session-picker-7c63b5d` exposed a real input race. Its
+client log records synchronized request 6 reserving target revision 8, then a
+remapped keyboard action reaching the switcher before request 6 completed.
+The switcher submitted request 7 against its still-observed revision 7, and
+the host rejected it as `StaleBaseLayoutRevision`; the first user toggle was
+therefore lost. Ordinary sidebar and inbox transitions now use the existing
+latest-state deferral discipline while any shell transaction is in flight and
+republish after its completion notification supplies the reserved target
+revision. Pointer interaction chains and native resize retries retain their
+separate transaction paths.
+
+Repeated backend-picker requests now cancel an already-created picker before
+opening its replacement. Picker selections are also admitted only when their
+picker ID matches the current backend-picker intent, so a late selection from
+the cancelled surface cannot create or activate a session.
+
+The focused Nix-backed session-switcher suite now passes 35 tests, including
+regressions for a keyboard toggle during a synchronized transition and for a
+selection from a replaced backend picker. All-target Clippy passes with
+warnings denied. The retained graphical run was inspected rather than rerun
+to avoid contending with the active integrated graphical verification lane.
