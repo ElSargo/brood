@@ -751,7 +751,12 @@ PICKER_PANE="$(
     "$CLIENT_LOG" \
     | tail -1
 )"
-[[ -n "$PICKER_PANE" ]]
+KEYBINDINGS_PANE="$(
+  sed -n 's/.*started presentation WASM actor id=keybindings .* pane=\([0-9][0-9]*\) .*/\1/p' \
+    "$CLIENT_LOG" \
+    | tail -1
+)"
+[[ -n "$PICKER_PANE" && -n "$KEYBINDINGS_PANE" ]]
 for _ in $(seq 1 100); do
   KEYBINDINGS_LAYOUT_LINE="$(
     rg -n "accepted synchronized layout actor=session-switcher .* target_rects=.*${PICKER_PANE}:" "$CLIENT_LOG" \
@@ -794,6 +799,13 @@ done
 rg -q 'sender=picker recipient=keybindings body=.*"type":"picker-selected"' "$CLIENT_LOG"
 rg -q 'sender=keybindings recipient=session-switcher body=.*"type":"keybindings-pane".*"visible":true' "$CLIENT_LOG"
 ((KEYBINDINGS_CAPTURE_LAYOUT_AFTER > KEYBINDINGS_CAPTURE_LAYOUT_BEFORE))
+for _ in $(seq 1 100); do
+  if rg -q "focused local plugin pane=$KEYBINDINGS_PANE" "$CLIENT_LOG"; then
+    break
+  fi
+  sleep 0.05
+done
+rg -q "focused local plugin pane=$KEYBINDINGS_PANE" "$CLIENT_LOG"
 env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
   WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
   "$OUT/virtual-keyboard-key" 23
