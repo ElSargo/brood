@@ -96,6 +96,13 @@ cleanup() {
 trap cleanup EXIT
 
 cargo build -p broodd -p brood-client --bins
+if [[ -n "$COMPUTER_USE" ]]; then
+  cargo build \
+    --manifest-path runtimes/computer-use-js/Cargo.toml \
+    --target wasm32-wasip1 \
+    --release \
+    --locked
+fi
 if [[ -n "$SSH_TARGET" ]]; then
   cargo build --release -p brood-remote --bin brood-remote --locked
 fi
