@@ -63,3 +63,30 @@ p99.9 claim, and a temporary package assembled for the untracked working tree
 contained stale unrelated terminal components. The graphics proof actor,
 visual captures, saturated lane, and direct 120 Hz lane nevertheless completed
 far enough to provide the profiler evidence above.
+
+## First scheduling correction
+
+A follow-up profile used the causal stages to identify two scheduler-accounting
+errors around the composition barrier. Guest cost included the time between a
+planned wake and actual dispatch even when the scheduler itself deliberately
+held the hint behind an uncomposed frame. A frame which had already missed its
+target could then keep that barrier indefinitely, preserving the one-frame-late
+steady state. The scheduler now measures guest execution from actual dispatch
+and releases only a stale composition barrier, one millisecond after its
+intended target; a still-viable frame retains atomic protection.
+
+In the real unsaturated two-pane workload, the resulting profile retained 261
+complete input flows with zero recorder drops. Input-to-present fell from
+23.671 ms p50 in the comparison capture to 11.527 ms p50, 18.696 ms p95, and
+19.751 ms p99. Graphics-ready-to-composed, previously the dominant 14.533 ms
+median wait, fell to 1.836 ms. Actor dispatch-to-WASM acceptance remained
+0.311 ms p50 and accepted-to-graphics-ready remained 0.567 ms, confirming that
+the improvement came from opportunity scheduling rather than faster guest or
+graphics work.
+
+Restoring a GPU completion wait for every frame was also measured and removed:
+it raised GPU completion wait to 10.545 ms p50 while leaving input at 25.310 ms
+p50. That rejects GPU queue completion as the pacing source. Strict
+render-scheduling acceptance is still pending because the improved runs exceed
+the existing deadline/target miss-rate gates even though their latency
+percentiles now meet the unsaturated thresholds.

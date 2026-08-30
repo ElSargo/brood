@@ -63,6 +63,7 @@ const MAX_HOST_COST_NS: u64 = 50_000_000;
 const ABANDON_BACKOFF_BASE_NS: u64 = 1_000_000;
 const ABANDON_BACKOFF_MAX_NS: u64 = 100_000_000;
 const MAX_INPUT_CORRELATIONS: usize = 4_096;
+const LATE_COMPOSITION_RELEASE_NS: u64 = 1_000_000;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ActorScope {
@@ -729,9 +730,13 @@ impl RenderScheduler {
         self.actors
             .iter()
             .filter_map(|(actor, state)| match &state.phase {
-                Phase::Armed(armed) if !self.actor_has_uncomposed_frame(actor) => {
-                    Some(armed.plan.dispatch_ns.max(state.backoff_until_ns))
-                }
+                Phase::Armed(armed) => Some(
+                    armed
+                        .plan
+                        .dispatch_ns
+                        .max(state.backoff_until_ns)
+                        .max(self.actor_composition_release_ns(actor).unwrap_or(0)),
+                ),
                 Phase::Idle
                     if (!state.relevant_panes.is_empty()
                         || state.requested_revision != state.satisfied_revision)
@@ -767,7 +772,9 @@ impl RenderScheduler {
             .filter_map(|(actor, state)| match &state.phase {
                 Phase::Armed(armed)
                     if now_ns >= armed.plan.dispatch_ns
-                        && !self.actor_has_uncomposed_frame(actor) =>
+                        && self
+                            .actor_composition_release_ns(actor)
+                            .is_none_or(|release_ns| now_ns >= release_ns) =>
                 {
                     Some(actor.clone())
                 }
@@ -902,6 +909,24 @@ impl RenderScheduler {
             self.metrics.protocol_errors = self.metrics.protocol_errors.saturating_add(1);
             return Err(FinishError::InvalidToken);
         };
+        let dispatched_ns = self
+            .active_traces
+            .get(&token)
+            .map_or(guest_finished_ns, |trace| trace.dispatched_ns);
+        let planned_dispatch_ns = self
+            .actors
+            .get(&actor)
+            .and_then(|state| match &state.phase {
+                Phase::Outstanding(outstanding) => Some(outstanding.plan.dispatch_ns),
+                _ => None,
+            })
+            .unwrap_or(dispatched_ns);
+        let composition_barrier_delay_ns = self
+            .actor_composition_release_ns(&actor)
+            .filter(|release_ns| planned_dispatch_ns < *release_ns && dispatched_ns >= *release_ns)
+            .map_or(0, |release_ns| {
+                release_ns.saturating_sub(planned_dispatch_ns)
+            });
         let Some(state) = self.actors.get_mut(&actor) else {
             self.metrics.protocol_errors = self.metrics.protocol_errors.saturating_add(1);
             return Err(FinishError::InvalidToken);
@@ -920,10 +945,14 @@ impl RenderScheduler {
         state.accepted_count = state.accepted_count.saturating_add(1);
         state.abandonments = 0;
         state.backoff_until_ns = 0;
-        // Include event-loop wake lateness in the estimate. Planning from the
-        // actual dispatch instant makes a consistently late wake invisible
-        // and asks the next opportunity to repeat the same miss.
-        let elapsed = guest_finished_ns.saturating_sub(outstanding.plan.dispatch_ns);
+        // Estimate guest execution from the instant the hint was actually
+        // dispatched. A pre-armed opportunity can deliberately remain behind
+        // the preceding frame's composition barrier after its planned wake.
+        // Charging that causal wait to the guest inflates a sub-millisecond
+        // actor toward one refresh interval and makes every following hint run
+        // immediately after presentation. Deadline feedback separately grows
+        // the predictor's safety margin for genuine late event-loop wakes.
+        let elapsed = guest_finished_ns.saturating_sub(dispatched_ns);
         state.guest_cost_ns = if elapsed > state.guest_cost_ns {
             elapsed
         } else {
@@ -934,7 +963,15 @@ impl RenderScheduler {
                 .saturating_div(8)
                 .max(1)
         };
-        let deadline_met = guest_finished_ns <= outstanding.plan.deadline_ns;
+        // A deliberately retained composition barrier is host scheduling
+        // time, not actor deadline budget. Shift only that known delay; any
+        // additional event-loop wake lateness still feeds the predictor's
+        // safety margin.
+        let deadline_met = guest_finished_ns
+            <= outstanding
+                .plan
+                .deadline_ns
+                .saturating_add(composition_barrier_delay_ns);
         self.metrics.accepted = self.metrics.accepted.saturating_add(1);
         if !deadline_met {
             self.metrics.late = self.metrics.late.saturating_add(1);
@@ -1475,18 +1512,19 @@ impl RenderScheduler {
             .map(|trace| trace.target_ns)
     }
 
-    fn actor_has_uncomposed_frame(&self, actor: &ActorScope) -> bool {
-        self.newest_unpresented
-            .get(actor)
-            .and_then(|token| self.active_traces.get(token))
-            .is_some_and(|trace| trace.composition_ns.is_none())
-    }
-
     fn actor_has_unreleased_frame(&self, actor: &ActorScope) -> bool {
         self.newest_unpresented
             .get(actor)
             .and_then(|token| self.active_traces.get(token))
             .is_some_and(|trace| !trace.composition_released)
+    }
+
+    fn actor_composition_release_ns(&self, actor: &ActorScope) -> Option<u64> {
+        self.newest_unpresented
+            .get(actor)
+            .and_then(|token| self.active_traces.get(token))
+            .filter(|trace| trace.composition_ns.is_none())
+            .map(|trace| trace.target_ns.saturating_add(LATE_COMPOSITION_RELEASE_NS))
     }
 
     fn trace_graphics_ready(trace: &CorrelationTrace) -> bool {
@@ -2053,6 +2091,34 @@ mod tests {
     }
 
     #[test]
+    fn composition_barrier_delay_is_not_charged_as_guest_execution() {
+        let (mut scheduler, actor, mut predictor) = ready_scheduler();
+        predictor.observe_presented(0);
+        assert!(scheduler.set_subscription(&actor, true));
+        assert!(scheduler.arm(&actor, 0, &predictor, 1_000_000));
+
+        let planned_dispatch_ns = scheduler.next_deadline_ns().unwrap();
+        let actual_dispatch_ns = planned_dispatch_ns.saturating_add(12_000_000);
+        let hint = scheduler.dispatch_due(actual_dispatch_ns).pop().unwrap().1;
+        scheduler
+            .finish(
+                hint.token,
+                actual_dispatch_ns.saturating_add(300_000),
+                &[11],
+            )
+            .unwrap();
+
+        assert_eq!(
+            scheduler
+                .actors
+                .get(&actor)
+                .map(|state| state.guest_cost_ns),
+            Some(1_787_500),
+            "the intentional barrier wait must not inflate the guest estimate"
+        );
+    }
+
+    #[test]
     fn delayed_graphics_readiness_moves_the_next_latest_safe_dispatch_earlier() {
         let (mut scheduler, actor, mut predictor) = ready_scheduler();
         predictor.observe_presented(0);
@@ -2574,7 +2640,7 @@ mod tests {
     }
 
     #[test]
-    fn released_frame_prearms_next_cell_but_composition_reveals_its_fixed_deadline() {
+    fn released_frame_exposes_next_cell_before_stale_composition() {
         let (mut scheduler, actor, mut predictor) = ready_scheduler();
         predictor.observe_presented(0);
         assert!(scheduler.set_subscription(&actor, true));
@@ -2588,6 +2654,14 @@ mod tests {
             accepted_at.saturating_add(100_000)
         ));
         assert_eq!(scheduler.release_ready_composition(), [first.token]);
+        assert_eq!(
+            scheduler.request_due_redraw(u64::MAX, 1_000_000, 14_000_000),
+            Some(first.target_presentation_time_ns)
+        );
+        assert_eq!(
+            scheduler.mark_redraw_consumed(),
+            first.target_presentation_time_ns
+        );
 
         assert!(scheduler.arm(&actor, accepted_at, &predictor, 1_000_000));
         let Some(fixed_plan) = scheduler
@@ -2607,17 +2681,17 @@ mod tests {
             );
             return;
         };
-        assert_eq!(scheduler.next_deadline_ns(), None);
-        assert!(scheduler.dispatch_due(u64::MAX).is_empty());
+        assert_eq!(scheduler.next_deadline_ns(), Some(fixed_plan.dispatch_ns));
 
-        // Continuous admitted input can service and retarget the scheduler,
-        // but it cannot expose, postpone, or dispatch the next hint before
-        // the released frame reaches composition.
+        // Continuous admitted input cannot postpone the fixed cutoff. Once a
+        // frame is graphics-ready, holding the next hint behind its eventual
+        // composition can make a frame which is already one cell late keep
+        // every later frame one cell late as well.
         for input in 1..=260_u64 {
             let at_ns = accepted_at.saturating_add(input.saturating_mul(1_000));
             assert!(scheduler.admit_event(&actor, false).is_some());
             scheduler.arm_all(at_ns, &predictor, 1_000_000);
-            assert_eq!(scheduler.next_deadline_ns(), None);
+            assert_eq!(scheduler.next_deadline_ns(), Some(fixed_plan.dispatch_ns));
             assert!(scheduler.dispatch_due(at_ns).is_empty());
         }
         let Some(retained_plan) =
@@ -2640,11 +2714,6 @@ mod tests {
         };
         assert_eq!(retained_plan, fixed_plan);
 
-        assert!(scheduler.mark_composed(
-            first.token,
-            first.target_presentation_time_ns.saturating_add(100_000)
-        ));
-        assert_eq!(scheduler.next_deadline_ns(), Some(fixed_plan.dispatch_ns));
         let second = scheduler
             .dispatch_due(fixed_plan.dispatch_ns)
             .pop()
@@ -2654,7 +2723,13 @@ mod tests {
             second.target_presentation_time_ns,
             first.target_presentation_time_ns.saturating_add(HZ_60)
         );
-        assert_eq!(scheduler.metrics().superseded, 0);
+        scheduler
+            .finish(second.token, second.submission_deadline_ns, &[11])
+            .unwrap();
+        assert_eq!(scheduler.metrics().superseded, 1);
+        assert!(scheduler.completed_traces().iter().any(|trace| {
+            trace.token == first.token && trace.settlement == Some(Settlement::Superseded)
+        }));
     }
 
     #[test]

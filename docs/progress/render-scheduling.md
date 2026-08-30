@@ -367,3 +367,38 @@ and presentation-boundary path, with particular attention to changes that
 removed per-frame GPU-completion wakeups and added immediate post-composition
 deadline synchronization. No performance threshold was changed and the current
 source is not accepted by the render-scheduling performance gate.
+
+### Profiler-guided latency correction
+
+The systemic profiler localized the resumed regression to scheduling waits:
+guest execution and graphics preparation were both sub-millisecond, while a
+graphics-ready frame waited roughly one refresh interval for composition. The
+scheduler had charged its own planned-wake-to-actual-dispatch barrier delay to
+guest execution. It also hid every next opportunity until composition even
+after the preceding frame's intended target had passed, so one late frame could
+hold the pipeline one cell late indefinitely.
+
+Guest cost is now measured from actual hint dispatch. An uncomposed frame keeps
+the barrier through its viable target and a one-millisecond grace period; after
+that point the next fixed opportunity can dispatch and supersede the stale
+frame through the existing correlation-transfer path. Known barrier delay is
+excluded from actor deadline feedback while unrelated event-loop wake lateness
+still grows the predictor margin. The focused release scheduler suite passes
+all 53 tests, including the four 10,000-opportunity simulations, stale-frame
+release, correlation transfer, and visibility atomicity.
+
+A profiler-enabled nested run retained 261 unsaturated input flows with p50
+11.527 ms, p95 18.696 ms, and p99 19.751 ms. Graphics-ready-to-composed fell
+from 14.533 ms to 1.836 ms p50. The harness's own unsaturated distribution was
+11.445/18.675/19.539 ms at p50/p95/p99, down from the resumed tree's
+23.294/31.004/31.990 ms. The same run kept partial actor-frame promotions at
+zero and measured saturated p50/p95 at 14.794/23.730 ms.
+
+The complete strict proof is not yet accepted. Improved runs still exceeded
+the unchanged miss-rate gates (one representative run had 17 of 1,137
+unsaturated deadline misses and 21 target misses), and one run recorded a
+single protocol error around renderer recovery. A no-profiler comparison kept
+unsaturated latency at 10.855/18.150 ms but likewise exceeded the miss-rate
+gate. No threshold was relaxed. Per-frame GPU-completion pacing was tested and
+removed after it left unsaturated p50 at approximately 25.3 ms and introduced a
+roughly 10.5 ms GPU wait.
