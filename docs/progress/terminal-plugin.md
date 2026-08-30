@@ -22,3 +22,16 @@ the observable evidence.
 
 The target product boundary is [[../targets/systems/terminal-plugin]]. Remaining
 design-level gaps are in [[../frictions/terminal-plugin]].
+
+## 2026-08-31 interaction polish
+
+The presentation actor now paints a selection across every selected cell,
+including spaces and gaps between styled runs, rather than limiting the visible
+highlight to cells which happen to carry a text run. Its cursor uses the shared
+Ashen accent and blinks on a single-flight 530 ms worker while the pane is
+focused. Input immediately restores the visible phase; losing focus leaves a
+steady cursor and stops scheduling blink workers.
+
+The Nix-backed focused terminal UI suite passed 10 tests, and the crate passed
+Clippy with warnings denied. The packaged nested terminal proof remains the
+graphical acceptance gate for the interaction as a whole.

@@ -33,6 +33,8 @@ const MOUSE_WHEEL_PIXELS_PER_CLICK: f32 = 15.0;
 const MAX_CACHED_LAYOUTS: usize = 512;
 const RESIZE_DEBOUNCE_MS: u64 = 24;
 const RESIZE_WORKER_PAYLOAD: &[u8] = b"terminal-resize-debounce";
+const CURSOR_BLINK_MS: u64 = 530;
+const CURSOR_BLINK_WORKER_PAYLOAD: &[u8] = b"terminal-cursor-blink";
 const PRESENTATION_BATCH_LIMIT: u8 = 16;
 // `focus_commands_for_mailbox` is not a presentation reducer. Every branch in
 // `handle_presentation` returns at most three commands, including clipboard
@@ -92,6 +94,9 @@ struct UiState {
     last_sent_grid_size: Option<(u16, u16)>,
     next_input_sequence: u64,
     pending_resize_epoch: Option<u64>,
+    focused: bool,
+    cursor_blink_on: bool,
+    cursor_blink_worker_pending: bool,
 }
 
 impl UiState {
@@ -139,6 +144,9 @@ impl UiState {
             last_sent_grid_size: None,
             next_input_sequence: 0,
             pending_resize_epoch: None,
+            focused: true,
+            cursor_blink_on: true,
+            cursor_blink_worker_pending: false,
         }
     }
 
@@ -214,6 +222,26 @@ impl UiState {
             worker,
             payload: RESIZE_WORKER_PAYLOAD.to_vec(),
         }))
+    }
+
+    fn schedule_cursor_blink(&mut self) -> Option<Command> {
+        if self.cursor_blink_worker_pending || !self.focused {
+            return None;
+        }
+        self.cursor_blink_worker_pending = true;
+        let worker = self.next_worker;
+        self.next_worker = self.next_worker.saturating_add(1).max(1);
+        Some(Command::SpawnWorker(WorkerRequest {
+            worker,
+            payload: CURSOR_BLINK_WORKER_PAYLOAD.to_vec(),
+        }))
+    }
+
+    fn wake_cursor(&mut self) {
+        if !self.cursor_blink_on {
+            self.cursor_blink_on = true;
+            let _ignored = brood_plugin_sdk::graphics::request_render();
+        }
     }
 
     fn viewport_command(&self, offset: usize) -> Command {
@@ -500,6 +528,16 @@ impl Guest for TerminalUi {
             {
                 finish_resize_debounce()
             }
+            Event::Worker(WorkerEvent::Finished(finished))
+                if finished.output == CURSOR_BLINK_WORKER_PAYLOAD =>
+            {
+                finish_cursor_blink()
+            }
+            Event::Worker(WorkerEvent::Failed(failed))
+                if failed.message.starts_with("terminal cursor blink:") =>
+            {
+                finish_cursor_blink()
+            }
             Event::Worker(WorkerEvent::Finished(_)) | Event::Worker(WorkerEvent::Failed(_)) => {
                 Vec::new()
             }
@@ -512,6 +550,10 @@ impl Guest for TerminalUi {
             wait_timer(RESIZE_DEBOUNCE_MS)
                 .await
                 .map_err(|error| format!("terminal resize debounce: {error}"))?;
+        } else if payload == CURSOR_BLINK_WORKER_PAYLOAD {
+            wait_timer(CURSOR_BLINK_MS)
+                .await
+                .map_err(|error| format!("terminal cursor blink: {error}"))?;
         }
         Ok(payload)
     }
@@ -591,7 +633,14 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
             }
             commands
         }
+        PresentationEvent::PaneFocused(focused) if focused.pane == state.pane => {
+            state.focused = focused.focused;
+            state.cursor_blink_on = true;
+            let _ignored = brood_plugin_sdk::graphics::request_render();
+            state.schedule_cursor_blink().into_iter().collect()
+        }
         PresentationEvent::Key(key) if key.pane == state.pane && key.pressed => {
+            state.wake_cursor();
             state.suppressed_text = ((key.modifiers & (MOD_CTRL | MOD_ALT)) != 0
                 && key.logical_key.chars().count() == 1)
                 .then(|| key.logical_key.clone());
@@ -649,6 +698,7 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
                 .collect()
         }
         PresentationEvent::Text(text) if text.pane == state.pane && !text.text.is_empty() => {
+            state.wake_cursor();
             if state
                 .suppressed_text
                 .take()
@@ -670,6 +720,7 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
             }
         }
         PresentationEvent::Paste(paste) if paste.pane == state.pane && !paste.text.is_empty() => {
+            state.wake_cursor();
             let bracketed = state
                 .latest
                 .as_ref()
@@ -860,6 +911,23 @@ fn finish_resize_debounce() -> Vec<Command> {
     };
     state.resize_worker_pending = false;
     state.send_resize_if_changed().into_iter().collect()
+}
+
+fn finish_cursor_blink() -> Vec<Command> {
+    let Ok(mut guard) = STATE.lock() else {
+        return Vec::new();
+    };
+    let Some(state) = guard.as_mut() else {
+        return Vec::new();
+    };
+    state.cursor_blink_worker_pending = false;
+    if !state.focused {
+        state.cursor_blink_on = true;
+        return Vec::new();
+    }
+    state.cursor_blink_on = !state.cursor_blink_on;
+    let _ignored = brood_plugin_sdk::graphics::request_render();
+    state.schedule_cursor_blink().into_iter().collect()
 }
 
 fn set_clipboard_command(text: String) -> Option<Command> {
@@ -1233,11 +1301,21 @@ fn handle_snapshot_chunk(body: &[u8]) -> Vec<Command> {
     state.requested_viewport = header.viewport_offset;
     let resize_epoch = state.pending_resize_epoch;
     let _ignored = brood_plugin_sdk::graphics::request_render_for_resize(state.pane, resize_epoch);
-    Vec::new()
+    state.schedule_cursor_blink().into_iter().collect()
 }
 
 fn render_latest_snapshot(resize_epoch: Option<u64>) -> Result<Vec<u8>, String> {
-    let (pane, width, height, cell_width, line_height, snapshot, selection, mut cache) = {
+    let (
+        pane,
+        width,
+        height,
+        cell_width,
+        line_height,
+        snapshot,
+        selection,
+        cursor_blink_on,
+        mut cache,
+    ) = {
         let mut guard = STATE
             .lock()
             .map_err(|_| "terminal UI state is poisoned".to_string())?;
@@ -1256,6 +1334,7 @@ fn render_latest_snapshot(resize_epoch: Option<u64>) -> Result<Vec<u8>, String> 
             state.line_height,
             snapshot,
             state.selection,
+            state.cursor_blink_on || !state.focused,
             std::mem::take(&mut state.cache),
         )
     };
@@ -1270,33 +1349,35 @@ fn render_latest_snapshot(resize_epoch: Option<u64>) -> Result<Vec<u8>, String> 
     for (row, runs) in snapshot.rows_data.iter().enumerate() {
         let y = PADDING + row as f32 * line_height;
         for run in runs {
-            let x = PADDING + f32::from(run.start) * cell_width;
-            let run_width = f32::from(run.cells) * cell_width;
             if run.bg != DEFAULT_BG {
                 packet.push(DrawCommand::FillRect {
-                    rect: Rect::new(x, y, run_width, line_height),
+                    rect: Rect::new(
+                        PADDING + f32::from(run.start) * cell_width,
+                        y,
+                        f32::from(run.cells) * cell_width,
+                        line_height,
+                    ),
                     color: rgb(run.bg),
                 });
             }
-            if let Some((selection_start, selection_end)) = selection
-                .and_then(|selection| selection_columns(selection, row as u16, snapshot.cols))
-            {
-                let run_start = run.start;
-                let run_end = run.start.saturating_add(run.cells);
-                let highlight_start = selection_start.max(run_start);
-                let highlight_end = selection_end.min(run_end);
-                if highlight_start < highlight_end {
-                    packet.push(DrawCommand::FillRect {
-                        rect: Rect::new(
-                            PADDING + f32::from(highlight_start) * cell_width,
-                            y,
-                            f32::from(highlight_end - highlight_start) * cell_width,
-                            line_height,
-                        ),
-                        color: rgb(SELECTION_BG),
-                    });
-                }
-            }
+        }
+        if let Some((selection_start, selection_end)) = selection
+            .and_then(|selection| selection_columns(selection, row as u16, snapshot.cols))
+            && selection_start < selection_end
+        {
+            packet.push(DrawCommand::FillRect {
+                rect: Rect::new(
+                    PADDING + f32::from(selection_start) * cell_width,
+                    y,
+                    f32::from(selection_end - selection_start) * cell_width,
+                    line_height,
+                ),
+                color: rgb(SELECTION_BG),
+            });
+        }
+        for run in runs {
+            let x = PADDING + f32::from(run.start) * cell_width;
+            let run_width = f32::from(run.cells) * cell_width;
             let text = run.text.trim_end();
             if text.is_empty() {
                 continue;
@@ -1365,6 +1446,7 @@ fn render_latest_snapshot(resize_epoch: Option<u64>) -> Result<Vec<u8>, String> 
         }
     }
     if snapshot.cursor_visible
+        && cursor_blink_on
         && snapshot.cursor_row < snapshot.rows
         && snapshot.cursor_col < snapshot.cols
     {
@@ -1762,7 +1844,6 @@ mod tests {
     #[test]
     fn opted_in_presentation_batch_stays_within_host_command_capacity() {
         assert_eq!(MAX_PRESENTATION_BATCH_COMMANDS, 48);
-        assert!(MAX_PRESENTATION_BATCH_COMMANDS <= 64);
     }
 
     #[test]
@@ -1864,5 +1945,15 @@ mod tests {
                 (3, 1, "e\u{301}".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn cursor_blink_worker_is_single_flight_and_stops_while_unfocused() {
+        let mut state = UiState::new(2, 7, "terminal-ui-b2-s7");
+        assert!(matches!(state.schedule_cursor_blink(), Some(Command::SpawnWorker(_))));
+        assert!(state.schedule_cursor_blink().is_none());
+        state.cursor_blink_worker_pending = false;
+        state.focused = false;
+        assert!(state.schedule_cursor_blink().is_none());
     }
 }

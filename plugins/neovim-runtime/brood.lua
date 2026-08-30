@@ -628,15 +628,22 @@ local function append_open_chunk(message)
   end
   local offset = tonumber(message.offset)
   if offset ~= transfer.offset then
+    open_transfers[id] = nil
     error("open chunk offset is not sequential")
   end
-  local content = bounded_string(
+  local valid_content, content = pcall(
+    bounded_string,
     message.content,
     "open chunk content",
     MAX_LINE_BYTES,
     true
   )
+  if not valid_content then
+    open_transfers[id] = nil
+    error(content)
+  end
   if transfer.offset + #content > transfer.size then
+    open_transfers[id] = nil
     error("open transfer exceeds its declared size")
   end
   table.insert(transfer.chunks, content)

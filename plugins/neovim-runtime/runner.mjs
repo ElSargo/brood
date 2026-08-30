@@ -4,7 +4,6 @@ import {
   lstatSync,
   readFileSync,
   readdirSync,
-  realpathSync,
   statSync,
 } from "node:fs";
 import { homedir } from "node:os";
@@ -179,16 +178,18 @@ function collectMirror(root, label) {
   }
 
   function walk(hostPath, relativePath, ancestors) {
-    const resolved = realpathSync(hostPath);
-    const stat = statSync(hostPath);
+    const linkStat = lstatSync(hostPath);
+    const followsLink = linkStat.isSymbolicLink();
+    const stat = followsLink ? statSync(hostPath) : linkStat;
 
     if (stat.isDirectory()) {
-      if (ancestors.has(resolved)) {
+      const identity = `${stat.dev}:${stat.ino}`;
+      if (ancestors.has(identity)) {
         skipped.push(`${relativePath || "."}: symlink cycle`);
         return;
       }
       const nextAncestors = new Set(ancestors);
-      nextAncestors.add(resolved);
+      nextAncestors.add(identity);
       directories.add(relativePath);
       const names = readdirSync(hostPath).sort();
       for (const name of names) {

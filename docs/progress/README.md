@@ -27,5 +27,6 @@ interpret evidence.
 - [[session-isolation]]
 - [[terminal-latency-spike-profile]]
 - [[terminal-plugin]]
+- [[editor-plugin]]
 - [[structural-lint]]
 - [[system-profiler]]

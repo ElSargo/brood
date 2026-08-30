@@ -186,6 +186,7 @@ async function main() {
       stdio: ["pipe", "pipe", "pipe"],
     },
   );
+  const startupStartedAt = Date.now();
   let stdout = Buffer.alloc(0);
   let stderr = "";
   const messages = [];
@@ -296,6 +297,7 @@ async function main() {
       (message) => message.type === "ready",
       "ready",
     );
+    const startupMs = Date.now() - startupStartedAt;
     if (ready.config_marker !== MARKER) {
       throw new Error(
         `host config/data/early-bridge marker mismatch: ${String(ready.config_marker)}`,
@@ -317,6 +319,52 @@ async function main() {
         `ordinary action reserve admitted ${startupPressure} startup messages; expected 56`,
       );
     }
+
+    // Malformed streamed opens used to retain their assembly slot. Four bad
+    // continuations could therefore wedge every later large-file open until
+    // the editor process was restarted. Exercise more than the slot count and
+    // require the same process to accept a healthy open afterwards.
+    for (let index = 0; index < 8; index += 1) {
+      const requestId = `malformed-open-${index}`;
+      send({
+        type: "open-content-start",
+        request_id: requestId,
+        path: `src/malformed-${index}.txt`,
+        version: "malformed",
+        size: 4,
+        line: 1,
+        column: 1,
+      });
+      send({
+        type: "open-content-chunk",
+        request_id: requestId,
+        offset: 1,
+        content: "bad",
+      });
+      await waitFor(
+        (message) =>
+          message.type === "error" &&
+          message.code === "invalid-input" &&
+          message.request_id === requestId,
+        `malformed open ${index} rejection`,
+      );
+    }
+    send({
+      type: "open-content",
+      request_id: "post-malformed-open",
+      path: "src/post-malformed.txt",
+      version: "post-malformed-revision",
+      content: "still alive\n",
+      line: 1,
+      column: 1,
+    });
+    await waitFor(
+      (message) =>
+        message.type === "open-result" &&
+        message.request_id === "post-malformed-open" &&
+        message.ok === true,
+      "healthy open after malformed transfer pressure",
+    );
 
     send({
       type: "text",
@@ -724,7 +772,7 @@ async function main() {
     await waitForCleanExit();
     await runTruncatedEofProbe(options);
     process.stdout.write(
-      "neovim_wasm_runner_smoke=verified config=host data=host remote_save=verified action=verified\n",
+      `neovim_wasm_runner_smoke=verified startup_ms=${startupMs} config=host data=host malformed_open_recovery=verified remote_save=verified action=verified\n`,
     );
   } finally {
     clearTimeout(hardTimeout);
