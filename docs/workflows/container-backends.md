@@ -39,8 +39,8 @@ remote flow accepts a named Podman system connection and an image separated by
 `::`. Once the relay is authenticated, the normal backend directory picker
 creates a session inside that container.
 
-The `podman` flake package is a drop-in command frontend. Non-`run` operations
-are executed by the real Podman binary unchanged. `run` retains the requested
+`brood container` is a drop-in Podman frontend. Non-`run` operations are
+executed by the real Podman binary unchanged. `run` retains the requested
 image, command, volumes, networking, interactivity, detachment, and other
 Podman arguments while installing and starting the Brood backend alongside the
 container workload. GPU forwarding is attempted automatically and retried
@@ -49,9 +49,20 @@ GPU option remains authoritative; `BROOD_CONTAINER_GPU=never` disables the
 automatic attempt.
 
 ```sh
-nix shell .#podman
-podman run --rm -it docker.io/library/alpine:latest /bin/sh
+nix shell .#brood
+brood container run --rm -it docker.io/library/alpine:latest /bin/sh
 ```
+
+Once the backend is ready, the command prints a reconnect hint to stderr. Open
+that container alongside the local backend with `brood container connect
+CONTAINER`. A container name works with the local engine; the full container ID
+from the hint also works for named remote Podman connections. Arguments after
+`--` are passed to the presentation client. Connection certificates are kept
+in the private Brood runtime/state directory rather than printed or mounted
+from the host.
+
+The `podman` flake package remains as a compatibility alias for scripts that
+want the augmented frontend under the `podman` executable name.
 
 The backend runtime includes the EGL/Mesa software path as a portable fallback.
 When Podman can expose a GPU through its normal `--gpus all` capability, the

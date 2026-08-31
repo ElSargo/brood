@@ -38,6 +38,16 @@ pub enum Command {
     Ctl(CtlArgs),
     /// Run a checked-in behavior proof.
     Test(TestArgs),
+    /// Run Podman with a Brood backend added to new containers.
+    Container(ContainerArgs),
+}
+
+#[derive(Debug, Parser)]
+#[command(disable_help_flag = true)]
+pub struct ContainerArgs {
+    /// Podman arguments. Use `connect CONTAINER` to open a Brood presentation.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub args: Vec<OsString>,
 }
 
 #[derive(Debug, Parser)]
@@ -501,6 +511,36 @@ mod tests {
                     })),
                 })),
             }) if out_dir == std::path::Path::new("render-scheduling-proof")
+        ));
+    }
+
+    #[test]
+    fn container_command_preserves_podman_arguments() {
+        let parsed = Args::try_parse_from([
+            "brood",
+            "container",
+            "run",
+            "--rm",
+            "-it",
+            "alpine",
+            "/bin/sh",
+        ]);
+        assert!(matches!(
+            parsed,
+            Ok(Args {
+                command: Some(Command::Container(ContainerArgs { args })),
+            }) if args == ["run", "--rm", "-it", "alpine", "/bin/sh"]
+        ));
+    }
+
+    #[test]
+    fn container_command_forwards_help_to_podman() {
+        let parsed = Args::try_parse_from(["brood", "container", "--help"]);
+        assert!(matches!(
+            parsed,
+            Ok(Args {
+                command: Some(Command::Container(ContainerArgs { args })),
+            }) if args == ["--help"]
         ));
     }
 }

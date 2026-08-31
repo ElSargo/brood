@@ -30,12 +30,15 @@ pub(crate) mod state;
 pub(crate) mod state_services;
 mod wasm_test;
 
+use std::{env, path::PathBuf, process::Command as ProcessCommand};
+
 use anyhow::{Context, Result};
 use brood_cli::{Args, Command};
 pub use brood_cli::{
     BROOD_HOST_DBUS_ADDRESS_ENV, BROOD_PANE_ID_ENV, BROOD_SESSION_ENV, BROODD_DBUS_ADDRESS_ENV,
-    BROODD_DBUS_DESTINATION_ENV, CommandOutcome, CtlArgs, DEFAULT_BROOD_DBUS_NAME, EnterArgs,
-    HideArgs, ListArgs, PlugArgs, RunArgs, SessionArgs, ShowArgs, ShowTarget, SwitchArgs, TestArgs,
+    BROODD_DBUS_DESTINATION_ENV, CommandOutcome, ContainerArgs, CtlArgs, DEFAULT_BROOD_DBUS_NAME,
+    EnterArgs, HideArgs, ListArgs, PlugArgs, RunArgs, SessionArgs, ShowArgs, ShowTarget,
+    SwitchArgs, TestArgs,
 };
 
 pub const BROOD_NATIVE_TOOL_SOCKET_ENV: &str = "BROOD_NATIVE_TOOL_SOCKET";
@@ -88,7 +91,29 @@ pub fn run_cli() -> Result<CommandOutcome> {
         Command::Test(args) => nested_test::run(args)
             .context("run checked-in behavior proof")
             .map(|()| CommandOutcome::Completed),
+        Command::Container(args) => run_container(args),
     }
+}
+
+fn run_container(args: ContainerArgs) -> Result<CommandOutcome> {
+    let remote = env::var_os("BROOD_REMOTE_BIN").map_or_else(
+        || {
+            env::current_exe().map_or_else(
+                |_| PathBuf::from("brood-remote"),
+                |executable| executable.with_file_name("brood-remote"),
+            )
+        },
+        PathBuf::from,
+    );
+    let status = ProcessCommand::new(&remote)
+        .arg("podman")
+        .args(args.args)
+        .status()
+        .with_context(|| format!("launch container frontend {}", remote.display()))?;
+    status.code().map_or_else(
+        || Err(anyhow::anyhow!("container frontend terminated by signal")),
+        |code| Ok(CommandOutcome::Exit(code)),
+    )
 }
 
 pub fn run_session_cli() -> Result<()> {

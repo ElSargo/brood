@@ -15,7 +15,7 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Args, ValueEnum};
 use rcgen::{CertifiedKey, generate_simple_self_signed};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 
 const CONTAINER_RELAY_PORT: u16 = 44_192;
@@ -97,6 +97,7 @@ pub struct ContainerSessionArgs {
 
 /// Raw arguments accepted by the packaged Podman replacement.
 #[derive(Debug, Args)]
+#[command(disable_help_flag = true)]
 pub struct PodmanArgs {
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     args: Vec<std::ffi::OsString>,
@@ -111,6 +112,12 @@ struct ContainerAttachReady<'a> {
     client_private_key: &'a Path,
     session_package: &'a str,
     session_root: &'a Path,
+}
+
+#[derive(Deserialize, Serialize)]
+struct SavedContainerConnection {
+    container: String,
+    connect: SocketAddr,
 }
 
 struct StartedContainer {
@@ -939,6 +946,13 @@ pub fn hold() -> Result<()> {
 
 pub fn podman(args: &PodmanArgs) -> Result<()> {
     let executable = resolve_podman(None)?;
+    if args
+        .args
+        .first()
+        .is_some_and(|argument| argument == "connect")
+    {
+        return connect_container(&executable, &args.args);
+    }
     let Some(run_index) = args.args.iter().position(|argument| argument == "run") else {
         let error = Command::new(executable).args(&args.args).exec();
         return Err(error).context("replace process with Podman");
@@ -960,9 +974,7 @@ fn run_with_backend(executable: &Path, arguments: &[OsString], run_index: usize)
     let run_arguments = arguments
         .get(run_index.saturating_add(1)..)
         .context("Podman run arguments are invalid")?;
-    let detached = run_arguments
-        .iter()
-        .any(|argument| argument == OsStr::new("-d") || argument == OsStr::new("--detach"));
+    let detached = run_arguments.iter().any(|argument| is_detach(argument));
     let host_network = run_arguments.windows(2).any(|pair| {
         pair.first().is_some_and(|argument| argument == "--network")
             && pair.get(1).is_some_and(|argument| argument == "host")
@@ -996,10 +1008,7 @@ fn run_with_backend(executable: &Path, arguments: &[OsString], run_index: usize)
             }
             GpuAccess::None => {}
         }
-        command.args(run_arguments.iter().filter(|argument| {
-            argument.as_os_str() != OsStr::new("-d")
-                && argument.as_os_str() != OsStr::new("--detach")
-        }));
+        command.args(without_detach(run_arguments));
         command.output().context("create backend-enabled container")
     };
     let attempts: &[GpuAccess] = if auto_gpu {
@@ -1041,9 +1050,20 @@ fn run_with_backend(executable: &Path, arguments: &[OsString], run_index: usize)
         drop(remove_raw(executable, global, &id));
     }
     let id = started.with_context(|| format!("Podman run failed: {last_failure}"))?;
-    if let Err(error) = start_persistent_backend(executable, global, &id) {
-        eprintln!("brood-podman: container started but its Brood backend did not: {error:#}");
-    }
+    start_persistent_backend(executable, global, &id)
+        .context("container started but its Brood backend did not")?;
+    let podman = Podman {
+        executable: executable.to_path_buf(),
+        connection: podman_connection(global),
+    };
+    let connect_host = resolve_connect_host(&podman, None)?;
+    let connect = if host_network {
+        SocketAddr::new(connect_host, CONTAINER_RELAY_PORT)
+    } else {
+        SocketAddr::new(connect_host, published_port_raw(executable, global, &id)?)
+    };
+    save_container_connection(&id, connect, state.path())?;
+    eprintln!("brood-container: backend ready; connect with `brood container connect {id}`");
     if detached {
         println!("{id}");
         return Ok(());
@@ -1053,6 +1073,220 @@ fn run_with_backend(executable: &Path, arguments: &[OsString], run_index: usize)
         .args([OsStr::new("attach"), OsStr::new(&id)])
         .exec();
     Err(error).context("replace process with Podman attach")
+}
+
+fn podman_connection(global: &[OsString]) -> Option<String> {
+    global
+        .windows(2)
+        .find_map(|pair| {
+            if pair
+                .first()
+                .is_some_and(|argument| argument == "--connection" || argument == "-c")
+            {
+                pair.get(1)
+                    .map(|argument| argument.to_string_lossy().into_owned())
+            } else {
+                None
+            }
+        })
+        .or_else(|| {
+            global.iter().find_map(|argument| {
+                argument
+                    .to_string_lossy()
+                    .strip_prefix("--connection=")
+                    .map(str::to_string)
+            })
+        })
+}
+
+fn is_detach(argument: &OsStr) -> bool {
+    detach_setting(argument).is_some_and(|enabled| enabled)
+        || compact_detach_flags(argument).is_some()
+}
+
+fn without_detach(arguments: &[OsString]) -> Vec<OsString> {
+    arguments
+        .iter()
+        .filter_map(|argument| {
+            if detach_setting(argument).is_some() {
+                return None;
+            }
+            if let Some(flags) = compact_detach_flags(argument) {
+                let retained = flags
+                    .chars()
+                    .filter(|character| *character != 'd')
+                    .collect::<String>();
+                return (!retained.is_empty()).then(|| OsString::from(format!("-{retained}")));
+            }
+            Some(argument.clone())
+        })
+        .collect()
+}
+
+fn detach_setting(argument: &OsStr) -> Option<bool> {
+    match argument.to_str()? {
+        "-d" | "-d=true" | "--detach" | "--detach=true" => Some(true),
+        "-d=false" | "--detach=false" => Some(false),
+        _ => None,
+    }
+}
+
+fn compact_detach_flags(argument: &OsStr) -> Option<&str> {
+    let flags = argument.to_str()?.strip_prefix('-')?;
+    (!flags.starts_with('-')
+        && flags.len() > 1
+        && flags
+            .chars()
+            .all(|character| character.is_ascii_alphabetic())
+        && flags.contains('d'))
+    .then_some(flags)
+}
+
+fn published_port_raw(executable: &Path, global: &[OsString], id: &str) -> Result<u16> {
+    let output = Command::new(executable)
+        .args(global)
+        .args(["port", id, "44192/udp"])
+        .output()
+        .context("query backend-enabled container relay port")?;
+    ensure!(
+        output.status.success(),
+        "querying container relay port failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let text = String::from_utf8(output.stdout).context("Podman port output is not UTF-8")?;
+    text.lines()
+        .filter_map(|line| line.trim().rsplit_once(':'))
+        .find_map(|(_host, port)| port.parse::<u16>().ok())
+        .context("Podman did not publish the container relay UDP port")
+}
+
+fn container_connection_root() -> Result<PathBuf> {
+    let root = env::var_os("BROOD_CONTAINER_STATE_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            env::var_os("XDG_RUNTIME_DIR")
+                .map(PathBuf::from)
+                .map(|path| path.join("brood/containers"))
+        })
+        .or_else(|| {
+            env::var_os("XDG_STATE_HOME")
+                .map(PathBuf::from)
+                .map(|path| path.join("brood/containers"))
+        })
+        .or_else(|| {
+            env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|path| path.join(".local/state/brood/containers"))
+        })
+        .context("no container state directory is available")?;
+    fs::create_dir_all(&root)
+        .with_context(|| format!("create container connection state {}", root.display()))?;
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("secure container connection state {}", root.display()))?;
+    Ok(root)
+}
+
+fn save_container_connection(id: &str, connect: SocketAddr, source: &Path) -> Result<()> {
+    ensure!(
+        !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "Podman returned an invalid container ID"
+    );
+    let destination = container_connection_root()?.join(id);
+    fs::create_dir_all(&destination)
+        .with_context(|| format!("create container connection {}", destination.display()))?;
+    fs::set_permissions(&destination, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("secure container connection {}", destination.display()))?;
+    for name in ["server.der", "client.der", "client-key.der"] {
+        let target = destination.join(name);
+        fs::copy(source.join(name), &target)
+            .with_context(|| format!("retain container credential {}", target.display()))?;
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("secure container credential {}", target.display()))?;
+    }
+    let manifest = SavedContainerConnection {
+        container: id.to_string(),
+        connect,
+    };
+    let encoded = serde_json::to_vec_pretty(&manifest).context("encode container connection")?;
+    fs::write(destination.join("connection.json"), encoded)
+        .context("write container connection manifest")?;
+    Ok(())
+}
+
+fn connect_container(executable: &Path, arguments: &[OsString]) -> Result<()> {
+    let target = arguments
+        .get(1)
+        .context("usage: brood container connect CONTAINER [-- CLIENT_ARGS...]")?;
+    let root = container_connection_root()?;
+    let direct = root.join(target);
+    let target_is_id = target.to_str().is_some_and(|value| {
+        !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    });
+    let (id, state) = if target_is_id && direct.join("connection.json").is_file() {
+        (target.to_string_lossy().into_owned(), direct)
+    } else {
+        let output = Command::new(executable)
+            .args([
+                OsStr::new("inspect"),
+                OsStr::new("--format"),
+                OsStr::new("{{.Id}}"),
+            ])
+            .arg(target)
+            .output()
+            .context("inspect container for Brood connection")?;
+        ensure!(
+            output.status.success(),
+            "Podman could not inspect container {}: {}",
+            target.to_string_lossy(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        let id = String::from_utf8(output.stdout)
+            .context("Podman container ID is not UTF-8")?
+            .trim()
+            .to_string();
+        let state = root.join(&id);
+        (id, state)
+    };
+    let manifest: SavedContainerConnection = serde_json::from_slice(
+        &fs::read(state.join("connection.json"))
+            .with_context(|| format!("container {id} has no saved Brood connection"))?,
+    )
+    .context("decode container connection manifest")?;
+    ensure!(
+        manifest.container == id,
+        "container connection identity mismatch"
+    );
+    let client = resolve_client(None)?;
+    let (package, root) = super::ssh::resolve_default_session_package(&client)?;
+    let client_arguments = arguments.get(2..).unwrap_or_default();
+    let client_arguments = client_arguments
+        .first()
+        .filter(|argument| argument.as_os_str() == "--")
+        .map_or(client_arguments, |_| {
+            client_arguments.get(1..).unwrap_or_default()
+        });
+    let status = Command::new(&client)
+        .arg("--remote-connect")
+        .arg(manifest.connect.to_string())
+        .arg("--include-local")
+        .arg("--remote-server-name")
+        .arg("localhost")
+        .arg("--remote-server-certificate")
+        .arg(state.join("server.der"))
+        .arg("--remote-client-certificate")
+        .arg(state.join("client.der"))
+        .arg("--remote-client-private-key")
+        .arg(state.join("client-key.der"))
+        .arg("--remote-offer-session-package")
+        .arg(format!("{package}={}", root.display()))
+        .args(client_arguments)
+        .status()
+        .with_context(|| format!("launch local presentation client {}", client.display()))?;
+    ensure!(
+        status.success(),
+        "local presentation client exited with {status}"
+    );
+    Ok(())
 }
 
 fn copy_raw(
@@ -1139,7 +1373,9 @@ const fn container_environment() -> [&'static str; 12] {
 
 #[cfg(test)]
 mod tests {
-    use super::uri_host;
+    use std::ffi::{OsStr, OsString};
+
+    use super::{is_detach, podman_connection, uri_host, without_detach};
 
     #[test]
     fn extracts_hosts_from_podman_connection_uris() {
@@ -1152,5 +1388,50 @@ mod tests {
             "2001:db8::42"
         );
         assert_eq!(uri_host("tcp://192.0.2.10:8080"), "192.0.2.10");
+    }
+
+    #[test]
+    fn removes_detach_without_losing_compact_run_flags() {
+        let arguments = [
+            OsString::from("--rm"),
+            OsString::from("-dit"),
+            OsString::from("alpine"),
+        ];
+        assert!(is_detach(OsStr::new("-dit")));
+        assert_eq!(
+            without_detach(&arguments),
+            [
+                OsString::from("--rm"),
+                OsString::from("-it"),
+                OsString::from("alpine")
+            ]
+        );
+    }
+
+    #[test]
+    fn detach_normalization_preserves_unrelated_values() {
+        let arguments = [
+            OsString::from("--detach=false"),
+            OsString::from("-v/tmp:/data"),
+            OsString::from("alpine"),
+        ];
+        assert!(!is_detach(OsStr::new("--detach=false")));
+        assert!(!is_detach(OsStr::new("-v/tmp:/data")));
+        assert_eq!(
+            without_detach(&arguments),
+            [OsString::from("-v/tmp:/data"), OsString::from("alpine")]
+        );
+    }
+
+    #[test]
+    fn finds_named_podman_connection_in_global_arguments() {
+        assert_eq!(
+            podman_connection(&[OsString::from("--connection"), OsString::from("builder")]),
+            Some("builder".to_string())
+        );
+        assert_eq!(
+            podman_connection(&[OsString::from("--connection=builder")]),
+            Some("builder".to_string())
+        );
     }
 }
