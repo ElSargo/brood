@@ -30,7 +30,7 @@ pub(crate) mod state;
 pub(crate) mod state_services;
 mod wasm_test;
 
-use std::{env, path::PathBuf, process::Command as ProcessCommand};
+use std::process::Command as ProcessCommand;
 
 use anyhow::{Context, Result};
 use brood_cli::{Args, Command};
@@ -96,15 +96,7 @@ pub fn run_cli() -> Result<CommandOutcome> {
 }
 
 fn run_container(args: ContainerArgs) -> Result<CommandOutcome> {
-    let remote = env::var_os("BROOD_REMOTE_BIN").map_or_else(
-        || {
-            env::current_exe().map_or_else(
-                |_| PathBuf::from("brood-remote"),
-                |executable| executable.with_file_name("brood-remote"),
-            )
-        },
-        PathBuf::from,
-    );
+    let remote = brood_cli::control::sidecar_binary("BROOD_REMOTE_BIN", "brood-remote")?;
     let status = ProcessCommand::new(&remote)
         .arg("podman")
         .args(args.args)

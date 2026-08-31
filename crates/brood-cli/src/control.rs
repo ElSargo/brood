@@ -620,22 +620,14 @@ pub fn handshake(target: &ControlTarget) -> Result<Handshake> {
 }
 
 pub fn launch_client() -> Result<ExitStatus> {
-    let current_executable = env::current_exe().context("resolve current executable")?;
-    let client = env::var_os("BROOD_CLIENT_BIN").map_or_else(
-        || current_executable.with_file_name("brood-client"),
-        PathBuf::from,
-    );
+    let client = sidecar_binary("BROOD_CLIENT_BIN", "brood-client")?;
     Command::new(&client)
         .status()
         .with_context(|| format!("start presentation client {}", client.display()))
 }
 
 pub fn spawn_client(target: &ControlTarget) -> Result<Child> {
-    let current_executable = env::current_exe().context("resolve current executable")?;
-    let client = env::var_os("BROOD_CLIENT_BIN").map_or_else(
-        || current_executable.with_file_name("brood-client"),
-        PathBuf::from,
-    );
+    let client = sidecar_binary("BROOD_CLIENT_BIN", "brood-client")?;
     let mut command = Command::new(&client);
     command
         .arg("--dbus-destination")
@@ -649,6 +641,28 @@ pub fn spawn_client(target: &ControlTarget) -> Result<Child> {
     command
         .spawn()
         .with_context(|| format!("spawn presentation client {}", client.display()))
+}
+
+/// Resolve a packaged companion binary.
+///
+/// Development builds prefer a sibling binary. Split packages fall back to
+/// the wrapper-provided `PATH`.
+pub fn sidecar_binary(variable: &str, name: &str) -> Result<PathBuf> {
+    if let Some(configured) = env::var_os(variable) {
+        return Ok(PathBuf::from(configured));
+    }
+    let sibling = env::current_exe()
+        .context("resolve current executable")?
+        .with_file_name(name);
+    Ok(sibling_or_path(sibling, name))
+}
+
+fn sibling_or_path(sibling: PathBuf, name: &str) -> PathBuf {
+    if sibling.is_file() {
+        sibling
+    } else {
+        PathBuf::from(name)
+    }
 }
 
 pub fn connect_or_spawn(target: &ControlTarget, launch: &ServerLaunch) -> Result<Handshake> {
@@ -812,9 +826,9 @@ pub fn session_marker_value(marker: &str, key: &str) -> Option<String> {
 
 #[cfg(test)]
 mod control_tests {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
-    use super::ControlTarget;
+    use super::{ControlTarget, sibling_or_path};
 
     #[test]
     fn explicit_bus_address_stabilizes_private_ipc_discovery() {
@@ -834,5 +848,16 @@ mod control_tests {
         );
         assert_eq!(target.local_ipc_path(), same_target.local_ipc_path());
         assert_ne!(target.local_ipc_path(), other_target.local_ipc_path());
+    }
+
+    #[test]
+    fn split_package_sidecar_falls_back_to_wrapper_path() {
+        assert_eq!(
+            sibling_or_path(
+                PathBuf::from("/definitely/missing/brood-client"),
+                "brood-client"
+            ),
+            Path::new("brood-client")
+        );
     }
 }
