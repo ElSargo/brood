@@ -22,6 +22,7 @@ Brood should feel like a native editor while behaving more like a rich tmux sess
 - `brood`: CLI entrypoint that starts the presentation client.
 - `brood-client`: WGPU presentation process that connects to the session server.
 - `brood-sessiond`: authoritative local session server.
+- `bmux`: tmux-shaped control interface backed by Brood sessions and first-party terminals.
 - pane producers: browser pane client, terminal pane client, hosted Wayland app surfaces, and future native panes.
 - plugins/WASM apps: built-in or user applications that use addressed actors, private shared-memory workers, completion-based I/O, WASI resources, optional sync policy lanes, canvas draw packets, native text services, and a future advanced-graphics escape hatch.
 

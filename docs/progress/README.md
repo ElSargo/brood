@@ -20,6 +20,7 @@ interpret evidence.
 
 - [[computer-use]]
 - [[coding-agent]]
+- [[bmux]]
 - [[internal-ipc-refactor]]
 - [[network-carrier-latency]]
 - [[plugin-runtime-proofs]]

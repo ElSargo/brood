@@ -29,6 +29,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
+use base64::Engine as _;
 pub use brood_cli::control::{
     ControlTarget, request_internal_command, resolve_control_target, session_marker_value,
 };
@@ -4342,6 +4343,45 @@ fn execute_tokens(tokens: &[String], state: &mut Brood) -> Result<String> {
                 .spawn_hosted_app_argv_in_session(argv, SurfaceSessionId::from_raw(session))?;
             format!("OK spawned {} pane_id={}\n", argv.join(" "), token.raw())
         }
+        "terminal" => match args {
+            [subcommand] if subcommand == "list-json" => {
+                format!("{}\n", serde_json::to_string(&state.terminal_summaries())?)
+            }
+            [subcommand, session, command] if subcommand == "new" => {
+                let session = SurfaceSessionId::from_raw(parse_u64(session, "session id")?);
+                let command = base64::engine::general_purpose::STANDARD
+                    .decode(command)
+                    .context("decode terminal command")?;
+                let command =
+                    String::from_utf8(command).context("terminal command is not UTF-8")?;
+                state.request_terminal_create(session, &command)?;
+                "OK terminal new queued=true\n".to_string()
+            }
+            [subcommand, session, ordinal, input] if subcommand == "send" => {
+                let session = SurfaceSessionId::from_raw(parse_u64(session, "session id")?);
+                let ordinal = parse_u64(ordinal, "terminal ordinal")?;
+                let input = base64::engine::general_purpose::STANDARD
+                    .decode(input)
+                    .context("decode terminal input")?;
+                state.send_terminal_input(session, ordinal, &input)?;
+                "OK terminal send queued=true\n".to_string()
+            }
+            [subcommand, session, ordinal] if subcommand == "focus" => {
+                let session = SurfaceSessionId::from_raw(parse_u64(session, "session id")?);
+                let ordinal = parse_u64(ordinal, "terminal ordinal")?;
+                state.request_terminal_focus(session, ordinal)?;
+                "OK terminal focus queued=true\n".to_string()
+            }
+            [subcommand, session, ordinal] if subcommand == "stop" => {
+                let session = SurfaceSessionId::from_raw(parse_u64(session, "session id")?);
+                let ordinal = parse_u64(ordinal, "terminal ordinal")?;
+                state.request_terminal_stop(session, ordinal)?;
+                "OK terminal stop queued=true\n".to_string()
+            }
+            _ => bail!(
+                "usage: terminal list-json|new <session> <base64-command>|send <session> <ordinal> <base64-input>|focus <session> <ordinal>|stop <session> <ordinal>"
+            ),
+        },
         "hosted-child-status" => {
             let [pane_id] = args else {
                 bail!("hosted-child-status requires exactly one pane id");

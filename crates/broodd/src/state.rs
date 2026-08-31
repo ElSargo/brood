@@ -312,6 +312,13 @@ pub struct PresentationWindowSummary {
     pub app_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct TerminalSummary {
+    pub session: u64,
+    pub ordinal: u64,
+    pub actor: String,
+}
+
 pub type ExtensionMetadata = BTreeMap<String, String>;
 pub const BROOD_STATUS_PUBLISHER: &str = "brood";
 
@@ -1366,6 +1373,103 @@ impl Brood {
             });
         }
         summaries
+    }
+
+    pub(crate) fn terminal_summaries(&mut self) -> Vec<TerminalSummary> {
+        let mut terminals = self
+            .plugin_actor_summaries()
+            .into_iter()
+            .filter_map(|actor| parse_terminal_actor_id(&actor.id))
+            .collect::<Vec<_>>();
+        terminals.sort_by_key(|terminal| (terminal.session, terminal.ordinal));
+        terminals
+    }
+
+    pub(crate) fn request_terminal_create(
+        &mut self,
+        session: SurfaceSessionId,
+        command: &str,
+    ) -> Result<()> {
+        ensure!(
+            self.sessions.contains(session),
+            "unknown surface session {}",
+            session.raw()
+        );
+        ensure!(
+            command.len() <= 8 * 1024 && !command.contains('\0'),
+            "terminal command is invalid or exceeds 8192 bytes"
+        );
+        let body = serde_json::to_vec(&serde_json::json!({
+            "kind": "create-terminal",
+            "command": command,
+        }))?;
+        // The blessed client init actor owns creation of the matching terminal
+        // presentation actor. Giving the request its identity makes the normal
+        // terminal-started reply take that existing path.
+        self.send_session_actor_message(session, "init", "brood.client-init", body)
+    }
+
+    pub(crate) fn send_terminal_input(
+        &mut self,
+        session: SurfaceSessionId,
+        ordinal: u64,
+        bytes: &[u8],
+    ) -> Result<()> {
+        let actor = terminal_actor_name(ordinal)?;
+        let mut body = Vec::with_capacity(bytes.len().saturating_add(9));
+        body.push(b'I');
+        body.extend_from_slice(&0_u64.to_le_bytes());
+        body.extend_from_slice(bytes);
+        self.send_session_actor_message(session, &actor, "bmux", body)
+    }
+
+    pub(crate) fn request_terminal_focus(
+        &mut self,
+        session: SurfaceSessionId,
+        ordinal: u64,
+    ) -> Result<()> {
+        ensure!(
+            self.sessions.active() == session,
+            "surface session {} is not active",
+            session.raw()
+        );
+        let terminal = terminal_actor_name(ordinal)?;
+        let body = serde_json::to_vec(&serde_json::json!({
+            "kind": "bmux-focus-terminal",
+            "terminal": terminal,
+        }))?;
+        self.send_presentation_actor_message(
+            BackendActorRealm::Session(session.raw()),
+            "init",
+            "brood.client-init",
+            &body,
+        )
+    }
+
+    pub(crate) fn request_terminal_stop(
+        &mut self,
+        session: SurfaceSessionId,
+        ordinal: u64,
+    ) -> Result<()> {
+        let terminal = terminal_actor_name(ordinal)?;
+        let body = serde_json::to_vec(&serde_json::json!({
+            "kind": "stop-terminal",
+            "terminal": terminal,
+        }))?;
+        self.send_session_actor_message(session, "init", "bmux", body)?;
+        if self.sessions.active() == session && self.dmabuf.fast_path.is_some() {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "kind": "bmux-stop-terminal",
+                "terminal": terminal,
+            }))?;
+            self.send_presentation_actor_message(
+                BackendActorRealm::Session(session.raw()),
+                "init",
+                "brood.client-init",
+                &body,
+            )?;
+        }
+        Ok(())
     }
 
     pub fn plugin_mailbox_summaries(
@@ -7486,6 +7590,31 @@ fn session_init_actor_id(session: SurfaceSessionId) -> String {
 
 fn session_init_child_actor_id(session: SurfaceSessionId, child: &str) -> String {
     format!("brood.session.{}.{}", session.raw(), child)
+}
+
+fn terminal_actor_name(ordinal: u64) -> Result<String> {
+    ensure!(ordinal != 0, "terminal ordinal must be greater than zero");
+    Ok(if ordinal == 1 {
+        "terminal-session".to_string()
+    } else {
+        format!("terminal-session-{ordinal}")
+    })
+}
+
+fn parse_terminal_actor_id(actor: &str) -> Option<TerminalSummary> {
+    let address = actor.strip_prefix("brood.session.")?;
+    let (session, actor_name) = address.split_once('.')?;
+    let session = session.parse().ok()?;
+    let ordinal = if actor_name == "terminal-session" {
+        1
+    } else {
+        actor_name.strip_prefix("terminal-session-")?.parse().ok()?
+    };
+    (ordinal != 0).then(|| TerminalSummary {
+        session,
+        ordinal,
+        actor: actor_name.to_string(),
+    })
 }
 
 fn fallback_marker_id(index: usize) -> u64 {

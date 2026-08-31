@@ -71,6 +71,7 @@ struct SessionState {
     session_id: u64,
     editor_role: bool,
     editor_socket: Option<String>,
+    bmux_pane_id: Option<u64>,
     subscriber: Option<String>,
     snapshot_notification: u64,
     snapshot_generation: u64,
@@ -111,11 +112,13 @@ impl SessionState {
         snapshot_notification: u64,
         editor_role: bool,
         editor_socket: Option<String>,
+        instance_id: &str,
     ) -> Self {
         Self {
             session_id,
             editor_role,
             editor_socket,
+            bmux_pane_id: terminal_ordinal(instance_id).map(|ordinal| (session_id << 32) | ordinal),
             subscriber: None,
             snapshot_notification,
             snapshot_generation: 0,
@@ -411,6 +414,7 @@ impl Guest for TerminalSession {
                         notification,
                         editor_role,
                         editor_socket,
+                        &context.instance_id,
                     ));
                 }
                 let _ = host::notification_watch_actor(notification, 0, SNAPSHOT_TOKEN);
@@ -597,6 +601,15 @@ fn is_editor_session_instance(instance_id: &str) -> bool {
         || instance_id
             .strip_suffix(EDITOR_SESSION_ID)
             .is_some_and(|prefix| prefix.ends_with('.'))
+}
+
+fn terminal_ordinal(instance_id: &str) -> Option<u64> {
+    let actor = instance_id.rsplit('.').next().unwrap_or(instance_id);
+    if actor == "terminal-session" {
+        return Some(1);
+    }
+    let ordinal = actor.strip_prefix("terminal-session-")?.parse().ok()?;
+    (ordinal != 0).then_some(ordinal)
 }
 
 fn parse_editor_open(body: &[u8]) -> Option<EditorOpen> {
@@ -1117,7 +1130,7 @@ fn editor_process_failure(output: &EditorProcessOutput) -> String {
 }
 
 async fn run_terminal_worker(notification: u64) -> Result<Vec<u8>, String> {
-    let (rows, cols, editor_socket) = {
+    let (rows, cols, editor_socket, bmux_pane_id) = {
         let guard = STATE
             .lock()
             .map_err(|_| "terminal state is poisoned".to_string())?;
@@ -1128,10 +1141,21 @@ async fn run_terminal_worker(notification: u64) -> Result<Vec<u8>, String> {
             state.screen.rows,
             state.screen.cols,
             state.editor_socket.clone(),
+            state.bmux_pane_id,
         )
     };
     let (command, arguments) = editor_socket.map_or_else(
-        || ("sh", vec!["-c".to_string(), SHELL_INTEGRATION.to_string()]),
+        || {
+            let integration = bmux_pane_id.map_or_else(
+                || SHELL_INTEGRATION.to_string(),
+                |pane| {
+                    format!(
+                        "TMUX=brood,${{BROODD_DBUS_DESTINATION:-org.brood.Session}},0; TMUX_PANE=%{pane}; export TMUX TMUX_PANE; {SHELL_INTEGRATION}"
+                    )
+                },
+            );
+            ("sh", vec!["-c".to_string(), integration])
+        },
         |socket| ("brood-nvim", vec!["--listen".to_string(), socket]),
     );
     let pty = host::pty_spawn(
@@ -2497,7 +2521,7 @@ mod tests {
 
     #[test]
     fn snapshots_bootstrap_fully_then_send_only_changed_rows() {
-        let mut state = SessionState::new(1, 1, false, None);
+        let mut state = SessionState::new(1, 1, false, None, "terminal-session");
         let initial = encode_snapshot(&mut state);
         assert_eq!(initial[0][4], SNAPSHOT_VERSION);
         assert_eq!(initial[0][5], SNAPSHOT_FULL);
@@ -2525,7 +2549,7 @@ mod tests {
 
     #[test]
     fn snapshot_acknowledges_only_fully_written_terminal_inputs() -> Result<(), String> {
-        let mut state = SessionState::new(1, 1, false, None);
+        let mut state = SessionState::new(1, 1, false, None, "terminal-session");
         state.queue_input(7, b"ab");
         state.queue_input(8, b"c");
         state.record_written_input(2);
@@ -2565,8 +2589,13 @@ mod tests {
 
     #[test]
     fn editor_exit_before_readiness_or_with_failure_is_not_clean() {
-        let mut state =
-            SessionState::new(7, 1, true, Some("/tmp/brood-nvim-test.sock".to_string()));
+        let mut state = SessionState::new(
+            7,
+            1,
+            true,
+            Some("/tmp/brood-nvim-test.sock".to_string()),
+            "neovim-session",
+        );
         state.exit_code = Some(0);
         let Command::SendLocalMessage(message) =
             editor_worker_finished_message(&state).expect("editor lifecycle message")
@@ -2645,8 +2674,13 @@ mod tests {
 
     #[test]
     fn editor_controls_are_serial_and_bounded() {
-        let mut state =
-            SessionState::new(7, 1, true, Some("/tmp/brood-nvim-test.sock".to_string()));
+        let mut state = SessionState::new(
+            7,
+            1,
+            true,
+            Some("/tmp/brood-nvim-test.sock".to_string()),
+            "neovim-session",
+        );
         state.editor_ready = true;
         let request = EditorOpen {
             path: "/tmp/a".to_string(),
@@ -2679,8 +2713,13 @@ mod tests {
 
     #[test]
     fn editor_readiness_waits_for_a_successful_server_probe() {
-        let mut state =
-            SessionState::new(7, 1, true, Some("/tmp/brood-nvim-test.sock".to_string()));
+        let mut state = SessionState::new(
+            7,
+            1,
+            true,
+            Some("/tmp/brood-nvim-test.sock".to_string()),
+            "neovim-session",
+        );
         state.child = Some(9);
         let queued = state.queue_editor_open(EditorOpen {
             path: "/tmp/a".to_string(),

@@ -30,6 +30,7 @@ design-level tensions in [[../frictions/README]].
 - [[systems/render-scheduling]]
 - [[systems/plugin-advanced-graphics]]
 - [[systems/terminal-plugin]]
+- [[systems/bmux]]
 - [[systems/editor-plugin]]
 - [[systems/inbox-plugin]]
 - [[systems/computer-use]]

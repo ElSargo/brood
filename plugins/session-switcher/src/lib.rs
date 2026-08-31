@@ -370,6 +370,12 @@ struct TerminalLifecycleMessage {
     terminal: Option<serde_json_core::heapless::String<64>>,
 }
 
+#[derive(Deserialize)]
+struct BmuxTerminalMessage {
+    kind: serde_json_core::heapless::String<32>,
+    terminal: serde_json_core::heapless::String<64>,
+}
+
 #[derive(Default, Deserialize)]
 #[serde(default)]
 struct EditorMessage {
@@ -1986,6 +1992,9 @@ fn remembered_workspace_focus(state: &SwitcherState, candidate: Option<u64>) -> 
 }
 
 fn handle_key_policy_action(bytes: &[u8]) -> Vec<ActorCommand> {
+    if let Some(commands) = handle_bmux_terminal_message(bytes) {
+        return commands;
+    }
     if let Ok((message, consumed)) = serde_json_core::from_slice::<CodingAgentActionMessage>(bytes)
         && consumed == bytes.len()
         && message.kind.as_str() == "coding-agent-action"
@@ -2090,7 +2099,61 @@ fn handle_key_policy_action(bytes: &[u8]) -> Vec<ActorCommand> {
     publish_synchronized_layout(&mut state, requested_focus, "sidebar", None)
 }
 
+fn terminal_ui_for_session_actor(
+    state: &SwitcherState,
+    backend_id: u64,
+    session_id: u64,
+    terminal: &str,
+) -> Option<String> {
+    let suffix = terminal.strip_prefix("terminal-session-");
+    state.terminal_uis.iter().find_map(|(actor, realm)| {
+        if *realm != (backend_id, session_id) {
+            return None;
+        }
+        let matches = suffix.map_or_else(
+            || {
+                actor == TERMINAL_UI_ID
+                    || actor == &format!("terminal-ui-b{backend_id}-s{session_id}")
+            },
+            |suffix| actor.ends_with(&format!("-{suffix}")),
+        );
+        matches.then(|| actor.clone())
+    })
+}
+
+fn handle_bmux_terminal_message(bytes: &[u8]) -> Option<Vec<ActorCommand>> {
+    let (message, consumed) = serde_json_core::from_slice::<BmuxTerminalMessage>(bytes).ok()?;
+    if consumed != bytes.len()
+        || !matches!(
+            message.kind.as_str(),
+            "bmux-focus-terminal" | "bmux-stop-terminal"
+        )
+    {
+        return None;
+    }
+    let Ok(mut state) = STATE.lock() else {
+        return Some(Vec::new());
+    };
+    let actor = terminal_ui_for_session_actor(
+        &state,
+        state.backend_id,
+        state.session_id,
+        message.terminal.as_str(),
+    )?;
+    if message.kind.as_str() == "bmux-stop-terminal" {
+        state.terminal_uis.remove(&actor);
+        return Some(vec![ActorCommand::StopActor(actor)]);
+    }
+    Some(vec![ActorCommand::SendLocalMessage(LocalActorMessage {
+        actor,
+        body: br#"{"kind":"focus"}"#.to_vec(),
+    })])
+}
+
 fn handle_session_message(sender: &str, bytes: &[u8]) -> Vec<ActorCommand> {
+    if let Some(commands) = handle_bmux_terminal_message(bytes) {
+        return commands;
+    }
     if let Ok(message) = serde_json::from_slice::<EditorMessage>(bytes)
         && (message.kind == "editor-started"
             || message.kind == "editor-present"
@@ -4776,7 +4839,7 @@ mod tests {
         publish_synchronized_layout, publish_synchronized_layout_attempt,
         remembered_workspace_focus, request_creation_backend_picker, request_editor,
         resize_paint_plan, sender_actor_is, shell_layout_state, shell_requested_focus,
-        start_neovim_client, submit, toggle_diff, truncate_to_width,
+        start_neovim_client, submit, terminal_ui_for_session_actor, toggle_diff, truncate_to_width,
         update_creation_backend_picker, valid_editor_actor_target,
     };
 
@@ -5935,6 +5998,33 @@ mod tests {
         assert_eq!(actor_realm(&id), Some((4, 27)));
         assert_eq!(neovim_client_realm(&id), Some((4, 27)));
         assert_eq!(neovim_client_realm("neovim-ui-b4-s27-spoof"), None);
+    }
+
+    #[test]
+    fn bmux_terminal_targets_resolve_only_inside_the_selected_realm() {
+        let mut state = SwitcherState::new();
+        state
+            .terminal_uis
+            .insert("terminal-ui-b2-s7".to_string(), (2, 7));
+        state
+            .terminal_uis
+            .insert("terminal-ui-b2-s7-3".to_string(), (2, 7));
+        state
+            .terminal_uis
+            .insert("terminal-ui-b4-s7-3".to_string(), (4, 7));
+
+        assert_eq!(
+            terminal_ui_for_session_actor(&state, 2, 7, "terminal-session"),
+            Some("terminal-ui-b2-s7".to_string())
+        );
+        assert_eq!(
+            terminal_ui_for_session_actor(&state, 2, 7, "terminal-session-3"),
+            Some("terminal-ui-b2-s7-3".to_string())
+        );
+        assert_eq!(
+            terminal_ui_for_session_actor(&state, 3, 7, "terminal-session-3"),
+            None
+        );
     }
 
     #[test]

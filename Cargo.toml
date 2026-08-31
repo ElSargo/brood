@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "clients/brood-client",
+    "crates/bmux",
     "crates/brood-capsuled",
     "crates/brood-cli",
     "crates/brood-computer-use",
