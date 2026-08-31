@@ -549,6 +549,7 @@ fn list_panes(bmux: &Bmux, args: &[String]) -> Result<()> {
     let session = (!args.iter().any(|arg| arg == "-a"))
         .then(|| bmux.resolve_session(option_value(args, "-t")))
         .transpose()?;
+    let sessions = bmux.sessions()?;
     let mut terminals = bmux
         .terminals()?
         .into_iter()
@@ -557,10 +558,8 @@ fn list_panes(bmux: &Bmux, args: &[String]) -> Result<()> {
     terminals.sort_by_key(|terminal| terminal.ordinal);
     for terminal in terminals {
         if let Some(format) = format {
-            println!(
-                "{}",
-                render_pane_format(format, &terminal, terminal.ordinal == 1)
-            );
+            let rendered = render_list_pane_format(format, &terminal, &sessions);
+            println!("{rendered}");
         } else {
             println!(
                 "{}: [Brood terminal]{}",
@@ -756,6 +755,20 @@ fn render_pane_format(format: &str, terminal: &Terminal, active: bool) -> String
         output = output.replace(&format!("#{{{key}}}"), &value);
     }
     output
+}
+
+fn render_list_pane_format(
+    format: &str,
+    terminal: &Terminal,
+    sessions: &[brood_cli::control::SurfaceSessionSummary],
+) -> String {
+    sessions
+        .iter()
+        .find(|session| session.id == terminal.session)
+        .map_or_else(
+            || render_pane_format(format, terminal, terminal.ordinal == 1),
+            |session| render_session_format(format, session, Some(terminal)),
+        )
 }
 
 fn encode_keys(keys: &[String], literal: bool, hex: bool) -> Result<Vec<u8>> {
@@ -977,6 +990,30 @@ mod tests {
                 Some(&terminal),
             ),
             "$7:work:%30064771073"
+        );
+    }
+
+    #[test]
+    fn list_pane_formats_include_their_session_and_window_context() {
+        let sessions = [brood_cli::control::SurfaceSessionSummary {
+            id: 7,
+            name: "work".to_string(),
+            active: true,
+            windows: 1,
+        }];
+        let terminal = Terminal {
+            session: 7,
+            ordinal: 3,
+            actor: "terminal-session-3".to_string(),
+        };
+
+        assert_eq!(
+            render_list_pane_format(
+                "#{session_name}:#{window_index}:#{pane_id}:#{pane_current_command}",
+                &terminal,
+                &sessions,
+            ),
+            "work:0:%30064771075:sh"
         );
     }
 
