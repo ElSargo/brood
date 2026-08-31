@@ -34,6 +34,7 @@ impl Guest for ExampleActor {
             }
         }
         match event {
+            Event::Lifecycle(_) => vec![Command::LifecycleComplete(Ok(()))],
             Event::Mailbox(message) if message.body.starts_with(RUBE_MESSAGE_MAGIC) => {
                 let Some((transition, input, generation, claimed)) =
                     parse_rube_message(&message.body)

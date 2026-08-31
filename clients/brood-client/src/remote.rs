@@ -39,7 +39,8 @@ const RELIABLE_CAPACITY: usize = 128;
 const MAX_PENDING_BACKEND_REQUESTS: usize = 128;
 const MAX_PENDING_SCENES: usize = 4;
 const MAX_PENDING_FRAME_PACKETS: usize = 256;
-const MAX_PENDING_FRAME_BYTES: usize = 256 * 1024 * 1024;
+const MAX_PENDING_DECODED_FRAME_BYTES: usize = 256 * 1024 * 1024;
+const SCENE_EVENT_CAPACITY: usize = 1;
 const CONNECTION_SETUP_TIMEOUT: Duration = Duration::from_secs(15);
 const CONNECTION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const CONNECTION_CANCEL_TIMEOUT: Duration = Duration::from_secs(1);
@@ -938,7 +939,10 @@ async fn receive_scenes(
     backend: BackendId,
     connection_generation: u64,
 ) -> Result<()> {
-    let (sender, mut events) = tokio_mpsc::channel(16);
+    // A network frame may occupy the full negotiated 64 MiB. Keep only one
+    // decoded envelope between the dedicated stream readers and the bounded
+    // join state; QUIC stream flow control carries the remaining backpressure.
+    let (sender, mut events) = tokio_mpsc::channel(SCENE_EVENT_CAPACITY);
     let scene_task = tokio::spawn(receive_scene_messages(latest, sender.clone()));
     let frame_task = tokio::spawn(receive_frame_messages(frames, sender));
     let mut pending_scenes = BTreeMap::<u64, FrameScene>::new();
@@ -954,7 +958,13 @@ async fn receive_scenes(
                     scene.backend == backend,
                     "remote scene backend identity does not match its connection"
                 );
-                pending_scenes.insert(scene.sequence, scene);
+                if last_published.is_some_and(|sequence| scene.sequence <= sequence) {
+                    continue;
+                }
+                ensure!(
+                    pending_scenes.insert(scene.sequence, scene).is_none(),
+                    "remote peer repeated a pending scene sequence"
+                );
                 while pending_scenes.len() > MAX_PENDING_SCENES {
                     let Some(sequence) = pending_scenes.keys().next().copied() else {
                         break;
@@ -965,11 +975,16 @@ async fn receive_scenes(
             }
             RemoteSceneEvent::Frame(frame) => {
                 if last_published.is_none_or(|sequence| frame.sequence > sequence) {
-                    pending_frames.insert((frame.sequence, frame.resource), frame);
+                    ensure!(
+                        pending_frames
+                            .insert((frame.sequence, frame.resource), frame)
+                            .is_none(),
+                        "remote peer repeated a pending frame identity"
+                    );
                 }
             }
         }
-        prune_pending_frames(&mut pending_scenes, &mut pending_frames);
+        prune_pending_frames(&mut pending_scenes, &mut pending_frames)?;
         publish_ready_scenes(
             &mut pending_scenes,
             &mut pending_frames,
@@ -1087,11 +1102,9 @@ async fn publish_ready_scenes(
 fn prune_pending_frames(
     scenes: &mut BTreeMap<u64, FrameScene>,
     frames: &mut HashMap<(u64, u64), NetworkFramePacket>,
-) {
+) -> Result<()> {
     while frames.len() > MAX_PENDING_FRAME_PACKETS
-        || frames.values().fold(0_usize, |total, frame| {
-            total.saturating_add(frame.compressed_pixels.len())
-        }) > MAX_PENDING_FRAME_BYTES
+        || pending_decoded_frame_bytes(frames)? > MAX_PENDING_DECODED_FRAME_BYTES
     {
         let Some(sequence) = frames.keys().map(|(sequence, _)| *sequence).min() else {
             break;
@@ -1099,6 +1112,15 @@ fn prune_pending_frames(
         frames.retain(|(frame_sequence, _), _| *frame_sequence != sequence);
         scenes.remove(&sequence);
     }
+    Ok(())
+}
+
+fn pending_decoded_frame_bytes(frames: &HashMap<(u64, u64), NetworkFramePacket>) -> Result<usize> {
+    frames.values().try_fold(0_usize, |total, frame| {
+        total
+            .checked_add(frame.decoded_len()?)
+            .context("pending remote frame byte budget overflow")
+    })
 }
 
 struct DecodedSceneWindows {
@@ -1237,7 +1259,9 @@ impl RemoteInputLane {
         if self.deferred.is_empty() {
             eprintln!("critical network input lane backpressured; deferring input messages");
         }
-        debug_assert!(self.deferred.len() < crate::actor_runtime::ACTOR_OUTPUT_BACKLOG);
+        if self.deferred.len() >= crate::actor_runtime::ACTOR_OUTPUT_BACKLOG {
+            return false;
+        }
         self.deferred.push_back(message);
         self.deferred_high_water = self.deferred_high_water.max(self.deferred.len());
         true
@@ -1276,15 +1300,11 @@ impl RemoteActorMessageLane {
             queued_at: Instant::now(),
         };
         if self.has_deferred() {
-            self.defer(command);
-            return Ok(());
+            return self.defer(command);
         }
         match self.sender.try_send(command) {
             Ok(()) => Ok(()),
-            Err(tokio_mpsc::error::TrySendError::Full(command)) => {
-                self.defer(command);
-                Ok(())
-            }
+            Err(tokio_mpsc::error::TrySendError::Full(command)) => self.defer(command),
             Err(tokio_mpsc::error::TrySendError::Closed(_)) => {
                 bail!("remote actor-message channel is closed")
             }
@@ -1311,9 +1331,13 @@ impl RemoteActorMessageLane {
         !self.deferred.is_empty()
     }
 
-    fn defer(&mut self, command: ActorCommand) {
-        debug_assert!(self.deferred.len() < crate::actor_runtime::ACTOR_OUTPUT_BACKLOG);
+    fn defer(&mut self, command: ActorCommand) -> Result<()> {
+        ensure!(
+            self.deferred.len() < crate::actor_runtime::ACTOR_OUTPUT_BACKLOG,
+            "remote actor-message backlog is full"
+        );
         self.deferred.push_back(command);
+        Ok(())
     }
 }
 
@@ -1441,14 +1465,21 @@ impl RemoteBackendCommandLane {
     reason = "bounded-lane tests stop immediately when a required send or receive does not occur"
 )]
 mod tests {
-    use brood_protocol::{BackendActorRealm, BackendId, ClientMessage, InputEvent, PanePosition};
+    use brood_protocol::{
+        BackendActorRealm, BackendId, ClientMessage, FrameColorSpace, FramePixelFormat, InputEvent,
+        PanePosition,
+    };
 
     use super::{
-        ReliableCommand, RemoteActorMessageLane, RemoteBackendCommandLane, RemoteInputLane,
-        send_retained,
+        MAX_PENDING_DECODED_FRAME_BYTES, ReliableCommand, RemoteActorMessageLane,
+        RemoteBackendCommandLane, RemoteInputLane, pending_decoded_frame_bytes,
+        prune_pending_frames, send_retained,
     };
     use crate::actor_runtime::BackendActorMessageRequest;
-    use std::time::Duration;
+    use std::{
+        collections::{BTreeMap, HashMap},
+        time::Duration,
+    };
 
     fn pointer(x: f64) -> ClientMessage {
         ClientMessage::Input(InputEvent::PointerMotion {
@@ -1487,6 +1518,11 @@ mod tests {
             lane.deferred.len(),
             crate::actor_runtime::ACTOR_OUTPUT_BACKLOG
         );
+        assert!(!lane.send(ClientMessage::Input(InputEvent::KeyboardReset)));
+        assert_eq!(
+            lane.deferred.len(),
+            crate::actor_runtime::ACTOR_OUTPUT_BACKLOG
+        );
         for _ in 0..=crate::actor_runtime::ACTOR_OUTPUT_BACKLOG {
             assert_eq!(
                 critical_receiver.try_recv().ok(),
@@ -1501,7 +1537,7 @@ mod tests {
     fn actor_messages_are_retained_fifo_beyond_channel_capacity() {
         let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
         let mut lane = RemoteActorMessageLane::new(sender);
-        for sequence in 0_u16..256 {
+        for sequence in 0_u16..=256 {
             lane.send(&BackendActorMessageRequest {
                 backend: BackendId(1),
                 sender: "source".to_string(),
@@ -1511,12 +1547,51 @@ mod tests {
             })
             .unwrap();
         }
-        for sequence in 0_u16..256 {
+        assert!(
+            lane.send(&BackendActorMessageRequest {
+                backend: BackendId(1),
+                sender: "source".to_string(),
+                realm: BackendActorRealm::Daemon,
+                actor: "sink".to_string(),
+                body: 257_u16.to_le_bytes().to_vec(),
+            })
+            .is_err()
+        );
+        for sequence in 0_u16..=256 {
             let command = receiver.try_recv().unwrap();
             assert_eq!(command.message.body, sequence.to_le_bytes());
             lane.flush_deferred();
         }
         assert!(!lane.has_deferred());
+    }
+
+    #[test]
+    fn pending_frame_budget_counts_decompressed_bytes() {
+        let mut scenes = BTreeMap::new();
+        let mut frames = HashMap::new();
+        for sequence in 1_u64..=5 {
+            let frame = brood_transport::NetworkFramePacket {
+                resource: sequence,
+                sequence,
+                pane: sequence,
+                width: 4_096,
+                height: 4_096,
+                stride: 16_384,
+                pixel_format: FramePixelFormat::Rgba8,
+                color_space: FrameColorSpace::Srgb,
+                damage: vec![[0, 0, 4_096, 4_096]],
+                compressed_pixels: vec![0],
+            };
+            frames.insert((sequence, sequence), frame);
+        }
+        assert!(pending_decoded_frame_bytes(&frames).unwrap() > MAX_PENDING_DECODED_FRAME_BYTES);
+        prune_pending_frames(&mut scenes, &mut frames).unwrap();
+        assert_eq!(frames.len(), 4);
+        assert!(!frames.contains_key(&(1, 1)));
+        assert_eq!(
+            pending_decoded_frame_bytes(&frames).unwrap(),
+            MAX_PENDING_DECODED_FRAME_BYTES
+        );
     }
 
     #[test]

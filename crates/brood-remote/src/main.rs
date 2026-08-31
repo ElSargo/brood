@@ -1,9 +1,13 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fs,
+    io::Write,
     mem::size_of,
     net::{Ipv4Addr, SocketAddr},
-    os::fd::AsFd,
+    os::{
+        fd::AsFd,
+        unix::fs::{OpenOptionsExt, PermissionsExt},
+    },
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     thread,
@@ -462,9 +466,43 @@ fn generate_certificate(server_name: &str, certificate: &Path, key: &Path) -> Re
             certificate.display()
         )
     })?;
-    fs::write(key, signing_key.serialize_der())
+    let mut key_file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(key)
+        .with_context(|| format!("open remote presentation private key {}", key.display()))?;
+    key_file
+        .set_permissions(fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("secure remote presentation private key {}", key.display()))?;
+    key_file
+        .write_all(&signing_key.serialize_der())
         .with_context(|| format!("write remote presentation private key {}", key.display()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod certificate_tests {
+    use std::{fs, os::unix::fs::PermissionsExt};
+
+    use anyhow::{Result, ensure};
+
+    use super::generate_certificate;
+
+    #[test]
+    fn generated_private_key_is_owner_only_even_when_replacing_a_file() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let certificate = root.path().join("server.der");
+        let key = root.path().join("server-key.der");
+        fs::write(&key, b"old key")?;
+        fs::set_permissions(&key, fs::Permissions::from_mode(0o644))?;
+
+        generate_certificate("localhost", &certificate, &key)?;
+
+        ensure!(fs::metadata(key)?.permissions().mode() & 0o777 == 0o600);
+        Ok(())
+    }
 }
 
 #[allow(
@@ -1815,13 +1853,22 @@ fn encode_network_scene(
 ) -> Result<NetworkScene> {
     let mut windows = Vec::with_capacity(scene.windows.len());
     let mut frames = Vec::with_capacity(scene.windows.len());
-    for window in scene.windows {
-        let frame = resources
+    let scene_frames = {
+        let resources = resources
             .lock()
-            .map_err(|_poisoned| anyhow!("shared frame resource registry is poisoned"))?
-            .get(&window.resource)
-            .cloned()
-            .with_context(|| format!("frame resource {} is unavailable", window.resource))?;
+            .map_err(|_poisoned| anyhow!("shared frame resource registry is poisoned"))?;
+        scene
+            .windows
+            .iter()
+            .map(|window| {
+                resources
+                    .get(&window.resource)
+                    .cloned()
+                    .with_context(|| format!("frame resource {} is unavailable", window.resource))
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
+    for (window, frame) in scene.windows.into_iter().zip(scene_frames) {
         let metadata = frame.image.metadata();
         let pixels = frame.image.pixels(scene.sequence)?;
         frames.push(NetworkFramePacket::from_pixels(

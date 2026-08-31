@@ -35,10 +35,11 @@ pub fn server_endpoint(
     let client_verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(client_roots))
         .build()
         .context("configure presentation client certificate verifier")?;
-    let tls = rustls::ServerConfig::builder()
+    let mut tls = rustls::ServerConfig::builder()
         .with_client_cert_verifier(client_verifier)
         .with_single_cert(vec![certificate], private_key)
         .context("configure QUIC server identity")?;
+    tls.alpn_protocols = vec![presentation_alpn()];
     let mut config = quinn::ServerConfig::with_crypto(Arc::new(
         QuicServerConfig::try_from(tls).context("configure QUIC server TLS")?,
     ));
@@ -59,13 +60,14 @@ pub fn client_endpoint(
             trusted_certificate_der,
         ))
         .context("add trusted presentation server certificate")?;
-    let tls = rustls::ClientConfig::builder()
+    let mut tls = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_client_auth_cert(
             vec![rustls::pki_types::CertificateDer::from(certificate_der)],
             rustls::pki_types::PrivatePkcs8KeyDer::from(private_key_der).into(),
         )
         .context("configure QUIC presentation client identity")?;
+    tls.alpn_protocols = vec![presentation_alpn()];
     let mut config = quinn::ClientConfig::new(Arc::new(
         QuicClientConfig::try_from(tls).context("configure QUIC client TLS")?,
     ));
@@ -78,6 +80,8 @@ pub fn client_endpoint(
 
 fn network_transport_config() -> quinn::TransportConfig {
     let mut config = quinn::TransportConfig::default();
+    config.max_concurrent_bidi_streams(VarInt::from_u32(MAX_PEER_BIDIRECTIONAL_STREAMS));
+    config.max_concurrent_uni_streams(VarInt::from_u32(0));
     config.keep_alive_interval(Some(Duration::from_secs(10)));
     let mut acknowledgements = AckFrequencyConfig::default();
     acknowledgements
@@ -85,6 +89,14 @@ fn network_transport_config() -> quinn::TransportConfig {
         .max_ack_delay(Some(Duration::from_millis(2)));
     config.ack_frequency_config(Some(acknowledgements));
     config
+}
+
+fn presentation_alpn() -> Vec<u8> {
+    format!(
+        "brood-presentation/{}",
+        brood_protocol::PRESENTATION_PROTOCOL_VERSION
+    )
+    .into_bytes()
 }
 
 const LANES: [Lane; 10] = [
@@ -107,6 +119,10 @@ const FRAME_ENVELOPE_BYTES: usize = 64 * 1024;
 const MAX_HANDSHAKE_BYTES: usize = 64 * 1024;
 const MAX_WIRE_MESSAGE_BYTES: usize = 64 * 1024 * 1024 + FRAME_ENVELOPE_BYTES;
 const MAX_FRAME_DAMAGE_RECTS: usize = 1_024;
+const LANE_FINISH_TIMEOUT: Duration = Duration::from_secs(5);
+// One handshake stream plus the ten fixed semantic lanes.
+const MAX_PEER_BIDIRECTIONAL_STREAMS: u32 = 11;
+const _: () = assert!(LANES.len() == 10);
 
 /// First authenticated application message sent by the remote client.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -307,10 +323,9 @@ impl NetworkSendLane {
         self.send
             .finish()
             .context("finish presentation network lane")?;
-        let _peer_stop = self
-            .send
-            .stopped()
+        let _peer_stop = tokio::time::timeout(LANE_FINISH_TIMEOUT, self.send.stopped())
             .await
+            .context("presentation network lane acknowledgement timed out")?
             .context("wait for presentation network lane acknowledgement")?;
         Ok(())
     }
@@ -353,10 +368,9 @@ impl NetworkReceiveLane {
 
     /// Read the peer's lane finish marker after its final framed message.
     pub async fn wait_for_finish(&mut self) -> Result<()> {
-        let trailing = self
-            .receive
-            .read_to_end(0)
+        let trailing = tokio::time::timeout(LANE_FINISH_TIMEOUT, self.receive.read_to_end(0))
             .await
+            .context("presentation network lane finish timed out")?
             .context("wait for presentation network lane finish")?;
         ensure!(
             trailing.is_empty(),
@@ -534,6 +548,10 @@ pub async fn connect_network(
     )
     .await?;
     let hello: ServerHello = read_serialized(&mut handshake_receive).await?;
+    ensure!(
+        hello.backend != brood_protocol::BackendId(0) && hello.connection_generation != 0,
+        "server returned an invalid connection identity"
+    );
     validate_capabilities(&hello.capabilities)?;
     let expected_profile = negotiate_profile(&capabilities, &hello.capabilities)
         .context("validate server-selected remote presentation profile")?;
@@ -576,6 +594,14 @@ pub async fn accept_network_connection(
         .await
         .context("accept presentation handshake stream")?;
     let hello: ClientHello = read_serialized(&mut handshake_receive).await?;
+    ensure!(
+        hello.backend != brood_protocol::BackendId(0),
+        "client supplied an invalid backend identity"
+    );
+    ensure!(
+        connection_generation != 0,
+        "server supplied an invalid connection generation"
+    );
     validate_capabilities(&hello.capabilities)?;
     let profile = negotiate_profile(&hello.capabilities, &capabilities)
         .context("negotiate remote presentation profile")?;
@@ -712,12 +738,7 @@ async fn read_frame(stream: &mut RecvStream, buffer: &mut Vec<u8>, limit: usize)
         .read_exact(&mut length)
         .await
         .context("read presentation message length")?;
-    let length = usize::try_from(u32::from_be_bytes(length))
-        .context("presentation message length is invalid")?;
-    ensure!(
-        length <= limit && length <= MAX_WIRE_MESSAGE_BYTES,
-        "presentation message length {length} exceeds the negotiated lane limit of {limit} bytes"
-    );
+    let length = checked_frame_length(u32::from_be_bytes(length), limit)?;
     buffer.clear();
     buffer.resize(length, 0);
     stream
@@ -725,6 +746,15 @@ async fn read_frame(stream: &mut RecvStream, buffer: &mut Vec<u8>, limit: usize)
         .await
         .context("read presentation message body")?;
     Ok(())
+}
+
+fn checked_frame_length(encoded: u32, limit: usize) -> Result<usize> {
+    let length = usize::try_from(encoded).context("presentation message length is invalid")?;
+    ensure!(
+        length <= limit && length <= MAX_WIRE_MESSAGE_BYTES,
+        "presentation message length {length} exceeds the negotiated lane limit of {limit} bytes"
+    );
+    Ok(length)
 }
 
 fn validate_capabilities(capabilities: &EndpointCapabilities) -> Result<()> {
@@ -762,6 +792,10 @@ fn lane_message_limit(capabilities: &EndpointCapabilities, lane: Lane) -> Result
 
 fn validate_actor_message(message: &brood_protocol::ActorMessage) -> Result<()> {
     ensure!(
+        !matches!(message.realm, BackendActorRealm::Session(0)),
+        "network actor session identity is invalid"
+    );
+    ensure!(
         !message.sender.is_empty()
             && message.sender.len() <= MAX_ACTOR_ID_BYTES
             && !message.recipient.is_empty()
@@ -783,7 +817,15 @@ fn validate_client_message(message: &ClientMessage) -> Result<()> {
         ClientMessage::Artifact(message) => message
             .validate()
             .context("validate network artifact message"),
-        ClientMessage::Lifecycle(_) | ClientMessage::ReleaseResource { .. } => Ok(()),
+        ClientMessage::Lifecycle(brood_protocol::ClientLifecycle::FramePresented { sequence }) => {
+            ensure!(*sequence != 0, "presented frame sequence is invalid");
+            Ok(())
+        }
+        ClientMessage::ReleaseResource { resource } => {
+            ensure!(*resource != 0, "released frame resource is invalid");
+            Ok(())
+        }
+        ClientMessage::Lifecycle(brood_protocol::ClientLifecycle::Disconnect) => Ok(()),
     }
 }
 
@@ -796,6 +838,7 @@ fn validate_server_message(message: &ServerMessage) -> Result<()> {
             .validate()
             .context("validate network artifact message"),
         ServerMessage::BackendResponse(response) => {
+            ensure!(response.id != 0, "backend response identity is invalid");
             if let Err(reason) = &response.result {
                 ensure!(reason.len() <= MAX_ACTOR_MESSAGE_BYTES as usize);
             }
@@ -823,8 +866,9 @@ fn validate_server_message(message: &ServerMessage) -> Result<()> {
 }
 
 fn validate_input(input: &brood_protocol::InputEvent) -> Result<()> {
-    let finite_position =
-        |position: &brood_protocol::PanePosition| position.x.is_finite() && position.y.is_finite();
+    let finite_position = |position: &brood_protocol::PanePosition| {
+        position.pane != 0 && position.x.is_finite() && position.y.is_finite()
+    };
     match input {
         brood_protocol::InputEvent::PointerMotion { position }
         | brood_protocol::InputEvent::PointerButton { position, .. }
@@ -875,16 +919,19 @@ fn validate_input(input: &brood_protocol::InputEvent) -> Result<()> {
                 "managed resize request has invalid units"
             );
         }
+        brood_protocol::InputEvent::WindowFocus { pane } => {
+            ensure!(*pane != 0, "focused pane identity is invalid");
+        }
         brood_protocol::InputEvent::KeyboardKey { .. }
         | brood_protocol::InputEvent::KeyboardReset
         | brood_protocol::InputEvent::PresentationFocus { .. }
-        | brood_protocol::InputEvent::WindowFocus { .. }
         | brood_protocol::InputEvent::PointerLeave => {}
     }
     Ok(())
 }
 
 fn validate_backend_request(request: &brood_protocol::BackendRequest) -> Result<()> {
+    ensure!(request.id != 0, "backend request identity is invalid");
     match &request.operation {
         brood_protocol::BackendOperation::Control { argv } => {
             ensure!(
@@ -952,12 +999,19 @@ fn validate_catalog(catalog: &brood_protocol::CatalogSnapshot) -> Result<()> {
 
 fn validate_scene(scene: &brood_protocol::FrameScene) -> Result<()> {
     ensure!(
+        scene.backend != brood_protocol::BackendId(0)
+            && scene.sequence != 0
+            && !scene.extent.contains(&0),
+        "network scene identity or extent is invalid"
+    );
+    ensure!(
         scene.windows.len() <= 16_384,
         "network scene has too many windows"
     );
     let mut panes = HashSet::with_capacity(scene.windows.len());
     let mut resources = HashSet::with_capacity(scene.windows.len());
     for window in &scene.windows {
+        ensure!(window.pane != 0, "network scene has an invalid pane ID");
         ensure!(panes.insert(window.pane), "network scene repeats a pane ID");
         ensure!(
             matches!(
@@ -969,6 +1023,10 @@ fn validate_scene(scene: &brood_protocol::FrameScene) -> Result<()> {
         ensure!(
             resources.insert(window.resource.id()),
             "network scene repeats a frame resource"
+        );
+        ensure!(
+            window.resource.id() != 0,
+            "network scene has an invalid frame resource"
         );
         ensure!(
             window.source[2] > 0
@@ -1132,12 +1190,7 @@ impl NetworkFramePacket {
     /// Decompress and validate this packet's packed pixels.
     pub fn pixels(&self) -> Result<Vec<u8>> {
         self.validate(MAX_NETWORK_FRAME_BYTES)?;
-        let expected = usize::try_from(
-            u64::from(self.stride)
-                .checked_mul(u64::from(self.height))
-                .context("network frame length overflow")?,
-        )
-        .context("network frame length exceeds address space")?;
+        let expected = self.decoded_len()?;
         let pixels = zstd::bulk::decompress(&self.compressed_pixels, expected)
             .context("decompress network frame")?;
         ensure!(
@@ -1147,7 +1200,21 @@ impl NetworkFramePacket {
         Ok(pixels)
     }
 
+    /// Number of bytes occupied after lossless decompression.
+    pub fn decoded_len(&self) -> Result<usize> {
+        usize::try_from(
+            u64::from(self.stride)
+                .checked_mul(u64::from(self.height))
+                .context("network frame length overflow")?,
+        )
+        .context("network frame length exceeds address space")
+    }
+
     fn validate(&self, max_frame_bytes: u64) -> Result<()> {
+        ensure!(
+            self.resource != 0 && self.sequence != 0 && self.pane != 0,
+            "network frame identity is invalid"
+        );
         ensure!(
             self.width != 0 && self.height != 0,
             "network frame has an empty extent"
@@ -1200,7 +1267,10 @@ impl NetworkFramePacket {
     reason = "test infrastructure failures cannot produce a useful fallback value"
 )]
 mod tests {
-    use std::net::{Ipv4Addr, SocketAddr};
+    use std::{
+        net::{Ipv4Addr, SocketAddr},
+        time::Duration,
+    };
 
     use brood_protocol::{
         ARTIFACT_ABI_VERSION, ActorMessage, ArtifactKind, ArtifactManifest, ArtifactMessage,
@@ -1216,9 +1286,9 @@ mod tests {
     use rcgen::{CertifiedKey, generate_simple_self_signed};
 
     use super::{
-        NetworkFramePacket, accept_network_connection, client_endpoint, client_message_lane,
-        connect_network, lane_priority, server_endpoint, validate_capabilities,
-        validate_client_message, validate_server_message,
+        NetworkFramePacket, accept_network_connection, checked_frame_length, client_endpoint,
+        client_message_lane, connect_network, lane_priority, server_endpoint,
+        validate_capabilities, validate_client_message, validate_server_message,
     };
 
     #[test]
@@ -1334,10 +1404,32 @@ mod tests {
     }
 
     #[test]
+    fn frame_validation_rejects_zero_generation_local_identity() {
+        let mut packet = NetworkFramePacket::from_pixels(
+            1,
+            2,
+            3,
+            1,
+            1,
+            FramePixelFormat::Rgba8,
+            FrameColorSpace::Srgb,
+            &[0; 4],
+        )
+        .unwrap_or_else(|error| unreachable!("{error}"));
+        packet.resource = 0;
+        assert!(packet.pixels().is_err());
+    }
+
+    #[test]
     fn endpoint_capabilities_cannot_advertise_unbounded_frames() {
         let mut capabilities = EndpointCapabilities::remote();
         capabilities.max_frame_bytes = u64::MAX;
         assert!(validate_capabilities(&capabilities).is_err());
+    }
+
+    #[test]
+    fn oversized_wire_prefix_is_rejected_before_buffer_growth() {
+        assert!(checked_frame_length(u32::MAX, MAX_ACTOR_MESSAGE_BYTES as usize).is_err());
     }
 
     #[test]
@@ -1734,6 +1826,81 @@ mod tests {
         server_task
             .await
             .unwrap_or_else(|error| unreachable!("{error}"));
+    }
+
+    #[tokio::test]
+    async fn stalled_frame_stream_does_not_block_critical_input() {
+        let (server_endpoint, client_endpoint, address) = endpoints();
+        let server_task = tokio::spawn(async move {
+            let incoming = server_endpoint
+                .accept()
+                .await
+                .unwrap_or_else(|| unreachable!("server endpoint closed"));
+            let mut connection =
+                accept_network_connection(incoming, EndpointCapabilities::remote(), 42)
+                    .await
+                    .unwrap_or_else(|error| unreachable!("{error}"));
+            let (_critical_send, mut critical_receive) = connection
+                .take_lane(Lane::Critical)
+                .unwrap_or_else(|error| unreachable!("{error}"))
+                .split();
+            let (_frame_send, _frame_receive) = connection
+                .take_lane(Lane::FrameResource)
+                .unwrap_or_else(|error| unreachable!("{error}"))
+                .split();
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                critical_receive.receive_client_message(),
+            )
+            .await
+            .unwrap_or_else(|error| unreachable!("critical lane timed out: {error}"))
+            .unwrap_or_else(|error| unreachable!("{error}"))
+        });
+
+        let mut client = connect_network(
+            &client_endpoint,
+            address,
+            "localhost",
+            brood_protocol::BackendId(7),
+            EndpointCapabilities::remote(),
+        )
+        .await
+        .unwrap_or_else(|error| unreachable!("{error}"));
+        let (mut critical_send, _critical_receive) = client
+            .take_lane(Lane::Critical)
+            .unwrap_or_else(|error| unreachable!("{error}"))
+            .split();
+        let (mut frame_send, _frame_receive) = client
+            .take_lane(Lane::FrameResource)
+            .unwrap_or_else(|error| unreachable!("{error}"))
+            .split();
+        let stalled_frame = tokio::spawn(async move {
+            let packet = NetworkFramePacket {
+                resource: 1,
+                sequence: 1,
+                pane: 1,
+                width: 2_048,
+                height: 1_024,
+                stride: 8_192,
+                pixel_format: FramePixelFormat::Rgba8,
+                color_space: FrameColorSpace::Srgb,
+                damage: vec![[0, 0, 2_048, 1_024]],
+                compressed_pixels: vec![0xa5; 8 * 1_024 * 1_024],
+            };
+            frame_send.send_frame(&packet).await
+        });
+        tokio::task::yield_now().await;
+        critical_send
+            .send_client_message(&ClientMessage::Input(InputEvent::KeyboardReset))
+            .await
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        assert_eq!(
+            server_task
+                .await
+                .unwrap_or_else(|error| unreachable!("{error}")),
+            ClientMessage::Input(InputEvent::KeyboardReset)
+        );
+        stalled_frame.abort();
     }
 
     #[tokio::test]
