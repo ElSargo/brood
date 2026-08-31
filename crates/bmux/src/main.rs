@@ -444,16 +444,15 @@ fn new_session(bmux: &Bmux, args: &[String]) -> Result<()> {
         bmux.present()?;
     }
     if print {
-        let terminal = bmux
-            .terminals()?
-            .into_iter()
-            .find(|terminal| terminal.session == session);
+        let terminal = wait_for_terminal(bmux, |terminal| {
+            terminal.session == session && terminal.ordinal == 1
+        })?;
         println!(
             "{}",
             render_session_format(
                 format.as_deref().unwrap_or("#{session_name}:"),
                 &session_summary(bmux, session)?,
-                terminal.as_ref(),
+                Some(&terminal),
             )
         );
     }
@@ -940,6 +939,30 @@ mod tests {
         assert_eq!(
             render_pane_format("#{pane_id}:#{pane_index}:#{pane_title}", &terminal, false),
             "%30064771075:2:terminal-session-3"
+        );
+    }
+
+    #[test]
+    fn formatted_session_print_includes_the_authoritative_initial_pane() {
+        let session = brood_cli::control::SurfaceSessionSummary {
+            id: 7,
+            name: "work".to_string(),
+            active: true,
+            windows: 1,
+        };
+        let terminal = Terminal {
+            session: 7,
+            ordinal: 1,
+            actor: "terminal-session".to_string(),
+        };
+
+        assert_eq!(
+            render_session_format(
+                "#{session_id}:#{session_name}:#{pane_id}",
+                &session,
+                Some(&terminal),
+            ),
+            "$7:work:%30064771073"
         );
     }
 
