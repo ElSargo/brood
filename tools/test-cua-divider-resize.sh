@@ -42,11 +42,12 @@ SWAY_CONFIG="$OUT/sway.conf"
 CUA_SOCKET="$RUNTIME_DIR/cua-driver.sock"
 DBUS_DESTINATION="org.brood.CuaDividerGrade.p$$"
 DRAG_DURATION_MS="${BROOD_CUA_DRAG_DURATION_MS:-1500}"
-DRAG_STEPS="${BROOD_CUA_DRAG_STEPS:-120}"
+TARGET_FRAME_RATE_HZ="${BROOD_CUA_TARGET_FRAME_RATE_HZ:-180}"
+DRAG_STEPS="${BROOD_CUA_DRAG_STEPS:-$((DRAG_DURATION_MS * TARGET_FRAME_RATE_HZ / 1000))}"
 DRAG_REPEATS="${BROOD_CUA_DRAG_REPEATS:-3}"
 CAPTURE_INTERVAL_MS="${BROOD_CUA_CAPTURE_INTERVAL_MS:-100}"
 MIN_SCORE="${BROOD_CUA_MIN_SCORE:-90}"
-for value in "$DRAG_DURATION_MS" "$DRAG_STEPS" "$DRAG_REPEATS" "$CAPTURE_INTERVAL_MS"; do
+for value in "$DRAG_DURATION_MS" "$TARGET_FRAME_RATE_HZ" "$DRAG_STEPS" "$DRAG_REPEATS" "$CAPTURE_INTERVAL_MS"; do
   if [[ ! "$value" =~ ^[1-9][0-9]*$ ]]; then
     echo "ERR Cua resize timing and count values must be positive integers" >&2
     exit 2
@@ -84,7 +85,7 @@ trap cleanup EXIT
 
 printf '%s\n' \
   'xwayland disable' \
-  'output * mode --custom 1280x720@60Hz' \
+  "output * mode --custom 1280x720@${TARGET_FRAME_RATE_HZ}Hz" \
   'output * scale 1' \
   'seat seat0 fallback true' \
   'default_border none' \
@@ -151,6 +152,12 @@ done
 wayland_env() {
   env XDG_RUNTIME_DIR="$RUNTIME_DIR" WAYLAND_DISPLAY="$WAYLAND_SOCKET" SWAYSOCK="$SWAY_SOCKET" "$@"
 }
+
+wayland_env swaymsg -t get_outputs -r > "$OUT/sway-outputs.json"
+TARGET_REFRESH_MILLIHZ=$((TARGET_FRAME_RATE_HZ * 1000))
+jq -e --argjson refresh "$TARGET_REFRESH_MILLIHZ" '
+  any(.[]; .active and .current_mode.refresh == $refresh)
+' "$OUT/sway-outputs.json" > /dev/null
 
 env -u brood_session \
   XDG_RUNTIME_DIR="$RUNTIME_DIR" \
@@ -299,6 +306,7 @@ for run in $(seq 1 "$DRAG_REPEATS"); do
     --argjson started_ns "$START_NS" \
     --argjson ended_ns "$END_NS" \
     --argjson duration_ms "$DRAG_DURATION_MS" \
+    --argjson target_frame_rate_hz "$TARGET_FRAME_RATE_HZ" \
     --argjson steps "$DRAG_STEPS" \
     --argjson start_x "$START_DIVIDER" \
     --argjson target_x "$TARGET_DIVIDER" \
@@ -306,7 +314,7 @@ for run in $(seq 1 "$DRAG_REPEATS"); do
     --argjson drag_result "$DRAG_RESULT" \
     --argjson client_alive "$CLIENT_ALIVE" \
     --arg final_file "${FINAL_CAPTURE#$OUT/}" \
-    '{run:$run,start_line:$start_line,end_line:$end_line,started_ns:$started_ns,ended_ns:$ended_ns,duration_ms:$duration_ms,steps:$steps,start_x:$start_x,target_x:$target_x,final_x:$final_x,drag_result:$drag_result,client_alive:$client_alive,final_file:$final_file}' \
+    '{run:$run,start_line:$start_line,end_line:$end_line,started_ns:$started_ns,ended_ns:$ended_ns,duration_ms:$duration_ms,target_frame_rate_hz:$target_frame_rate_hz,steps:$steps,start_x:$start_x,target_x:$target_x,final_x:$final_x,drag_result:$drag_result,client_alive:$client_alive,final_file:$final_file}' \
     >> "$RUNS"
 done
 

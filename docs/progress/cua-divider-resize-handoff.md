@@ -279,3 +279,79 @@ Final extended evidence is retained at `/tmp/brood-cua-divider-final-100`:
 
 Verification also passed all 37 session-switcher unit tests and all 281
 `brood-client` unit tests through the checked-in Nix development environment.
+
+### 180 Hz follow-up
+
+The default gate now configures and verifies a 180 Hz headless Sway output and,
+unless explicitly overridden, derives 270 Cua steps for the 1.5 second drag.
+The retained `sway-outputs.json` must report an active mode with refresh
+`180000`; a compositor that silently selects another rate fails before grading.
+
+Six strict follow-up runs are retained at
+`/tmp/brood-cua-divider-180hz-final-2`. Every run scored **100.00/100** with:
+
+- 270 requested Cua steps and 196 distinct pixel motion events per drag;
+- one synchronized release transaction and zero supersessions;
+- zero stale actor frames, stale region replies, resource losses, stale final
+  reuse detections, or final-position error;
+- tracking RMSE from 0.00147 to 0.00329, with 100% unique and forward-moving
+  in-gesture samples;
+- release completion from 5.675 ms to 15.030 ms.
+
+### Render-geometry invariant follow-up
+
+The client now records a render-time invariant for every pane in the accepted
+paint order. It independently compares backing-surface area, projected pane
+area, and accepted-layout area, then requires their full pixel rectangles to
+agree. Missing surfaces, area mismatches, and geometry mismatches are separate
+counts with per-pane diagnostics. The Cua grader treats an absent sample or any
+presented mismatch as a hard failure.
+
+The first instrumented run exposed the remaining brief desynchronization: the
+terminal and session-switcher surfaces were commonly one pixel behind their
+pane and layout rectangles during the drag. Active divider resize now defers
+such a render attempt until all three geometries agree, retaining the previous
+compositor frame rather than presenting the incoherent projection. The metric
+remains global, so startup and non-divider mismatches are still observable;
+deferral is limited to the active divider path to avoid blocking the initial
+plug-in surface-resize handshake.
+
+Three strict 180 Hz runs are retained at
+`/tmp/brood-cua-geometry-metric-3`. Every run scored **100.00/100** with:
+
+- 408 to 410 presented-frame invariant samples per run;
+- 1,224 to 1,230 pane comparisons per run, all verified and exact;
+- zero missing surfaces, area mismatches, or geometry mismatches in presented
+  frames;
+- 133 to 152 incoherent intermediate render attempts deferred per run;
+- tracking RMSE from 0.00000 to 0.00257, one synchronized release transaction,
+  zero supersessions, and exact final geometry.
+
+### Painted-extent and pixel-oracle correction
+
+The allocation-only invariant above was insufficient. A faster 196 px drag in
+300 ms, driven with 180 steps and sampled every 10 ms, exposed frames where the
+GPU texture allocation, pane rectangle, and layout rectangle agreed while the
+packet inside the texture had been painted for an older width. The ordinary
+refresh path compiled that stale coordinate space directly into the newer
+allocation. Its opaque background ended early, exposing the renderer's clear
+color at the right edge. The original grader still awarded 100 because it
+observed allocation metadata and divider position, not painted coverage.
+
+GPU canvas preparation now derives an explicit source painted extent from an
+opaque origin-anchored canvas fill. Ordinary live previews project that complete
+source coordinate space across the current allocation. The same opaque canvas
+color initializes the offscreen render target, preventing multisample boundary
+coverage from exposing transparency at the outer pixel. Once a production
+three-pane frame has established exact geometry, incoherent subsequent frames
+are deferred across the complete interaction lifecycle, including release.
+
+The Cua analyzer now checks both projected painted extent and captured pixels.
+It scans pane-boundary and output-edge columns for the exact renderer-clear
+color; any slice is a hard failure. Regrading the intermediate artifact at
+`/tmp/brood-cua-fast-painted-4` finds 23 affected captures across three runs,
+including one 12 px slice. The corrected 300 ms stress artifact at
+`/tmp/brood-cua-fast-painted-5` has zero clear slices and scores **100.00/100**
+in all three runs, with tracking RMSE 0.00248 to 0.00392 and exact final
+geometry. The normal 1.5 s, 180 Hz gate also scores **100.00/100** in all three
+runs at `/tmp/brood-cua-painted-default-1` with zero clear slices.

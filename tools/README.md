@@ -24,8 +24,13 @@ Run `./tools/brood-build.sh --help` for the build modes and concurrency control.
 session-switcher, and client under private headless Sway, then uses the external
 Cua project driver to perform native Wayland divider drags. It captures the
 visible divider during each gesture and grades tracking, synchronized-layout
-efficiency, final correctness, survival, and release latency. The default gate
-is 90/100 and the overall grade is the worst of three alternating drags:
+efficiency, final correctness, survival, and release latency. Every presented
+frame is also checked for exact backing-surface, pane, and accepted-layout area
+and geometry, including the packet's projected painted extent. Captured pixels
+are independently scanned for renderer-clear slices near pane boundaries and
+screen edges. An absent sample, mismatch, or clear slice is a hard failure. The default gate
+uses a verified 180 Hz headless output, requests one Cua motion step per target
+frame, and reports the worst of three alternating drags:
 
 ```sh
 nix develop --command bash tools/test-cua-divider-resize.sh
@@ -34,6 +39,8 @@ nix develop --command bash tools/test-cua-divider-resize.sh
 Set `CUA_DRIVER_BIN` when `cua-driver` is not on `PATH`. During investigation,
 `BROOD_CUA_ALLOW_FAIL=1` retains a failing grade without making the shell
 command fail. `BROOD_CUA_RESIZE_OUT` selects the retained artifact directory.
+`BROOD_CUA_TARGET_FRAME_RATE_HZ` overrides the default 180 Hz target; unless
+`BROOD_CUA_DRAG_STEPS` is explicit, the gesture step count follows that rate.
 The Cua daemon uses a private socket and disposable nested display, so the proof
 does not stop or reuse an operator's existing Cua daemon.
 

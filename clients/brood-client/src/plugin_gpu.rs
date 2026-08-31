@@ -172,6 +172,10 @@ pub struct GpuCanvasScene {
     pub width: u32,
     pub height: u32,
     pub scale: f32,
+    /// Pixel extent covered after projecting an opaque origin-anchored canvas
+    /// fill from the packet into this GPU allocation.
+    pub painted_extent: Option<(u32, u32)>,
+    canvas_clear: Option<wgpu::Color>,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     ops: Vec<CanvasOp>,
@@ -194,6 +198,8 @@ pub struct PreparedCanvasScene {
     width: u32,
     height: u32,
     scale: f32,
+    painted_extent: Option<(u32, u32)>,
+    canvas_clear: Option<wgpu::Color>,
     vertices: Vec<CanvasVertex>,
     indices: Vec<u32>,
     ops: Vec<CanvasOp>,
@@ -432,7 +438,21 @@ impl GpuCanvasRenderer {
     ) -> Result<PreparedCanvasScene> {
         let started = Instant::now();
         let (width, height, scale) = extent;
-        let mut compiler = SceneCompiler::new(width, height, scale);
+        let opaque_canvas = opaque_canvas_fill(&snapshot.packet, scale);
+        let source_painted_extent = opaque_canvas.map(|(extent, _color)| extent);
+        let painted_extent = source_painted_extent.map(|_| (width, height));
+        let canvas_clear = opaque_canvas.map(|(_extent, color)| wgpu::Color {
+            r: f64::from(srgb_to_linear(color.r)),
+            g: f64::from(srgb_to_linear(color.g)),
+            b: f64::from(srgb_to_linear(color.b)),
+            a: f64::from(color.a),
+        });
+        let mut compiler = SceneCompiler::new_projected(
+            width,
+            height,
+            scale,
+            source_painted_extent.unwrap_or((width, height)),
+        );
         compiler.compile(&snapshot, Some(&context.glyph_atlas))?;
         let SceneCompiler {
             vertices,
@@ -446,6 +466,8 @@ impl GpuCanvasRenderer {
             width,
             height,
             scale,
+            painted_extent,
+            canvas_clear,
             vertices,
             indices,
             ops,
@@ -599,6 +621,8 @@ impl GpuCanvasRenderer {
             width,
             height,
             scale,
+            painted_extent,
+            canvas_clear,
             vertices,
             indices,
             ops,
@@ -692,6 +716,8 @@ impl GpuCanvasRenderer {
             width,
             height,
             scale,
+            painted_extent,
+            canvas_clear,
             vertex_buffer,
             index_buffer,
             ops,
@@ -723,7 +749,12 @@ impl GpuCanvasRenderer {
         if simple {
             self.encode_simple_scene(encoder, scene)?;
         } else {
-            clear_target(encoder, &scene.root, "plugin GPU canvas clear root");
+            clear_target(
+                encoder,
+                &scene.root,
+                scene.canvas_clear.unwrap_or(wgpu::Color::TRANSPARENT),
+                "plugin GPU canvas clear root",
+            );
             let mut target_stack = vec![TargetId::Root];
             for op in &scene.ops {
                 match op {
@@ -738,7 +769,12 @@ impl GpuCanvasRenderer {
                             .layers
                             .get(*layer)
                             .context("plugin GPU canvas lost layer target")?;
-                        clear_target(encoder, target, "plugin GPU canvas clear layer");
+                        clear_target(
+                            encoder,
+                            target,
+                            wgpu::Color::TRANSPARENT,
+                            "plugin GPU canvas clear layer",
+                        );
                         target_stack.push(TargetId::Layer(*layer));
                     }
                     CanvasOp::EndLayer { layer, draw } => {
@@ -784,7 +820,9 @@ impl GpuCanvasRenderer {
                 resolve_target: Some(&scene.root.view),
                 depth_slice: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    load: wgpu::LoadOp::Clear(
+                        scene.canvas_clear.unwrap_or(wgpu::Color::TRANSPARENT),
+                    ),
                     store: wgpu::StoreOp::Store,
                 },
             })],
@@ -1015,6 +1053,8 @@ struct SceneCompiler {
     width: u32,
     height: u32,
     scale: f32,
+    projection: [f32; 2],
+    logical_canvas: [f32; 2],
     vertices: Vec<CanvasVertex>,
     indices: Vec<u32>,
     ops: Vec<CanvasOp>,
@@ -1022,11 +1062,28 @@ struct SceneCompiler {
 }
 
 impl SceneCompiler {
-    const fn new(width: u32, height: u32, scale: f32) -> Self {
+    fn new(width: u32, height: u32, scale: f32) -> Self {
+        Self::new_projected(width, height, scale, (width, height))
+    }
+
+    fn new_projected(
+        width: u32,
+        height: u32,
+        scale: f32,
+        source_painted_extent: (u32, u32),
+    ) -> Self {
         Self {
             width,
             height,
             scale,
+            projection: [
+                width as f32 / source_painted_extent.0.max(1) as f32,
+                height as f32 / source_painted_extent.1.max(1) as f32,
+            ],
+            logical_canvas: [
+                source_painted_extent.0 as f32 / scale,
+                source_painted_extent.1 as f32 / scale,
+            ],
             vertices: Vec::new(),
             indices: Vec::new(),
             ops: Vec::new(),
@@ -1181,8 +1238,7 @@ impl SceneCompiler {
                     let layer = layers.pop().ok_or_else(|| {
                         SceneCompileError::Invalid("layer stack underflow".to_owned())
                     })?;
-                    let logical_width = self.width as f32 / self.scale;
-                    let logical_height = self.height as f32 / self.scale;
+                    let [logical_width, logical_height] = self.logical_canvas;
                     let geometry = self.quad_geometry(
                         Rect::new(0.0, 0.0, logical_width, logical_height),
                         Transform::IDENTITY,
@@ -1395,7 +1451,9 @@ impl SceneCompiler {
         let transform_scale = ((sum_of_squares + discriminant.sqrt()) * 0.5)
             .sqrt()
             .max(1.0);
-        let device_scale = f64::from(self.scale.clamp(1.0, MAX_TESSELLATION_SCALE));
+        let projection_scale = f64::from(self.projection[0].max(self.projection[1]));
+        let device_scale =
+            f64::from(self.scale.clamp(1.0, MAX_TESSELLATION_SCALE)) * projection_scale;
         (f64::from(TARGET_CURVE_ERROR_PIXELS) / (transform_scale * device_scale)).clamp(
             f64::from(MIN_TESSELLATION_TOLERANCE),
             f64::from(TARGET_CURVE_ERROR_PIXELS),
@@ -1403,8 +1461,8 @@ impl SceneCompiler {
     }
 
     fn ndc(&self, logical: [f32; 2]) -> [f32; 2] {
-        let physical_x = logical[0] * self.scale;
-        let physical_y = logical[1] * self.scale;
+        let physical_x = logical[0] * self.scale * self.projection[0];
+        let physical_y = logical[1] * self.scale * self.projection[1];
         [
             physical_x * 2.0 / self.width as f32 - 1.0,
             physical_y * 2.0 / self.height as f32 - 1.0,
@@ -1635,6 +1693,41 @@ fn ndc(width: u32, height: u32, scale: f32, logical: [f32; 2]) -> [f32; 2] {
     ]
 }
 
+fn opaque_canvas_fill(packet: &brood_graphics::Packet, scale: f32) -> Option<((u32, u32), Color)> {
+    if !scale.is_finite() || scale <= 0.0 {
+        return None;
+    }
+    packet
+        .commands
+        .iter()
+        .filter_map(|command| {
+            let Command::FillRect { rect, color } = command else {
+                return None;
+            };
+            if rect.x != 0.0
+                || rect.y != 0.0
+                || color.a != 1.0
+                || !rect.width.is_finite()
+                || !rect.height.is_finite()
+                || rect.width <= 0.0
+                || rect.height <= 0.0
+            {
+                return None;
+            }
+            let width = (rect.width * scale).round();
+            let height = (rect.height * scale).round();
+            if !(1.0..=u32::MAX as f32).contains(&width)
+                || !(1.0..=u32::MAX as f32).contains(&height)
+            {
+                return None;
+            }
+            Some(((width as u32, height as u32), *color))
+        })
+        .max_by_key(|((width, height), _color)| {
+            u64::from(*width).saturating_mul(u64::from(*height))
+        })
+}
+
 fn premultiplied(color: Color, opacity: f32) -> [f32; 4] {
     let alpha = color.a * opacity;
     [
@@ -1772,7 +1865,12 @@ fn create_stencil(device: &wgpu::Device, width: u32, height: u32) -> StencilTarg
     }
 }
 
-fn clear_target(encoder: &mut wgpu::CommandEncoder, target: &CanvasTarget, label: &'static str) {
+fn clear_target(
+    encoder: &mut wgpu::CommandEncoder,
+    target: &CanvasTarget,
+    color: wgpu::Color,
+    label: &'static str,
+) {
     let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: Some(label),
         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1780,7 +1878,7 @@ fn clear_target(encoder: &mut wgpu::CommandEncoder, target: &CanvasTarget, label
             resolve_target: Some(&target.view),
             depth_slice: None,
             ops: wgpu::Operations {
-                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                load: wgpu::LoadOp::Clear(color),
                 store: wgpu::StoreOp::Store,
             },
         })],
@@ -2016,6 +2114,30 @@ fn composite_blend(input: VertexOutput, blended: vec3<f32>) -> vec4<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opaque_canvas_extent_tracks_the_packet_painted_size() {
+        let mut packet = brood_graphics::Packet::new();
+        packet.push(Command::FillRect {
+            rect: Rect::new(0.0, 0.0, 511.0, 343.0),
+            color: Color::rgba(0.1, 0.2, 0.3, 1.0),
+        });
+        assert_eq!(
+            opaque_canvas_fill(&packet, 1.0).map(|(extent, _color)| extent),
+            Some((511, 343))
+        );
+        assert_eq!(
+            opaque_canvas_fill(&packet, 1.5).map(|(extent, _color)| extent),
+            Some((767, 515))
+        );
+    }
+
+    #[test]
+    fn stale_canvas_extent_projects_to_the_complete_gpu_target() {
+        let compiler = SceneCompiler::new_projected(516, 686, 1.0, (514, 686));
+        assert_eq!(compiler.ndc([0.0, 0.0]), [-1.0, -1.0]);
+        assert_eq!(compiler.ndc([514.0, 686.0]), [1.0, 1.0]);
+    }
 
     #[test]
     fn glyph_atlas_allocator_wraps_rows_without_overlap() {

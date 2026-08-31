@@ -58,11 +58,9 @@ def is_divider(red: int, green: int, blue: int) -> bool:
     ) <= 30**2
 
 
-def detect_divider(path: pathlib.Path, start_x: int, target_x: int) -> int | None:
-    try:
-        width, height, raw = load_rgb(path)
-    except (OSError, subprocess.CalledProcessError, ValueError):
-        return None
+def detect_divider(
+    width: int, height: int, raw: bytes, start_x: int, target_x: int
+) -> int | None:
     left = max(0, min(start_x, target_x) - 32)
     right = min(width - 1, max(start_x, target_x) + 32)
     row_start = round(height * 0.05)
@@ -78,6 +76,29 @@ def detect_divider(path: pathlib.Path, start_x: int, target_x: int) -> int | Non
         return None
     score, x = max(scores)
     return x if score >= 0.45 else None
+
+
+def clear_slice_columns(
+    width: int, height: int, raw: bytes, start_x: int, target_x: int
+) -> list[int]:
+    clear = tuple(srgb(channel) for channel in (0.04, 0.05, 0.07))
+    row_start = round(height * 0.05)
+    row_end = round(height * 0.92)
+    threshold = math.ceil((row_end - row_start) * 0.95)
+    candidates = set(range(0, min(8, width)))
+    candidates.update(range(max(0, width - 8), width))
+    candidates.update(
+        range(max(0, min(start_x, target_x) - 32), min(width, max(start_x, target_x) + 33))
+    )
+    columns = []
+    for x in sorted(candidates):
+        matches = 0
+        for y in range(row_start, row_end):
+            offset = (y * width + x) * 3
+            matches += tuple(raw[offset : offset + 3]) == clear
+        if matches >= threshold:
+            columns.append(x)
+    return columns
 
 
 def clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
@@ -153,6 +174,37 @@ def main() -> int:
             "layout-region response-rejected" in line and "StaleEpoch" in line
             for line in segment
         )
+        render_geometry = [
+            tuple(map(int, match.groups()))
+            for line in segment
+            if "render-geometry-invariant" in line
+            if (
+                match := re.search(
+                    r"panes=(\d+) verified=(\d+) missing_surfaces=(\d+) "
+                    r"missing_painted_extents=(\d+) area_mismatches=(\d+) "
+                    r"geometry_mismatches=(\d+)",
+                    line,
+                )
+            )
+        ]
+        render_geometry_samples = len(render_geometry)
+        render_geometry_deferred = sum(
+            "render-geometry-deferred" in line for line in segment
+        )
+        render_geometry_panes = sum(sample[0] for sample in render_geometry)
+        render_geometry_verified = sum(sample[1] for sample in render_geometry)
+        render_missing_surfaces = sum(sample[2] for sample in render_geometry)
+        render_missing_painted_extents = sum(sample[3] for sample in render_geometry)
+        render_area_mismatches = sum(sample[4] for sample in render_geometry)
+        render_geometry_mismatches = sum(sample[5] for sample in render_geometry)
+        render_geometry_ok = bool(render_geometry) and not any(
+            (
+                render_missing_surfaces,
+                render_missing_painted_extents,
+                render_area_mismatches,
+                render_geometry_mismatches,
+            )
+        )
         fatal_resource = any(
             "lost a referenced resource" in line for line in segment
         )
@@ -187,9 +239,25 @@ def main() -> int:
 
         observed = []
         for sample in (item for item in samples if int(item["run"]) == run_number):
-            detected = detect_divider(
-                args.root / sample["file"], int(sample["start_x"]), int(sample["target_x"])
-            )
+            try:
+                width, height, raw = load_rgb(args.root / sample["file"])
+                detected = detect_divider(
+                    width,
+                    height,
+                    raw,
+                    int(sample["start_x"]),
+                    int(sample["target_x"]),
+                )
+                clear_slices = clear_slice_columns(
+                    width,
+                    height,
+                    raw,
+                    int(sample["start_x"]),
+                    int(sample["target_x"]),
+                )
+            except (OSError, subprocess.CalledProcessError, ValueError):
+                detected = None
+                clear_slices = []
             elapsed_ms = (int(sample["captured_ns"]) - int(sample["drag_started_ns"])) / 1e6
             captured_ns = int(sample["captured_ns"])
             if motion_timestamps:
@@ -215,6 +283,7 @@ def main() -> int:
                     "detected_x": detected,
                     "actual_progress": None if actual is None else round(actual, 4),
                     "during_gesture": during_gesture,
+                    "clear_slice_columns": clear_slices,
                     "file": sample["file"],
                 }
             )
@@ -256,12 +325,22 @@ def main() -> int:
 
         protocol_efficiency = clamp(1.0 - supersessions / max(1, motion_events))
         protocol_score = 20.0 * protocol_efficiency
+        clear_slice_frames = sum(bool(item["clear_slice_columns"]) for item in observed)
+        max_clear_slice_columns = max(
+            (len(item["clear_slice_columns"]) for item in observed), default=0
+        )
         final_error = abs(int(run["final_x"]) - int(run["target_x"]))
         alive = bool(run["client_alive"])
         correctness_score = (
             5.0 * alive
             + 5.0 * (final_error <= 3)
-            + 5.0 * (not stale_final_reuse and not fatal_resource)
+            + 5.0
+            * (
+                not stale_final_reuse
+                and not fatal_resource
+                and render_geometry_ok
+                and clear_slice_frames == 0
+            )
         )
         if completion_us is None:
             latency_score = 0.0
@@ -284,6 +363,24 @@ def main() -> int:
             hard_failures.append(
                 f"run {run_number}: final epoch reused stale session-switcher content"
             )
+        if not render_geometry:
+            hard_failures.append(
+                f"run {run_number}: no render-time surface/pane/layout geometry samples"
+            )
+        elif not render_geometry_ok:
+            hard_failures.append(
+                f"run {run_number}: render-time geometry invariant failed "
+                f"(missing surfaces {render_missing_surfaces}, area mismatches "
+                f"{render_area_mismatches}, missing painted extents "
+                f"{render_missing_painted_extents}, geometry mismatches "
+                f"{render_geometry_mismatches})"
+            )
+        if clear_slice_frames:
+            hard_failures.append(
+                f"run {run_number}: renderer-clear background slices appeared in "
+                f"{clear_slice_frames} captured frames (maximum width "
+                f"{max_clear_slice_columns}px)"
+            )
         run_metrics.append(
             {
                 **run,
@@ -292,6 +389,17 @@ def main() -> int:
                 "supersessions": supersessions,
                 "stale_actor_frames": stale_frames,
                 "stale_region_responses": stale_regions,
+                "render_geometry_samples": render_geometry_samples,
+                "render_geometry_deferred": render_geometry_deferred,
+                "render_geometry_panes": render_geometry_panes,
+                "render_geometry_verified": render_geometry_verified,
+                "render_missing_surfaces": render_missing_surfaces,
+                "render_missing_painted_extents": render_missing_painted_extents,
+                "render_area_mismatches": render_area_mismatches,
+                "render_geometry_mismatches": render_geometry_mismatches,
+                "render_geometry_ok": render_geometry_ok,
+                "clear_slice_frames": clear_slice_frames,
+                "max_clear_slice_columns": max_clear_slice_columns,
                 "fatal_resource_loss": fatal_resource,
                 "stale_final_reuse": stale_final_reuse,
                 "final_error_px": final_error,
@@ -313,7 +421,7 @@ def main() -> int:
     overall = min((item["scores"]["total"] for item in run_metrics), default=0.0)
     passed = bool(run_metrics) and overall >= args.minimum_score and not hard_failures
     metrics = {
-        "schema": 1,
+        "schema": 3,
         "workload": "production session-switcher + terminal, native Wayland Cua drag",
         "score": round(overall, 2),
         "grade": grade_letter(overall),
@@ -333,7 +441,8 @@ def main() -> int:
     summary_rows = "\n".join(
         f"| {run['run']} | {run['scores']['total']:.2f} | {run['motion_events']} | "
         f"{run['transactions']} | {run['supersessions']} | {run['tracking_rmse']:.3f} | "
-        f"{run['final_error_px']} | {'yes' if run['client_alive'] else 'no'} |"
+        f"{run['final_error_px']} | {'yes' if run['render_geometry_ok'] else 'no'} | "
+        f"{'yes' if run['client_alive'] else 'no'} |"
         for run in run_metrics
     )
     failures = "\n".join(f"- {failure}" for failure in hard_failures) or "- None"
@@ -342,15 +451,15 @@ def main() -> int:
 
 Overall: **{overall:.2f}/100 ({grade_letter(overall)})** — {'PASS' if passed else 'FAIL'}
 
-| Run | Score | Motions | Transactions | Superseded | Tracking RMSE | Final error px | Survived |
-|---:|---:|---:|---:|---:|---:|---:|:---:|
+| Run | Score | Motions | Transactions | Superseded | Tracking RMSE | Final error px | Render geometry | Survived |
+|---:|---:|---:|---:|---:|---:|---:|:---:|:---:|
 {summary_rows}
 
 ## Hard failures
 
 {failures}
 
-The grade uses real native Wayland input from Cua. Fifty points measure visible divider tracking from captured frames, twenty penalize wasted/superseded synchronized transactions, fifteen require survival and correct final content/geometry, and fifteen measure release-to-completion latency. The overall score is the worst run so intermittent crashes cannot be averaged away.
+The grade uses real native Wayland input from Cua. Fifty points measure visible divider tracking from captured frames, twenty penalize wasted/superseded synchronized transactions, fifteen require survival, correct final content/geometry, exact render-time painted-surface/pane/layout area and geometry, and no renderer-clear slices in captured pixels, and fifteen measure release-to-completion latency. The overall score is the worst run so intermittent failures cannot be averaged away.
 """
     )
     print(f"Cua divider resize: {overall:.2f}/100 ({grade_letter(overall)}) {'PASS' if passed else 'FAIL'}")

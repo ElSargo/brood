@@ -13401,6 +13401,7 @@ impl ApplicationHandler<ClientEvent> for Application {
                         timings,
                         submitted_at,
                         presented_at,
+                        geometry_invariant,
                     } => {
                         callback_guard.set_driver_present_ns(timings.driver_present_ns);
                         if sequence.is_some() {
@@ -13507,6 +13508,16 @@ impl ApplicationHandler<ClientEvent> for Application {
                                 paint.explicit_overlay_panes,
                                 paint.elevated_overlay_panes,
                                 paint.low_z_divider_over_ordinary,
+                            );
+                            eprintln!(
+                                "render-geometry-invariant panes={} verified={} missing_surfaces={} missing_painted_extents={} area_mismatches={} geometry_mismatches={} details=[{}]",
+                                geometry_invariant.panes,
+                                geometry_invariant.verified,
+                                geometry_invariant.missing_surfaces,
+                                geometry_invariant.missing_painted_extents,
+                                geometry_invariant.area_mismatches,
+                                geometry_invariant.geometry_mismatches,
+                                geometry_invariant.details.join(","),
                             );
                         }
                         if let Some(benchmark) = self.plugin_scroll_benchmark.as_mut() {
@@ -14238,6 +14249,10 @@ struct Renderer {
     automation_owned_panes: BTreeSet<u64>,
     automation_spectator: Option<AutomationSpectatorFrame>,
     automation_presentation: Option<AutomationPresentationState>,
+    /// Armed after the production pane set has produced one exact frame.
+    /// Bootstrap rendering remains permissive so native-window and plug-in
+    /// resize handshakes can establish their first coherent surfaces.
+    geometry_guard_armed: bool,
 }
 
 /// CPU-side state which survives a renderer/device replacement.
@@ -14480,6 +14495,119 @@ enum ImportedFrameSource {
 struct PluginPaneTexture {
     scene: GpuCanvasScene,
     rect: [i32; 4],
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct RenderGeometryInvariant {
+    panes: usize,
+    verified: usize,
+    missing_surfaces: usize,
+    missing_painted_extents: usize,
+    area_mismatches: usize,
+    geometry_mismatches: usize,
+    details: Vec<String>,
+}
+
+impl RenderGeometryInvariant {
+    fn is_exact(&self) -> bool {
+        self.verified == self.panes
+            && self.missing_surfaces == 0
+            && self.missing_painted_extents == 0
+            && self.area_mismatches == 0
+            && self.geometry_mismatches == 0
+    }
+
+    fn record(
+        &mut self,
+        pane: u64,
+        surface_extent: Option<(u32, u32)>,
+        painted_extent: Option<(u32, u32)>,
+        pane_rect: [i32; 4],
+        layout_rect: [i32; 4],
+    ) {
+        self.panes = self.panes.saturating_add(1);
+        let Some((surface_width, surface_height)) = surface_extent else {
+            self.missing_surfaces = self.missing_surfaces.saturating_add(1);
+            self.details.push(format!(
+                "{pane}:surface=missing:pane={}:{}:{}:{}:layout={}:{}:{}:{}",
+                pane_rect[0],
+                pane_rect[1],
+                pane_rect[2],
+                pane_rect[3],
+                layout_rect[0],
+                layout_rect[1],
+                layout_rect[2],
+                layout_rect[3],
+            ));
+            return;
+        };
+        let Some((painted_width, painted_height)) = painted_extent else {
+            self.missing_painted_extents = self.missing_painted_extents.saturating_add(1);
+            self.details.push(format!(
+                "{pane}:surface={surface_width}:{surface_height}:painted=missing:pane={}:{}:{}:{}:layout={}:{}:{}:{}",
+                pane_rect[0],
+                pane_rect[1],
+                pane_rect[2],
+                pane_rect[3],
+                layout_rect[0],
+                layout_rect[1],
+                layout_rect[2],
+                layout_rect[3],
+            ));
+            return;
+        };
+        self.verified = self.verified.saturating_add(1);
+        let surface_rect = [
+            pane_rect[0],
+            pane_rect[1],
+            i32::try_from(surface_width).unwrap_or(i32::MAX),
+            i32::try_from(surface_height).unwrap_or(i32::MAX),
+        ];
+        let painted_rect = [
+            pane_rect[0],
+            pane_rect[1],
+            i32::try_from(painted_width).unwrap_or(i32::MAX),
+            i32::try_from(painted_height).unwrap_or(i32::MAX),
+        ];
+        let surface_area = u64::from(surface_width).saturating_mul(u64::from(surface_height));
+        let painted_area = u64::from(painted_width).saturating_mul(u64::from(painted_height));
+        let pane_area = positive_rect_extent(pane_rect)
+            .map(|(width, height)| u64::from(width).saturating_mul(u64::from(height)));
+        let layout_area = positive_rect_extent(layout_rect)
+            .map(|(width, height)| u64::from(width).saturating_mul(u64::from(height)));
+        let area_matches = painted_area == surface_area
+            && pane_area == Some(surface_area)
+            && layout_area == Some(surface_area);
+        let geometry_matches =
+            painted_rect == surface_rect && surface_rect == pane_rect && pane_rect == layout_rect;
+        if !area_matches {
+            self.area_mismatches = self.area_mismatches.saturating_add(1);
+        }
+        if !geometry_matches {
+            self.geometry_mismatches = self.geometry_mismatches.saturating_add(1);
+        }
+        if !area_matches || !geometry_matches {
+            self.details.push(format!(
+                "{pane}:surface={}:{}:{}:{}:painted={}:{}:{}:{}:pane={}:{}:{}:{}:layout={}:{}:{}:{}",
+                surface_rect[0],
+                surface_rect[1],
+                surface_rect[2],
+                surface_rect[3],
+                painted_rect[0],
+                painted_rect[1],
+                painted_rect[2],
+                painted_rect[3],
+                pane_rect[0],
+                pane_rect[1],
+                pane_rect[2],
+                pane_rect[3],
+                layout_rect[0],
+                layout_rect[1],
+                layout_rect[2],
+                layout_rect[3],
+            ));
+        }
+    }
 }
 
 struct DeferredPluginActorScene {
@@ -16933,6 +17061,7 @@ impl Renderer {
             automation_owned_panes,
             automation_spectator: _,
             automation_presentation,
+            geometry_guard_armed: _,
         } = self;
         RendererRecoveryState {
             next_frame_key,
@@ -17259,6 +17388,7 @@ impl Renderer {
             automation_owned_panes: BTreeSet::new(),
             automation_spectator: None,
             automation_presentation: None,
+            geometry_guard_armed: false,
         })
     }
 
@@ -19575,6 +19705,25 @@ impl Renderer {
     fn render(&mut self, on_composed: impl FnOnce(Instant)) -> RenderOutcome {
         let _profile_span = brood_profiler::profile_span!("frame", "cpu_render_and_present");
         let started = Instant::now();
+        let geometry_invariant = self.render_geometry_invariant();
+        if geometry_invariant.panes >= 3 && geometry_invariant.is_exact() {
+            self.geometry_guard_armed = true;
+        }
+        if self.geometry_guard_armed && !geometry_invariant.is_exact() {
+            if std::env::var_os("BROOD_TRACE_RESIZE").is_some() {
+                eprintln!(
+                    "render-geometry-deferred panes={} verified={} missing_surfaces={} missing_painted_extents={} area_mismatches={} geometry_mismatches={} details=[{}]",
+                    geometry_invariant.panes,
+                    geometry_invariant.verified,
+                    geometry_invariant.missing_surfaces,
+                    geometry_invariant.missing_painted_extents,
+                    geometry_invariant.area_mismatches,
+                    geometry_invariant.geometry_mismatches,
+                    geometry_invariant.details.join(","),
+                );
+            }
+            return RenderOutcome::Skipped;
+        }
         let (frame, reconfigure) = match self.surface.get_current_texture() {
             CurrentSurfaceTexture::Success(frame) => (frame, false),
             CurrentSurfaceTexture::Suboptimal(frame) => (frame, true),
@@ -19890,6 +20039,7 @@ impl Renderer {
             reconfigure,
             submitted_at: submitted,
             presented_at: presented,
+            geometry_invariant,
             timings: RenderTimings {
                 acquire_us: acquired.duration_since(started).as_micros(),
                 encode_us: encoded.duration_since(acquired).as_micros(),
@@ -19903,6 +20053,51 @@ impl Renderer {
                 .unwrap_or(u64::MAX),
             },
         }
+    }
+
+    fn render_geometry_invariant(&self) -> RenderGeometryInvariant {
+        let mut invariant = RenderGeometryInvariant::default();
+        let extent = self.layout_extent();
+        for target in self.layout_paint_targets() {
+            let LayoutPaintTarget::Pane(pane) = target else {
+                continue;
+            };
+            let Some(item) = self.accepted_layout.pane_item(pane) else {
+                continue;
+            };
+            let layout = item.pixel_rect(extent);
+            let layout_rect = [layout.x, layout.y, layout.w, layout.h];
+            if let Some(plugin) = self.plugin_panes.get(&pane) {
+                invariant.record(
+                    pane,
+                    Some((plugin.scene.width, plugin.scene.height)),
+                    plugin.scene.painted_extent,
+                    plugin.rect,
+                    layout_rect,
+                );
+                continue;
+            }
+            if let Some(window) = self
+                .current_windows
+                .iter()
+                .find(|window| window.window_id == pane)
+            {
+                let surface_extent = self
+                    .imported_frames
+                    .get(&window.resource_id)
+                    .map(|frame| frame.extent);
+                invariant.record(
+                    pane,
+                    surface_extent,
+                    surface_extent,
+                    window.rect,
+                    layout_rect,
+                );
+            } else {
+                invariant.record(pane, None, None, layout_rect, layout_rect);
+            }
+        }
+        invariant
     }
 
     fn layout_paint_targets(&self) -> Vec<LayoutPaintTarget> {
@@ -21103,6 +21298,7 @@ enum RenderOutcome {
         timings: RenderTimings,
         submitted_at: Instant,
         presented_at: Instant,
+        geometry_invariant: RenderGeometryInvariant,
     },
     Reconfigure,
     Skipped,
@@ -21138,6 +21334,44 @@ fn low_latency_present_mode(supported: &[wgpu::PresentMode]) -> wgpu::PresentMod
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn render_geometry_invariant_requires_equal_surface_pane_and_layout_geometry() {
+        let mut exact = RenderGeometryInvariant::default();
+        exact.record(
+            7,
+            Some((320, 200)),
+            Some((320, 200)),
+            [40, 20, 320, 200],
+            [40, 20, 320, 200],
+        );
+        assert_eq!(
+            exact,
+            RenderGeometryInvariant {
+                panes: 1,
+                verified: 1,
+                ..RenderGeometryInvariant::default()
+            }
+        );
+        assert!(exact.is_exact());
+
+        let mut mismatched = RenderGeometryInvariant::default();
+        mismatched.record(
+            7,
+            Some((320, 200)),
+            Some((300, 200)),
+            [40, 20, 320, 200],
+            [41, 20, 320, 200],
+        );
+        mismatched.record(8, None, None, [0, 0, 10, 10], [0, 0, 10, 10]);
+        assert_eq!(mismatched.panes, 2);
+        assert_eq!(mismatched.verified, 1);
+        assert_eq!(mismatched.missing_surfaces, 1);
+        assert_eq!(mismatched.area_mismatches, 1);
+        assert_eq!(mismatched.geometry_mismatches, 1);
+        assert_eq!(mismatched.details.len(), 2);
+        assert!(!mismatched.is_exact());
+    }
 
     #[test]
     fn delegated_pane_trace_is_sorted_and_exact() {
