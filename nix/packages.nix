@@ -109,6 +109,79 @@ let
     buildInputs = profiles.nativeLibs;
   };
 
+  # buildDepsOnly intentionally compiles dummy versions of workspace crates.
+  # That is enough to cache registry dependencies, but it means every real
+  # workspace crate is rebuilt together in buildPackage. Build the local
+  # library graph in a few topological layers as well, so edits only invalidate
+  # the affected layer and its dependants.
+  workspaceDummySrc = craneLib.mkDummySrc craneBaseArgs;
+
+  mkMemberSrc =
+    member:
+    lib.cleanSourceWith {
+      src = ../. + "/${member}";
+      filter =
+        path: type:
+        craneLib.filterCargoSources path type || lib.hasSuffix ".wit" path || lib.hasSuffix ".witx" path;
+    };
+
+  mkWorkspaceSrc =
+    _name: members:
+    # Keep the unpack directory at /build/source. Cargo records absolute source
+    # paths in fingerprints, so changing this name would invalidate artifacts
+    # inherited from the preceding layer.
+    pkgs.runCommand "source" { } ''
+      mkdir -p "$out"
+      cp -R ${workspaceDummySrc}/. "$out/"
+      chmod -R u+w "$out"
+      cp ${../Cargo.toml} "$out/Cargo.toml"
+      ${lib.concatMapStringsSep "\n" (member: ''
+        rm -rf "$out/${member}"
+        mkdir -p "$out/${dirOf member}"
+        cp -R ${mkMemberSrc member} "$out/${member}"
+      '') members}
+    '';
+
+  foundationMembers = [
+    "crates/brood-computer-use"
+    "crates/brood-dmabuf"
+    "crates/brood-graphics"
+    "crates/brood-keybindings"
+    "crates/brood-layout"
+    "crates/brood-profiler"
+    "crates/brood-protocol"
+    "crates/brood-wayland-drop"
+  ];
+  serviceMembers = foundationMembers ++ [
+    "crates/brood-ipc"
+    "crates/brood-transport"
+    "crates/brood-wasm"
+  ];
+  commandMembers = serviceMembers ++ [
+    "crates/bmux"
+    "crates/brood-capsuled"
+    "crates/brood-cli"
+  ];
+
+  mkWorkspaceArtifactLayer =
+    {
+      name,
+      members,
+      cargoArtifacts,
+    }:
+    craneLib.cargoBuild (
+      craneBaseArgs
+      // {
+        pname = "brood-${name}";
+        src = mkWorkspaceSrc name members;
+        inherit cargoArtifacts;
+        # Keep the Cargo unit graph identical to buildDepsOnly. Building a
+        # subset as roots changes feature unification and recompiles registry
+        # crates even when their sources are cached.
+        cargoExtraArgs = "--locked -p bmux -p broodd -p brood-capsuled -p brood-client -p brood-remote --bins";
+      }
+    );
+
   craneLintArgs = craneBaseArgs // {
     cargoExtraArgs = "--workspace --locked";
     env.CARGO_PROFILE = "";
@@ -163,14 +236,100 @@ let
     }
   );
 
-  broodd = craneLib.buildPackage (
-    craneBaseArgs
-    // {
-      cargoArtifacts = brooddArtifacts;
-      cargoBuildExtraArgs = "-p bmux -p broodd -p brood-capsuled -p brood-client -p brood-remote --bins";
-      doCheck = false;
-    }
-  );
+  foundationArtifacts = mkWorkspaceArtifactLayer {
+    name = "foundation-artifacts";
+    members = foundationMembers;
+    cargoArtifacts = brooddArtifacts;
+  };
+
+  serviceArtifacts = mkWorkspaceArtifactLayer {
+    name = "service-artifacts";
+    members = serviceMembers;
+    cargoArtifacts = foundationArtifacts;
+  };
+
+  commandArtifacts = mkWorkspaceArtifactLayer {
+    name = "command-artifacts";
+    members = commandMembers;
+    cargoArtifacts = serviceArtifacts;
+  };
+
+  brooddMembers = commandMembers ++ [ "crates/broodd" ];
+  brooddLibArtifacts = mkWorkspaceArtifactLayer {
+    name = "broodd-lib-artifacts";
+    members = brooddMembers;
+    cargoArtifacts = commandArtifacts;
+  };
+
+  mkBinaryPackage =
+    {
+      name,
+      members,
+      cargoArtifacts,
+      bins,
+    }:
+    craneLib.buildPackage (
+      craneBaseArgs
+      // {
+        pname = name;
+        src = mkWorkspaceSrc "${name}-binary" members;
+        inherit cargoArtifacts;
+        cargoBuildExtraArgs = "-p bmux -p broodd -p brood-capsuled -p brood-client -p brood-remote --bins";
+        doCheck = false;
+        doNotPostBuildInstallCargoBinaries = true;
+        installPhaseCommand = ''
+          mkdir -p "$out/bin"
+          ${lib.concatMapStringsSep "\n" (bin: ''
+            install -Dm755 "target/release/${bin}" "$out/bin/${bin}"
+          '') bins}
+        '';
+      }
+    );
+
+  brooddBins = mkBinaryPackage {
+    name = "broodd";
+    members = brooddMembers;
+    cargoArtifacts = brooddLibArtifacts;
+    bins = [
+      "bmux"
+      "brood"
+      "brood-computer-use-mcp"
+      "brood-runner-exec"
+      "brood-runner-nix-develop"
+      "brood-sessiond"
+    ];
+  };
+
+  capsuledBins = mkBinaryPackage {
+    name = "brood-capsuled";
+    members = commandMembers;
+    cargoArtifacts = commandArtifacts;
+    bins = [ "brood-capsuled" ];
+  };
+
+  clientBins = mkBinaryPackage {
+    name = "brood-client";
+    members = commandMembers ++ [ "clients/brood-client" ];
+    cargoArtifacts = commandArtifacts;
+    bins = [ "brood-client" ];
+  };
+
+  remoteBins = mkBinaryPackage {
+    name = "brood-remote";
+    members = commandMembers ++ [ "crates/brood-remote" ];
+    cargoArtifacts = commandArtifacts;
+    bins = [ "brood-remote" ];
+  };
+
+  broodd = pkgs.symlinkJoin {
+    name = "brood-native-binaries";
+    paths = [
+      brooddBins
+      capsuledBins
+      clientBins
+      remoteBins
+    ];
+  };
 
   shellCheck = pkgs.runCommand "brood-shellcheck" { nativeBuildInputs = [ pkgs.shellcheck ]; } ''
     cp -R ${src}/. source

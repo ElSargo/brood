@@ -3782,6 +3782,7 @@ struct PointerInteractionRecord {
 struct PointerInteractionClaim {
     key: PointerInteractionClaimKey,
     chain_base_layout_revision: Option<u64>,
+    terminal: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3927,7 +3928,7 @@ impl PointerInteractionRegistry {
             record.sequences.push_back(entry);
         }
         eprintln!(
-            "pointer-interaction event interaction={} event_sequence={} lease={} lease_generation={} holder={} holder_generation={} phase={:?} terminal={}",
+            "pointer-interaction event interaction={} event_sequence={} lease={} lease_generation={} holder={} holder_generation={} phase={:?} terminal={} wall_ns={}",
             interaction.0,
             event_sequence,
             record.binding.lease.id.0,
@@ -3936,6 +3937,9 @@ impl PointerInteractionRegistry {
             record.binding.holder_generation,
             reserved.phase,
             reserved.terminal,
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos()),
         );
         Ok(())
     }
@@ -4069,6 +4073,9 @@ impl PointerInteractionRegistry {
                 .is_none_or(|previous| event_sequence > previous),
             "interaction event sequence did not advance"
         );
+        let terminal = record
+            .terminal
+            .is_some_and(|entry| entry.event_sequence == event_sequence);
         let entry = record
             .sequences
             .iter_mut()
@@ -4102,6 +4109,7 @@ impl PointerInteractionRegistry {
                 request_id,
             },
             chain_base_layout_revision: record.chain_base_layout_revision,
+            terminal,
         })
     }
 
@@ -8156,6 +8164,7 @@ impl Application {
             None
         };
         let interaction_claim_key = interaction_claim.map(|claim| claim.key);
+        let interaction_preview = interaction_claim.is_some_and(|claim| !claim.terminal);
         if !self.pending_synchronized_layout_notifications.is_empty() {
             self.reject_synchronized_layout_for_claim(
                 sender,
@@ -8442,6 +8451,14 @@ impl Application {
         if native_resize_request {
             affected_panes.extend(unique_wait.iter().copied());
         }
+        if interaction_preview {
+            // Pointer motion is a scaled visual projection. Keep pane and
+            // descendant resize work for the terminal interaction request so
+            // a raw input stream cannot repeatedly restart the durable
+            // synchronized barrier.
+            unique_wait.clear();
+            affected_panes.clear();
+        }
         let Some(epoch_id) = allocate_resize_epoch(&mut self.next_resize_epoch) else {
             self.reject_synchronized_layout_for_claim(
                 sender,
@@ -8486,12 +8503,14 @@ impl Application {
         }
 
         let mut regions = BTreeMap::new();
-        if let Some((child, source_viewport, target_viewport)) = changed_rest_child(
-            &base_tree,
-            &target_tree,
-            submitted_lease,
-            renderer.layout_extent(),
-        ) {
+        if !interaction_preview
+            && let Some((child, source_viewport, target_viewport)) = changed_rest_child(
+                &base_tree,
+                &target_tree,
+                submitted_lease,
+                renderer.layout_extent(),
+            )
+        {
             let Some(holder) = self.layout_holders.get(&child.id).cloned() else {
                 self.reject_synchronized_layout_for_claim(
                     sender,

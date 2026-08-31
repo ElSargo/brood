@@ -312,6 +312,35 @@ struct ReferencedResources {
     ready: bool,
 }
 
+fn scene_references_resource(scene: &PaneScene, resource: u64) -> bool {
+    scene.packet.commands.iter().any(|command| match command {
+        Command::DrawImage { image, .. } => *image == resource,
+        Command::DrawTextLayout { layout, .. } => *layout == resource,
+        _ => false,
+    })
+}
+
+fn resource_is_referenced(state: &GraphicsState, resource: u64) -> bool {
+    state
+        .panes
+        .values()
+        .chain(state.deferred_panes.values())
+        .chain(state.staged_panes.values())
+        .chain(
+            state
+                .pending_actor_frames
+                .values()
+                .flat_map(|frame| frame.scenes.values()),
+        )
+        .chain(
+            state
+                .deferred_actor_frames
+                .values()
+                .flat_map(|frame| frame.scenes.values()),
+        )
+        .any(|scene| scene_references_resource(scene, resource))
+}
+
 fn record_complete_state_watermark(state: &mut GraphicsState, pane: u64, watermark: u64) {
     state
         .latest_complete_state_watermarks
@@ -2306,19 +2335,7 @@ impl PresentationHost for ActorPresentationHost {
         if actor_generation != self.generation.load(Ordering::Acquire) {
             return Err(PresentationError::InvalidPane);
         }
-        if state
-            .panes
-            .values()
-            .chain(state.deferred_panes.values())
-            .chain(state.staged_panes.values())
-            .any(|scene| {
-                scene.packet.commands.iter().any(|command| match command {
-                    Command::DrawImage { image, .. } => *image == resource,
-                    Command::DrawTextLayout { layout, .. } => *layout == resource,
-                    _ => false,
-                })
-            })
-        {
+        if resource_is_referenced(&state, resource) {
             return Err(PresentationError::ResourceInUse);
         }
         let owned_image = state.images.get(&resource).is_some_and(|candidate| {
@@ -2814,6 +2831,33 @@ mod tests {
                 blocker_epochs: BTreeSet::new(),
             },
         );
+    }
+
+    #[test]
+    fn accepted_actor_frames_keep_referenced_resources_live() {
+        let scene = |resource| PaneScene {
+            generation: 11,
+            sequence: resource,
+            resize_epoch: None,
+            terminal_input_sequence: None,
+            packet: text_packet(&[resource]),
+        };
+        let frame = |revision, resource| PendingGraphicsActorFrame {
+            actor: ActorScope::new("resource-owner", 11),
+            token: revision,
+            revision,
+            scenes: BTreeMap::from([(7, scene(resource))]),
+            ready_notified: false,
+            required_panes: None,
+            blocker_epochs: BTreeSet::new(),
+        };
+        let mut state = GraphicsState::default();
+        state.pending_actor_frames.insert(1, frame(1, 41));
+        state.deferred_actor_frames.insert(2, frame(2, 42));
+
+        assert!(resource_is_referenced(&state, 41));
+        assert!(resource_is_referenced(&state, 42));
+        assert!(!resource_is_referenced(&state, 43));
     }
 
     fn visible_resize_sequences(state: &GraphicsState) -> Vec<(u64, u64)> {

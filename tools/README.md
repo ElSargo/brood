@@ -20,6 +20,23 @@ Run `./tools/brood-build.sh --help` for the build modes and concurrency control.
 
 ## Presentation Proofs
 
+`test-cua-divider-resize.sh` launches the packaged production server, terminal,
+session-switcher, and client under private headless Sway, then uses the external
+Cua project driver to perform native Wayland divider drags. It captures the
+visible divider during each gesture and grades tracking, synchronized-layout
+efficiency, final correctness, survival, and release latency. The default gate
+is 90/100 and the overall grade is the worst of three alternating drags:
+
+```sh
+nix develop --command bash tools/test-cua-divider-resize.sh
+```
+
+Set `CUA_DRIVER_BIN` when `cua-driver` is not on `PATH`. During investigation,
+`BROOD_CUA_ALLOW_FAIL=1` retains a failing grade without making the shell
+command fail. `BROOD_CUA_RESIZE_OUT` selects the retained artifact directory.
+The Cua daemon uses a private socket and disposable nested display, so the proof
+does not stop or reuse an operator's existing Cua daemon.
+
 ## System profiling
 
 `profile-brood.sh` enables bounded cross-process profiling for a supplied real

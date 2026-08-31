@@ -12,7 +12,7 @@ use brood_plugin_sdk::{
         LocalActorMessage, PresentationEvent, SessionActorMessage, SessionCommand,
         SessionCommandCompleted, SessionEvent, SessionOperation, SessionSnapshot,
     },
-    graphics::{TextLayoutCache, reuse_pane_content},
+    graphics::TextLayoutCache,
     input::{BUTTON_PRIMARY as LEFT_BUTTON, BUTTON_SECONDARY as RIGHT_BUTTON},
     layout::{
         Axis, DelegateLayoutRest, DividerItem, InputZone, ItemKind, LayoutFragment, LayoutItem,
@@ -185,6 +185,7 @@ struct SwitcherState {
     durable_shell_layout: Option<ShellLayoutState>,
     pending_shell_layouts: BTreeMap<u64, PendingShellLayout>,
     deferred_shell_layout: Option<DeferredShellLayout>,
+    deferred_pointer_layout: Option<DeferredPointerLayout>,
     pointer_drag: Option<ShellDividerDrag>,
     hovered: Option<SwitcherTarget>,
     pressed: Option<SwitcherTarget>,
@@ -302,6 +303,14 @@ struct DeferredShellLayout {
     reason: &'static str,
 }
 
+#[derive(Clone)]
+struct DeferredPointerLayout {
+    state: ShellLayoutState,
+    reason: &'static str,
+    interaction: u64,
+    event_sequence: u64,
+}
+
 #[derive(Deserialize)]
 struct LayoutTransactionNotification {
     #[serde(rename = "type")]
@@ -340,7 +349,6 @@ struct LayoutRegionResizeMessage {
 enum ResizePaintPlan {
     OrdinaryRedraw,
     TaggedRedraw(u64),
-    Reuse(u64),
 }
 
 #[derive(Deserialize)]
@@ -647,6 +655,7 @@ impl SwitcherState {
             durable_shell_layout: None,
             pending_shell_layouts: BTreeMap::new(),
             deferred_shell_layout: None,
+            deferred_pointer_layout: None,
             pointer_drag: None,
             hovered: None,
             pressed: None,
@@ -1819,9 +1828,13 @@ fn apply_layout_pointer_message(
     } else {
         "inbox-resize"
     };
-    let commands =
-        publish_synchronized_pointer_layout(state, interaction, message.event_sequence, reason);
-    if commands.is_empty() {
+    let commands = if message.phase.as_str() == "motion" {
+        let focus = state.layout.as_ref().and_then(|layout| layout.focused_pane);
+        publish_layout(state, false, focus)
+    } else {
+        publish_synchronized_pointer_layout(state, interaction, message.event_sequence, reason)
+    };
+    if commands.is_empty() && state.deferred_pointer_layout.is_none() {
         restore_latest_submitted_or_durable_shell_layout(state);
     }
     if message.phase.as_str() == "button-release" {
@@ -1887,6 +1900,19 @@ fn restore_deferred_shell_layout(state: &mut SwitcherState) -> Option<(Option<u6
 }
 
 fn publish_deferred_shell_layout(state: &mut SwitcherState) -> Vec<ActorCommand> {
+    if let Some(deferred) = state.deferred_pointer_layout.take() {
+        restore_shell_layout_state(state, &deferred.state);
+        let focus = deferred.state.focus;
+        return publish_synchronized_layout_attempt(
+            state,
+            focus,
+            deferred.reason,
+            None,
+            0,
+            Some(deferred.interaction),
+            Some(deferred.event_sequence),
+        );
+    }
     let Some((focus, reason)) = restore_deferred_shell_layout(state) else {
         return Vec::new();
     };
@@ -3757,6 +3783,15 @@ fn publish_synchronized_pointer_layout(
     reason: &'static str,
 ) -> Vec<ActorCommand> {
     let focus = state.layout.as_ref().and_then(|layout| layout.focused_pane);
+    if !state.pending_shell_layouts.is_empty() {
+        state.deferred_pointer_layout = Some(DeferredPointerLayout {
+            state: shell_layout_state(state, focus),
+            reason,
+            interaction,
+            event_sequence,
+        });
+        return Vec::new();
+    }
     publish_synchronized_layout_attempt(
         state,
         focus,
@@ -4339,12 +4374,11 @@ fn redraw_or_record_error(state: &mut SwitcherState) {
 }
 
 fn resize_paint_plan(
-    current: (f32, f32, f32),
-    target: (f32, f32, f32),
+    _current: (f32, f32, f32),
+    _target: (f32, f32, f32),
     resize_epoch: Option<u64>,
 ) -> ResizePaintPlan {
     match resize_epoch {
-        Some(resize_epoch) if current == target => ResizePaintPlan::Reuse(resize_epoch),
         Some(resize_epoch) => ResizePaintPlan::TaggedRedraw(resize_epoch),
         None => ResizePaintPlan::OrdinaryRedraw,
     }
@@ -4360,7 +4394,6 @@ fn paint_for_resize_or_record_error(state: &mut SwitcherState, paint: ResizePain
                     Some(resize_epoch),
                 )
             }
-            ResizePaintPlan::Reuse(resize_epoch) => reuse_pane_content(state.pane, resize_epoch),
         };
         if let Err(error) = result {
             state.error = true;
@@ -4375,8 +4408,6 @@ fn paint_for_resize_or_record_error(state: &mut SwitcherState, paint: ResizePain
             // its resize notification. The old epoch is then no longer a
             // valid staging target, but the pane still needs a current frame.
             .or_else(|_tagged_error| redraw(state, None)),
-        ResizePaintPlan::Reuse(resize_epoch) => reuse_pane_content(state.pane, resize_epoch)
-            .or_else(|_reuse_error| redraw(state, Some(resize_epoch)).map(|_| ())),
     };
     if let Err(error) = result {
         state.error = true;
@@ -5382,7 +5413,7 @@ mod tests {
     }
 
     #[test]
-    fn three_column_shell_dividers_resize_main_sidebar_and_inbox_atomically() {
+    fn three_column_shell_dividers_preview_motion_and_commit_release_atomically() {
         let mut state = SwitcherState::new();
         state.pane = 1;
         state.picker_pane = Some(2);
@@ -5466,18 +5497,13 @@ mod tests {
             &mut state,
             &pointer(super::SIDEBAR_DIVIDER_ZONE_ID, "motion", 2, -0.125, None),
         );
-        let [ActorCommand::SendHostMessage(motion)] = motion.as_slice() else {
-            panic!("sidebar divider motion did not submit one synchronized layout");
-        };
+        let motion = host_command(&motion, "set-resolved-layout");
         let motion: serde_json::Value = serde_json::from_slice(motion).expect("motion JSON");
-        assert_eq!(motion["interaction"], 99);
-        assert_eq!(motion["event_sequence"], 2);
-        assert_eq!(motion["wait_for_panes"], serde_json::json!([1, 4, 5, 6]));
-        let rest_width = motion["fragment"]["rest"]["transform"]["size"]["u"]
+        let rest_width = motion["rest"]["transform"]["size"]["u"]
             .as_f64()
             .expect("rest width")
             * 640.0;
-        let sidebar = motion["fragment"]["layout"]["items"]
+        let sidebar = motion["layout"]["items"]
             .as_array()
             .expect("items")
             .iter()
@@ -5491,6 +5517,22 @@ mod tests {
         assert!((sidebar_width - 400.0).abs() < 0.01);
         assert!((state.inbox_width - 320.0).abs() < f64::EPSILON);
 
+        let release = apply_layout_pointer_message(
+            &mut state,
+            &pointer(
+                super::SIDEBAR_DIVIDER_ZONE_ID,
+                "button-release",
+                3,
+                -0.125,
+                Some(super::PRIMARY_BUTTON),
+            ),
+        );
+        let release = host_command(&release, "submit-synchronized-layout");
+        let release: serde_json::Value = serde_json::from_slice(release).expect("release JSON");
+        assert_eq!(release["request_id"], 1);
+        assert_eq!(release["interaction"], 99);
+        assert_eq!(release["event_sequence"], 3);
+        assert_eq!(release["wait_for_panes"], serde_json::json!([1, 4, 5, 6]));
         assert!(apply_layout_transaction_notification(
             &mut state,
             &super::decode_layout_transaction_notification(
@@ -5509,13 +5551,6 @@ mod tests {
         assert!(
             apply_layout_pointer_message(
                 &mut state,
-                &pointer(super::SIDEBAR_DIVIDER_ZONE_ID, "cancel", 3, -0.125, None,),
-            )
-            .is_empty()
-        );
-        assert!(
-            apply_layout_pointer_message(
-                &mut state,
                 &pointer(
                     super::INBOX_DIVIDER_ZONE_ID,
                     "button-press",
@@ -5530,20 +5565,16 @@ mod tests {
             &mut state,
             &pointer(super::INBOX_DIVIDER_ZONE_ID, "motion", 5, 0.625, None),
         );
-        let [ActorCommand::SendHostMessage(inbox_motion)] = inbox_motion.as_slice() else {
-            panic!("inbox divider motion did not submit one synchronized layout");
-        };
+        let inbox_motion = host_command(&inbox_motion, "set-resolved-layout");
         let inbox_motion: serde_json::Value =
             serde_json::from_slice(inbox_motion).expect("inbox motion JSON");
-        assert_eq!(inbox_motion["request_id"], 2);
-        assert_eq!(inbox_motion["event_sequence"], 5);
-        let sidebar = inbox_motion["fragment"]["layout"]["items"]
+        let sidebar = inbox_motion["layout"]["items"]
             .as_array()
             .expect("items")
             .iter()
             .find(|item| item["id"] == 1)
             .expect("sidebar");
-        let inbox = inbox_motion["fragment"]["layout"]["items"]
+        let inbox = inbox_motion["layout"]["items"]
             .as_array()
             .expect("items")
             .iter()
@@ -5878,10 +5909,10 @@ mod tests {
     }
 
     #[test]
-    fn synchronized_resize_reuses_equal_extents_and_tags_changed_extents() {
+    fn synchronized_resize_redraws_equal_and_changed_extents() {
         assert_eq!(
             resize_paint_plan((320.0, 720.0, 1.0), (320.0, 720.0, 1.0), Some(41)),
-            ResizePaintPlan::Reuse(41)
+            ResizePaintPlan::TaggedRedraw(41)
         );
         assert_eq!(
             resize_paint_plan((320.0, 720.0, 1.0), (300.0, 720.0, 1.0), Some(42)),
