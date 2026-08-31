@@ -654,9 +654,17 @@ fn display_message(bmux: &Bmux, args: &[String]) -> Result<()> {
     let print = args.iter().any(|arg| arg == "-p");
     let positional = positional_after_options(args, &["-t", "-c"])?;
     let format = positional.first().map_or("#{session_name}", String::as_str);
-    let session = bmux.resolve_session(option_value(args, "-t"))?;
+    let target = option_value(args, "-t");
+    let target_terminal = bmux.resolve_terminal(target).ok();
+    let session = target_terminal.as_ref().map_or_else(
+        || bmux.resolve_session(target),
+        |terminal| Ok(terminal.session),
+    )?;
     let summary = session_summary(bmux, session)?;
-    let terminal = bmux.resolve_terminal(option_value(args, "-t")).ok();
+    let terminal = match target_terminal {
+        Some(terminal) => Some(terminal),
+        None => initial_terminal_for_session(bmux.terminals()?, session),
+    };
     let output = render_session_format(format, &summary, terminal.as_ref());
     if print || !output.is_empty() {
         println!("{output}");
@@ -694,6 +702,12 @@ fn session_summary(bmux: &Bmux, id: u64) -> Result<brood_cli::control::SurfaceSe
         .into_iter()
         .find(|session| session.id == id)
         .context("session disappeared")
+}
+
+fn initial_terminal_for_session(terminals: Vec<Terminal>, session: u64) -> Option<Terminal> {
+    terminals
+        .into_iter()
+        .find(|terminal| terminal.session == session && terminal.ordinal == 1)
 }
 
 fn render_session_format(
@@ -964,6 +978,33 @@ mod tests {
             ),
             "$7:work:%30064771073"
         );
+    }
+
+    #[test]
+    fn session_display_target_selects_its_initial_pane() {
+        let pane_id = initial_terminal_for_session(
+            vec![
+                Terminal {
+                    session: 2,
+                    ordinal: 1,
+                    actor: "terminal-session".to_string(),
+                },
+                Terminal {
+                    session: 7,
+                    ordinal: 2,
+                    actor: "terminal-session-2".to_string(),
+                },
+                Terminal {
+                    session: 7,
+                    ordinal: 1,
+                    actor: "terminal-session".to_string(),
+                },
+            ],
+            7,
+        )
+        .map(|terminal| terminal.pane_id());
+
+        assert_eq!(pane_id, Some(30_064_771_073));
     }
 
     #[test]
