@@ -13519,6 +13519,16 @@ impl ApplicationHandler<ClientEvent> for Application {
                                 geometry_invariant.geometry_mismatches,
                                 geometry_invariant.details.join(","),
                             );
+                            let projection = renderer.render_content_projection();
+                            eprintln!(
+                                "render-content-projection panes={} projected_panes={} max_width_delta={} max_height_delta={} max_scale_error_ppm={} details=[{}]",
+                                projection.panes,
+                                projection.projected_panes,
+                                projection.max_width_delta,
+                                projection.max_height_delta,
+                                projection.max_scale_error_ppm,
+                                projection.details.join(","),
+                            );
                         }
                         if let Some(benchmark) = self.plugin_scroll_benchmark.as_mut() {
                             benchmark.record_present(Instant::now(), timings);
@@ -14245,6 +14255,10 @@ struct Renderer {
     pending_ordinary_managed_recovery: BTreeMap<u64, PendingOrdinaryManagedRecovery>,
     pending_managed_resource_releases: BTreeSet<(BackendId, u64)>,
     sent_plugin_sizes: HashMap<u64, PluginPaneSize>,
+    divider_resize_mode: DividerResizeMode,
+    live_native_resize_cohort: BTreeSet<u64>,
+    live_native_resize_dirty: BTreeSet<u64>,
+    live_native_pending_plugin_panes: BTreeMap<u64, PluginPaneTexture>,
     window_resize_in_progress: bool,
     automation_owned_panes: BTreeSet<u64>,
     automation_spectator: Option<AutomationSpectatorFrame>,
@@ -14253,6 +14267,26 @@ struct Renderer {
     /// Bootstrap rendering remains permissive so native-window and plug-in
     /// resize handshakes can establish their first coherent surfaces.
     geometry_guard_armed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum DividerResizeMode {
+    #[default]
+    Native,
+    StableProjection,
+}
+
+impl DividerResizeMode {
+    fn from_environment() -> Self {
+        match std::env::var("BROOD_DIVIDER_RESIZE_MODE").as_deref() {
+            Ok("stable-projection") => Self::StableProjection,
+            Ok("native") | Err(_) => Self::Native,
+            Ok(value) => {
+                eprintln!("unknown BROOD_DIVIDER_RESIZE_MODE={value:?}; using native live resize");
+                Self::Native
+            }
+        }
+    }
 }
 
 /// CPU-side state which survives a renderer/device replacement.
@@ -14506,6 +14540,47 @@ struct RenderGeometryInvariant {
     area_mismatches: usize,
     geometry_mismatches: usize,
     details: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct RenderContentProjection {
+    panes: usize,
+    projected_panes: usize,
+    max_width_delta: u32,
+    max_height_delta: u32,
+    max_scale_error_ppm: u64,
+    details: Vec<String>,
+}
+
+impl RenderContentProjection {
+    fn record(&mut self, pane: u64, sequence: u64, source: Option<(u32, u32)>, target: (u32, u32)) {
+        self.panes = self.panes.saturating_add(1);
+        let Some((source_width, source_height)) = source else {
+            self.details.push(format!(
+                "{pane}:{sequence}:missing:missing:{}:{}",
+                target.0, target.1
+            ));
+            return;
+        };
+        let width_delta = source_width.abs_diff(target.0);
+        let height_delta = source_height.abs_diff(target.1);
+        let width_error_ppm =
+            u64::from(width_delta).saturating_mul(1_000_000) / u64::from(source_width.max(1));
+        let height_error_ppm =
+            u64::from(height_delta).saturating_mul(1_000_000) / u64::from(source_height.max(1));
+        if width_delta != 0 || height_delta != 0 {
+            self.projected_panes = self.projected_panes.saturating_add(1);
+        }
+        self.max_width_delta = self.max_width_delta.max(width_delta);
+        self.max_height_delta = self.max_height_delta.max(height_delta);
+        self.max_scale_error_ppm = self
+            .max_scale_error_ppm
+            .max(width_error_ppm.max(height_error_ppm));
+        self.details.push(format!(
+            "{pane}:{sequence}:{source_width}:{source_height}:{}:{}",
+            target.0, target.1
+        ));
+    }
 }
 
 impl RenderGeometryInvariant {
@@ -14841,6 +14916,15 @@ fn flush_renderer_plugin_resize_events_best_effort(
     renderer: &mut Renderer,
     context: &str,
 ) -> bool {
+    // During a divider drag the compositor already projects the last native
+    // scene across every exact target viewport. Sending every intermediate
+    // size makes actors return late layouts which then visibly snap inside a
+    // newer allocation. Keep one stable native coordinate space through the
+    // gesture; the synchronized release path below bypasses this coalescing
+    // and sends the exact tagged terminal size with a deadline-backed hint.
+    if renderer.stable_projection_resize_active() {
+        return true;
+    }
     let panes = renderer
         .pending_plugin_resize_events()
         .into_iter()
@@ -14908,6 +14992,9 @@ fn send_plugin_pane_resize_events_best_effort(
     target_layout_epoch: Option<u64>,
     context: &str,
 ) -> bool {
+    if !panes.is_empty() && resize_epoch.is_none() && target_layout_epoch.is_none() {
+        renderer.note_native_resize_cohort(panes);
+    }
     let mut all_sent = true;
     for pane in panes {
         if let Err(error) = send_plugin_pane_resize_events(
@@ -17057,6 +17144,10 @@ impl Renderer {
             pending_ordinary_managed_recovery,
             pending_managed_resource_releases,
             sent_plugin_sizes,
+            divider_resize_mode: _,
+            live_native_resize_cohort: _,
+            live_native_resize_dirty: _,
+            live_native_pending_plugin_panes: _,
             window_resize_in_progress,
             automation_owned_panes,
             automation_spectator: _,
@@ -17312,6 +17403,7 @@ impl Renderer {
         )?;
         let plugin_canvas =
             GpuCanvasRenderer::new(&device, &queue, &frame_bind_group_layout, &frame_sampler);
+        let divider_resize_mode = DividerResizeMode::from_environment();
         plugin_graphics.set_raster_scale(window.scale_factor() as f32);
         surface.configure(&device, &config);
         eprintln!(
@@ -17322,6 +17414,7 @@ impl Renderer {
             config.present_mode,
             config.desired_maximum_frame_latency,
         );
+        eprintln!("configured divider resize mode={divider_resize_mode:?}");
         Ok(Self {
             generation,
             window,
@@ -17384,6 +17477,10 @@ impl Renderer {
             pending_ordinary_managed_recovery: BTreeMap::new(),
             pending_managed_resource_releases: BTreeSet::new(),
             sent_plugin_sizes: HashMap::new(),
+            divider_resize_mode,
+            live_native_resize_cohort: BTreeSet::new(),
+            live_native_resize_dirty: BTreeSet::new(),
+            live_native_pending_plugin_panes: BTreeMap::new(),
             window_resize_in_progress: false,
             automation_owned_panes: BTreeSet::new(),
             automation_spectator: None,
@@ -18249,6 +18346,85 @@ impl Renderer {
         })
     }
 
+    fn live_divider_resize_active(&self) -> bool {
+        self.captured_zone.is_some_and(|captured| {
+            self.accepted_dividers
+                .iter()
+                .any(|divider| divider.zone == captured)
+        })
+    }
+
+    fn stable_projection_resize_active(&self) -> bool {
+        self.divider_resize_mode == DividerResizeMode::StableProjection
+            && self.live_divider_resize_active()
+    }
+
+    fn native_live_resize_active(&self) -> bool {
+        self.divider_resize_mode == DividerResizeMode::Native && self.live_divider_resize_active()
+    }
+
+    fn note_native_resize_cohort(&mut self, panes: &[u64]) {
+        if !self.native_live_resize_active() {
+            self.live_native_resize_cohort.clear();
+            self.live_native_resize_dirty.clear();
+            self.live_native_pending_plugin_panes.clear();
+            return;
+        }
+        self.live_native_resize_cohort = panes.iter().copied().collect();
+        self.live_native_resize_dirty
+            .retain(|pane| self.live_native_resize_cohort.contains(pane));
+    }
+
+    fn accept_ordinary_plugin_texture(
+        &mut self,
+        pane: u64,
+        sequence: u64,
+        texture: PluginPaneTexture,
+    ) -> bool {
+        let native_geometry_changed = self.plugin_panes.get(&pane).is_some_and(|current| {
+            current.scene.source_painted_extent != texture.scene.source_painted_extent
+        });
+        let cohort_member = self.native_live_resize_active()
+            && self.live_native_resize_cohort.len() > 1
+            && self.live_native_resize_cohort.contains(&pane);
+        if cohort_member
+            && (native_geometry_changed
+                || self.live_native_pending_plugin_panes.contains_key(&pane))
+        {
+            self.live_native_pending_plugin_panes.insert(pane, texture);
+            self.live_native_resize_dirty.insert(pane);
+            if !self
+                .live_native_resize_cohort
+                .is_subset(&self.live_native_resize_dirty)
+            {
+                return false;
+            }
+            let cohort = self
+                .live_native_resize_cohort
+                .iter()
+                .copied()
+                .collect::<Vec<_>>();
+            for cohort_pane in cohort {
+                let Some(mut pending) = self.live_native_pending_plugin_panes.remove(&cohort_pane)
+                else {
+                    continue;
+                };
+                if let Some(current) = self.plugin_panes.get(&cohort_pane) {
+                    pending.rect = current.rect;
+                }
+                let pending_sequence = pending.scene.sequence;
+                self.plugin_panes.insert(cohort_pane, pending);
+                self.projected_plugin_scenes
+                    .accept_ordinary(cohort_pane, pending_sequence);
+            }
+            self.live_native_resize_dirty.clear();
+            return true;
+        }
+        self.plugin_panes.insert(pane, texture);
+        self.projected_plugin_scenes.accept_ordinary(pane, sequence);
+        true
+    }
+
     fn set_zone_pointer_state(
         &mut self,
         hovered: Option<ComposedZoneId>,
@@ -18360,6 +18536,11 @@ impl Renderer {
         self.presented_layout = self.accepted_layout.clone();
         self.presented_zones = self.accepted_zones.clone();
         self.presented_dividers = self.accepted_dividers.clone();
+        if !self.native_live_resize_active() {
+            self.live_native_resize_cohort.clear();
+            self.live_native_resize_dirty.clear();
+            self.live_native_pending_plugin_panes.clear();
+        }
     }
 
     fn accepted_layout_differs_from_presented(&self) -> bool {
@@ -19356,9 +19537,9 @@ impl Renderer {
             |pane| self.plugin_panes.contains_key(&pane),
             compiled.iter().map(|(pane, _sequence, _texture)| *pane),
         );
+        let mut visible_scene_changed = false;
         for (pane, sequence, texture) in compiled {
-            self.plugin_panes.insert(pane, texture);
-            self.projected_plugin_scenes.accept_ordinary(pane, sequence);
+            visible_scene_changed |= self.accept_ordinary_plugin_texture(pane, sequence, texture);
         }
         self.layout_state_dirty |= changes_layout_inventory;
         let focus_change = changes_layout_inventory
@@ -19367,7 +19548,7 @@ impl Renderer {
         for (pane, epoch, scene) in staged {
             self.staged_plugin_panes.insert((pane, epoch), scene);
         }
-        if has_visible_changes {
+        if has_visible_changes && visible_scene_changed {
             self.window.request_redraw();
         }
         Ok(GraphicsRefresh::Applied(focus_change))
@@ -19462,10 +19643,11 @@ impl Renderer {
             },
             |current| current.rect,
         );
-        self.plugin_panes
-            .insert(pane, PluginPaneTexture { scene, rect });
-        self.projected_plugin_scenes
-            .accept_ordinary(pane, snapshot.sequence);
+        let visible_scene_changed = self.accept_ordinary_plugin_texture(
+            pane,
+            snapshot.sequence,
+            PluginPaneTexture { scene, rect },
+        );
         let changes_layout_inventory =
             plugin_refresh_changes_layout_inventory(new_plugin_pane, force_visible_restore);
         self.layout_state_dirty |= changes_layout_inventory;
@@ -19489,7 +19671,13 @@ impl Renderer {
             };
             drop(self.take_or_enqueue_prepared_scenes(vec![(snapshot, updated_target)], resume)?);
         }
-        self.window.request_redraw();
+        // Hinted actor frames already own a target presentation cell. During
+        // native live resize, let the scheduler or the next compositor input
+        // frame coalesce peer-pane readiness instead of forcing an immediate
+        // half-updated composition from this one actor callback.
+        if visible_scene_changed {
+            self.window.request_redraw();
+        }
         Ok(GraphicsRefresh::Applied(focus_change))
     }
 
@@ -19581,7 +19769,10 @@ impl Renderer {
         // the epoch-tagged scene is compiled at the target extent. Recompiling
         // the visible packet here would crop guest coordinates at the new
         // target instead of smoothly projecting the complete old frame.
-        if self.window_resize_in_progress || !self.staged_layouts.is_empty() {
+        if self.window_resize_in_progress
+            || self.stable_projection_resize_active()
+            || !self.staged_layouts.is_empty()
+        {
             return Ok(());
         }
         let scenes = self
@@ -19624,7 +19815,7 @@ impl Renderer {
 
     fn plugin_scene_extent(&self, pane: u64) -> (u32, u32, f32) {
         let scale = self.window.scale_factor() as f32;
-        if self.window_resize_in_progress
+        if (self.window_resize_in_progress || self.stable_projection_resize_active())
             && let Some(plugin) = self.plugin_panes.get(&pane)
         {
             return (plugin.scene.width, plugin.scene.height, plugin.scene.scale);
@@ -20068,10 +20259,14 @@ impl Renderer {
             let layout = item.pixel_rect(extent);
             let layout_rect = [layout.x, layout.y, layout.w, layout.h];
             if let Some(plugin) = self.plugin_panes.get(&pane) {
+                // The render-time surface is the viewport-sized sampled output,
+                // not its private backing texture. A fully painted backing
+                // texture therefore covers the complete projected surface.
+                let rendered_extent = positive_rect_extent(plugin.rect);
                 invariant.record(
                     pane,
-                    Some((plugin.scene.width, plugin.scene.height)),
-                    plugin.scene.painted_extent,
+                    rendered_extent,
+                    plugin.scene.painted_extent.and(rendered_extent),
                     plugin.rect,
                     layout_rect,
                 );
@@ -20098,6 +20293,26 @@ impl Renderer {
             }
         }
         invariant
+    }
+
+    fn render_content_projection(&self) -> RenderContentProjection {
+        let mut projection = RenderContentProjection::default();
+        for target in self.layout_paint_targets() {
+            let LayoutPaintTarget::Pane(pane) = target else {
+                continue;
+            };
+            let Some(plugin) = self.plugin_panes.get(&pane) else {
+                continue;
+            };
+            projection.record(
+                pane,
+                plugin.scene.sequence,
+                plugin.scene.source_painted_extent,
+                positive_rect_extent(plugin.rect)
+                    .unwrap_or((plugin.scene.width, plugin.scene.height)),
+            );
+        }
+        projection
     }
 
     fn layout_paint_targets(&self) -> Vec<LayoutPaintTarget> {

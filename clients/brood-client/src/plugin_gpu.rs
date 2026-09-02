@@ -175,6 +175,9 @@ pub struct GpuCanvasScene {
     /// Pixel extent covered after projecting an opaque origin-anchored canvas
     /// fill from the packet into this GPU allocation.
     pub painted_extent: Option<(u32, u32)>,
+    /// Native packet extent before projection. Keeping this separate makes
+    /// compositor stretching observable even when the target is fully painted.
+    pub source_painted_extent: Option<(u32, u32)>,
     canvas_clear: Option<wgpu::Color>,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
@@ -199,6 +202,7 @@ pub struct PreparedCanvasScene {
     height: u32,
     scale: f32,
     painted_extent: Option<(u32, u32)>,
+    source_painted_extent: Option<(u32, u32)>,
     canvas_clear: Option<wgpu::Color>,
     vertices: Vec<CanvasVertex>,
     indices: Vec<u32>,
@@ -467,6 +471,7 @@ impl GpuCanvasRenderer {
             height,
             scale,
             painted_extent,
+            source_painted_extent,
             canvas_clear,
             vertices,
             indices,
@@ -622,6 +627,7 @@ impl GpuCanvasRenderer {
             height,
             scale,
             painted_extent,
+            source_painted_extent,
             canvas_clear,
             vertices,
             indices,
@@ -717,6 +723,7 @@ impl GpuCanvasRenderer {
             height,
             scale,
             painted_extent,
+            source_painted_extent,
             canvas_clear,
             vertex_buffer,
             index_buffer,

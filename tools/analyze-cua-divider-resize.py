@@ -205,6 +205,74 @@ def main() -> int:
                 render_geometry_mismatches,
             )
         )
+        projection_frames = []
+        for line in segment:
+            if "render-content-projection" not in line:
+                continue
+            header = re.search(
+                r"panes=(\d+) projected_panes=(\d+) max_width_delta=(\d+) "
+                r"max_height_delta=(\d+) max_scale_error_ppm=(\d+) details=\[(.*)\]",
+                line,
+            )
+            if not header:
+                continue
+            panes = []
+            for detail in filter(None, header.group(6).split(",")):
+                fields = detail.split(":")
+                if len(fields) != 6 or fields[2] == "missing":
+                    continue
+                panes.append(tuple(map(int, fields)))
+            projection_frames.append(
+                (tuple(map(int, header.groups()[:5])), panes)
+            )
+        projected_frame_count = sum(
+            header[1] > 0 for header, _panes in projection_frames
+        )
+        projection_pane_samples = sum(
+            header[0] for header, _panes in projection_frames
+        )
+        projected_pane_samples = sum(
+            header[1] for header, _panes in projection_frames
+        )
+        max_projection_width_delta = max(
+            (header[2] for header, _panes in projection_frames), default=0
+        )
+        max_projection_scale_error_ppm = max(
+            (header[4] for header, _panes in projection_frames), default=0
+        )
+        previous_source: dict[int, tuple[int, int]] = {}
+        projected_source_switches = 0
+        native_source_updates = 0
+        regressive_source_updates = 0
+        native_update_frame_panes: list[set[int]] = []
+        for _header, panes in projection_frames:
+            changed_panes: set[int] = set()
+            for pane, _sequence, source_width, source_height, target_width, target_height in panes:
+                source = (source_width, source_height)
+                target = (target_width, target_height)
+                if pane in previous_source and previous_source[pane] != source:
+                    native_source_updates += 1
+                    changed_panes.add(pane)
+                    previous_error = sum(
+                        abs(value - target_value)
+                        for value, target_value in zip(previous_source[pane], target)
+                    )
+                    current_error = sum(
+                        abs(value - target_value)
+                        for value, target_value in zip(source, target)
+                    )
+                    if source != target:
+                        projected_source_switches += 1
+                    if current_error > previous_error:
+                        regressive_source_updates += 1
+                previous_source[pane] = source
+            native_update_frame_panes.append(changed_panes)
+        moving_source_panes = set().union(*native_update_frame_panes)
+        native_update_frames = sum(bool(panes) for panes in native_update_frame_panes)
+        skewed_native_update_frames = sum(
+            bool(panes) and panes != moving_source_panes
+            for panes in native_update_frame_panes
+        )
         fatal_resource = any(
             "lost a referenced resource" in line for line in segment
         )
@@ -339,6 +407,9 @@ def main() -> int:
                 not stale_final_reuse
                 and not fatal_resource
                 and render_geometry_ok
+                and bool(projection_frames)
+                and regressive_source_updates == 0
+                and skewed_native_update_frames == 0
                 and clear_slice_frames == 0
             )
         )
@@ -375,6 +446,20 @@ def main() -> int:
                 f"{render_missing_painted_extents}, geometry mismatches "
                 f"{render_geometry_mismatches})"
             )
+        if not projection_frames:
+            hard_failures.append(
+                f"run {run_number}: no render-time native-content projection samples"
+            )
+        elif regressive_source_updates:
+            hard_failures.append(
+                f"run {run_number}: {regressive_source_updates} late native relayouts "
+                "moved content farther from the current target"
+            )
+        if skewed_native_update_frames:
+            hard_failures.append(
+                f"run {run_number}: {skewed_native_update_frames} presented native "
+                "update frames advanced only part of the resize cohort"
+            )
         if clear_slice_frames:
             hard_failures.append(
                 f"run {run_number}: renderer-clear background slices appeared in "
@@ -398,6 +483,28 @@ def main() -> int:
                 "render_area_mismatches": render_area_mismatches,
                 "render_geometry_mismatches": render_geometry_mismatches,
                 "render_geometry_ok": render_geometry_ok,
+                "projection_frames": len(projection_frames),
+                "projected_frames": projected_frame_count,
+                "projected_frame_ratio": round(
+                    projected_frame_count / max(1, len(projection_frames)), 5
+                ),
+                "projection_pane_samples": projection_pane_samples,
+                "projected_pane_samples": projected_pane_samples,
+                "projected_pane_ratio": round(
+                    projected_pane_samples / max(1, projection_pane_samples), 5
+                ),
+                "projected_source_switches": projected_source_switches,
+                "native_source_updates": native_source_updates,
+                "regressive_source_updates": regressive_source_updates,
+                "native_update_frames": native_update_frames,
+                "skewed_native_update_frames": skewed_native_update_frames,
+                "skewed_native_update_frame_ratio": round(
+                    skewed_native_update_frames / max(1, native_update_frames), 5
+                ),
+                "max_projection_width_delta_px": max_projection_width_delta,
+                "max_projection_scale_error_pct": round(
+                    max_projection_scale_error_ppm / 10_000.0, 3
+                ),
                 "clear_slice_frames": clear_slice_frames,
                 "max_clear_slice_columns": max_clear_slice_columns,
                 "fatal_resource_loss": fatal_resource,
@@ -421,7 +528,7 @@ def main() -> int:
     overall = min((item["scores"]["total"] for item in run_metrics), default=0.0)
     passed = bool(run_metrics) and overall >= args.minimum_score and not hard_failures
     metrics = {
-        "schema": 3,
+        "schema": 4,
         "workload": "production session-switcher + terminal, native Wayland Cua drag",
         "score": round(overall, 2),
         "grade": grade_letter(overall),
@@ -441,7 +548,10 @@ def main() -> int:
     summary_rows = "\n".join(
         f"| {run['run']} | {run['scores']['total']:.2f} | {run['motion_events']} | "
         f"{run['transactions']} | {run['supersessions']} | {run['tracking_rmse']:.3f} | "
-        f"{run['final_error_px']} | {'yes' if run['render_geometry_ok'] else 'no'} | "
+        f"{run['projected_frames']}/{run['projection_frames']} | "
+        f"{run['native_source_updates']} | {run['regressive_source_updates']} | "
+        f"{run['skewed_native_update_frames']} | {run['final_error_px']} | "
+        f"{'yes' if run['render_geometry_ok'] else 'no'} | "
         f"{'yes' if run['client_alive'] else 'no'} |"
         for run in run_metrics
     )
@@ -451,15 +561,15 @@ def main() -> int:
 
 Overall: **{overall:.2f}/100 ({grade_letter(overall)})** — {'PASS' if passed else 'FAIL'}
 
-| Run | Score | Motions | Transactions | Superseded | Tracking RMSE | Final error px | Render geometry | Survived |
-|---:|---:|---:|---:|---:|---:|---:|:---:|:---:|
+| Run | Score | Motions | Transactions | Superseded | Tracking RMSE | Projected frames | Native updates | Regressive updates | Skewed update frames | Final error px | Render geometry | Survived |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|:---:|
 {summary_rows}
 
 ## Hard failures
 
 {failures}
 
-The grade uses real native Wayland input from Cua. Fifty points measure visible divider tracking from captured frames, twenty penalize wasted/superseded synchronized transactions, fifteen require survival, correct final content/geometry, exact render-time painted-surface/pane/layout area and geometry, and no renderer-clear slices in captured pixels, and fifteen measure release-to-completion latency. The overall score is the worst run so intermittent failures cannot be averaged away.
+The grade uses real native Wayland input from Cua. Projected frames report how often native pane content differs from its current target extent. Native updates count genuine source relayouts; a regressive update is a late relayout that moves source geometry farther from the current target. Skewed update frames show that only part of the live-resize pane cohort changed in one presented frame. Any regressive or skewed update is a hard failure. Fifty points measure visible divider tracking from captured frames, twenty penalize wasted/superseded synchronized transactions, fifteen require survival, correct final content/geometry, exact render-time painted-surface/pane/layout area and geometry, and no renderer-clear slices in captured pixels, and fifteen measure release-to-completion latency. The overall score is the worst run so intermittent failures cannot be averaged away.
 """
     )
     print(f"Cua divider resize: {overall:.2f}/100 ({grade_letter(overall)}) {'PASS' if passed else 'FAIL'}")

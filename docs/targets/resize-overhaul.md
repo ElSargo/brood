@@ -402,7 +402,12 @@ The first implementation supports these modes:
 - `HoldThenAtomic` keeps the old region until the wait set is ready.
 - `ScaleThenAtomic` shows scaled visible content until the wait set is ready.
 
-`ScaleThenAtomic` is the default mode for interactive resize.
+`ScaleThenAtomic` is the default synchronized-epoch presentation mode. The
+live phase of an interactive divider gesture uses coordinated native pane
+redraws by default, then submits one exact `ScaleThenAtomic` epoch on release.
+A stable-projection live phase remains available as an explicit operator mode;
+it scales one retained native image until that release epoch and is not the
+default interaction.
 
 The host sets the maximum wait time.
 An actor cannot request an unlimited wait.

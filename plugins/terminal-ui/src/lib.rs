@@ -31,7 +31,10 @@ const SELECTION_BG: u32 = ashen::SELECTION_RGB;
 const SCROLL_PIXELS_PER_LINE: f32 = 5.0;
 const MOUSE_WHEEL_PIXELS_PER_CLICK: f32 = 15.0;
 const MAX_CACHED_LAYOUTS: usize = 512;
-const RESIZE_DEBOUNCE_MS: u64 = 24;
+// Presentation events are already latest-state coalesced and render requests
+// are paced by host hints. Keep only a minimal burst guard here so live resize
+// can drive genuine PTY reflow instead of snapping at the old 24 ms cadence.
+const RESIZE_DEBOUNCE_MS: u64 = 1;
 const RESIZE_WORKER_PAYLOAD: &[u8] = b"terminal-resize-debounce";
 const CURSOR_BLINK_MS: u64 = 530;
 const CURSOR_BLINK_WORKER_PAYLOAD: &[u8] = b"terminal-cursor-blink";
@@ -634,11 +637,10 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
             state.height = resized.height.max(1.0);
             state.pending_resize_epoch = resized.resize_epoch;
             let commands = state.schedule_resize().into_iter().collect();
-            let redraw_epoch = resized.resize_epoch.filter(|_| state.latest.is_some());
-            if let Some(resize_epoch) = redraw_epoch {
+            if state.latest.is_some() {
                 let _ignored = brood_plugin_sdk::graphics::request_render_for_resize(
                     state.pane,
-                    Some(resize_epoch),
+                    resized.resize_epoch,
                 );
             }
             commands

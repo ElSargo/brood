@@ -355,3 +355,122 @@ including one 12 px slice. The corrected 300 ms stress artifact at
 in all three runs, with tracking RMSE 0.00248 to 0.00392 and exact final
 geometry. The normal 1.5 s, 180 Hz gate also scores **100.00/100** in all three
 runs at `/tmp/brood-cua-painted-default-1` with zero clear slices.
+
+### Live-content projection and scheduling follow-up
+
+The nominal 300 ms stress configuration above was not actually a fast drag.
+Cua's foreground input delivery serialized 180 requested steps over roughly
+1.47 seconds, or about 133 px/s. Reducing the gesture to 24 steps made the same
+196 px motion complete in about 190 ms, or roughly 1,030 px/s. This faster
+workload made the remaining pane-content stutter repeatable even though the
+divider, painted coverage, and layout geometry still scored 100.
+
+The missing measurement was native content geometry. `GpuCanvasScene` now
+retains the packet's source painted extent separately from its rendered output
+extent. Each presented frame logs how many pane surfaces are projected, the
+maximum width/height and scale error, and pane/sequence/source/target tuples.
+The first analyzer schema 4 revision reported projected frame and pane ratios,
+maximum projection, and `projected_source_switches`. It treated every native
+source-extent change accepted during projection as a failure. That rule was
+appropriate for evaluating the experimental stable-image mode, but it was not
+fit for genuine live resize because forward native relayout is the desired
+work rather than a defect. The later native-mode correction below replaces
+that rule with direction and cohort synchronization metrics.
+
+Manual reconstruction of the pre-fix fast trace at
+`/tmp/brood-cua-real-fast-stretch-1` found 7, 6, and 8 terminal content
+generations reused across differing target sizes in the three runs. Individual
+generations were stretched over as many as four target widths with a maximum
+25 px span before the next late native relayout snapped into place.
+
+Live divider capture now coalesces ordinary plug-in pane-resize notifications.
+The compositor samples one stable native texture through the gesture instead
+of asking actors to relayout for every raw motion. The release path remains a
+single synchronized transaction: it sends the exact tagged pane size and uses
+the existing deadline-backed render hint for the atomic native redraw. GPU
+scene extent synchronization is likewise held during capture, so the stable
+texture is sampled directly rather than retessellated and reallocated at every
+intermediate width.
+
+The render-geometry invariant now names the actual rendered surface correctly:
+for a plug-in pane this is the viewport-sized sampled output, while backing
+texture/source geometry is measured by the separate projection metric. The
+rendered surface, painted output, pane rectangle, and layout rectangle must
+still have identical area and pixel geometry.
+
+The optimized approximately 1,030 px/s evidence is retained at
+`/tmp/brood-cua-scheduling-fast-2`. All three runs scored **100.00/100** with:
+
+- zero projected source switches, renderer-clear slices, geometry mismatches,
+  and deferred geometry renders;
+- three total accepted GPU draw targets across the entire three-run workload,
+  down from 147 before direct stable-texture sampling;
+- tracking RMSE from 0.01162 to 0.02694;
+- exact final divider geometry and release completion from 5.535 ms to
+  8.429 ms.
+
+The standard 1.5 second, 180 Hz regression at
+`/tmp/brood-cua-scheduling-default-1` also scored **100.00/100** in every run.
+Across 1,180 presented projection samples it recorded zero projected source
+switches and zero deferred geometry renders. Release completion was 10.871 ms
+to 12.715 ms, with no clear slices or final-position error.
+
+### Native live-resize correction (2026-09-02)
+
+The stable-image implementation above is retained but is no longer the default.
+Set `BROOD_DIVIDER_RESIZE_MODE=stable-projection` to select it explicitly.
+`BROOD_DIVIDER_RESIZE_MODE=native`, which is also the default when the variable
+is absent or invalid, keeps pane rendering and terminal reflow live throughout
+the gesture.
+
+The visible jitter in native mode had two independent scheduling causes:
+
+- terminal-ui held every latest PTY resize behind a 24 ms worker debounce,
+  capping real terminal reflow near 42 Hz regardless of the 180 Hz compositor;
+- the session-switcher and terminal actors could publish their native source
+  geometry in separate compositor frames, briefly exposing a half-updated
+  resize cohort.
+
+Presentation-event ingress already coalesces latest pane sizes, and every
+ordinary resize redraw is requested through the render scheduler. Terminal-ui
+now keeps only a 1 ms burst guard before forwarding changed grid dimensions and
+requests a watermark-bound render hint for every pane extent, even when the PTY
+row/column count has not crossed a cell boundary. PTY grid changes remain
+discrete and real; the surrounding canvas now tracks every native pane width.
+
+The renderer retains the latest native scene for each affected pane in a
+bounded live-resize cohort staging map. Old pane scenes remain visible and are
+projected under current divider geometry while only part of the cohort is
+ready. Once every affected pane has changed native source geometry, all pending
+scenes promote together. This never blocks a compositor frame or divider
+motion. Content-only redraws do not falsely satisfy geometry readiness, and
+the final release still uses one exact tagged synchronized epoch.
+
+Analyzer schema 4 now distinguishes healthy and unhealthy native work:
+
+- `native_source_updates` counts genuine source-geometry changes;
+- `regressive_source_updates` counts late changes which move source geometry
+  farther from the current target and is a hard failure;
+- `skewed_native_update_frames` counts presented frames where only part of the
+  changing pane cohort advanced and is also a hard failure;
+- projected frame ratios and maximum source/target error quantify the remaining
+  temporary interpolation without treating forward native work as failure.
+
+The approximately 1,030 px/s final stress evidence is retained at
+`/tmp/brood-cua-native-fast-final`. All three 24-motion runs scored
+**100.00/100** with 22 to 23 paired native update frames, zero regressive
+updates, zero skewed update frames, zero geometry deferrals, and maximum width
+lag of 9 to 16 px. Release completion was 5.890 ms to 9.653 ms.
+
+The standard 1.5 second, 180 Hz evidence is retained at
+`/tmp/brood-cua-native-default-final`. All three runs scored **100.00/100**.
+For 196 distinct motion events they presented 185 to 191 paired native update
+frames, zero regressive or skewed updates, and at most 2 px source/target lag.
+Tracking RMSE was 0.00217 to 0.00268; release completed in 4.701 ms to
+15.581 ms. There were no geometry deferrals, renderer-clear slices, or final
+position errors.
+
+The optional stable mode also retained **100.00/100** in its explicit fast
+check at `/tmp/brood-cua-stable-optional-1`. Verification passed all 284
+`brood-client` tests and all 11 terminal-ui tests in the checked-in Nix
+environment.
