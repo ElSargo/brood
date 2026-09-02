@@ -2,7 +2,7 @@
 status: target
 type: system
 authority: product
-last-reviewed: 2026-08-21
+last-reviewed: 2026-09-02
 ---
 
 # Plugin Runtime
@@ -16,13 +16,14 @@ A remote peer cannot authorize code execution merely by sending a WASM
 artifact. The destination realm owns installation policy and capabilities; see
 [[artifact-distribution]].
 
-The complete model has three execution roles:
+The complete model has four execution roles:
 
 | Role | Purpose | May wait on I/O? | Isolation |
 | --- | --- | --- | --- |
 | Actor | Public identity, mailbox, state, and lifecycle | Only while dormant between events | Own address space |
 | Worker | Private concurrent work inside an actor | Yes; only that worker suspends | Shares its actor's memory |
 | Policy provider | Immediate bounded host decision | No | Reads immutable published state |
+| Render facet | Host-timed conversion of live actor state and exact pane parameters into graphics | No | Exclusive phase in its actor instance |
 
 The detailed I/O and resource protocol is specified in
 [[plugin-io-and-resources]].
@@ -203,6 +204,31 @@ cancellation or peer-scheduling latency.
 
 Use another actor when work needs an independent address, memory space, failure
 domain, or lifecycle.
+
+## Render Facets
+
+A presentation actor may expose an optional host-driven render facet as defined
+by [[plugin-pure-renderer]]. The presentation client invokes that export in the
+actor's existing instance with exact host-owned pane geometry. The facet has no
+mailbox, public address, workers, I/O, commands, publications, or independent
+product lifecycle.
+
+The host waits until an actor dispatch has returned and worker execution is
+suspended at a host-controlled safe boundary, then runs the render phase
+exclusively before ordinary mailbox work resumes. An epoch yield in the middle
+of a guest handler is not reentrant and remains the same active turn. Rendering
+reads live actor state without serialization or copying. Render requests are
+host-priority work at a safe turn boundary, not messages inserted into the
+actor's FIFO.
+
+The host masks effectful imports during the phase, while internal semantic
+purity remains a trusted plugin contract. Cooperative guest yield preserves
+peer progress but does not let the same actor process another event
+concurrently.
+Hard interruption cannot restore same-instance state and therefore belongs to
+generation failure or teardown, not normal latest-wins rendering. Stopping or
+replacing the generation destroys its pending requests and accepted-generation
+outputs with the rest of the actor.
 
 ## Workers
 

@@ -404,10 +404,12 @@ pub enum Settlement {
 pub struct CorrelationTrace {
     pub token: RenderToken,
     pub actor: ActorScope,
+    pub event_watermark: u64,
     pub target_ns: u64,
     pub opportunity_end_ns: u64,
     pub deadline_ns: u64,
     pub dispatched_ns: u64,
+    pub guest_finished_ns: Option<u64>,
     pub accepted_ns: Option<u64>,
     pub graphics_ready_ns: BTreeMap<u64, u64>,
     pub composition_ns: Option<u64>,
@@ -825,10 +827,12 @@ impl RenderScheduler {
                 CorrelationTrace {
                     token,
                     actor: actor.clone(),
+                    event_watermark: outstanding.event_watermark,
                     target_ns: outstanding.plan.target_ns,
                     opportunity_end_ns: outstanding.plan.opportunity_end_ns,
                     deadline_ns: outstanding.plan.deadline_ns,
                     dispatched_ns: now_ns,
+                    guest_finished_ns: None,
                     accepted_ns: None,
                     graphics_ready_ns: BTreeMap::new(),
                     composition_ns: None,
@@ -983,6 +987,7 @@ impl RenderScheduler {
                 self.measured_accepted_opportunities.saturating_add(1);
         }
         if let Some(trace) = self.active_traces.get_mut(&token) {
+            trace.guest_finished_ns = Some(guest_finished_ns);
             trace.accepted_ns = Some(accepted_ns);
             trace.deadline_met = Some(deadline_met);
             trace.measured_opportunity = measured_opportunity;
@@ -1583,6 +1588,32 @@ impl RenderScheduler {
             }
         }
         trace.settlement = Some(settlement);
+        if std::env::var_os("BROOD_TRACE_RESIZE_PIPELINE").is_some()
+            && matches!(
+                trace.actor.name.as_str(),
+                "session-switcher" | "terminal-ui"
+            )
+        {
+            let graphics_ready_ns = trace.graphics_ready_ns.values().copied().max().unwrap_or(0);
+            eprintln!(
+                "resize-pipeline-token token={} actor={} generation={} event_watermark={} target_ns={} deadline_ns={} dispatched_ns={} guest_finished_ns={} accepted_ns={} graphics_ready_ns={} composition_ns={} gpu_submission_ns={} presentation_ns={} settlement={settlement:?} deadline_met={} target_presented={}",
+                trace.token.0,
+                trace.actor.name,
+                trace.actor.generation,
+                trace.event_watermark,
+                trace.target_ns,
+                trace.deadline_ns,
+                trace.dispatched_ns,
+                trace.guest_finished_ns.unwrap_or(0),
+                trace.accepted_ns.unwrap_or(0),
+                graphics_ready_ns,
+                trace.composition_ns.unwrap_or(0),
+                trace.gpu_submission_ns.unwrap_or(0),
+                trace.presentation_ns.unwrap_or(0),
+                trace.deadline_met.map_or(-1, i32::from),
+                trace.target_presented.map_or(-1, i32::from),
+            );
+        }
         if self.completed_traces.len() == MAX_CORRELATION_TRACES {
             self.completed_traces.pop_front();
         }

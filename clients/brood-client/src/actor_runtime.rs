@@ -1958,6 +1958,26 @@ impl PresentationWasmRuntime {
                 watermark.unwrap_or(0),
             );
         }
+        if std::env::var_os("BROOD_TRACE_RESIZE_PIPELINE").is_some()
+            && let PresentationEvent::PaneResized {
+                pane,
+                width,
+                height,
+                ..
+            } = &event
+        {
+            eprintln!(
+                "resize-pipeline-event time_ns={} actor={} generation={} pane={} event_watermark={} logical_width={width:.2} logical_height={height:.2}",
+                self.graphics.as_ref().map_or(
+                    0,
+                    crate::plugin_graphics::PluginGraphicsBridge::render_now_ns
+                ),
+                actor_name,
+                hosted.actor.generation(),
+                pane,
+                watermark.unwrap_or(0),
+            );
+        }
         match &hosted.actor {
             HostedWasmActor::Component(actor) => {
                 self.send_ordered_presentation_event(actor_name, actor, event, watermark)

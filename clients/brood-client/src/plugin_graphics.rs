@@ -2120,6 +2120,28 @@ impl PresentationHost for ActorPresentationHost {
                 .map_err(|_closed| PresentationError::ActorStopped)?;
             return Ok(0);
         };
+        if std::env::var_os("BROOD_TRACE_RESIZE_PIPELINE").is_some()
+            && matches!(scope.name.as_str(), "session-switcher" | "terminal-ui")
+        {
+            let pane_watermarks = decoded
+                .iter()
+                .map(|(pane, _epoch, watermark, _bytes, _packet)| {
+                    format!("{pane}:{}", watermark.unwrap_or(0))
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            eprintln!(
+                "resize-pipeline-frame token={} actor={} generation={} sequence={} guest_finished_ns={} accepted_ns={} validation_ns={} pane_watermarks=[{}]",
+                token.0,
+                scope.name,
+                scope.generation,
+                next_sequence,
+                guest_finished_ns,
+                accepted_ns,
+                actor_host_cost_ns,
+                pane_watermarks,
+            );
+        }
         state.next_sequence = next_sequence;
         state
             .pending_actor_frames

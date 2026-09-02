@@ -1408,6 +1408,7 @@ struct GraphicsPreparationRequest {
     keys: Vec<GraphicsPreparationKey>,
     items: Vec<GraphicsPreparationItem>,
     resume: Box<ClientEvent>,
+    queued_at: Instant,
 }
 
 #[derive(Debug)]
@@ -1416,6 +1417,9 @@ struct GraphicsPreparationCompletion {
     keys: Vec<GraphicsPreparationKey>,
     prepared: std::result::Result<Vec<PreparedCanvasScene>, String>,
     resume: Box<ClientEvent>,
+    queued_at: Instant,
+    started_at: Instant,
+    finished_at: Instant,
 }
 
 struct GraphicsPreparationLane {
@@ -1674,7 +1678,9 @@ fn run_graphics_preparation_worker(
             keys,
             items,
             resume,
+            queued_at,
         } = request;
+        let started_at = Instant::now();
         let _profile_span = brood_profiler::profile_span!("graphics", "prepare_scene_batch");
         if worker_generation.load(Ordering::Acquire) != renderer_generation {
             if !publish(ClientEvent::GraphicsPreparationCapacityAvailable) {
@@ -1700,6 +1706,9 @@ fn run_graphics_preparation_worker(
                             keys,
                             prepared: Err(format!("{error:#}")),
                             resume,
+                            queued_at,
+                            started_at,
+                            finished_at: Instant::now(),
                         },
                     )) {
                         break 'requests;
@@ -1725,6 +1734,9 @@ fn run_graphics_preparation_worker(
                 keys,
                 prepared: Ok(prepared),
                 resume,
+                queued_at,
+                started_at,
+                finished_at: Instant::now(),
             },
         )) {
             break;
@@ -5168,6 +5180,7 @@ struct Application {
     renderer_failures: u64,
     renderer_plugin_panes_replayed: u64,
     render_scheduling_present_count: u64,
+    resize_element_last_present_ns: Option<u64>,
     render_scheduling_warmup_complete: bool,
     render_scheduling_forced_recovery: bool,
     render_scheduling_key_presses: u64,
@@ -11572,7 +11585,29 @@ impl ApplicationHandler<ClientEvent> for Application {
                     keys,
                     prepared,
                     resume,
+                    queued_at,
+                    started_at,
+                    finished_at,
                 } = completion;
+                if std::env::var_os("BROOD_TRACE_RESIZE_PIPELINE").is_some() {
+                    let handled_at = Instant::now();
+                    for key in &keys {
+                        eprintln!(
+                            "resize-pipeline-prepare pane={} sequence={} width={} height={} queue_us={} run_us={} completion_hop_us={}",
+                            key.pane,
+                            key.sequence,
+                            key.width,
+                            key.height,
+                            started_at.saturating_duration_since(queued_at).as_micros(),
+                            finished_at
+                                .saturating_duration_since(started_at)
+                                .as_micros(),
+                            handled_at
+                                .saturating_duration_since(finished_at)
+                                .as_micros(),
+                        );
+                    }
+                }
                 let Some(renderer) = self.renderer.as_mut() else {
                     return;
                 };
@@ -12411,6 +12446,16 @@ impl ApplicationHandler<ClientEvent> for Application {
             self.handle_scale_factor_changed(event_loop, *scale_factor);
             return;
         }
+        let resize_element_pane = std::env::var_os("BROOD_TRACE_RESIZE_ELEMENT")
+            .is_some()
+            .then(|| {
+                self.wasm_runtime.as_ref().and_then(|runtime| {
+                    runtime
+                        .pane_actor_ids()
+                        .find_map(|(pane, actor)| (actor == "session-switcher").then_some(pane))
+                })
+            })
+            .flatten();
         let mut composition_revealed_deadline = false;
         let Some(renderer) = self.renderer.as_mut() else {
             return;
@@ -13457,6 +13502,56 @@ impl ApplicationHandler<ClientEvent> for Application {
                         }
                         self.render_scheduling_present_count =
                             self.render_scheduling_present_count.saturating_add(1);
+                        if let Some(pane) = resize_element_pane
+                            && let Some(sample) = renderer.resize_element_geometry(pane)
+                        {
+                            let present_ns = self
+                                .plugin_graphics
+                                .as_ref()
+                                .map_or(0, PluginGraphicsBridge::render_now_ns);
+                            let interval_us = self
+                                .resize_element_last_present_ns
+                                .map_or(0, |previous| present_ns.saturating_sub(previous) / 1_000);
+                            self.resize_element_last_present_ns = Some(present_ns);
+                            let position_error_x =
+                                sample.geometry.drawn_rect[0] - sample.geometry.expected_rect[0];
+                            let position_error_y =
+                                sample.geometry.drawn_rect[1] - sample.geometry.expected_rect[1];
+                            let size_error_w =
+                                sample.geometry.drawn_rect[2] - sample.geometry.expected_rect[2];
+                            let size_error_h =
+                                sample.geometry.drawn_rect[3] - sample.geometry.expected_rect[3];
+                            eprintln!(
+                                "resize-element-present name=new-session-button present={} time_ns={} interval_us={} pane={} sequence={} source_extent={}x{} target_rect={}:{}:{}:{} source_rect={:.4}:{:.4}:{:.4}:{:.4} drawn_rect={:.4}:{:.4}:{:.4}:{:.4} expected_rect={:.4}:{:.4}:{:.4}:{:.4} error={:.4}:{:.4}:{:.4}:{:.4}",
+                                self.render_scheduling_present_count,
+                                present_ns,
+                                interval_us,
+                                pane,
+                                sample.sequence,
+                                sample.source_extent.0,
+                                sample.source_extent.1,
+                                sample.target_rect[0],
+                                sample.target_rect[1],
+                                sample.target_rect[2],
+                                sample.target_rect[3],
+                                sample.geometry.source_rect[0],
+                                sample.geometry.source_rect[1],
+                                sample.geometry.source_rect[2],
+                                sample.geometry.source_rect[3],
+                                sample.geometry.drawn_rect[0],
+                                sample.geometry.drawn_rect[1],
+                                sample.geometry.drawn_rect[2],
+                                sample.geometry.drawn_rect[3],
+                                sample.geometry.expected_rect[0],
+                                sample.geometry.expected_rect[1],
+                                sample.geometry.expected_rect[2],
+                                sample.geometry.expected_rect[3],
+                                position_error_x,
+                                position_error_y,
+                                size_error_w,
+                                size_error_h,
+                            );
+                        }
                         self.winit_driver_present_calls =
                             self.winit_driver_present_calls.saturating_add(1);
                         self.winit_driver_present_samples_ns
@@ -14550,6 +14645,82 @@ struct RenderContentProjection {
     max_height_delta: u32,
     max_scale_error_ppm: u64,
     details: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[allow(clippy::struct_field_names)]
+struct ResizeElementGeometry {
+    source_rect: [f64; 4],
+    drawn_rect: [f64; 4],
+    expected_rect: [f64; 4],
+}
+
+struct ResizeElementSample {
+    sequence: u64,
+    source_extent: (u32, u32),
+    target_rect: [i32; 4],
+    geometry: ResizeElementGeometry,
+}
+
+fn session_switcher_new_button_geometry(
+    source_extent: (u32, u32),
+    source_button_rect: brood_graphics::Rect,
+    target_rect: [i32; 4],
+    raster_scale: f32,
+) -> Option<ResizeElementGeometry> {
+    const SIDE_MARGIN: f64 = 14.0;
+    const BUTTON_Y: f64 = 10.0;
+    const BUTTON_HEIGHT: f64 = 32.0;
+    const COMPACT_WIDTH: f64 = 260.0;
+    const COMPACT_BUTTON_WIDTH: f64 = 32.0;
+    const REGULAR_BUTTON_WIDTH: f64 = 50.0;
+
+    let scale = f64::from(raster_scale);
+    if !scale.is_finite() || scale <= 0.0 || source_extent.0 == 0 || source_extent.1 == 0 {
+        return None;
+    }
+    let target_width = f64::from(target_rect[2]);
+    let target_height = f64::from(target_rect[3]);
+    if target_width <= 0.0 || target_height <= 0.0 {
+        return None;
+    }
+
+    let source_rect = [
+        f64::from(source_button_rect.x) * scale,
+        f64::from(source_button_rect.y) * scale,
+        f64::from(source_button_rect.width) * scale,
+        f64::from(source_button_rect.height) * scale,
+    ];
+
+    let projection_x = target_width / f64::from(source_extent.0);
+    let projection_y = target_height / f64::from(source_extent.1);
+    let drawn_rect = [
+        source_rect[0].mul_add(projection_x, f64::from(target_rect[0])),
+        source_rect[1].mul_add(projection_y, f64::from(target_rect[1])),
+        source_rect[2] * projection_x,
+        source_rect[3] * projection_y,
+    ];
+
+    let target_logical_width = target_width / scale;
+    let expected_button_width = if target_logical_width < COMPACT_WIDTH {
+        COMPACT_BUTTON_WIDTH
+    } else {
+        REGULAR_BUTTON_WIDTH
+    };
+    let expected_button_x =
+        (target_logical_width - SIDE_MARGIN - expected_button_width).max(SIDE_MARGIN);
+    let expected_rect = [
+        expected_button_x.mul_add(scale, f64::from(target_rect[0])),
+        BUTTON_Y.mul_add(scale, f64::from(target_rect[1])),
+        expected_button_width * scale,
+        BUTTON_HEIGHT * scale,
+    ];
+
+    Some(ResizeElementGeometry {
+        source_rect,
+        drawn_rect,
+        expected_rect,
+    })
 }
 
 impl RenderContentProjection {
@@ -17043,6 +17214,7 @@ impl Renderer {
                 keys: keys.clone(),
                 items,
                 resume: Box::new(resume),
+                queued_at: Instant::now(),
             })?;
         self.pending_graphics_preparation_batches.insert(keys);
         Ok(None)
@@ -20315,6 +20487,23 @@ impl Renderer {
         projection
     }
 
+    fn resize_element_geometry(&self, pane: u64) -> Option<ResizeElementSample> {
+        let plugin = self.plugin_panes.get(&pane)?;
+        let source_extent = plugin.scene.source_painted_extent?;
+        let geometry = session_switcher_new_button_geometry(
+            source_extent,
+            plugin.scene.header_button_source_rect?,
+            plugin.rect,
+            plugin.scene.scale,
+        )?;
+        Some(ResizeElementSample {
+            sequence: plugin.scene.sequence,
+            source_extent,
+            target_rect: plugin.rect,
+            geometry,
+        })
+    }
+
     fn layout_paint_targets(&self) -> Vec<LayoutPaintTarget> {
         layout_paint_targets(
             &self.accepted_layout,
@@ -21549,6 +21738,41 @@ fn low_latency_present_mode(supported: &[wgpu::PresentMode]) -> wgpu::PresentMod
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_session_button_oracle_exposes_projection_and_locks_at_native_extent() {
+        let source_button = brood_graphics::Rect::new(256.0, 10.0, 50.0, 32.0);
+        let exact = session_switcher_new_button_geometry(
+            (320, 720),
+            source_button,
+            [960, 0, 320, 720],
+            1.0,
+        )
+        .expect("exact button geometry");
+        for (actual, expected) in exact.drawn_rect.into_iter().zip([1216.0, 10.0, 50.0, 32.0]) {
+            assert!((actual - expected).abs() < 0.000_1);
+        }
+        for (actual, expected) in exact.drawn_rect.into_iter().zip(exact.expected_rect) {
+            assert!((actual - expected).abs() < 0.000_1);
+        }
+
+        let projected = session_switcher_new_button_geometry(
+            (320, 720),
+            source_button,
+            [900, 0, 380, 720],
+            1.0,
+        )
+        .expect("projected button geometry");
+        for (actual, expected) in projected
+            .expected_rect
+            .into_iter()
+            .zip([1216.0, 10.0, 50.0, 32.0])
+        {
+            assert!((actual - expected).abs() < 0.000_1);
+        }
+        assert!((projected.drawn_rect[0] - 1204.0).abs() < 0.000_1);
+        assert!((projected.drawn_rect[2] - 59.375).abs() < 0.000_1);
+    }
 
     #[test]
     fn render_geometry_invariant_requires_equal_surface_pane_and_layout_geometry() {
@@ -26791,6 +27015,7 @@ mod tests {
             keys: vec![preparation_test_key(1, sequence, None)],
             items: Vec::new(),
             resume: Box::new(ClientEvent::RenderSchedulingChanged),
+            queued_at: Instant::now(),
         }
     }
 

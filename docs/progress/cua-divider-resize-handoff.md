@@ -474,3 +474,86 @@ The optional stable mode also retained **100.00/100** in its explicit fast
 check at `/tmp/brood-cua-stable-optional-1`. Verification passed all 284
 `brood-client` tests and all 11 terminal-ui tests in the checked-in Nix
 environment.
+
+### Presentation-rate element oracle reproduction (2026-09-02)
+
+The previous allocation and native-source metrics did not directly answer
+whether one fixed UI element stayed locked while its pane changed width. The
+Cua gate now traces the session switcher's new-session button on every
+successful presentation. The client derives the button rectangle in the
+packet's native source coordinate space, applies the same source-to-pane
+projection used by rendering, and compares the resulting drawn rectangle with
+the rectangle produced from current target geometry. The analyzer retains both
+rectangles, their signed position and size errors, the packet sequence, source
+extent, target pane rectangle, presentation identity, monotonic timestamp, and
+inter-presentation interval.
+
+A 196 px, 24-motion drag driven over approximately 300 ms reproduced the
+remaining defect in all three alternating runs. The final artifact, whose
+source rectangles come from the actual packet draw command, is retained at
+`/tmp/brood-cua-element-repro-final`:
+
+- run 1 had 22 unlocked button samples in 42 presented samples, with 3.238 px
+  maximum position error and 2.530 px maximum width error;
+- run 2 had 15 unlocked samples in 42, with 1.985 px maximum position error and
+  1.550 px maximum width error;
+- run 3 had 13 unlocked samples in 43, with 3.200 px maximum position error and
+  2.500 px maximum width error;
+- median inter-presentation intervals were 5.116-5.232 ms, while p95 ranged
+  from 7.059-7.767 ms and maxima ranged from 14.663-15.164 ms.
+
+The older rubric still calculated 100/100 because divider tracking, cohort
+ordering, final geometry, and release latency all passed. The new element
+invariant correctly makes the overall result a failure. Example failing frames
+show a native 336 px source projected into a 353 px target: the nominal 50 px
+button is drawn 52.530 px wide and 3.238 px left of its target-geometry
+position. This is direct evidence of the visible stretch-and-snap mechanism,
+not an inference from pane allocation lag.
+
+### Correlated resize pipeline profile (2026-09-02)
+
+The Cua gate now correlates each pane-resize admission and exact actor event
+watermark with render-token dispatch, guest frame completion, host validation,
+graphics readiness, composition, GPU submission, and presentation. Scene
+preparation separately records bounded-worker queue time, execution time, and
+the completion hop back to the event loop, keyed by pane and scene sequence.
+Analyzer schema 5 retains per-run distributions, actor-specific distributions,
+and the five worst end-to-end presentations. Subscription redraws of an
+already-covered watermark are excluded by keeping the first presented token
+for each actor/watermark pair.
+
+The retained 180 Hz, 300 ms, 54-motion-per-drag capture is at
+`/tmp/brood-resize-pipeline-profile`. It joined 103-107 first presentations to
+110 relevant resize events per run. Across the three runs:
+
+- resize event to actor dispatch cost 2.366-2.570 ms at p50 and
+  4.927-5.086 ms at p95, with an 8.033 ms maximum;
+- guest drawing cost 0.049-0.185 ms at p50 and 0.229-0.355 ms at p95;
+- host validation cost 0.070-0.096 ms at p50 and 0.117-0.192 ms at p95;
+- acceptance to graphics readiness cost 0.242-0.278 ms at p50 and
+  0.411-0.707 ms at p95;
+- graphics readiness to composition cost 0.982-1.623 ms at p50 and
+  3.279-4.594 ms at p95;
+- composition to GPU submission cost 0.127-0.136 ms at p50 and
+  0.224-0.236 ms at p95;
+- submission to presentation-call return cost 0.038-0.042 ms at p50 and
+  0.052-0.067 ms at p95;
+- resize event to presentation cost 4.498-5.575 ms at p50 and
+  7.237-8.760 ms at p95, with an 11.947 ms maximum.
+
+The preparation worker itself is not the dominant cost: its p50 was
+0.022-0.040 ms and its p95 was 0.100-0.109 ms. Queue p50 was 0.004-0.005 ms;
+the worker-to-event-loop completion hop was 0.046-0.060 ms at p50 and
+0.177-0.285 ms at p95. One 2.564 ms completion-hop outlier occurred in run 3.
+
+For the session switcher specifically, median guest drawing was
+0.181-0.231 ms and median validation plus accepted-to-ready time was
+0.374-0.413 ms. The two scheduling intervals surrounding that work consumed
+3.425-3.834 ms at their medians. The evidence therefore supports the premise
+that a complete repaint fits comfortably inside a 5.3 ms refresh interval;
+the present defect is dominated by when work is admitted to an actor and when
+ready work is allowed to compose, not by packet construction, lowering, or GPU
+submission. It also confirms a correctness gap independent of raw speed:
+ordinary target geometry may present before the render token covering that
+exact resize watermark, so whole-pane projection remains observable even when
+the subsequent repaint is fast.

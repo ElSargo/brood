@@ -2,16 +2,17 @@
 status: target
 type: system
 authority: product
-last-reviewed: 2026-07-25
+last-reviewed: 2026-09-02
 ---
 
 # Plugin Graphics
 
 The base plugin graphics API is a bounded canvas display list. A presentation
-actor records pane-local drawing commands into a packet and submits that packet
-to the presentation client. The client copies and validates the packet, retains
-the latest accepted packet for the pane, and lowers it into its WGPU renderer.
-The backend is not on this interactive path.
+plugin records pane-local drawing commands into a packet, either through the
+host-driven render facet in [[plugin-pure-renderer]] or through an asynchronous
+actor frame. The client copies and validates the packet, retains the latest
+accepted packet for the pane, and lowers it into its WGPU renderer. The backend
+is not on this interactive path.
 
 The base protocol is deliberately not a GPU API. It has paths, rectangles,
 images, text, transforms, clips, layers, and compositing. It has no user-defined
@@ -21,13 +22,13 @@ protocol.
 
 ## Boundary
 
-The presentation actor and its SDK own:
+The presentation actor, render facet, and SDK collectively own:
 
 - application and widget state;
 - component layout, styling, and event handling;
 - hit testing within the actor's own UI model;
 - packet construction and reusable SDK-side caches;
-- the decision to submit a new visual state.
+- mutation of semantic visual state and construction of its draw packets.
 
 The presentation client owns:
 
@@ -333,11 +334,12 @@ after the host has copied and validated the packet. Rendering and presentation
 happen on the client renderer's normal frame path.
 
 Static panes are redrawn from their retained packet only when damaged, exposed,
-resized, or recomposed. An actor that needs to draw requests or subscribes to a
-render hint, samples its visual state for the hint's target presentation time,
-and returns the hint token with its replacement packet. The presentation client
-uses that correlation to pace future hints and trace the accepted state through
-composition and presentation. Hidden panes do not receive an unbounded hint
+resized, or recomposed. A pure-render actor expresses render interest; the host
+invokes its render facet over live actor state with the target time and exact
+current geometry. An asynchronous actor instead receives a
+render hint, samples its visual state, and returns the token with its replacement
+packet. The presentation client traces either result through preparation,
+composition, and presentation. Hidden panes do not receive an unbounded render
 stream. The complete timing, token, executor-isolation, and recovery contract is
 defined by [[render-scheduling]]. More specialized host-driven shader animation
 belongs to [[plugin-advanced-graphics]], not the base canvas contract.
@@ -378,6 +380,7 @@ not this base protocol.
 Related:
 
 - [[plugin-ui]]
+- [[plugin-pure-renderer]]
 - [[render-scheduling]]
 - [[plugin-advanced-graphics]]
 - [[presentation-client]]

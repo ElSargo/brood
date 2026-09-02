@@ -119,6 +119,157 @@ def grade_letter(score: float) -> str:
     return "F"
 
 
+def nearest_rank(values: list[float], percentile: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    rank = max(1, math.ceil(percentile * len(ordered)))
+    return ordered[min(len(ordered), rank) - 1]
+
+
+def distribution(values: list[float]) -> dict[str, float | int | None]:
+    return {
+        "samples": len(values),
+        "p50_us": nearest_rank(values, 0.50),
+        "p95_us": nearest_rank(values, 0.95),
+        "p99_us": nearest_rank(values, 0.99),
+        "max_us": max(values, default=None),
+    }
+
+
+def analyze_resize_pipeline(segment: list[str]) -> dict[str, object]:
+    events: dict[tuple[str, int], int] = {}
+    pane_actors: dict[int, str] = {}
+    for line in segment:
+        match = re.search(
+            r"resize-pipeline-event time_ns=(\d+) actor=(\S+) generation=\d+ "
+            r"pane=(\d+) event_watermark=(\d+)",
+            line,
+        )
+        if match and match.group(2) in ("session-switcher", "terminal-ui"):
+            actor = match.group(2)
+            pane = int(match.group(3))
+            watermark = int(match.group(4))
+            events[(actor, watermark)] = int(match.group(1))
+            pane_actors[pane] = actor
+
+    frames: dict[int, tuple[str, int]] = {}
+    for line in segment:
+        match = re.search(
+            r"resize-pipeline-frame token=(\d+) actor=(\S+) generation=\d+ "
+            r"sequence=(\d+)",
+            line,
+        )
+        if match:
+            frames[int(match.group(1))] = (match.group(2), int(match.group(3)))
+
+    preparation = {"queue": [], "run": [], "completion_hop": []}
+    preparation_by_actor = {
+        actor: {"queue": [], "run": [], "completion_hop": []}
+        for actor in ("session-switcher", "terminal-ui")
+    }
+    for line in segment:
+        match = re.search(
+            r"resize-pipeline-prepare pane=(\d+) sequence=(\d+) width=\d+ height=\d+ "
+            r"queue_us=(\d+) run_us=(\d+) completion_hop_us=(\d+)",
+            line,
+        )
+        if not match or int(match.group(1)) not in pane_actors:
+            continue
+        actor = pane_actors[int(match.group(1))]
+        for stage, group in zip(
+            ("queue", "run", "completion_hop"), match.groups()[2:5]
+        ):
+            preparation[stage].append(float(group))
+            preparation_by_actor[actor][stage].append(float(group))
+
+    token_pattern = re.compile(
+        r"resize-pipeline-token token=(\d+) actor=(\S+) generation=\d+ "
+        r"event_watermark=(\d+) target_ns=(\d+) deadline_ns=(\d+) "
+        r"dispatched_ns=(\d+) guest_finished_ns=(\d+) accepted_ns=(\d+) "
+        r"graphics_ready_ns=(\d+) composition_ns=(\d+) gpu_submission_ns=(\d+) "
+        r"presentation_ns=(\d+) settlement=(.*?) deadline_met="
+    )
+    joined: dict[tuple[str, int], dict[str, object]] = {}
+    presented_without_event = 0
+    for line in segment:
+        match = token_pattern.search(line)
+        if not match or not match.group(13).startswith("Presented"):
+            continue
+        token = int(match.group(1))
+        actor = match.group(2)
+        watermark = int(match.group(3))
+        event_ns = events.get((actor, watermark))
+        if event_ns is None:
+            presented_without_event += 1
+            continue
+        target_ns, deadline_ns, dispatched_ns, guest_finished_ns, accepted_ns, graphics_ready_ns, composition_ns, gpu_submission_ns, presentation_ns = map(
+            int, match.groups()[3:12]
+        )
+        sample = {
+            "token": token,
+            "actor": actor,
+            "event_watermark": watermark,
+            "sequence": frames.get(token, (actor, 0))[1],
+            "event_to_dispatch_us": (dispatched_ns - event_ns) / 1_000,
+            "guest_draw_us": (guest_finished_ns - dispatched_ns) / 1_000,
+            "host_validation_us": (accepted_ns - guest_finished_ns) / 1_000,
+            "accepted_to_graphics_ready_us": (graphics_ready_ns - accepted_ns) / 1_000,
+            "graphics_ready_to_composition_us": (composition_ns - graphics_ready_ns) / 1_000,
+            "composition_to_submission_us": (gpu_submission_ns - composition_ns) / 1_000,
+            "submission_to_present_us": (presentation_ns - gpu_submission_ns) / 1_000,
+            "event_to_present_us": (presentation_ns - event_ns) / 1_000,
+            "present_vs_target_us": (presentation_ns - target_ns) / 1_000,
+            "present_vs_deadline_us": (presentation_ns - deadline_ns) / 1_000,
+        }
+        # A subscription may draw the same admitted state again. Preserve the
+        # first presentation causally attributable to each resize watermark.
+        joined.setdefault((actor, watermark), sample)
+
+    stage_names = (
+        "event_to_dispatch_us",
+        "guest_draw_us",
+        "host_validation_us",
+        "accepted_to_graphics_ready_us",
+        "graphics_ready_to_composition_us",
+        "composition_to_submission_us",
+        "submission_to_present_us",
+        "event_to_present_us",
+        "present_vs_target_us",
+    )
+    samples = list(joined.values())
+    by_actor = {}
+    for actor in ("session-switcher", "terminal-ui"):
+        actor_samples = [sample for sample in samples if sample["actor"] == actor]
+        by_actor[actor] = {
+            "samples": len(actor_samples),
+            "stages": {
+                stage: distribution([float(sample[stage]) for sample in actor_samples])
+                for stage in stage_names
+            },
+            "preparation": {
+                stage: distribution(values)
+                for stage, values in preparation_by_actor[actor].items()
+            },
+        }
+    return {
+        "resize_events": len(events),
+        "joined_presentations": len(samples),
+        "presented_tokens_without_segment_event": presented_without_event,
+        "preparation": {
+            stage: distribution(values) for stage, values in preparation.items()
+        },
+        "stages": {
+            stage: distribution([float(sample[stage]) for sample in samples])
+            for stage in stage_names
+        },
+        "actors": by_actor,
+        "worst_presentations": sorted(
+            samples, key=lambda sample: float(sample["event_to_present_us"]), reverse=True
+        )[:5],
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", required=True, type=pathlib.Path)
@@ -174,6 +325,62 @@ def main() -> int:
             "layout-region response-rejected" in line and "StaleEpoch" in line
             for line in segment
         )
+        element_samples = []
+        for line in segment:
+            if "resize-element-present name=new-session-button" not in line:
+                continue
+            header = re.search(
+                r"present=(\d+) time_ns=(\d+) interval_us=(\d+) pane=(\d+) "
+                r"sequence=(\d+) source_extent=(\d+)x(\d+) "
+                r"target_rect=(-?\d+):(-?\d+):(\d+):(\d+)",
+                line,
+            )
+            drawn = re.search(
+                r"drawn_rect=(-?[0-9.]+):(-?[0-9.]+):(-?[0-9.]+):(-?[0-9.]+)",
+                line,
+            )
+            expected_rect = re.search(
+                r"expected_rect=(-?[0-9.]+):(-?[0-9.]+):(-?[0-9.]+):(-?[0-9.]+)",
+                line,
+            )
+            error = re.search(
+                r"error=(-?[0-9.]+):(-?[0-9.]+):(-?[0-9.]+):(-?[0-9.]+)",
+                line,
+            )
+            if not header or not drawn or not expected_rect or not error:
+                continue
+            element_samples.append(
+                {
+                    "present": int(header.group(1)),
+                    "time_ns": int(header.group(2)),
+                    "interval_us": int(header.group(3)),
+                    "pane": int(header.group(4)),
+                    "sequence": int(header.group(5)),
+                    "source_extent": [int(header.group(6)), int(header.group(7))],
+                    "target_rect": [int(value) for value in header.groups()[7:11]],
+                    "drawn_rect": [float(value) for value in drawn.groups()],
+                    "expected_rect": [float(value) for value in expected_rect.groups()],
+                    "error": [float(value) for value in error.groups()],
+                }
+            )
+        element_intervals = [
+            float(sample["interval_us"])
+            for sample in element_samples[1:]
+            if sample["interval_us"] > 0
+        ]
+        max_element_position_error = max(
+            (max(abs(sample["error"][0]), abs(sample["error"][1])) for sample in element_samples),
+            default=0.0,
+        )
+        max_element_size_error = max(
+            (max(abs(sample["error"][2]), abs(sample["error"][3])) for sample in element_samples),
+            default=0.0,
+        )
+        unlocked_element_samples = sum(
+            max(abs(value) for value in sample["error"]) > 0.25
+            for sample in element_samples
+        )
+        resize_pipeline = analyze_resize_pipeline(segment)
         render_geometry = [
             tuple(map(int, match.groups()))
             for line in segment
@@ -466,6 +673,17 @@ def main() -> int:
                 f"{clear_slice_frames} captured frames (maximum width "
                 f"{max_clear_slice_columns}px)"
             )
+        if not element_samples:
+            hard_failures.append(
+                f"run {run_number}: no presentation-rate new-session-button geometry samples"
+            )
+        elif unlocked_element_samples:
+            hard_failures.append(
+                f"run {run_number}: new-session-button moved or stretched in "
+                f"{unlocked_element_samples}/{len(element_samples)} presented frames "
+                f"(maximum position error {max_element_position_error:.3f}px, "
+                f"maximum size error {max_element_size_error:.3f}px)"
+            )
         run_metrics.append(
             {
                 **run,
@@ -507,6 +725,19 @@ def main() -> int:
                 ),
                 "clear_slice_frames": clear_slice_frames,
                 "max_clear_slice_columns": max_clear_slice_columns,
+                "resize_element": {
+                    "name": "new-session-button",
+                    "samples": len(element_samples),
+                    "unlocked_samples": unlocked_element_samples,
+                    "max_position_error_px": round(max_element_position_error, 5),
+                    "max_size_error_px": round(max_element_size_error, 5),
+                    "present_interval_us_p50": nearest_rank(element_intervals, 0.50),
+                    "present_interval_us_p95": nearest_rank(element_intervals, 0.95),
+                    "present_interval_us_p99": nearest_rank(element_intervals, 0.99),
+                    "present_interval_us_max": max(element_intervals, default=None),
+                    "frames": element_samples,
+                },
+                "resize_pipeline": resize_pipeline,
                 "fatal_resource_loss": fatal_resource,
                 "stale_final_reuse": stale_final_reuse,
                 "final_error_px": final_error,
@@ -528,7 +759,7 @@ def main() -> int:
     overall = min((item["scores"]["total"] for item in run_metrics), default=0.0)
     passed = bool(run_metrics) and overall >= args.minimum_score and not hard_failures
     metrics = {
-        "schema": 4,
+        "schema": 5,
         "workload": "production session-switcher + terminal, native Wayland Cua drag",
         "score": round(overall, 2),
         "grade": grade_letter(overall),
@@ -551,9 +782,42 @@ def main() -> int:
         f"{run['projected_frames']}/{run['projection_frames']} | "
         f"{run['native_source_updates']} | {run['regressive_source_updates']} | "
         f"{run['skewed_native_update_frames']} | {run['final_error_px']} | "
+        f"{run['resize_element']['unlocked_samples']}/{run['resize_element']['samples']} | "
+        f"{run['resize_element']['max_position_error_px']:.3f} | "
+        f"{run['resize_element']['max_size_error_px']:.3f} | "
         f"{'yes' if run['render_geometry_ok'] else 'no'} | "
         f"{'yes' if run['client_alive'] else 'no'} |"
         for run in run_metrics
+    )
+    pipeline_stage_labels = (
+        ("event_to_dispatch_us", "Resize event → actor dispatch"),
+        ("guest_draw_us", "Guest draw"),
+        ("host_validation_us", "Host validation/lowering validation"),
+        ("accepted_to_graphics_ready_us", "Accepted → graphics ready"),
+        ("graphics_ready_to_composition_us", "Graphics ready → composition"),
+        ("composition_to_submission_us", "Composition → GPU submission"),
+        ("submission_to_present_us", "Submission → present call returned"),
+        ("event_to_present_us", "Resize event → present"),
+    )
+    pipeline_rows = "\n".join(
+        f"| {run['run']} | {label} | {stage['samples']} | "
+        f"{stage['p50_us']:.1f} | {stage['p95_us']:.1f} | "
+        f"{stage['p99_us']:.1f} | {stage['max_us']:.1f} |"
+        for run in run_metrics
+        for key, label in pipeline_stage_labels
+        if (stage := run["resize_pipeline"]["stages"][key])["samples"]
+    )
+    preparation_rows = "\n".join(
+        f"| {run['run']} | {label} | {stage['samples']} | "
+        f"{stage['p50_us']:.1f} | {stage['p95_us']:.1f} | "
+        f"{stage['p99_us']:.1f} | {stage['max_us']:.1f} |"
+        for run in run_metrics
+        for key, label in (
+            ("queue", "Preparation queue"),
+            ("run", "Preparation worker"),
+            ("completion_hop", "Worker completion → event loop"),
+        )
+        if (stage := run["resize_pipeline"]["preparation"][key])["samples"]
     )
     failures = "\n".join(f"- {failure}" for failure in hard_failures) or "- None"
     args.report.write_text(
@@ -561,15 +825,31 @@ def main() -> int:
 
 Overall: **{overall:.2f}/100 ({grade_letter(overall)})** — {'PASS' if passed else 'FAIL'}
 
-| Run | Score | Motions | Transactions | Superseded | Tracking RMSE | Projected frames | Native updates | Regressive updates | Skewed update frames | Final error px | Render geometry | Survived |
-|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|:---:|
+| Run | Score | Motions | Transactions | Superseded | Tracking RMSE | Projected frames | Native updates | Regressive updates | Skewed update frames | Final error px | Unlocked element frames | Max position error px | Max size error px | Render geometry | Survived |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|:---:|
 {summary_rows}
 
 ## Hard failures
 
 {failures}
 
-The grade uses real native Wayland input from Cua. Projected frames report how often native pane content differs from its current target extent. Native updates count genuine source relayouts; a regressive update is a late relayout that moves source geometry farther from the current target. Skewed update frames show that only part of the live-resize pane cohort changed in one presented frame. Any regressive or skewed update is a hard failure. Fifty points measure visible divider tracking from captured frames, twenty penalize wasted/superseded synchronized transactions, fifteen require survival, correct final content/geometry, exact render-time painted-surface/pane/layout area and geometry, and no renderer-clear slices in captured pixels, and fifteen measure release-to-completion latency. The overall score is the worst run so intermittent failures cannot be averaged away.
+## Resize pipeline timing
+
+All values are microseconds. Each resize event is joined by actor and exact
+event watermark to the first presented render token covering that state.
+
+| Run | Stage | Samples | p50 | p95 | p99 | Max |
+|---:|---|---:|---:|---:|---:|---:|
+{pipeline_rows}
+
+Preparation is asynchronous and is joined to its exact pane/scene sequence;
+its sub-stages overlap the accepted-to-graphics-ready interval above.
+
+| Run | Preparation sub-stage | Samples | p50 | p95 | p99 | Max |
+|---:|---|---:|---:|---:|---:|---:|
+{preparation_rows}
+
+The grade uses real native Wayland input from Cua. Projected frames report how often native pane content differs from its current target extent. Native updates count genuine source relayouts; a regressive update is a late relayout that moves source geometry farther from the current target. Skewed update frames show that only part of the live-resize pane cohort changed in one presented frame. The new-session-button oracle projects its source-space rectangle through the exact pane stretch used for every presented frame and compares that result with the rectangle from current target geometry. Any regressive or skewed update, or any element position/size error above 0.25 px, is a hard failure. Fifty points measure visible divider tracking from captured frames, twenty penalize wasted/superseded synchronized transactions, fifteen require survival, correct final content/geometry, exact render-time painted-surface/pane/layout area and geometry, and no renderer-clear slices in captured pixels, and fifteen measure release-to-completion latency. The overall score is the worst run so intermittent failures cannot be averaged away.
 """
     )
     print(f"Cua divider resize: {overall:.2f}/100 ({grade_letter(overall)}) {'PASS' if passed else 'FAIL'}")

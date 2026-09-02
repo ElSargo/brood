@@ -2,15 +2,17 @@
 status: target
 type: system
 authority: product
-last-reviewed: 2026-08-09
+last-reviewed: 2026-09-02
 ---
 
 # Plugin UI And Pane Rendering
 
 Plugin UI is actor-owned application state rendered through the canvas packet
-contract in [[plugin-graphics]]. Rich components are SDK functions built from
-that contract. The presentation client does not implement, validate, retain, or
-patch a plugin component tree.
+contract in [[plugin-graphics]]. Resize-sensitive interactive panes preferably
+produce those packets through the host-driven [[plugin-pure-renderer]]; the
+asynchronous actor-frame path remains available. Rich components are SDK
+functions built from the canvas contract. The presentation client does not
+implement, validate, retain, or patch a plugin component tree.
 
 ## Ownership
 
@@ -76,17 +78,19 @@ Client -> Actor: PaneResized { optional resize epoch } / PaneFocused / PaneHidde
 Client -> Actor: Pointer / Key / Text / Ime
 Client -> Actor: RenderHint { token, target time, deadline, relevant panes, watermark }
 Actor -> Client: RequestRender / SetRenderSubscription
-Actor -> Client: FinishActorFrame { token, changed pane draw packets }
+Actor -> Client: PublishRenderState / RequestRender
+Actor -> Client: FinishActorFrame { token, changed pane draw packets } (asynchronous path)
 Actor -> Client: ReusePaneContent { pane, resize epoch }
 Actor -> Client: CommandRequest / Status
 ```
 
 The actor returns from each dispatch without waiting for I/O, a worker, or GPU
 execution. It may delegate unrelated work and request rendering when a
-completion arrives. The render hint is actor-scoped, and the actor atomically
-finishes all changed owned panes in one token-bearing batch. Drawing is normal
-actor output, not a synchronous key decision lane. The complete pacing and
-token lifecycle is defined by [[render-scheduling]].
+completion arrives. On the pure path, the host invokes a reserved render phase
+in the same actor instance with its live state and exact current geometry. On
+the asynchronous path, the render hint is actor-scoped and the actor atomically
+finishes all changed owned panes in one token-bearing batch. The complete pacing
+and token lifecycle is defined by [[render-scheduling]].
 
 A resize-epoch-tagged packet is staged rather than replacing the visible pane
 immediately. When a synchronized layout waits for that pane, only a packet or

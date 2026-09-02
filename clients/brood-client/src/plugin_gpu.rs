@@ -178,6 +178,10 @@ pub struct GpuCanvasScene {
     /// Native packet extent before projection. Keeping this separate makes
     /// compositor stretching observable even when the target is fully painted.
     pub source_painted_extent: Option<(u32, u32)>,
+    /// Rightmost fixed-height header button submitted by the pane packet.
+    /// Resize diagnostics use the original draw command rather than
+    /// reconstructing the element from pane geometry.
+    pub header_button_source_rect: Option<Rect>,
     canvas_clear: Option<wgpu::Color>,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
@@ -203,6 +207,7 @@ pub struct PreparedCanvasScene {
     scale: f32,
     painted_extent: Option<(u32, u32)>,
     source_painted_extent: Option<(u32, u32)>,
+    header_button_source_rect: Option<Rect>,
     canvas_clear: Option<wgpu::Color>,
     vertices: Vec<CanvasVertex>,
     indices: Vec<u32>,
@@ -444,6 +449,7 @@ impl GpuCanvasRenderer {
         let (width, height, scale) = extent;
         let opaque_canvas = opaque_canvas_fill(&snapshot.packet, scale);
         let source_painted_extent = opaque_canvas.map(|(extent, _color)| extent);
+        let header_button_source_rect = rightmost_header_button_rect(&snapshot.packet);
         let painted_extent = source_painted_extent.map(|_| (width, height));
         let canvas_clear = opaque_canvas.map(|(_extent, color)| wgpu::Color {
             r: f64::from(srgb_to_linear(color.r)),
@@ -472,6 +478,7 @@ impl GpuCanvasRenderer {
             scale,
             painted_extent,
             source_painted_extent,
+            header_button_source_rect,
             canvas_clear,
             vertices,
             indices,
@@ -628,6 +635,7 @@ impl GpuCanvasRenderer {
             scale,
             painted_extent,
             source_painted_extent,
+            header_button_source_rect,
             canvas_clear,
             vertices,
             indices,
@@ -724,6 +732,7 @@ impl GpuCanvasRenderer {
             scale,
             painted_extent,
             source_painted_extent,
+            header_button_source_rect,
             canvas_clear,
             vertex_buffer,
             index_buffer,
@@ -1038,6 +1047,25 @@ impl GpuCanvasRenderer {
             bind_group,
         }
     }
+}
+
+fn rightmost_header_button_rect(packet: &brood_graphics::Packet) -> Option<Rect> {
+    let near = |value: f32, expected: f32| (value - expected).abs() < f32::EPSILON;
+    packet
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::FillRoundedRect { rect, radius, .. }
+                if near(rect.y, 10.0)
+                    && near(rect.height, 32.0)
+                    && near(*radius, 4.0)
+                    && rect.width > 0.0 =>
+            {
+                Some(*rect)
+            }
+            _ => None,
+        })
+        .max_by(|left, right| left.x.total_cmp(&right.x))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2121,6 +2149,26 @@ fn composite_blend(input: VertexOutput, blended: vec3<f32>) -> vec4<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resize_oracle_uses_the_rightmost_actual_header_button_command() {
+        let mut packet = brood_graphics::Packet::new();
+        for rect in [
+            Rect::new(94.0, 10.0, 152.0, 32.0),
+            Rect::new(258.0, 10.0, 50.0, 32.0),
+            Rect::new(500.0, 60.0, 50.0, 32.0),
+        ] {
+            packet.push(Command::FillRoundedRect {
+                rect,
+                radius: 4.0,
+                color: Color::rgba(1.0, 1.0, 1.0, 1.0),
+            });
+        }
+        assert_eq!(
+            rightmost_header_button_rect(&packet),
+            Some(Rect::new(258.0, 10.0, 50.0, 32.0))
+        );
+    }
 
     #[test]
     fn opaque_canvas_extent_tracks_the_packet_painted_size() {

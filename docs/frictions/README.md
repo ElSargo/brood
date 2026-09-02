@@ -29,3 +29,4 @@ When design work resolves a friction, update the applicable page in
 - [[terminal-plugin]]
 - [[ui-concurrency]]
 - [[system-profiler-coverage]]
+- [[resize-element-stability]]

@@ -33,7 +33,11 @@ clear slice is a hard failure. The default gate uses a verified 180 Hz headless
 output, requests one Cua motion step per target frame, and reports the worst of
 three alternating drags. Native-content
 projection, forward/regressive relayouts, and partial-cohort presentations are
-reported separately; a backward relayout is a hard failure:
+reported separately; a backward relayout is a hard failure. A presentation-rate
+element oracle also tracks the session switcher's fixed-width new-session
+button. It projects that button from the native packet coordinate space through
+the actual pane stretch on every successful presentation and fails if its drawn
+position or size differs from current target geometry by more than 0.25 px:
 
 ```sh
 nix develop --command bash tools/test-cua-divider-resize.sh
@@ -51,6 +55,13 @@ release; `native` selects the default explicitly.
 
 The Cua daemon uses a private socket and disposable nested display, so the proof
 does not stop or reuse an operator's existing Cua daemon.
+
+The same capture records a correlated resize pipeline for the session switcher
+and terminal. `metrics.json` and `report.md` break the exact first presentation
+for each actor event watermark into admission-to-dispatch, guest draw, host
+validation, graphics readiness, composition wait, GPU submission, and present
+stages. Preparation queue, worker, and completion-hop distributions are also
+reported by pane/scene sequence.
 
 ## System profiling
 

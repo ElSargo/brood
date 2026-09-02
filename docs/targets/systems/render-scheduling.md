@@ -2,16 +2,17 @@
 status: target
 type: system
 authority: product
-last-reviewed: 2026-08-23
+last-reviewed: 2026-09-02
 ---
 
 # Render Hints And Interactive Scheduling
 
 Brood schedules interactive work around the next useful presentation
 opportunity. A plugin does not run an independent animation timer and hope that
-its result reaches the renderer at the right point. It requests or subscribes
-to render hints, receives a host-timed opportunity carrying an opaque token,
-and returns that token with the visual state produced for the opportunity.
+its result reaches the renderer at the right point. A host-driven pure renderer
+is invoked directly with an opaque token, live actor state, exact geometry,
+and target time. An asynchronous renderer receives the equivalent opportunity
+as an actor render hint and returns that token with its visual state.
 
 The same scheduling layer protects the native input and composition paths from
 unrelated actor, backend, and I/O work. Winit and Smithay remain the exclusive
@@ -22,6 +23,39 @@ This target applies to client-local plugin rendering and to the host work which
 turns accepted plugin and managed-window state into a presented OS window. It
 does not move plugin policy into the host or make arbitrary guest code run on a
 Winit or Smithay event-loop thread.
+
+## Pure Render Opportunities
+
+The preferred resize-sensitive path is [[plugin-pure-renderer]]. Render
+interest and prediction remain actor-scoped, but dispatch is reserved
+host-priority work at the next actor turn boundary rather than a render hint
+inserted into its mailbox. The request captures one completed-turn watermark,
+dirty revision, and exact host geometry revision. A turn already in progress
+must return to a safe host boundary before rendering; an epoch yield inside the
+handler is not reentrant. Queued ordinary events do not have to drain first.
+
+There is at most one running pure invocation and one overwriteable latest
+request per facet. A newer dirty or geometry revision replaces pending work.
+Returned work is validated only if its captured tuple is still current;
+otherwise it is discarded and the newest feasible request may start.
+
+A facet runs at most once per predicted presentation opportunity. Interest
+raised by rendering targets a later opportunity rather than recursively
+re-entering the export. Lifecycle stop and generation failure outrank rendering;
+bounded render priority does not remove ordinary actor and worker progress.
+
+Pure execution is a synchronous phase on the actor executor, never on Winit.
+It is exclusive with actor and worker execution for that generation and reads
+the instance's live state without copying. Graphics-ready output may join the
+next eligible redraw before its predicted target when doing so reduces latency
+without crossing its captured geometry revision. The scheduler does not hold
+ready resize output merely to preserve a later animation cadence.
+
+For exact UI panes, a composition candidate containing geometry revision N is
+released only after every required pure output for N is ready. Missing the
+cutoff repeats the previous complete revision instead of projecting stale pane
+content. This global geometry cohort is distinct from atomicity among panes
+owned by one actor.
 
 ## Goals
 
@@ -384,6 +418,7 @@ are necessary lower layers but are not sufficient acceptance.
 
 Related:
 
+- [[plugin-pure-renderer]]
 - [[plugin-graphics]]
 - [[plugin-runtime]]
 - [[presentation-client]]
