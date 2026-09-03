@@ -24,5 +24,5 @@ Active experiments:
   separate subscribing presentation UI.
 - [[session-switcher-ui]] — guest-owned shell UI built from canvas packets,
   native text, pane input, commands, and actor lifecycle.
-- [[host-ui-framework]] — future comparison of host-managed framework UI with
-  the plugin-authored pure-render path.
+- [[host-ui-framework]] — full GPUI transition specification and feasibility
+  gates, retained as an alternative to the plugin-authored pure-render target.

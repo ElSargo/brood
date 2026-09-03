@@ -2,10 +2,10 @@
 status: target
 type: system
 authority: product
-last-reviewed: 2026-09-02
+last-reviewed: 2026-09-04
 ---
 
-# Host-Driven Pure Plugin Rendering
+# Pure Renderer End-State Specification
 
 Interactive plugin panes may expose a host-driven **render facet**. The facet
 reads its actor's live state and turns exact host-owned pane parameters into a
@@ -17,6 +17,30 @@ tree.
 This is the preferred path for resize-sensitive plugin UI. The asynchronous
 actor-frame path in [[plugin-graphics]] remains available for compatibility,
 background rendering, and workloads which cannot use the pure contract.
+
+## Status And Scope
+
+This page is the normative end state for the implementation path Brood is
+pursuing now. “Must”, “must not”, and “may” describe product requirements even
+where the current code has not implemented them.
+
+The specification covers client-local Component Model presentation actors,
+their pane-local canvas output, host-driven rendering, and the composition
+transaction which makes that output visible. It does not replace the actor
+model, move application state into the host, define a host component tree, or
+grant plugins direct WGPU or platform-window access.
+
+The completed system has one preferred interactive path and two explicit
+alternatives:
+
+| Path | Intended use | Presentation authority |
+| --- | --- | --- |
+| Same-instance pure render | Normal interactive plugin UI | Host calls the actor export |
+| Asynchronous actor frame | Compatibility and naturally asynchronous graphics | Actor answers a render hint |
+| Hardened render profile | Future exceptional isolation/parallelism need | Host calls a separate instance from published state |
+
+One pane generation selects exactly one production path. Outputs from two paths
+must never race to become authoritative for the same pane.
 
 ## Purpose
 
@@ -113,6 +137,52 @@ render {
 } -> render-result
 ```
 
+The conceptual Component Model surface is:
+
+```wit
+record render-pane-target {
+    pane: u64,
+    geometry-revision: u64,
+    logical-width: f32,
+    logical-height: f32,
+    physical-width: u32,
+    physical-height: u32,
+    scale: f32,
+    visible: bool,
+    focused: bool,
+}
+
+record pure-render-request {
+    token: render-token,
+    reduced-watermark: u64,
+    dirty-revision: u64,
+    target-presentation-time-ns: u64,
+    submission-deadline-ns: u64,
+    panes: list<render-pane-target>,
+}
+
+variant pure-pane-output {
+    draw(actor-frame-draw),
+    replay-retained-packet(u64),
+    no-change,
+}
+
+record pure-render-result {
+    token: render-token,
+    dirty-revision: u64,
+    panes: list<tuple<u64, pure-pane-output>>,
+    request-next-frame: bool,
+}
+
+export render: func(request: pure-render-request)
+    -> result<pure-render-result, pure-render-error>;
+```
+
+This is a semantic sketch, not frozen field syntax. The checked-in WIT remains
+the exact ABI authority once implementation begins. In particular, scale may
+become an exact rational and accessibility may use a separately revisioned
+result if workload evidence makes either change necessary.
+
 The request includes:
 
 - actor generation, render token, completed-turn watermark, and dirty revision;
@@ -135,6 +205,59 @@ those notifications is not a prerequisite for drawing the current pane.
 Target time is explicit input so deterministic animation does not depend on
 invocation latency. Ambient wall time, randomness, environment changes, and
 other hidden inputs are unavailable to the facet.
+
+For a geometry-sensitive pane, every new geometry revision must produce a draw
+packet for that revision. `no-change` is valid only when neither semantic state
+nor geometry changed. `replay-retained-packet` asks the host to lower the
+retained logical packet again at the requested target extent; it never means
+stretching the prior raster target. The host accepts replay only for a packet
+whose declared geometry dependencies permit it. The value carried by the
+conceptual replay case identifies the exact previously accepted pane-packet
+revision.
+
+## Actor Executor State Machine
+
+The host retains the latest pending render tuple rather than a FIFO:
+
+```text
+actor phase:
+  idle
+  dispatching-event
+  running-worker-quantum
+  rendering(token, captured tuple)
+  stopping
+
+render interest:
+  clean
+  pending(latest dirty revision, latest geometry revision, target)
+```
+
+The required transitions are:
+
+1. An actor event or worker completion may mutate state and request rendering.
+   Returning the turn publishes its reduced watermark and leaves one latest
+   pending render tuple.
+2. A host geometry, scale, theme, exposure, or recovery change may replace that
+   tuple without entering the actor mailbox.
+3. At the next safe guest boundary, lifecycle failure or stop is handled first.
+   A due render may then run before an ordinary queued event.
+4. Starting render captures the actor generation, reduced watermark, dirty
+   revision, renderer generation, pane targets, and predicted opportunity.
+5. No actor handler or worker quantum for that generation runs until the export
+   returns or the generation is terminated.
+6. A current valid result enters transactional graphics preparation. A stale,
+   invalid, or failed result leaves the prior accepted output unchanged.
+7. Interest raised during rendering remains pending for a later opportunity;
+   the export is never recursively entered.
+
+An actor event admitted before render but not yet reduced is not part of the
+captured state. This preserves actor ordering without forcing the host to drain
+an arbitrarily busy mailbox before rendering an already coherent state.
+
+The scheduler must give ordinary work progress between presentation
+opportunities. Continuous render interest cannot create more than one render
+turn per predicted opportunity, and one actor's render cannot consume another
+actor's execution budget.
 
 ## Render-Phase Imports
 
@@ -189,8 +312,8 @@ intentional safety tradeoff which avoids copying normal frontend state.
 
 A geometry revision is presentable only with exact output from every
 geometry-sensitive pane in its required resize cohort. The composition frame
-records the geometry revision, actor-state watermarks, render tokens, pane outputs,
-and managed-window frames it contains.
+records the geometry revision, actor-state watermarks, render tokens, pane
+outputs, and managed-window frames it contains.
 
 If the cohort becomes ready before the cutoff, Brood commits its geometry and
 content together. If it misses, the default exact policy repeats the previous
@@ -259,6 +382,50 @@ substantially different state shape, text load, and multi-actor resize cohort.
 The asynchronous path remains available until those workloads prove the new
 contract under normal input, animation, actor replacement, renderer recovery,
 and resource churn.
+
+Migration proceeds in independently verifiable stages:
+
+1. Add the render export and actor-executor priority state without changing
+   composition. A probe actor proves same-instance state visibility, import
+   masking, no re-entry, latest-pending coalescing, and peer fairness.
+2. Route the session switcher's ordinary render hints through the host-called
+   export while retaining its existing canvas packet construction and text
+   resources. Compare packet pixels and input behavior with the asynchronous
+   path.
+3. Attach exact geometry revisions to pure requests, prepared scenes, and
+   composition candidates. Make the new-session-button oracle a required gate.
+4. Introduce the cross-actor live-resize cohort so session-switcher and terminal
+   outputs become presentable only with their captured geometry.
+5. Move terminal rendering to the same path and prove text-heavy state, PTY
+   updates, scrolling, and actor-worker interaction.
+6. Make pure rendering the default for bundled interactive presentation actors.
+   Keep asynchronous production selectable per pane generation and retain a
+   rollback switch until repeated real workloads show no regression.
+
+No stage removes the current path before its replacement passes the real nested
+workload. Migration does not rewrite draw commands, component SDK code, or WGPU
+lowering merely to change who invokes rendering.
+
+## End-State Invariants
+
+- The host is the only authority which starts a pure render invocation.
+- The export reads the same live state as the actor and receives host geometry
+  directly; no resize event must be reduced first.
+- The same actor generation is never executing an event, worker quantum, and
+  render export concurrently.
+- A render result has exactly one actor generation, reduced watermark, dirty
+  revision, renderer generation, and geometry revision tuple.
+- Stale work is discardable and never partially replaces accepted pane output.
+- Exact UI geometry is never presented with a raster produced for another
+  geometry revision.
+- Render-phase host effects are rejected, while bounded render-only caches may
+  survive discarded calls.
+- A missed deadline repeats a complete prior revision and is visible in
+  diagnostics; it is not concealed by scaling stale UI.
+- Render interest and retained diagnostics are bounded latest-state structures,
+  not unbounded callback or packet queues.
+- Winit, graphics preparation, and unrelated actors never wait indefinitely for
+  one render export.
 
 ## Acceptance Before ABI Freeze
 
