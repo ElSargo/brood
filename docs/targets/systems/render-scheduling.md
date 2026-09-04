@@ -2,7 +2,7 @@
 status: target
 type: system
 authority: product
-last-reviewed: 2026-09-02
+last-reviewed: 2026-09-05
 ---
 
 # Render Hints And Interactive Scheduling
@@ -10,7 +10,7 @@ last-reviewed: 2026-09-02
 Brood schedules interactive work around the next useful presentation
 opportunity. A plugin does not run an independent animation timer and hope that
 its result reaches the renderer at the right point. A host-driven pure renderer
-is invoked directly with an opaque token, live actor state, exact geometry,
+is invoked directly with an opaque token, a pinned immutable application snapshot, exact geometry,
 and target time. An asynchronous renderer receives the equivalent opportunity
 as an actor render hint and returns that token with its visual state.
 
@@ -26,36 +26,34 @@ Winit or Smithay event-loop thread.
 
 ## Pure Render Opportunities
 
-The preferred resize-sensitive path is [[plugin-pure-renderer]]. Render
-interest and prediction remain actor-scoped, but dispatch is reserved
-host-priority work at the next actor turn boundary rather than a render hint
-inserted into its mailbox. The request captures one completed-turn watermark,
-dirty revision, and exact host geometry revision. A turn already in progress
-must return to a safe host boundary before rendering; an epoch yield inside the
-handler is not reentrant. Queued ordinary events do not have to drain first.
+The preferred interactive path is [[plugin-pure-renderer]]. Atomic application
+snapshot publication establishes render demand. The host selects a pinned
+revision, concrete geometry, explicit configuration, and target time without
+entering the actor mailbox or waiting for actor/worker turns to finish.
 
-There is at most one running pure invocation and one overwriteable latest
-request per facet. A newer dirty or geometry revision replaces pending work.
-Returned work is validated only if its captured tuple is still current;
-otherwise it is discarded and the newest feasible request may start.
+There is at most one running invocation and one replaceable pending demand per
+facet, with at most one invocation per predicted presentation opportunity.
+New publication feeds the next invocation; it does not automatically invalidate
+an older coherent result. Desired geometry is coalesced separately from a pinned
+composition candidate so sustained input cannot starve every render attempt.
+Generation and candidate validity are checked at acceptance and commit.
 
-A facet runs at most once per predicted presentation opportunity. Interest
-raised by rendering targets a later opportunity rather than recursively
-re-entering the export. Lifecycle stop and generation failure outrank rendering;
-bounded render priority does not remove ordinary actor and worker progress.
+Render output includes immutable interaction data for its concrete layout.
+The host commits geometry, graphics, and interaction identity together. Input
+interpretation is bounded host-priority work against the frame associated with
+input admission, returning ordered semantic actor events and explicit interaction
+sequence state. It does not wait for another render or reconstruct actor layout.
 
-Pure execution is a synchronous phase on the actor executor, never on Winit.
-It is exclusive with actor and worker execution for that generation and reads
-the instance's live state without copying. Graphics-ready output may join the
-next eligible redraw before its predicted target when doing so reduces latency
-without crossing its captured geometry revision. The scheduler does not hold
-ready resize output merely to preserve a later animation cadence.
+Both facets execute away from Winit/Smithay under bounded scheduling and import
+contracts. Publication, interpretation, rendering, and preparation have distinct
+budgets and diagnostics. Continuous animation preserves peer and ordinary-work
+progress. A missed exact resize cohort repeats the previous complete revision;
+input continues to use that revision. Ready work may join an earlier eligible
+redraw without violating its captured geometry or explicit time semantics.
 
-For exact UI panes, a composition candidate containing geometry revision N is
-released only after every required pure output for N is ready. Missing the
-cutoff repeats the previous complete revision instead of projecting stale pane
-content. This global geometry cohort is distinct from atomicity among panes
-owned by one actor.
+The hint/token sections below describe the asynchronous compatibility path.
+They do not impose mailbox-watermark draining or actor-turn boundaries on the
+snapshot facets. Both paths share presentation prediction and graphics recovery.
 
 ## Goals
 
@@ -303,8 +301,9 @@ The client has these execution domains:
    submission, and presentation. Its callbacks perform bounded in-memory work
    and never run plugin code or wait for an actor, transport, file, process, or
    cleanup task.
-2. **Presentation actors.** A dedicated bounded executor runs client-local
-   actors. Render hints and input-caused actor turns carry deadlines and cannot
+2. **Presentation actors and facets.** Bounded execution domains run client-local
+   actors and host-invoked render/input facets. Facet admission and execution
+   remain independent of busy actor/worker calls under [[plugin-pure-renderer]]. Render hints and input-caused actor turns carry deadlines and cannot
    wait behind unrelated backend or bulk work. One actor generation still runs
    at most one turn at a time, and Wasmtime yield points enforce peer progress.
 3. **Graphics preparation.** Bounded workers perform parallelizable text,

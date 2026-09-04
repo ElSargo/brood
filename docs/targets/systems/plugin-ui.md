@@ -2,7 +2,7 @@
 status: target
 type: system
 authority: product
-last-reviewed: 2026-09-02
+last-reviewed: 2026-09-05
 ---
 
 # Plugin UI And Pane Rendering
@@ -26,7 +26,7 @@ The presentation client owns:
 - final clipping, composition, scheduling, and renderer recovery;
 - projection of optional accessibility metadata onto platform APIs.
 
-The plugin actor and its SDK own:
+The plugin actor, facets, and SDK own:
 
 - pane-local application and UI state;
 - components, layout, styling, themes, and widget identity;
@@ -78,19 +78,30 @@ Client -> Actor: PaneResized { optional resize epoch } / PaneFocused / PaneHidde
 Client -> Actor: Pointer / Key / Text / Ime
 Client -> Actor: RenderHint { token, target time, deadline, relevant panes, watermark }
 Actor -> Client: RequestRender / SetRenderSubscription
-Actor -> Client: PublishRenderState / RequestRender
+Actor -> Client: PublishImmutableRenderView
+Client -> RenderFacet: Render { pinned view, geometry, time, configuration }
+RenderFacet -> Client: DrawPackets + InteractionSnapshot
+Client -> InputFacet: Interpret { input, committed interaction snapshot, sequence state }
+InputFacet -> Client: SemanticEvents + NextSequenceState + PermittedHostRequests
+Client -> Actor: SemanticEvents { input sequence, source revisions }
 Actor -> Client: FinishActorFrame { token, changed pane draw packets } (asynchronous path)
 Actor -> Client: ReusePaneContent { pane, resize epoch }
 Actor -> Client: CommandRequest / Status
 ```
 
-The actor returns from each dispatch without waiting for I/O, a worker, or GPU
-execution. It may delegate unrelated work and request rendering when a
-completion arrives. On the pure path, the host invokes a reserved render phase
-in the same actor instance with its live state and exact current geometry. On
-the asynchronous path, the render hint is actor-scoped and the actor atomically
-finishes all changed owned panes in one token-bearing batch. The complete pacing
-and token lifecycle is defined by [[render-scheduling]].
+The actor returns from each dispatch without waiting for I/O, workers, or GPU
+execution. On the preferred path it publishes an immutable application render
+view. The host calls a plugin render facet with that view and concrete geometry;
+the result pairs draw packets with immutable interaction data. At input admission
+the host pins the committed frame identity and calls the input facet, which
+returns semantic actor events, next interaction-sequence state, and permitted
+host requests. The actor does not reconstruct layout to decode coordinates.
+The complete publication and input contract is [[plugin-pure-renderer]].
+
+Raw pane input and render hints in the lifecycle sketch apply to the asynchronous
+compatibility path. For that path the actor finishes changed panes in one
+token-bearing batch. The following resize-epoch mechanism describes that path;
+the preferred path uses exact candidate geometry and paired interaction commits.
 
 A resize-epoch-tagged packet is staged rather than replacing the visible pane
 immediately. When a synchronized layout waits for that pane, only a packet or
@@ -109,8 +120,9 @@ layout handles. The session actor, not the presentation actor, owns the shell.
 ## Input And Text Editing
 
 The client converts platform events into a stable pane-local event model and
-owns focus between panes and client chrome. Inside the pane, the SDK decides
-which component is hovered, pressed, focused, scrolled, or edited.
+owns focus between panes and client chrome. Inside the pane, plugin input code decides which component is hovered, pressed,
+focused, scrolled, or edited using retained frame layout. Gesture/capture state
+is explicit and survives frames; application edits are reduced by the actor.
 
 Keyboard events use stable semantic names for navigation, editing, and function
 keys. Modifier bits are Ctrl=1, Alt=2, Shift=4, and Super=8 across key and
@@ -148,9 +160,10 @@ incompatible geometry and accessibility metadata.
 
 A session-switcher SDK may implement a list, buttons, query editor, selection,
 and fuzzy matching entirely in guest code. The host provides session events,
-command capabilities, pane input, canvas rendering, and text layout. A button
-click becomes a pane-local pointer event interpreted by the SDK, followed by a
-normal command request and render request.
+command capabilities, pane input, canvas rendering, and text layout. A button click is interpreted by the plugin input facet against the committed
+interaction snapshot. It yields a stable semantic action for the actor, which
+validates current state and publishes any resulting visual update. A discarded
+render cannot change which button the user clicked.
 
 The client never receives a `Button` node or preserves a host widget instance.
 

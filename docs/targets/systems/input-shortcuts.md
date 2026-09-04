@@ -2,7 +2,7 @@
 status: target
 type: system
 authority: product
-last-reviewed: 2026-08-09
+last-reviewed: 2026-09-05
 ---
 
 # Input And Keyboard Shortcuts
@@ -269,6 +269,16 @@ Input diagnostics should separate client keymap behavior from policy provider an
 - consumed, forwarded, and transformed key counts
 - messages emitted from key policy provider results
 - lease-authorized hosted-application forwarding and backend rejection
+
+## Pane Interaction Facets
+
+Global key policy retains its existing scope and precedence. After host routing,
+the preferred plugin-pane path interprets input through a bounded host-invoked
+facet against the interaction snapshot associated with the committed frame.
+It returns semantic actor events, explicit gesture state, and narrowly allowed
+host requests. This shares the host-invoked principle of key policy without
+changing global shortcut precedence or introducing a host widget model.
+See [[plugin-pure-renderer]] for ordering, revision retention, and cancellation.
 
 Related:
 

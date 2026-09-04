@@ -40,3 +40,13 @@ option rather than a demonstrated performance necessity. The current ordinary
 resize path also permits target geometry to present before the actor token
 covering that exact event watermark; optimizing drawing alone cannot turn
 that non-atomic relationship into a guarantee.
+
+## Selected Direction After Architecture Review
+
+The current target [[../targets/systems/plugin-pure-renderer]] selects immutable
+application publication, host-invoked render/input facets, and exact paired
+geometry/content/interaction commits. This addresses the policy question above
+without selecting host-owned widgets or whole-pane projection. The original
+measurements remain evidence; implementation and responsiveness are unproven.
+A 0.25 physical-pixel committed-geometry oracle must be accompanied by explicit
+latency and frame-repetition budgets so stale geometry cannot pass indefinitely.

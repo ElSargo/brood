@@ -5,7 +5,7 @@ security-boundary: mixed
 runtime-boundary: process-and-network
 wire-format: not-frozen
 authority: product
-last-reviewed: 2026-08-22
+last-reviewed: 2026-09-05
 ---
 
 # UI Concurrency
@@ -183,3 +183,12 @@ The system must demonstrate these invariants:
 - a mutation receipt and its authoritative publication converge regardless of
   arrival order.
 
+
+## Host-Invoked Presentation Facets
+
+Render and pane-input facets consume immutable revisioned inputs under
+[[plugin-pure-renderer]]. They run outside platform event loops and must remain
+invocable while application actors/workers are busy. They do not read mutable
+actor state or require global worker suspension. Ordered interpretation updates
+opaque sequence state and admits semantic actor events atomically. Snapshot
+storage and executor isolation must be demonstrated before choosing the ABI.

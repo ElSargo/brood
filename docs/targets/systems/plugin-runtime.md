@@ -2,7 +2,7 @@
 status: target
 type: system
 authority: product
-last-reviewed: 2026-09-02
+last-reviewed: 2026-09-05
 ---
 
 # Plugin Runtime
@@ -23,7 +23,8 @@ The complete model has four execution roles:
 | Actor | Public identity, mailbox, state, and lifecycle | Only while dormant between events | Own address space |
 | Worker | Private concurrent work inside an actor | Yes; only that worker suspends | Shares its actor's memory |
 | Policy provider | Immediate bounded host decision | No | Reads immutable published state |
-| Render facet | Host-timed conversion of live actor state and exact pane parameters into graphics | No | Exclusive phase in its actor instance |
+| Input facet | Interpret committed layout and input into semantic actor events | No | Host-invoked facet |
+| Render facet | Host-timed conversion of immutable published state and exact pane parameters into graphics | No | Host-invoked facet |
 
 The detailed I/O and resource protocol is specified in
 [[plugin-io-and-resources]].
@@ -205,30 +206,28 @@ cancellation or peer-scheduling latency.
 Use another actor when work needs an independent address, memory space, failure
 domain, or lifecycle.
 
-## Render Facets
+## Render And Input Facets
 
-A presentation actor may expose an optional host-driven render facet as defined
-by [[plugin-pure-renderer]]. The presentation client invokes that export in the
-actor's existing instance with exact host-owned pane geometry. The facet has no
-mailbox, public address, workers, I/O, commands, publications, or independent
-product lifecycle.
+Presentation plugins expose host-invoked render and input facets as defined in
+[[plugin-pure-renderer]]. Actors atomically publish immutable render views.
+The host invokes rendering with a pinned view, concrete geometry, and explicit
+time/configuration. The result pairs canvas output with an immutable interaction
+snapshot. Input interpretation uses the committed frame's interaction snapshot
+and explicit sequence state, returning semantic events for ordinary actor
+reduction and bounded host requests.
 
-The host waits until an actor dispatch has returned and worker execution is
-suspended at a host-controlled safe boundary, then runs the render phase
-exclusively before ordinary mailbox work resumes. An epoch yield in the middle
-of a guest handler is not reentrant and remains the same active turn. Rendering
-reads live actor state without serialization or copying. Render requests are
-host-priority work at a safe turn boundary, not messages inserted into the
-actor's FIFO.
+Facets do not read live mutable actor/worker state. They must remain invocable
+without waiting for actor dispatch to return or freezing arbitrary workers.
+Publication storage, instance placement, and isolation must be proven before
+ABI selection; shared memory alone does not establish immutability or execution
+independence. Existing actor-private shared-memory workers are not removed by
+this design, but may not mutate published render views.
 
-The host masks effectful imports during the phase, while internal semantic
-purity remains a trusted plugin contract. Cooperative guest yield preserves
-peer progress but does not let the same actor process another event
-concurrently.
-Hard interruption cannot restore same-instance state and therefore belongs to
-generation failure or teardown, not normal latest-wins rendering. Stopping or
-replacing the generation destroys its pending requests and accepted-generation
-outputs with the rest of the actor.
+The host restricts facet imports and owns scheduling, revision leases, event
+admission, and generation cancellation. Plugin code owns layout and interaction
+semantics. Facets have no independent mailbox or product lifecycle. Their
+failure/recreation scope depends on the selected runtime isolation mechanism;
+trapped execution is not assumed to roll back safely.
 
 ## Workers
 
@@ -323,8 +322,9 @@ diagnostic facilities available to other plugins.
 The session actor parses output in a worker and publishes revisioned snapshots.
 It coalesces a short burst of PTY reads before publishing and chunks a snapshot
 to stay below mailbox limits; it does not forward one actor message per native
-read. The presentation actor assembles a complete revision, supersedes stale
-render work, and emits a retained canvas packet. Input dispatch only enqueues
+read. The presentation actor assembles a complete revision and publishes an immutable
+render view. The host-invoked facet emits concrete canvas packets and interaction
+data; input interpretation returns semantic events to the actor. Input dispatch only enqueues
 bounded writes or work and never waits for the PTY or renderer.
 
 Terminal escape handling, the screen grid, scrollback, selection, and

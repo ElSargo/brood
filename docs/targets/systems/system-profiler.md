@@ -97,3 +97,13 @@ The primary optimization loop selects the largest stage contribution among
 the worst completed flows, changes one scheduling or implementation cause,
 and repeats the same real workload. It does not optimize an average at the
 expense of p99.9, actor progress, correctness, or idle behavior.
+
+## Snapshot And Interaction Correlation
+
+Trace snapshot construction separately from atomic publication and acquisition.
+Join render tokens to exact published application, geometry, interaction, and
+configuration revisions. Join input admission and interpretation to the committed
+frame used for routing, then to semantic event admission and actor reduction.
+Report commit versus confirmed presentation honestly, retained snapshot bytes,
+queue bounds, cancellation, and lost instrumentation. The contract is
+[[plugin-pure-renderer]]; actor mailbox latency is not facet execution latency.

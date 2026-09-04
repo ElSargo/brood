@@ -2,7 +2,7 @@
 status: target
 type: system
 authority: product
-last-reviewed: 2026-09-02
+last-reviewed: 2026-09-05
 ---
 
 # Plugin Graphics
@@ -45,8 +45,9 @@ commands. The host sees those commands, not the component that produced them.
 ## Draw Packets
 
 A **draw packet** is a bounded, versioned sequence of canvas commands describing
-the latest visual state of one pane. Actors submit changed pane packets as one
-atomic actor-frame batch. The stable Component Model API is conceptually:
+the latest visual state of one pane. Pure facets return changed packets paired with interaction snapshots under
+[[plugin-pure-renderer]]. The asynchronous path submits changed pane packets as
+one atomic actor-frame batch; the submission API below describes that path. The stable Component Model API is conceptually:
 
 ```text
 finish_actor_frame(render_token, [{ pane, optional_resize_epoch, optional_state_watermark, packet_bytes }])
@@ -158,9 +159,11 @@ Filled and clipped paths use the canvas-standard nonzero winding rule.
 Coordinates are pane-local logical units. The host supplies pane size and scale
 events, clips every packet to the pane content area, and maps logical drawing to
 the physical target. Each retained canvas target has the physical extent of its
-accepted pane rectangle, not the extent of the presentation window. A layout
-commit or output-scale change replays the retained packet into that target and
-delivers the new pane-local logical size to the actor. Composition may translate
+accepted pane rectangle, not the extent of the presentation window. For the asynchronous path, a layout commit or output-scale change replays the
+retained packet into that target and delivers the new pane-local logical size
+to the actor. Exact pure panes instead require output for the selected geometry
+before commit, following [[plugin-pure-renderer]]; replay alone does not prove
+that fixed UI elements were laid out correctly for a new extent. Composition may translate
 and clip the result, but does not independently stretch its axes to fit a pane.
 
 The base profile defines one color and alpha convention so SDKs do not branch on
@@ -242,8 +245,10 @@ pending replacement.
 
 Resource creation copies the source data needed by the host. Updating a
 resource creates a new immutable revision or handle; previously accepted packets
-continue to see the version they retained. The actor explicitly drops obsolete
-handles after submitting the replacement packet. A handle still referenced by
+continue to see the version they retained. On the asynchronous path the actor explicitly drops obsolete
+handles after submitting the replacement packet. Pure facets use invocation
+leases and bounded cache retirement as specified in [[plugin-pure-renderer]],
+without requiring future actor input for cleanup. A handle still referenced by
 an accepted packet cannot be dropped. Ending the owning actor generation drops
 all of its resources without forcing a GPU wait: the client releases internal
 objects after accepted packets and in-flight rendering stop referencing them.
@@ -315,11 +320,16 @@ list(...)       -> guest layout + clips + rows + input mapping
 editor(...)     -> guest document state + text layouts + selection drawing
 ```
 
-The presentation client delivers pane resize, focus, pointer, keyboard, text,
-IME, visibility, and actor-scoped render hints. The actor or SDK maps pane-local
-input onto its own component state, requests rendering, and finishes the changed
-pane set when the hint arrives. Brood does not retain a component tree, patch
-widget nodes, preserve widget identity, or translate backend widget events.
+On the preferred snapshot path, the host invokes plugin rendering with a pinned
+application view and concrete geometry. SDK components emit concrete graphics
+plus plugin-owned immutable interaction data. Both commit together. Plugin input
+interpretation resolves frame-associated events into semantic actor messages;
+Brood retains opaque interaction state but no widget tree. Layout logic never
+travels inside draw commands for deferred host evaluation.
+
+The asynchronous compatibility path continues to deliver pane resize, focus,
+pointer, keyboard, text, IME, visibility, and actor-scoped render hints directly
+to the actor. Its SDK maps input and submits changed packets through actor frames.
 
 Accessibility is orthogonal to component implementation. A later or optional
 semantic channel may describe roles, bounds, labels, values, and actions for
@@ -335,8 +345,9 @@ happen on the client renderer's normal frame path.
 
 Static panes are redrawn from their retained packet only when damaged, exposed,
 resized, or recomposed. A pure-render actor expresses render interest; the host
-invokes its render facet over live actor state with the target time and exact
-current geometry. An asynchronous actor instead receives a
+invokes its render facet over a pinned immutable published view with explicit
+target time and exact candidate geometry. Its interaction snapshot commits with
+the resulting graphics and is retained for frame-correct input interpretation. An asynchronous actor instead receives a
 render hint, samples its visual state, and returns the token with its replacement
 packet. The presentation client traces either result through preparation,
 composition, and presentation. Hidden panes do not receive an unbounded render

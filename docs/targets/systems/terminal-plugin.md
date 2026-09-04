@@ -2,7 +2,7 @@
 status: target
 type: system
 authority: product
-last-reviewed: 2026-07-28
+last-reviewed: 2026-09-05
 ---
 
 # First-Party Terminal Plugin
@@ -132,6 +132,17 @@ metrics.
 
 Implementation evidence is in [[../../progress/terminal-plugin]]. Unresolved
 design-level mismatches are in [[../../frictions/terminal-plugin]].
+
+## Snapshot Presentation
+
+The preferred presentation path publishes immutable terminal render views and
+uses host-invoked rendering at concrete geometry. Unchanged rows may be retained
+across revisions. Rendering also produces interaction data for text positions
+and selection; input interpretation uses the committed frame and explicit
+gesture state to send semantic events to the presentation actor. PTY parsing
+and backend worker ownership remain separate from this publication boundary.
+Grid/PTY resize requests are actor policy, not effects performed during pure
+rendering. See [[plugin-pure-renderer]].
 
 Related:
 
