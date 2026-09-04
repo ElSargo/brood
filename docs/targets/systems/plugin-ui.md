@@ -7,12 +7,12 @@ last-reviewed: 2026-09-02
 
 # Plugin UI And Pane Rendering
 
-Plugin UI is actor-owned application state rendered through the canvas packet
-contract in [[plugin-graphics]]. Resize-sensitive interactive panes preferably
-produce those packets through the host-driven [[plugin-pure-renderer]]; the
-asynchronous actor-frame path remains available. Rich components are SDK
-functions built from the canvas contract. The presentation client does not
-implement, validate, retain, or patch a plugin component tree.
+The selected ordinary plugin UI path is the host-managed semantic document
+model in [[gpui-presentation]]. Plugin application state remains actor-owned,
+while the GPUI adapter validates, retains, patches, lays out, and presents the
+component tree. The canvas packet contract in [[plugin-graphics]] and its
+host-driven [[plugin-pure-renderer]] remain supported for custom content and
+the terminal canvas.
 
 ## Ownership
 
@@ -21,6 +21,8 @@ The presentation client owns:
 - pane shells, tabs, borders, title bars, menus, overlays, and recovery UI;
 - pane placement, resize, focus, visibility, scale, and lifecycle events;
 - delivery of pane-local keyboard, pointer, touch, text, and IME input;
+- validation, reconciliation, transient state, hit testing, and rendering of
+  managed semantic documents;
 - validation and rendering of canvas draw packets;
 - native text shaping and platform font integration;
 - final clipping, composition, scheduling, and renderer recovery;
@@ -29,11 +31,11 @@ The presentation client owns:
 The plugin actor and its SDK own:
 
 - pane-local application and UI state;
-- components, layout, styling, themes, and widget identity;
-- widget hit testing and event dispatch;
-- text-editing behavior and document state;
+- stable semantic node identity and document revisions;
+- domain values, commands, and durable editor/document state;
+- semantic theme tokens and bounded style overrides;
 - packet encoding and submission;
-- optional semantic accessibility descriptions.
+- accessibility labels, roles, values, relationships, and commands.
 
 If an actor exits, the pane identity can remain host-owned. The client replaces
 plugin content with native recovery chrome such as restart, close, and logs
@@ -41,8 +43,7 @@ actions without needing to understand the failed UI's components.
 
 ## SDK Components
 
-Components are library code, not protocol entities. An SDK may expose functions
-such as:
+SDK component helpers construct stable protocol nodes such as:
 
 ```text
 column
@@ -56,16 +57,12 @@ virtual-list
 tooltip
 ```
 
-Those functions may use immediate-mode, retained, reactive, or application-
-specific guest-side internals. Their common output is canvas commands, image and
-text-layout references, plus optionally accessibility metadata. SDK text helpers
-call or cache the host `layout_text` service outside the packet and emit only
-`draw-text-layout` commands. No component kind, property schema, patch stream,
-native toolkit object, or widget event is part of the host ABI.
-
-This keeps SDK evolution independent from the runtime. Different SDKs may offer
-different component systems while producing compatible draw packets. Iced,
-GPUI, GTK, browser DOM types, or another toolkit must not become the plugin ABI.
+Their common output is a bounded semantic snapshot or atomic patch. The host
+maps that protocol to GPUI and returns semantic actions. SDK APIs may be
+immediate, retained, or reactive, but GPUI, GTK, browser DOM types, arbitrary
+host closures, and toolkit widget handles never become the plugin ABI. Canvas
+helpers remain separate and produce canvas resources for explicit canvas or
+terminal-view nodes.
 
 ## Pane Lifecycle
 
@@ -76,6 +73,8 @@ pane shell and routes lifecycle and pane-local input events to the actor:
 Client -> Actor: PaneCreated { pane, size, scale, capabilities }
 Client -> Actor: PaneResized { optional resize epoch } / PaneFocused / PaneHidden / PaneDestroyed
 Client -> Actor: Pointer / Key / Text / Ime
+Actor -> Client: PublishManagedUi { snapshot | atomic patch | remove pane }
+Client -> Actor: UiAction { document and interaction revisions }
 Client -> Actor: RenderHint { token, target time, deadline, relevant panes, watermark }
 Actor -> Client: RequestRender / SetRenderSubscription
 Actor -> Client: PublishRenderState / RequestRender
@@ -109,18 +108,21 @@ layout handles. The session actor, not the presentation actor, owns the shell.
 ## Input And Text Editing
 
 The client converts platform events into a stable pane-local event model and
-owns focus between panes and client chrome. Inside the pane, the SDK decides
-which component is hovered, pressed, focused, scrolled, or edited.
+owns pane and managed-node focus. GPUI owns managed hover, press, scrolling,
+selection, composition, pointer capture, and other transient interaction state;
+the actor receives semantic actions. Canvas nodes continue to receive
+normalized pane-local input for plugin-defined hit testing.
 
 Keyboard events use stable semantic names for navigation, editing, and function
 keys. Modifier bits are Ctrl=1, Alt=2, Shift=4, and Super=8 across key and
 pointer events. Printable insertion uses text events; a plugin must not derive
 locale-dependent text from the physical scancode.
 
-The client bridges platform text and IME input but does not own the plugin's
-editor or text-field state. The SDK combines those events with native text
-measurement and hit-testing services from [[plugin-graphics]] to implement
-selection, carets, navigation, and drawing.
+The client implements native text input, IME, clipboard, selection, carets, and
+navigation for managed fields according to their controlled, host-transient, or
+hybrid state mode. Durable document state remains actor-owned. Canvas editors
+may still combine pane events with native text services from
+[[plugin-graphics]].
 
 ## Native Chrome
 
@@ -134,39 +136,35 @@ a full-pane draw packet without a separate presentation role.
 
 ## Accessibility
 
-Pixels and canvas commands do not preserve component semantics. An SDK may
-therefore publish a companion accessibility description containing stable IDs,
-roles, bounds, labels, values, states, and actions. The client validates and
-projects that description to the platform accessibility adapter.
-
-This semantic description is not a component tree or rendering input. It does
-not prescribe SDK layout, styling, state ownership, or widget implementation.
-Visual and semantic updates use explicit revisions so the client does not pair
-incompatible geometry and accessibility metadata.
+Managed nodes carry stable accessibility roles, labels, values, relationships,
+states, and commands in the same revisioned document used for rendering. The
+client validates and projects this tree to the platform adapter. Canvas nodes
+may publish a bounded companion semantic subtree when pixels alone cannot
+express their meaning.
 
 ## Example
 
-A session-switcher SDK may implement a list, buttons, query editor, selection,
-and fuzzy matching entirely in guest code. The host provides session events,
-command capabilities, pane input, canvas rendering, and text layout. A button
-click becomes a pane-local pointer event interpreted by the SDK, followed by a
-normal command request and render request.
-
-The client never receives a `Button` node or preserves a host widget instance.
+A session-switcher actor owns its query and fuzzy-matched session model and
+publishes search-field, virtual-list, selectable-row, and button nodes. GPUI
+handles editing and interaction locally; a selection produces a revisioned
+semantic action that the actor reduces into a normal session command and later
+document patch.
 
 ## Advanced Drawing
 
-The base UI path uses canvas packets. Future applications that need custom
-geometry, user shaders, or GPU-style resources may use the separate
+The base UI path uses managed semantic documents. Applications that need custom
+geometry or GPU-style resources use canvas nodes and, where necessary, the
+separate
 [[plugin-advanced-graphics]] protocol. Advanced graphics is an escape hatch, not
 the substrate that every SDK component must encode against.
 
 ## Validation And Diagnostics
 
-The client validates packet bounds, resource ownership, pane authority, input
-revisions, and optional semantic metadata. Diagnostics report rejected or
-superseded UI updates, actor latency, frame/update counters, text failures,
-resource use, and recovery state.
+The client validates document/patch bounds, node identity and depth, semantic
+relationships, resource ownership, pane authority, input revisions, and canvas
+packets. Diagnostics report rejected, stale, or superseded publications and
+actions, actor latency, frame/update counters, text failures, resource use, and
+recovery state.
 
 For input-driven panes, diagnostics correlate the first admitted key event with
 the first subsequently refreshed plugin scene that is actually presented. This

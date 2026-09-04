@@ -211,6 +211,15 @@ impl Guest for ExampleActor {
         }
         Ok(bytes)
     }
+
+    fn render(
+        _request: exports::brood::plugin::actor::PureRenderRequest,
+    ) -> Result<
+        exports::brood::plugin::actor::PureRenderResult,
+        exports::brood::plugin::actor::PureRenderError,
+    > {
+        Err(exports::brood::plugin::actor::PureRenderError::Unsupported)
+    }
 }
 
 fn parse_rube_message(bytes: &[u8]) -> Option<(u64, u64, u64, u64)> {

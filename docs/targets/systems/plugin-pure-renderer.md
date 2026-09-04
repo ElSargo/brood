@@ -7,22 +7,24 @@ last-reviewed: 2026-09-04
 
 # Pure Renderer End-State Specification
 
-Interactive plugin panes may expose a host-driven **render facet**. The facet
+Custom-canvas plugin panes may expose a host-driven **render facet**. The facet
 reads its actor's live state and turns exact host-owned pane parameters into a
 bounded canvas draw packet. The presentation client chooses when to invoke it
 and either commits its result with the matching geometry or discards it.
 Rendering remains plugin-authored; Brood does not receive or retain a widget
 tree.
 
-This is the preferred path for resize-sensitive plugin UI. The asynchronous
-actor-frame path in [[plugin-graphics]] remains available for compatibility,
-background rendering, and workloads which cannot use the pure contract.
+This is the preferred escape hatch for resize-sensitive custom graphics under
+[[gpui-presentation]]. Managed semantic documents are the default for ordinary
+plugin UI. The asynchronous actor-frame path in [[plugin-graphics]] remains
+available for compatibility, background rendering, and workloads which cannot
+use the pure contract.
 
 ## Status And Scope
 
-This page is the normative end state for the implementation path Brood is
-pursuing now. “Must”, “must not”, and “may” describe product requirements even
-where the current code has not implemented them.
+This page is the normative contract for the custom-canvas path retained by the
+GPUI presentation target. “Must”, “must not”, and “may” describe product
+requirements even where the current code has not implemented them.
 
 The specification covers client-local Component Model presentation actors,
 their pane-local canvas output, host-driven rendering, and the composition

@@ -12,6 +12,10 @@ use brood_plugin_sdk::{
     input::BUTTON_PRIMARY as LEFT_BUTTON,
     runtime::sleep,
     text::{truncate, truncate_to_width},
+    ui::{
+        self, MANAGED_UI_PROTOCOL_VERSION, UiAccessibility, UiAccessibilityRole, UiColorToken,
+        UiDocument, UiNode, UiNodeKind, UiPublication, UiStateMode, UiStyle, UiTextRole,
+    },
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -292,6 +296,7 @@ struct PickerState {
     spinner_worker: Option<SpinnerLease>,
     next_spinner_worker: u64,
     scroll_accumulator: f32,
+    ui_revision: u64,
 }
 
 impl PickerState {
@@ -312,6 +317,7 @@ impl PickerState {
             spinner_worker: None,
             next_spinner_worker: 1,
             scroll_accumulator: 0.0,
+            ui_revision: 0,
         }
     }
 
@@ -386,8 +392,9 @@ static STATE: Mutex<PickerState> = Mutex::new(PickerState::new());
 struct PickerActor;
 
 impl Guest for PickerActor {
+    fn render(_request: brood_plugin_sdk::exports::brood::plugin::actor::PureRenderRequest) -> Result<brood_plugin_sdk::exports::brood::plugin::actor::PureRenderResult, brood_plugin_sdk::exports::brood::plugin::actor::PureRenderError> { Err(brood_plugin_sdk::exports::brood::plugin::actor::PureRenderError::Unsupported) }
     fn dispatch(event: Event) -> Vec<ActorCommand> {
-        match event {
+        let mut commands = match event {
             Event::Lifecycle(LifecycleEvent::Start(_)) => {
                 vec![ActorCommand::LifecycleComplete(Ok(()))]
             }
@@ -398,7 +405,14 @@ impl Guest for PickerActor {
             Event::Presentation(event) => handle_presentation(event),
             Event::Worker(event) => handle_worker(event),
             _ => Vec::new(),
+        };
+        if let Ok(mut state) = STATE.lock()
+            && state.pane != 0
+            && let Some(command) = managed_picker_document(&mut state)
+        {
+            commands.push(command);
         }
+        commands
     }
 
     async fn worker_run(_worker: u64, _payload: Vec<u8>) -> Result<Vec<u8>, String> {
@@ -408,6 +422,11 @@ impl Guest for PickerActor {
 }
 
 fn handle_message(sender: &str, bytes: &[u8]) -> Vec<ActorCommand> {
+    if sender == "managed-ui-host"
+        && let Ok(action) = serde_json::from_slice::<ui::UiAction>(bytes)
+    {
+        return handle_managed_action(action);
+    }
     let message = match serde_json::from_slice::<PickerMessage>(bytes) {
         Ok(message) => message,
         Err(error) => {
@@ -454,6 +473,205 @@ fn handle_message(sender: &str, bytes: &[u8]) -> Vec<ActorCommand> {
         }
         PickerMessage::Close => Vec::new(),
     }
+}
+
+fn handle_managed_action(action: ui::UiAction) -> Vec<ActorCommand> {
+    let Ok(mut state) = STATE.lock() else {
+        return Vec::new();
+    };
+    if action.pane != state.pane {
+        return Vec::new();
+    }
+    match (action.node, action.value) {
+        (2, ui::UiActionValue::Text(query)) => {
+            if let Some(active) = state.active.as_mut() {
+                active.query_cursor = query.chars().count();
+                active.query = query;
+                active.ensure_selection();
+            }
+            Vec::new()
+        }
+        (2, ui::UiActionValue::Submit) => select_active(&mut state),
+        (3, ui::UiActionValue::Activate) => finish_active(&mut state, false),
+        (node, ui::UiActionValue::Activate) if node >= 1_000 => {
+            select_picker_target(&mut state, (node - 1_000) as usize)
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn managed_picker_document(state: &mut PickerState) -> Option<ActorCommand> {
+    state.ui_revision = state.ui_revision.checked_add(1)?;
+    let mut children = Vec::new();
+    if let Some(active) = state.active.as_ref() {
+        children.push(UiNode {
+            id: 10,
+            kind: UiNodeKind::Text {
+                text: active.title.clone(),
+                role: UiTextRole::Heading,
+            },
+            style: UiStyle::default(),
+            accessibility: UiAccessibility::default(),
+            optional: false,
+            interaction_revision: 0,
+            children: Vec::new(),
+        });
+        children.push(UiNode {
+            id: 2,
+            kind: UiNodeKind::SearchField {
+                value: active.query.clone(),
+                placeholder: active.placeholder.clone(),
+                state_mode: UiStateMode::Hybrid,
+            },
+            style: UiStyle {
+                height: Some(36.0),
+                padding: ui::UiInsets {
+                    top: 8.0,
+                    right: 10.0,
+                    bottom: 8.0,
+                    left: 10.0,
+                },
+                background: Some(UiColorToken::Surface),
+                ..UiStyle::default()
+            },
+            accessibility: UiAccessibility {
+                role: UiAccessibilityRole::SearchBox,
+                label: Some("Filter choices".to_string()),
+                ..UiAccessibility::default()
+            },
+            optional: false,
+            interaction_revision: 0,
+            children: Vec::new(),
+        });
+        let filtered = active.filtered_indices();
+        let rows = filtered
+            .iter()
+            .skip(active.scroll)
+            .take(state.visible_rows())
+            .map(|index| {
+                let entry = &active.items[*index];
+                UiNode {
+                    id: 1_000 + entry.index as u64,
+                    kind: UiNodeKind::SelectableRow {
+                        selected: active.selected == Some(entry.index),
+                    },
+                    style: UiStyle {
+                        min_height: Some(30.0),
+                        padding: ui::UiInsets {
+                            top: 5.0,
+                            right: 8.0,
+                            bottom: 5.0,
+                            left: 8.0,
+                        },
+                        ..UiStyle::default()
+                    },
+                    accessibility: UiAccessibility {
+                        role: UiAccessibilityRole::ListItem,
+                        label: Some(entry.label.clone()),
+                        description: entry.detail.clone(),
+                        selected: Some(active.selected == Some(entry.index)),
+                        ..UiAccessibility::default()
+                    },
+                    optional: false,
+                    interaction_revision: 0,
+                    children: vec![UiNode {
+                        id: 100_000 + entry.index as u64,
+                        kind: UiNodeKind::Text {
+                            text: entry.label.clone(),
+                            role: UiTextRole::Body,
+                        },
+                        style: UiStyle::default(),
+                        accessibility: UiAccessibility::default(),
+                        optional: false,
+                        interaction_revision: 0,
+                        children: Vec::new(),
+                    }],
+                }
+            })
+            .collect();
+        children.push(UiNode {
+            id: 20,
+            kind: UiNodeKind::VirtualList {
+                item_count: filtered.len() as u64,
+                estimated_item_extent: 30.0,
+            },
+            style: UiStyle {
+                grow: 1.0,
+                ..UiStyle::default()
+            },
+            accessibility: UiAccessibility {
+                role: UiAccessibilityRole::List,
+                label: Some("Choices".to_string()),
+                ..UiAccessibility::default()
+            },
+            optional: false,
+            interaction_revision: 0,
+            children: rows,
+        });
+        if active.loading {
+            children.push(UiNode {
+                id: 30,
+                kind: UiNodeKind::Progress { value: None },
+                style: UiStyle::default(),
+                accessibility: UiAccessibility {
+                    role: UiAccessibilityRole::ProgressIndicator,
+                    label: Some(active.loading_label.clone()),
+                    ..UiAccessibility::default()
+                },
+                optional: false,
+                interaction_revision: 0,
+                children: Vec::new(),
+            });
+        }
+        children.push(UiNode {
+            id: 3,
+            kind: UiNodeKind::Button {
+                label: "Cancel".to_string(),
+            },
+            style: UiStyle::default(),
+            accessibility: UiAccessibility {
+                role: UiAccessibilityRole::Button,
+                label: Some("Cancel picker".to_string()),
+                ..UiAccessibility::default()
+            },
+            optional: false,
+            interaction_revision: 0,
+            children: Vec::new(),
+        });
+    }
+    ui::publish(UiPublication::Snapshot(Box::new(UiDocument {
+        protocol_version: MANAGED_UI_PROTOCOL_VERSION,
+        pane: state.pane,
+        document_revision: state.ui_revision,
+        root: UiNode {
+            id: 1,
+            kind: UiNodeKind::Dialog {
+                title: "Picker".to_string(),
+            },
+            style: UiStyle {
+                grow: 1.0,
+                gap: 8.0,
+                padding: ui::UiInsets {
+                    top: 14.0,
+                    right: 14.0,
+                    bottom: 14.0,
+                    left: 14.0,
+                },
+                background: Some(UiColorToken::Background),
+                foreground: Some(UiColorToken::Foreground),
+                ..UiStyle::default()
+            },
+            accessibility: UiAccessibility {
+                role: UiAccessibilityRole::Dialog,
+                label: Some("Picker".to_string()),
+                ..UiAccessibility::default()
+            },
+            optional: false,
+            interaction_revision: 0,
+            children,
+        },
+    })))
+    .ok()
 }
 
 fn create_picker(

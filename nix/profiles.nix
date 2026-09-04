@@ -157,6 +157,7 @@ let
     pkgs.passt
     pkgs.sway
     pkgs.speedcrunch
+    pkgs.tmux
     pkgs.vulkan-tools
     pkgs.wayland-scanner
     pkgs.wayland-protocols

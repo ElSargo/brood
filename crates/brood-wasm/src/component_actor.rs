@@ -46,8 +46,9 @@ use crate::lifecycle::wait_for_lifecycle_reply;
 use crate::lifecycle::{PluginLifecycleEvent, PluginStartReason, PluginStopReason};
 use crate::presentation::{
     ActorFrameDraw, FontIntent, FontStyle, FontWeight, PresentationError, PresentationEvent,
-    PresentationHost, RenderHint, RenderToken, SessionCommandRequest, SessionEvent,
-    SessionOperation, SessionSummary, TextLayoutOptions,
+    PresentationHost, PurePaneOutput, PureRenderError, PureRenderRequest, PureRenderResult,
+    RenderHint, RenderToken, SessionCommandRequest, SessionEvent, SessionOperation, SessionSummary,
+    TextLayoutOptions,
 };
 use crate::resource_limits::{
     GenerationByteBudget, GenerationBytePermit, GenerationStoreLimits, WasmResourceLimits,
@@ -619,12 +620,57 @@ struct ActorStore {
     limits: GenerationStoreLimits,
 }
 
+tokio::task_local! {
+    static PURE_RENDER_PHASE: ();
+}
+
+fn in_pure_render_phase() -> bool {
+    PURE_RENDER_PHASE.try_with(|()| ()).is_ok()
+}
+
 #[derive(Clone)]
 struct WorkerFilesystem {
     root: Arc<Dir>,
     writable: bool,
     max_bytes: usize,
     max_replace_bytes: usize,
+}
+
+#[allow(
+    clippy::unused_self,
+    reason = "render denial helpers intentionally share the ActorStore host-call vocabulary"
+)]
+impl ActorStore {
+    fn deny_render_runtime_io<T>(
+        &self,
+    ) -> Option<
+        wasmtime::Result<std::result::Result<T, bindings::brood::plugin::host::RuntimeIoError>>,
+    > {
+        in_pure_render_phase().then(|| {
+            Ok(Err(
+                bindings::brood::plugin::host::RuntimeIoError::NotPermitted,
+            ))
+        })
+    }
+
+    fn deny_render_notification<T>(
+        &self,
+    ) -> Option<
+        wasmtime::Result<std::result::Result<T, bindings::brood::plugin::host::NotificationError>>,
+    > {
+        in_pure_render_phase().then(|| {
+            Ok(Err(
+                bindings::brood::plugin::host::NotificationError::ActorStopped,
+            ))
+        })
+    }
+
+    fn deny_render_wait<T>(
+        &self,
+    ) -> Option<wasmtime::Result<std::result::Result<T, bindings::brood::plugin::host::WaitError>>>
+    {
+        in_pure_render_phase().then(|| Ok(Err(bindings::brood::plugin::host::WaitError::Cancelled)))
+    }
 }
 
 #[derive(Default)]
@@ -801,6 +847,11 @@ impl bindings::brood::plugin::host::Host for ActorStore {
         draws: Vec<bindings::brood::plugin::host::ActorFrameDraw>,
     ) -> wasmtime::Result<std::result::Result<u64, bindings::brood::plugin::host::GraphicsError>>
     {
+        if in_pure_render_phase() {
+            return Ok(Err(
+                bindings::brood::plugin::host::GraphicsError::Unavailable,
+            ));
+        }
         let token = RenderToken(token.opaque);
         let draws = draws
             .into_iter()
@@ -827,6 +878,11 @@ impl bindings::brood::plugin::host::Host for ActorStore {
         resize_epoch: u64,
     ) -> wasmtime::Result<std::result::Result<(), bindings::brood::plugin::host::GraphicsError>>
     {
+        if in_pure_render_phase() {
+            return Ok(Err(
+                bindings::brood::plugin::host::GraphicsError::Unavailable,
+            ));
+        }
         Ok(self
             .presentation
             .as_ref()
@@ -915,6 +971,11 @@ impl bindings::brood::plugin::host::Host for ActorStore {
         resource: u64,
     ) -> wasmtime::Result<std::result::Result<(), bindings::brood::plugin::host::GraphicsError>>
     {
+        if in_pure_render_phase() {
+            return Ok(Err(
+                bindings::brood::plugin::host::GraphicsError::Unavailable,
+            ));
+        }
         Ok(self
             .presentation
             .as_ref()
@@ -935,6 +996,9 @@ impl bindings::brood::plugin::host::Host for ActorStore {
             bindings::brood::plugin::host::RuntimeIoError,
         >,
     > {
+        if let Some(denied) = self.deny_render_runtime_io() {
+            return denied;
+        }
         Ok(self
             .runtime_io
             .spawn_process(&command, &arguments)
@@ -963,6 +1027,9 @@ impl bindings::brood::plugin::host::Host for ActorStore {
             bindings::brood::plugin::host::RuntimeIoError,
         >,
     > {
+        if let Some(denied) = self.deny_render_runtime_io() {
+            return denied;
+        }
         Ok(self
             .runtime_io
             .spawn_pty(
@@ -993,6 +1060,9 @@ impl bindings::brood::plugin::host::Host for ActorStore {
         cols: u16,
     ) -> wasmtime::Result<std::result::Result<(), bindings::brood::plugin::host::RuntimeIoError>>
     {
+        if let Some(denied) = self.deny_render_runtime_io() {
+            return denied;
+        }
         Ok(self
             .runtime_io
             .resize_pty(child, rows, cols)
@@ -1004,6 +1074,9 @@ impl bindings::brood::plugin::host::Host for ActorStore {
         handle: u64,
     ) -> wasmtime::Result<std::result::Result<u64, bindings::brood::plugin::host::RuntimeIoError>>
     {
+        if let Some(denied) = self.deny_render_runtime_io() {
+            return denied;
+        }
         Ok(self
             .runtime_io
             .stream(handle)
@@ -1021,6 +1094,9 @@ impl bindings::brood::plugin::host::Host for ActorStore {
             bindings::brood::plugin::host::RuntimeIoError,
         >,
     > {
+        if let Some(denied) = self.deny_render_runtime_io() {
+            return denied;
+        }
         Ok(self
             .runtime_io
             .stream(handle)
@@ -1043,6 +1119,9 @@ impl bindings::brood::plugin::host::Host for ActorStore {
         bytes: Vec<u8>,
     ) -> wasmtime::Result<std::result::Result<u32, bindings::brood::plugin::host::RuntimeIoError>>
     {
+        if let Some(denied) = self.deny_render_runtime_io() {
+            return denied;
+        }
         Ok(self
             .runtime_io
             .stream(handle)
@@ -1058,6 +1137,9 @@ impl bindings::brood::plugin::host::Host for ActorStore {
         handle: u64,
     ) -> wasmtime::Result<std::result::Result<(), bindings::brood::plugin::host::RuntimeIoError>>
     {
+        if let Some(denied) = self.deny_render_runtime_io() {
+            return denied;
+        }
         Ok(self
             .runtime_io
             .stream(handle)
@@ -1070,6 +1152,9 @@ impl bindings::brood::plugin::host::Host for ActorStore {
         child: u64,
     ) -> wasmtime::Result<std::result::Result<u64, bindings::brood::plugin::host::RuntimeIoError>>
     {
+        if let Some(denied) = self.deny_render_runtime_io() {
+            return denied;
+        }
         Ok(self
             .runtime_io
             .child(child)
@@ -1086,6 +1171,9 @@ impl bindings::brood::plugin::host::Host for ActorStore {
             bindings::brood::plugin::host::RuntimeIoError,
         >,
     > {
+        if let Some(denied) = self.deny_render_runtime_io() {
+            return denied;
+        }
         Ok(self
             .runtime_io
             .child(child)
@@ -1108,6 +1196,9 @@ impl bindings::brood::plugin::host::Host for ActorStore {
         delay_ms: u64,
     ) -> wasmtime::Result<std::result::Result<u64, bindings::brood::plugin::host::RuntimeIoError>>
     {
+        if let Some(denied) = self.deny_render_runtime_io() {
+            return denied;
+        }
         Ok(self
             .runtime_io
             .create_timer(Duration::from_millis(delay_ms))
@@ -1120,6 +1211,9 @@ impl bindings::brood::plugin::host::Host for ActorStore {
         timer: u64,
     ) -> wasmtime::Result<std::result::Result<u64, bindings::brood::plugin::host::RuntimeIoError>>
     {
+        if let Some(denied) = self.deny_render_runtime_io() {
+            return denied;
+        }
         Ok(self
             .runtime_io
             .timer(timer)
@@ -1136,6 +1230,9 @@ impl bindings::brood::plugin::host::Host for ActorStore {
             bindings::brood::plugin::host::RuntimeIoError,
         >,
     > {
+        if let Some(denied) = self.deny_render_runtime_io() {
+            return denied;
+        }
         Ok(self
             .runtime_io
             .timer(timer)
@@ -1157,6 +1254,11 @@ impl bindings::brood::plugin::host::Host for ActorStore {
             bindings::brood::plugin::host::FilesystemWatchError,
         >,
     > {
+        if in_pure_render_phase() {
+            return Ok(Err(
+                bindings::brood::plugin::host::FilesystemWatchError::NotPermitted,
+            ));
+        }
         Ok(self
             .filesystem_watches
             .create(Path::new(&path), recursive)
@@ -1175,6 +1277,11 @@ impl bindings::brood::plugin::host::Host for ActorStore {
         max_bytes: u64,
     ) -> wasmtime::Result<std::result::Result<u64, bindings::brood::plugin::host::SubmitError>>
     {
+        if in_pure_render_phase() {
+            return Ok(Err(
+                bindings::brood::plugin::host::SubmitError::NotPermitted,
+            ));
+        }
         let max_bytes = usize::try_from(max_bytes)
             .map_err(|_| wasmtime::Error::msg("completion read size does not fit usize"))?;
         Ok(self
@@ -1191,6 +1298,11 @@ impl bindings::brood::plugin::host::Host for ActorStore {
         bytes: Vec<u8>,
     ) -> wasmtime::Result<std::result::Result<u64, bindings::brood::plugin::host::SubmitError>>
     {
+        if in_pure_render_phase() {
+            return Ok(Err(
+                bindings::brood::plugin::host::SubmitError::NotPermitted,
+            ));
+        }
         Ok(self
             .completion_io
             .submit_write(path, offset, bytes)
@@ -1199,6 +1311,9 @@ impl bindings::brood::plugin::host::Host for ActorStore {
     }
 
     fn cancel(&mut self, operation: u64) -> wasmtime::Result<bool> {
+        if in_pure_render_phase() {
+            return Ok(false);
+        }
         Ok(self
             .completion_io
             .cancel(OperationId::new(self.completion_io.generation(), operation)))
@@ -1208,6 +1323,9 @@ impl bindings::brood::plugin::host::Host for ActorStore {
         &mut self,
     ) -> wasmtime::Result<std::result::Result<u64, bindings::brood::plugin::host::NotificationError>>
     {
+        if let Some(denied) = self.deny_render_notification() {
+            return denied;
+        }
         Ok(self
             .coordination
             .create_notification()
@@ -1220,6 +1338,9 @@ impl bindings::brood::plugin::host::Host for ActorStore {
         notification: u64,
     ) -> wasmtime::Result<std::result::Result<(), bindings::brood::plugin::host::NotificationError>>
     {
+        if let Some(denied) = self.deny_render_notification() {
+            return denied;
+        }
         Ok(self
             .coordination
             .drop_notification(NotificationId::from_raw(notification))
@@ -1232,6 +1353,9 @@ impl bindings::brood::plugin::host::Host for ActorStore {
         published_generation: u64,
     ) -> wasmtime::Result<std::result::Result<u64, bindings::brood::plugin::host::NotificationError>>
     {
+        if let Some(denied) = self.deny_render_notification() {
+            return denied;
+        }
         Ok(self
             .coordination
             .signal(NotificationId::from_raw(notification), published_generation)
@@ -1249,6 +1373,9 @@ impl bindings::brood::plugin::host::Host for ActorStore {
             bindings::brood::plugin::host::NotificationError,
         >,
     > {
+        if let Some(denied) = self.deny_render_notification() {
+            return denied;
+        }
         Ok(self
             .coordination
             .watch_actor(
@@ -1270,6 +1397,9 @@ impl bindings::brood::plugin::host::Host for ActorStore {
         notification: u64,
     ) -> wasmtime::Result<std::result::Result<bool, bindings::brood::plugin::host::NotificationError>>
     {
+        if let Some(denied) = self.deny_render_notification() {
+            return denied;
+        }
         Ok(self
             .coordination
             .unwatch_actor(NotificationId::from_raw(notification))
@@ -1281,6 +1411,9 @@ impl bindings::brood::plugin::host::Host for ActorStore {
         notification: u64,
         observed_generation: u64,
     ) -> wasmtime::Result<std::result::Result<u64, bindings::brood::plugin::host::WaitError>> {
+        if let Some(denied) = self.deny_render_wait() {
+            return denied;
+        }
         Ok(self
             .coordination
             .notification_pollable(NotificationId::from_raw(notification), observed_generation)
@@ -1292,6 +1425,9 @@ impl bindings::brood::plugin::host::Host for ActorStore {
         &mut self,
         pollable: u64,
     ) -> wasmtime::Result<std::result::Result<(), bindings::brood::plugin::host::WaitError>> {
+        if let Some(denied) = self.deny_render_wait() {
+            return denied;
+        }
         Ok(self
             .coordination
             .drop_pollable(PollableId::from_raw(pollable))
@@ -1307,6 +1443,9 @@ impl bindings::brood::plugin::host::Host for ActorStore {
             bindings::brood::plugin::host::WaitError,
         >,
     > {
+        if let Some(denied) = self.deny_render_wait() {
+            return denied;
+        }
         let pollables = pollables
             .into_iter()
             .map(PollableId::from_raw)
@@ -1326,6 +1465,11 @@ impl bindings::brood::plugin::host::HostFilesystemWatch for ActorStore {
     ) -> wasmtime::Result<
         std::result::Result<u64, bindings::brood::plugin::host::FilesystemWatchError>,
     > {
+        if in_pure_render_phase() {
+            return Ok(Err(
+                bindings::brood::plugin::host::FilesystemWatchError::NotPermitted,
+            ));
+        }
         Ok(self
             .filesystem_watches
             .notification(FilesystemWatchId::from_raw(u64::from(watch.rep())))
@@ -1342,6 +1486,11 @@ impl bindings::brood::plugin::host::HostFilesystemWatch for ActorStore {
             bindings::brood::plugin::host::FilesystemWatchError,
         >,
     > {
+        if in_pure_render_phase() {
+            return Ok(Err(
+                bindings::brood::plugin::host::FilesystemWatchError::NotPermitted,
+            ));
+        }
         Ok(self
             .filesystem_watches
             .read_typed(FilesystemWatchId::from_raw(u64::from(watch.rep())))
@@ -1361,6 +1510,11 @@ impl bindings::brood::plugin::host::HostFilesystemWatch for ActorStore {
         &mut self,
         watch: Resource<bindings::brood::plugin::host::FilesystemWatch>,
     ) -> wasmtime::Result<()> {
+        if in_pure_render_phase() {
+            return Err(wasmtime::Error::msg(
+                "filesystem watch resources cannot be dropped during pure rendering",
+            ));
+        }
         self.filesystem_watches
             .drop_watch(FilesystemWatchId::from_raw(u64::from(watch.rep())))
             .map_err(|error| wasmtime::Error::msg(error.to_string()))
@@ -1376,8 +1530,14 @@ impl bindings::brood::plugin::host::HostWithStore<ActorStore> for HasSelf<ActorS
             std::result::Result<(), bindings::brood::plugin::host::RuntimeIoError>,
         >,
     > + Send {
+        let render_phase = in_pure_render_phase();
         let runtime_io = accessor.with(|mut access| access.get().runtime_io.clone());
         async move {
+            if render_phase {
+                return Ok(Err(
+                    bindings::brood::plugin::host::RuntimeIoError::NotPermitted,
+                ));
+            }
             Ok(runtime_io
                 .drop_stream(handle)
                 .await
@@ -1393,8 +1553,14 @@ impl bindings::brood::plugin::host::HostWithStore<ActorStore> for HasSelf<ActorS
             std::result::Result<(), bindings::brood::plugin::host::RuntimeIoError>,
         >,
     > + Send {
+        let render_phase = in_pure_render_phase();
         let runtime_io = accessor.with(|mut access| access.get().runtime_io.clone());
         async move {
+            if render_phase {
+                return Ok(Err(
+                    bindings::brood::plugin::host::RuntimeIoError::NotPermitted,
+                ));
+            }
             Ok(runtime_io
                 .drop_child(child)
                 .await
@@ -1410,8 +1576,14 @@ impl bindings::brood::plugin::host::HostWithStore<ActorStore> for HasSelf<ActorS
             std::result::Result<(), bindings::brood::plugin::host::RuntimeIoError>,
         >,
     > + Send {
+        let render_phase = in_pure_render_phase();
         let runtime_io = accessor.with(|mut access| access.get().runtime_io.clone());
         async move {
+            if render_phase {
+                return Ok(Err(
+                    bindings::brood::plugin::host::RuntimeIoError::NotPermitted,
+                ));
+            }
             Ok(runtime_io
                 .drop_timer(timer)
                 .await
@@ -1427,9 +1599,15 @@ impl bindings::brood::plugin::host::HostWithStore<ActorStore> for HasSelf<ActorS
             std::result::Result<u64, bindings::brood::plugin::host::RuntimeIoError>,
         >,
     > + Send {
+        let render_phase = in_pure_render_phase();
         let current = current_component_worker(accessor);
         let runtime_io = accessor.with(|mut access| access.get().runtime_io.clone());
         async move {
+            if render_phase {
+                return Ok(Err(
+                    bindings::brood::plugin::host::RuntimeIoError::NotPermitted,
+                ));
+            }
             let (_worker, cancellation) = current?;
             if cancellation.is_requested() {
                 return Ok(Err(
@@ -1468,9 +1646,13 @@ impl bindings::brood::plugin::host::HostWithStore<ActorStore> for HasSelf<ActorS
             >,
         >,
     > + Send {
+        let render_phase = in_pure_render_phase();
         let current = current_component_worker(accessor);
         let coordination = accessor.with(|mut access| access.get().coordination.clone());
         async move {
+            if render_phase {
+                return Ok(Err(bindings::brood::plugin::host::WaitError::Cancelled));
+            }
             let (_worker, cancellation) = current?;
             let pollables = pollables
                 .into_iter()
@@ -1496,6 +1678,11 @@ impl bindings::brood::plugin::host::HostWithStore<ActorStore> for HasSelf<ActorS
     async fn worker_yield(
         accessor: &wasmtime::component::Accessor<ActorStore, Self>,
     ) -> wasmtime::Result<bool> {
+        if in_pure_render_phase() {
+            return Err(wasmtime::Error::msg(
+                "worker yielding is unavailable during pure rendering",
+            ));
+        }
         let (_worker, cancellation) = current_component_worker(accessor)?;
         tokio::task::yield_now().await;
         Ok(cancellation.is_requested())
@@ -1511,6 +1698,7 @@ impl bindings::brood::plugin::host::HostWithStore<ActorStore> for HasSelf<ActorS
             std::result::Result<Vec<u8>, bindings::brood::plugin::host::SubmitError>,
         >,
     > + Send {
+        let render_phase = in_pure_render_phase();
         let current = current_component_worker(accessor);
         let (filesystem, event_observer, blocking_io) = accessor.with(|mut access| {
             let store = access.get();
@@ -1521,6 +1709,11 @@ impl bindings::brood::plugin::host::HostWithStore<ActorStore> for HasSelf<ActorS
             )
         });
         async move {
+            if render_phase {
+                return Ok(Err(
+                    bindings::brood::plugin::host::SubmitError::NotPermitted,
+                ));
+            }
             let (_worker, cancellation) = current?;
             if cancellation.is_requested() {
                 return Ok(Err(bindings::brood::plugin::host::SubmitError::Cancelled));
@@ -1577,12 +1770,18 @@ impl bindings::brood::plugin::host::HostWithStore<ActorStore> for HasSelf<ActorS
             std::result::Result<Vec<u8>, bindings::brood::plugin::host::SubmitError>,
         >,
     > + Send {
+        let render_phase = in_pure_render_phase();
         let current = current_component_worker(accessor);
         let (filesystem, blocking_io) = accessor.with(|mut access| {
             let store = access.get();
             (store.worker_filesystem.clone(), store.blocking_io.clone())
         });
         async move {
+            if render_phase {
+                return Ok(Err(
+                    bindings::brood::plugin::host::SubmitError::NotPermitted,
+                ));
+            }
             let (_worker, cancellation) = current?;
             if cancellation.is_requested() {
                 return Ok(Err(bindings::brood::plugin::host::SubmitError::Cancelled));
@@ -1634,12 +1833,18 @@ impl bindings::brood::plugin::host::HostWithStore<ActorStore> for HasSelf<ActorS
             std::result::Result<u64, bindings::brood::plugin::host::SubmitError>,
         >,
     > + Send {
+        let render_phase = in_pure_render_phase();
         let current = current_component_worker(accessor);
         let (filesystem, blocking_io) = accessor.with(|mut access| {
             let store = access.get();
             (store.worker_filesystem.clone(), store.blocking_io.clone())
         });
         async move {
+            if render_phase {
+                return Ok(Err(
+                    bindings::brood::plugin::host::SubmitError::NotPermitted,
+                ));
+            }
             let (_worker, cancellation) = current?;
             if cancellation.is_requested() {
                 return Ok(Err(bindings::brood::plugin::host::SubmitError::Cancelled));
@@ -1699,12 +1904,18 @@ impl bindings::brood::plugin::host::HostWithStore<ActorStore> for HasSelf<ActorS
             std::result::Result<u64, bindings::brood::plugin::host::SubmitError>,
         >,
     > + Send {
+        let render_phase = in_pure_render_phase();
         let current = current_component_worker(accessor);
         let (filesystem, blocking_io) = accessor.with(|mut access| {
             let store = access.get();
             (store.worker_filesystem.clone(), store.blocking_io.clone())
         });
         async move {
+            if render_phase {
+                return Ok(Err(
+                    bindings::brood::plugin::host::SubmitError::NotPermitted,
+                ));
+            }
             let (_worker, cancellation) = current?;
             if cancellation.is_requested() {
                 return Ok(Err(bindings::brood::plugin::host::SubmitError::Cancelled));
@@ -1757,12 +1968,18 @@ impl bindings::brood::plugin::host::HostWithStore<ActorStore> for HasSelf<ActorS
             std::result::Result<(), bindings::brood::plugin::host::SubmitError>,
         >,
     > + Send {
+        let render_phase = in_pure_render_phase();
         let current = current_component_worker(accessor);
         let (filesystem, blocking_io) = accessor.with(|mut access| {
             let store = access.get();
             (store.worker_filesystem.clone(), store.blocking_io.clone())
         });
         async move {
+            if render_phase {
+                return Ok(Err(
+                    bindings::brood::plugin::host::SubmitError::NotPermitted,
+                ));
+            }
             let (_worker, cancellation) = current?;
             if cancellation.is_requested() {
                 return Ok(Err(bindings::brood::plugin::host::SubmitError::Cancelled));
@@ -2060,6 +2277,10 @@ enum RuntimeCommand {
         events: Vec<(PresentationEvent, Option<u64>)>,
     },
     Session(SessionEvent),
+    PureRender {
+        request: PureRenderRequest,
+        response: oneshot::Sender<std::result::Result<PureRenderResult, PureRenderError>>,
+    },
     Shutdown,
 }
 
@@ -2380,6 +2601,23 @@ impl ComponentActor {
         Self::try_send_presentation_envelope(&self.commands, events)
     }
 
+    /// Queue one host-driven rendering phase without blocking the caller.
+    /// The actor executor runs it only at an exclusive guest-call boundary.
+    pub fn try_request_pure_render(
+        &self,
+        request: PureRenderRequest,
+    ) -> std::result::Result<
+        oneshot::Receiver<std::result::Result<PureRenderResult, PureRenderError>>,
+        PureRenderRequest,
+    > {
+        let (response, receiver) = oneshot::channel();
+        let Ok(permit) = self.commands.try_reserve() else {
+            return Err(request);
+        };
+        permit.send(RuntimeCommand::PureRender { request, response });
+        Ok(receiver)
+    }
+
     fn try_send_presentation_envelope(
         commands: &mpsc::Sender<RuntimeCommand>,
         events: Vec<(PresentationEvent, Option<u64>)>,
@@ -2695,6 +2933,16 @@ enum GuestCallOutcome {
         worker: WorkerId,
         result: wasmtime::Result<std::result::Result<Vec<u8>, String>>,
     },
+    PureRender {
+        result: wasmtime::Result<
+            std::result::Result<
+                bindings::exports::brood::plugin::actor::PureRenderResult,
+                bindings::exports::brood::plugin::actor::PureRenderError,
+            >,
+        >,
+        response: oneshot::Sender<std::result::Result<PureRenderResult, PureRenderError>>,
+        reduced_watermark: u64,
+    },
 }
 
 type GuestCallFuture<'a> = Pin<Box<dyn Future<Output = GuestCallOutcome> + Send + 'a>>;
@@ -2810,6 +3058,7 @@ async fn run_component_event_loop(
 
     let dispatch = guest.func_dispatch();
     let worker_run = guest.func_worker_run();
+    let pure_render = guest.func_render();
     let mut calls: FuturesUnordered<GuestCallFuture<'_>> = FuturesUnordered::new();
     let mut completion_queue = VecDeque::new();
     let mut notification_queue = VecDeque::new();
@@ -2820,11 +3069,51 @@ async fn run_component_event_loop(
     let mut active_workers = HashSet::new();
     let mut cancelled_workers = HashSet::new();
     let mut pending_lifecycle: Option<oneshot::Sender<std::result::Result<(), String>>> = None;
+    let mut pending_pure_render: Option<(
+        PureRenderRequest,
+        oneshot::Sender<std::result::Result<PureRenderResult, PureRenderError>>,
+    )> = None;
     let mut dispatch_lane = 0_usize;
     let mut presentation_batch_limit = DEFAULT_PRESENTATION_BATCH_EVENTS;
+    let mut completed_turn_watermark = 0_u64;
 
     loop {
-        if component_dispatch_can_start(dispatcher_busy, event_observer) {
+        if !dispatcher_busy && let Some((mut request, response)) = pending_pure_render.take() {
+            dispatcher_busy = true;
+            request.reduced_watermark = completed_turn_watermark;
+            let reduced_watermark = request.reduced_watermark;
+            let request = pure_render_request_to_guest(request);
+            calls.push(
+                async move {
+                    let _profile_span = brood_profiler::Span::asynchronous(
+                        "wasm",
+                        "actor_pure_render",
+                        None,
+                        Vec::new(),
+                    );
+                    let result = PURE_RENDER_PHASE
+                        .scope((), async move {
+                            let call = accessor.with(|mut access| {
+                                pure_render.start_call_concurrent(&mut access, (request,))
+                            })?;
+                            pure_render
+                                .finish_call_concurrent(accessor, call)
+                                .await
+                                .map(|(result,)| result)
+                        })
+                        .await;
+                    GuestCallOutcome::PureRender {
+                        result,
+                        response,
+                        reduced_watermark,
+                    }
+                }
+                .boxed(),
+            );
+        }
+        if pending_pure_render.is_none()
+            && component_dispatch_can_start(dispatcher_busy, event_observer)
+        {
             let event = pop_component_dispatch(
                 &mut dispatch_lane,
                 &mut completion_queue,
@@ -2972,6 +3261,13 @@ async fn run_component_event_loop(
                         component_session_to_guest(event),
                     );
                 }
+                Some(RuntimeCommand::PureRender { request, response }) => {
+                    if let Some((_superseded, prior_response)) =
+                        pending_pure_render.replace((request, response))
+                    {
+                        let _ = prior_response.send(Err(PureRenderError::Busy));
+                    }
+                }
                 Some(RuntimeCommand::Shutdown) | None => break,
             },
             completion = io_completions.recv(), if completion_queue.len() < config.max_outstanding_io
@@ -3008,6 +3304,8 @@ async fn run_component_event_loop(
                         }
                         match result {
                             Ok(returned) => {
+                                completed_turn_watermark =
+                                    completed_turn_watermark.saturating_add(1);
                                 ensure!(
                                     returned.len() <= config.command_capacity,
                                     "actor dispatcher returned too many commands"
@@ -3222,6 +3520,21 @@ async fn run_component_event_loop(
                                 anyhow::bail!("component actor dispatcher failed: {message}");
                             }
                         }
+                    }
+                    GuestCallOutcome::PureRender {
+                        result,
+                        response,
+                        reduced_watermark,
+                    } => {
+                        dispatcher_busy = false;
+                        let result = match result {
+                            Ok(Ok(result)) => {
+                                pure_render_result_from_guest(result, reduced_watermark)
+                            }
+                            Ok(Err(error)) => Err(pure_render_error_from_guest(error)),
+                            Err(_error) => Err(PureRenderError::Failed),
+                        };
+                        let _ = response.send(result);
                     }
                     GuestCallOutcome::Worker { worker, result } => {
                         active_workers.remove(&worker);
@@ -3521,6 +3834,89 @@ fn component_presentation_to_guest_event(
             relevant_panes,
             event_watermark,
         }),
+    }
+}
+
+fn pure_render_request_to_guest(
+    request: PureRenderRequest,
+) -> bindings::exports::brood::plugin::actor::PureRenderRequest {
+    use bindings::exports::brood::plugin::actor as abi;
+    abi::PureRenderRequest {
+        token: abi::RenderToken {
+            opaque: request.token.0,
+        },
+        reduced_watermark: request.reduced_watermark,
+        dirty_revision: request.dirty_revision,
+        target_presentation_time_ns: request.target_presentation_time_ns,
+        submission_deadline_ns: request.submission_deadline_ns,
+        panes: request
+            .panes
+            .into_iter()
+            .map(|pane| abi::RenderPaneTarget {
+                pane: pane.pane,
+                geometry_revision: pane.geometry_revision,
+                logical_width: pane.logical_width,
+                logical_height: pane.logical_height,
+                physical_width: pane.physical_width,
+                physical_height: pane.physical_height,
+                scale: pane.scale,
+                visible: pane.visible,
+                focused: pane.focused,
+            })
+            .collect(),
+    }
+}
+
+fn pure_render_result_from_guest(
+    result: bindings::exports::brood::plugin::actor::PureRenderResult,
+    reduced_watermark: u64,
+) -> std::result::Result<PureRenderResult, PureRenderError> {
+    use bindings::exports::brood::plugin::actor as abi;
+    if result.token.opaque == 0 || result.dirty_revision == 0 || result.panes.len() > 64 {
+        return Err(PureRenderError::InvalidRequest);
+    }
+    let mut pane_ids = HashSet::new();
+    let mut panes = Vec::with_capacity(result.panes.len());
+    for (pane, output) in result.panes {
+        if pane == 0 || !pane_ids.insert(pane) {
+            return Err(PureRenderError::InvalidRequest);
+        }
+        let output = match output {
+            abi::PurePaneOutput::Draw(draw) => {
+                if draw.pane != pane {
+                    return Err(PureRenderError::InvalidRequest);
+                }
+                PurePaneOutput::Draw(ActorFrameDraw {
+                    pane: draw.pane,
+                    resize_epoch: None,
+                    state_watermark: Some(reduced_watermark),
+                    packet: draw.packet,
+                })
+            }
+            abi::PurePaneOutput::ReplayRetainedPacket(revision) => {
+                PurePaneOutput::ReplayRetainedPacket(revision)
+            }
+            abi::PurePaneOutput::NoChange => PurePaneOutput::NoChange,
+        };
+        panes.push((pane, output));
+    }
+    Ok(PureRenderResult {
+        token: RenderToken(result.token.opaque),
+        dirty_revision: result.dirty_revision,
+        panes,
+        request_next_frame: result.request_next_frame,
+    })
+}
+
+const fn pure_render_error_from_guest(
+    error: bindings::exports::brood::plugin::actor::PureRenderError,
+) -> PureRenderError {
+    use bindings::exports::brood::plugin::actor::PureRenderError as Abi;
+    match error {
+        Abi::Unsupported => PureRenderError::Unsupported,
+        Abi::Busy => PureRenderError::Busy,
+        Abi::InvalidRequest => PureRenderError::InvalidRequest,
+        Abi::Failed => PureRenderError::Failed,
     }
 }
 
@@ -4904,5 +5300,73 @@ mod tests {
             queue.front().map(|queued| &queued.event),
             Some(PresentationEvent::PointerMoved { x: 2.0, y: 2.0, .. })
         ));
+    }
+
+    #[test]
+    fn pure_render_result_is_causally_stamped_and_pane_atomic() -> Result<()> {
+        use bindings::exports::brood::plugin::actor as abi;
+
+        let result = pure_render_result_from_guest(
+            abi::PureRenderResult {
+                token: abi::RenderToken { opaque: 7 },
+                dirty_revision: 9,
+                panes: vec![(
+                    3,
+                    abi::PurePaneOutput::Draw(abi::PureActorFrameDraw {
+                        pane: 3,
+                        packet: vec![1, 2, 3],
+                    }),
+                )],
+                request_next_frame: false,
+            },
+            11,
+        )
+        .map_err(|error| anyhow::anyhow!("valid pure render result was rejected: {error:?}"))?;
+        anyhow::ensure!(
+            matches!(
+                result.panes.as_slice(),
+                [(
+                    3,
+                    PurePaneOutput::Draw(ActorFrameDraw {
+                        state_watermark: Some(11),
+                        ..
+                    })
+                )]
+            ),
+            "pure render result lost its causal watermark"
+        );
+
+        let duplicate = abi::PureRenderResult {
+            token: abi::RenderToken { opaque: 7 },
+            dirty_revision: 9,
+            panes: vec![
+                (3, abi::PurePaneOutput::NoChange),
+                (3, abi::PurePaneOutput::NoChange),
+            ],
+            request_next_frame: false,
+        };
+        anyhow::ensure!(
+            pure_render_result_from_guest(duplicate, 11) == Err(PureRenderError::InvalidRequest),
+            "duplicate pure pane output was accepted"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pure_render_capability_mask_is_future_scoped() {
+        assert!(!in_pure_render_phase());
+        let (inside, sibling) = tokio::join!(
+            PURE_RENDER_PHASE.scope((), async {
+                tokio::task::yield_now().await;
+                in_pure_render_phase()
+            }),
+            async {
+                tokio::task::yield_now().await;
+                in_pure_render_phase()
+            }
+        );
+        assert!(inside);
+        assert!(!sibling);
+        assert!(!in_pure_render_phase());
     }
 }

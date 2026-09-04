@@ -370,6 +370,7 @@ static STATE: Mutex<RoleState> = Mutex::new(RoleState::Unknown);
 struct CodingAgentPlugin;
 
 impl Guest for CodingAgentPlugin {
+    fn render(_request: brood_plugin_sdk::exports::brood::plugin::actor::PureRenderRequest) -> Result<brood_plugin_sdk::exports::brood::plugin::actor::PureRenderResult, brood_plugin_sdk::exports::brood::plugin::actor::PureRenderError> { Err(brood_plugin_sdk::exports::brood::plugin::actor::PureRenderError::Unsupported) }
     fn dispatch(event: Event) -> Vec<ActorCommand> {
         match event {
             Event::Lifecycle(event) => handle_lifecycle(event),

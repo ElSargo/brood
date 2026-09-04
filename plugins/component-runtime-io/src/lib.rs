@@ -12,6 +12,7 @@ const REPORT: &str = ".brood/runtime-io-transcript.md";
 struct RuntimeIoProof;
 
 impl Guest for RuntimeIoProof {
+    fn render(_request: brood_plugin_sdk::exports::brood::plugin::actor::PureRenderRequest) -> Result<brood_plugin_sdk::exports::brood::plugin::actor::PureRenderResult, brood_plugin_sdk::exports::brood::plugin::actor::PureRenderError> { Err(brood_plugin_sdk::exports::brood::plugin::actor::PureRenderError::Unsupported) }
     fn dispatch(event: Event) -> Vec<Command> {
         match event {
             Event::Mailbox(message) => vec![spawn_worker(WORKER, message.body)],

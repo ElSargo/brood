@@ -18,6 +18,7 @@ design-level tensions in [[../frictions/README]].
 ## Product and system targets
 
 - [[systems/presentation-client]]
+- [[systems/gpui-presentation]]
 - [[systems/presentation-transport]]
 - [[systems/artifact-distribution]]
 - [[systems/session-isolation]]

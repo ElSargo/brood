@@ -16,6 +16,10 @@ use brood_plugin_sdk::{
         BUTTON_MIDDLE as MIDDLE_BUTTON, BUTTON_PRIMARY as LEFT_BUTTON, MOD_ALT, MOD_CTRL, MOD_SHIFT,
     },
     runtime::sleep as wait_timer,
+    ui::{
+        self, MANAGED_UI_PROTOCOL_VERSION, UiAccessibility, UiAccessibilityRole, UiDocument,
+        UiNode, UiNodeKind, UiPublication, UiStyle,
+    },
 };
 use unicode_width::UnicodeWidthChar;
 
@@ -41,9 +45,10 @@ const CURSOR_BLINK_WORKER_PAYLOAD: &[u8] = b"terminal-cursor-blink";
 const PRESENTATION_BATCH_LIMIT: u8 = 16;
 // `focus_commands_for_mailbox` is not a presentation reducer. Every branch in
 // `handle_presentation` returns at most three commands, including clipboard
-// and resize paths, so one opted-in batch remains below the host's aggregate
-// 64-command dispatch ceiling.
-const MAX_PRESENTATION_COMMANDS_PER_EVENT: usize = 3;
+// and resize paths; dispatch may append one coalesced render-metrics command.
+// One opted-in batch therefore remains within the host's aggregate 64-command
+// dispatch ceiling.
+const MAX_PRESENTATION_COMMANDS_PER_EVENT: usize = 4;
 const MAX_PRESENTATION_BATCH_COMMANDS: usize =
     PRESENTATION_BATCH_LIMIT as usize * MAX_PRESENTATION_COMMANDS_PER_EVENT;
 const _: () = assert!(MAX_PRESENTATION_BATCH_COMMANDS <= 64);
@@ -100,6 +105,9 @@ struct UiState {
     focused: bool,
     cursor_blink_on: bool,
     cursor_blink_worker: Option<u64>,
+    // Pure rendering cannot emit actor commands. Retain only its newest
+    // diagnostic sample and publish it from the next ordinary actor turn.
+    pending_render_metrics: Option<Vec<u8>>,
 }
 
 impl UiState {
@@ -153,6 +161,7 @@ impl UiState {
             focused: false,
             cursor_blink_on: true,
             cursor_blink_worker: None,
+            pending_render_metrics: None,
         }
     }
 
@@ -248,13 +257,16 @@ impl UiState {
     }
 
     fn restart_cursor_blink(&mut self) -> Vec<Command> {
-        let mut commands = self.cancel_cursor_blink().into_iter().collect::<Vec<_>>();
         if !self.cursor_blink_on {
             self.cursor_blink_on = true;
             let _ignored = brood_plugin_sdk::graphics::request_render();
         }
-        commands.extend(self.schedule_cursor_blink());
-        commands
+        // A presentation batch can contain hundreds of key events. Cancelling and
+        // replacing the timer for every event briefly retains every cancelled guest
+        // worker and can exhaust the bounded worker table before completions drain.
+        // Keep the one existing deadline; input still makes the cursor immediately
+        // visible and the next blink schedules the following bounded deadline.
+        self.schedule_cursor_blink().into_iter().collect()
     }
 
     fn viewport_command(&self, offset: usize) -> Command {
@@ -495,8 +507,45 @@ fn terminal_text_layout(
 }
 
 impl Guest for TerminalUi {
+    fn render(
+        request: brood_plugin_sdk::exports::brood::plugin::actor::PureRenderRequest,
+    ) -> Result<
+        brood_plugin_sdk::exports::brood::plugin::actor::PureRenderResult,
+        brood_plugin_sdk::exports::brood::plugin::actor::PureRenderError,
+    > {
+        use brood_plugin_sdk::exports::brood::plugin::actor::PureRenderError;
+        let prior = {
+            let Ok(mut guard) = STATE.lock() else {
+                return Err(PureRenderError::Busy);
+            };
+            let Some(state) = guard.as_mut() else {
+                return Err(PureRenderError::InvalidRequest);
+            };
+            let Some(target) = request.panes.iter().find(|target| target.pane == state.pane) else {
+                return Err(PureRenderError::InvalidRequest);
+            };
+            let prior = (state.width, state.height);
+            state.width = target.logical_width;
+            state.height = target.logical_height;
+            prior
+        };
+        let mut metrics = None;
+        let result = brood_plugin_sdk::graphics::render_pure(&request, || {
+            metrics = Some(render_latest_snapshot(None)?);
+            Ok(())
+        });
+        if let Ok(mut guard) = STATE.lock()
+            && let Some(state) = guard.as_mut()
+        {
+            (state.width, state.height) = prior;
+            if let Some(metrics) = metrics {
+                state.pending_render_metrics = Some(metrics);
+            }
+        }
+        result
+    }
     fn dispatch(event: Event) -> Vec<Command> {
-        match event {
+        let mut commands = match event {
             Event::Lifecycle(LifecycleEvent::Start(context)) => {
                 let Some(backend_id) = context.backend_id else {
                     return vec![Command::LifecycleComplete(Err(
@@ -555,7 +604,15 @@ impl Guest for TerminalUi {
                 Vec::new()
             }
             _ => Vec::new(),
+        };
+        if let Ok(mut guard) = STATE.lock()
+            && let Some(state) = guard.as_mut()
+            && let Some(metrics) = state.pending_render_metrics.take()
+            && let Some(command) = state.metrics_command_if_due(metrics)
+        {
+            commands.push(command);
         }
+        commands
     }
 
     async fn worker_run(_worker: u64, payload: Vec<u8>) -> Result<Vec<u8>, String> {
@@ -630,7 +687,11 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
                 state.line_height = metrics.line_height.max(1.0);
                 let _ = host::graphics_drop_resource(state.pane, metrics.handle);
             }
-            terminal_ready_commands(state)
+            let mut commands = terminal_ready_commands(state);
+            if let Ok(command) = terminal_document(state.pane) {
+                commands.push(command);
+            }
+            commands
         }
         PresentationEvent::PaneResized(resized) if resized.pane == state.pane => {
             state.width = resized.width.max(1.0);
@@ -903,6 +964,31 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
         }
         _ => Vec::new(),
     }
+}
+
+fn terminal_document(pane: u64) -> Result<Command, serde_json::Error> {
+    ui::publish(UiPublication::Snapshot(Box::new(UiDocument {
+        protocol_version: MANAGED_UI_PROTOCOL_VERSION,
+        pane,
+        document_revision: 1,
+        root: UiNode {
+            id: 1,
+            kind: UiNodeKind::TerminalView { terminal: pane },
+            style: UiStyle {
+                grow: 1.0,
+                ..UiStyle::default()
+            },
+            accessibility: UiAccessibility {
+                role: UiAccessibilityRole::Terminal,
+                label: Some("Terminal".to_string()),
+                description: Some("Interactive terminal session".to_string()),
+                ..UiAccessibility::default()
+            },
+            optional: false,
+            interaction_revision: 0,
+            children: Vec::new(),
+        },
+    })))
 }
 
 fn terminal_ready_commands(state: &mut UiState) -> Vec<Command> {
@@ -1887,7 +1973,7 @@ mod tests {
 
     #[test]
     fn opted_in_presentation_batch_stays_within_host_command_capacity() {
-        assert_eq!(MAX_PRESENTATION_BATCH_COMMANDS, 48);
+        assert_eq!(MAX_PRESENTATION_BATCH_COMMANDS, 64);
     }
 
     #[test]
@@ -2007,7 +2093,7 @@ mod tests {
     }
 
     #[test]
-    fn cursor_input_restarts_the_blink_deadline_and_ignores_the_stale_timer() {
+    fn cursor_input_reuses_the_bounded_blink_deadline() {
         let mut state = UiState::new(2, 7, "terminal-ui-b2-s7");
         state.focused = true;
         let Some(Command::SpawnWorker(first)) = state.schedule_cursor_blink() else {
@@ -2015,22 +2101,10 @@ mod tests {
         };
         state.cursor_blink_on = true;
 
-        let commands = state.restart_cursor_blink();
-        assert!(
-            matches!(commands.first(), Some(Command::CancelWorker(worker)) if *worker == first.worker)
-        );
-        let Some(Command::SpawnWorker(second)) = commands.get(1) else {
-            panic!("cursor input did not schedule a fresh blink deadline");
-        };
-        assert_ne!(second.worker, first.worker);
+        assert!(state.restart_cursor_blink().is_empty());
+        assert_eq!(state.cursor_blink_worker, Some(first.worker));
 
-        let (stale_redraw, stale_commands) =
-            finish_cursor_blink_for_state(&mut state, first.worker);
-        assert!(!stale_redraw);
-        assert!(stale_commands.is_empty());
-        assert!(state.cursor_blink_on);
-        assert_eq!(state.cursor_blink_worker, Some(second.worker));
-        let (redraw, commands) = finish_cursor_blink_for_state(&mut state, second.worker);
+        let (redraw, commands) = finish_cursor_blink_for_state(&mut state, first.worker);
         assert!(redraw);
         assert!(matches!(commands.as_slice(), [Command::SpawnWorker(_)]));
         assert!(!state.cursor_blink_on);

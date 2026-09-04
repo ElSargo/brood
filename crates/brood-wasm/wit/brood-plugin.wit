@@ -607,6 +607,52 @@ interface actor {
         event-watermark: u64,
     }
 
+    record render-pane-target {
+        pane: u64,
+        geometry-revision: u64,
+        logical-width: f32,
+        logical-height: f32,
+        physical-width: u32,
+        physical-height: u32,
+        scale: f32,
+        visible: bool,
+        focused: bool,
+    }
+
+    record pure-render-request {
+        token: render-token,
+        reduced-watermark: u64,
+        dirty-revision: u64,
+        target-presentation-time-ns: u64,
+        submission-deadline-ns: u64,
+        panes: list<render-pane-target>,
+    }
+
+    record pure-actor-frame-draw {
+        pane: u64,
+        packet: list<u8>,
+    }
+
+    variant pure-pane-output {
+        draw(pure-actor-frame-draw),
+        replay-retained-packet(u64),
+        no-change,
+    }
+
+    record pure-render-result {
+        token: render-token,
+        dirty-revision: u64,
+        panes: list<tuple<u64, pure-pane-output>>,
+        request-next-frame: bool,
+    }
+
+    enum pure-render-error {
+        unsupported,
+        busy,
+        invalid-request,
+        failed,
+    }
+
     enum isolation-profile {
         isolated,
         direct,
@@ -783,6 +829,9 @@ interface actor {
         stop,
     }
 
+    /// Host-driven, same-instance rendering phase. Actors which do not opt in
+    /// return `unsupported`; the asynchronous render-hint path remains valid.
+    render: func(request: pure-render-request) -> result<pure-render-result, pure-render-error>;
     dispatch: func(event: event) -> list<command>;
     worker-run: async func(worker: worker-id, payload: list<u8>) -> result<list<u8>, string>;
 }

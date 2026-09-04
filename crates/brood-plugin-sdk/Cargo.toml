@@ -6,7 +6,9 @@ publish = false
 
 [dependencies]
 brood-graphics.workspace = true
+brood-protocol.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 wit-bindgen = "0.57.1"
 
 [lints]

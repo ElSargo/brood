@@ -1,22 +1,18 @@
 use std::{collections::BTreeMap, sync::Mutex};
 
-use brood_graphics::{Color, Command, Packet, Rect, theme::ashen};
 use brood_plugin_sdk::{
     bindings,
     exports::brood::plugin::actor::{
         Command as ActorCommand, Event, Guest, LifecycleEvent, LocalActorMessage,
         PresentationEvent, SessionEvent,
     },
-    graphics::UiFrame,
+    ui::{self, MANAGED_UI_PROTOCOL_VERSION, UiAccessibility, UiColorToken, UiDocument, UiInsets,
+        UiNode, UiNodeKind, UiStyle, UiTextRole},
 };
 use serde::Deserialize;
 
 const STATUS_BAR_ACTOR_ID: &str = "status-bar";
 const SHELL_ACTOR_ID: &str = "session-switcher";
-
-const SURFACE: Color = ashen::SURFACE;
-const BORDER: Color = ashen::BORDER;
-const TEXT: Color = ashen::TEXT;
 
 #[derive(Default)]
 struct StatusBackend {
@@ -29,7 +25,7 @@ struct StatusBarState {
     width: f32,
     height: f32,
     backends: BTreeMap<u64, StatusBackend>,
-    text_resources: Vec<u64>,
+    document_revision: u64,
     error: String,
     notice: String,
 }
@@ -41,7 +37,7 @@ impl StatusBarState {
             width: 1440.0,
             height: 34.0,
             backends: BTreeMap::new(),
-            text_resources: Vec::new(),
+            document_revision: 0,
             error: String::new(),
             notice: String::new(),
         }
@@ -53,6 +49,7 @@ static STATE: Mutex<StatusBarState> = Mutex::new(StatusBarState::new());
 struct StatusBar;
 
 impl Guest for StatusBar {
+    fn render(_request: brood_plugin_sdk::exports::brood::plugin::actor::PureRenderRequest) -> Result<brood_plugin_sdk::exports::brood::plugin::actor::PureRenderResult, brood_plugin_sdk::exports::brood::plugin::actor::PureRenderError> { Err(brood_plugin_sdk::exports::brood::plugin::actor::PureRenderError::Unsupported) }
     fn dispatch(event: Event) -> Vec<ActorCommand> {
         match event {
             Event::Lifecycle(LifecycleEvent::Start(context)) => {
@@ -76,12 +73,13 @@ impl Guest for StatusBar {
                 state.pane = created.pane;
                 state.width = created.width.max(240.0);
                 state.height = created.height.max(24.0);
-                redraw_or_record_error(&mut state);
-                vec![ActorCommand::SendLocalMessage(LocalActorMessage {
+                let mut commands = publish_or_record_error(&mut state).into_iter().collect::<Vec<_>>();
+                commands.push(ActorCommand::SendLocalMessage(LocalActorMessage {
                     actor: SHELL_ACTOR_ID.to_string(),
                     body: format!(r#"{{"kind":"status-bar-ready","pane":{}}}"#, state.pane)
                         .into_bytes(),
-                })]
+                }));
+                commands
             }
             Event::Presentation(PresentationEvent::PaneResized(resized)) => {
                 let Ok(mut state) = STATE.lock() else {
@@ -90,21 +88,11 @@ impl Guest for StatusBar {
                 if resized.pane == state.pane {
                     state.width = resized.width.max(240.0);
                     state.height = resized.height.max(24.0);
-                    redraw_for_resize_or_record_error(&mut state, resized.resize_epoch);
+                    return publish_or_record_error(&mut state).into_iter().collect();
                 }
                 Vec::new()
             }
-            Event::Presentation(PresentationEvent::RenderHint(hint)) => {
-                let Ok(mut state) = STATE.lock() else {
-                    return Vec::new();
-                };
-                if let Err(error) =
-                    brood_plugin_sdk::graphics::render_with_hint(&hint, || redraw(&mut state, None))
-                {
-                    state.error = error;
-                }
-                Vec::new()
-            }
+            Event::Presentation(PresentationEvent::RenderHint(_)) => Vec::new(),
             Event::Session(SessionEvent::Snapshot(snapshot)) => {
                 let Ok(mut state) = STATE.lock() else {
                     return Vec::new();
@@ -121,8 +109,7 @@ impl Guest for StatusBar {
                         active_session,
                     },
                 );
-                redraw_or_record_error(&mut state);
-                Vec::new()
+                publish_or_record_error(&mut state).into_iter().collect()
             }
             Event::Mailbox(message) if message.sender == SHELL_ACTOR_ID => {
                 let Ok(notice) = serde_json::from_slice::<StatusBarNotice>(&message.body) else {
@@ -135,8 +122,7 @@ impl Guest for StatusBar {
                     return Vec::new();
                 };
                 state.notice = notice.message;
-                redraw_or_record_error(&mut state);
-                Vec::new()
+                publish_or_record_error(&mut state).into_iter().collect()
             }
             _ => Vec::new(),
         }
@@ -147,55 +133,51 @@ impl Guest for StatusBar {
     }
 }
 
-fn redraw_or_record_error(state: &mut StatusBarState) {
-    redraw_for_resize_or_record_error(state, None);
-}
-
-fn redraw_for_resize_or_record_error(state: &mut StatusBarState, resize_epoch: Option<u64>) {
-    let result = if brood_plugin_sdk::graphics::render_is_active() {
-        redraw(state, resize_epoch)
-    } else {
-        brood_plugin_sdk::graphics::request_render_for_resize(state.pane, resize_epoch)
-    };
-    if let Err(error) = result {
-        state.error = error;
-    }
-}
-
-fn redraw(state: &mut StatusBarState, resize_epoch: Option<u64>) -> Result<(), String> {
+fn publish_or_record_error(state: &mut StatusBarState) -> Option<ActorCommand> {
     if state.pane == 0 {
-        return Ok(());
+        return None;
     }
-    let mut frame = UiFrame::new(state.pane);
-    let mut packet = Packet::new();
-    packet.push(Command::FillRect {
-        rect: Rect::new(0.0, 0.0, state.width, state.height),
-        color: SURFACE,
-    });
-    packet.push(Command::FillRect {
-        rect: Rect::new(0.0, 0.0, state.width, 1.0),
-        color: BORDER,
-    });
+    state.document_revision = state.document_revision.saturating_add(1).max(1);
     let text = status_bar_text(state, state.width);
-    if let Err(error) = frame.draw_text_clipped(
-        &mut packet,
-        &text,
-        12.0,
-        state.width - 24.0,
-        16.0,
-        TEXT,
-        12.0,
-        ((state.height - 16.0) * 0.5).max(3.0),
-    ) {
-        // Establish the pane's canvas even if text shaping is temporarily
-        // unavailable. The accepted layout can then resize the pane and a
-        // later resize/session event retries the complete packet.
-        frame.queue(resize_epoch, &packet, &mut state.text_resources)?;
-        return Err(format!("layout status bar text: {error}"));
+    let document = UiDocument {
+        protocol_version: MANAGED_UI_PROTOCOL_VERSION,
+        pane: state.pane,
+        document_revision: state.document_revision,
+        root: UiNode {
+            id: 1,
+            kind: UiNodeKind::Row,
+            style: UiStyle {
+                width: Some(state.width),
+                height: Some(state.height),
+                padding: UiInsets { top: 6.0, right: 12.0, bottom: 6.0, left: 12.0 },
+                background: Some(UiColorToken::Surface),
+                foreground: Some(UiColorToken::Foreground),
+                ..UiStyle::default()
+            },
+            accessibility: UiAccessibility { label: Some("Brood status".to_string()), ..UiAccessibility::default() },
+            optional: false,
+            interaction_revision: 0,
+            children: vec![UiNode {
+                id: 2,
+                kind: UiNodeKind::Text { text, role: UiTextRole::Caption },
+                style: UiStyle::default(),
+                accessibility: UiAccessibility::default(),
+                optional: false,
+                interaction_revision: 0,
+                children: Vec::new(),
+            }],
+        },
+    };
+    match ui::publish(ui::UiPublication::Snapshot(Box::new(document))) {
+        Ok(command) => {
+            state.error.clear();
+            Some(command)
+        }
+        Err(error) => {
+            state.error = format!("serialize managed status UI: {error}");
+            None
+        }
     }
-    frame.queue(resize_epoch, &packet, &mut state.text_resources)?;
-    state.error.clear();
-    Ok(())
 }
 
 fn status_bar_text(state: &StatusBarState, width: f32) -> String {

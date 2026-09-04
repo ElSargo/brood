@@ -181,6 +181,15 @@ impl Guest for ExampleInitActor {
     async fn worker_run(_worker: u64, _payload: Vec<u8>) -> Result<Vec<u8>, String> {
         Ok(Vec::new())
     }
+
+    fn render(
+        _request: exports::brood::plugin::actor::PureRenderRequest,
+    ) -> Result<
+        exports::brood::plugin::actor::PureRenderResult,
+        exports::brood::plugin::actor::PureRenderError,
+    > {
+        Err(exports::brood::plugin::actor::PureRenderError::Unsupported)
+    }
 }
 
 fn start_agent(id: &str) -> Command {

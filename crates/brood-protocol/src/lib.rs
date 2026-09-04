@@ -5,6 +5,7 @@
 //! codecs for these types; neither carrier defines presentation behavior.
 
 pub mod backend_catalogue;
+pub mod managed_ui;
 
 use std::{fmt, str::FromStr};
 

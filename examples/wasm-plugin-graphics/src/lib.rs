@@ -180,6 +180,51 @@ impl Guest for GraphicsDemo {
     async fn worker_run(_worker: u64, _payload: Vec<u8>) -> Result<Vec<u8>, String> {
         Ok(Vec::new())
     }
+
+    fn render(
+        request: exports::brood::plugin::actor::PureRenderRequest,
+    ) -> Result<
+        exports::brood::plugin::actor::PureRenderResult,
+        exports::brood::plugin::actor::PureRenderError,
+    > {
+        use exports::brood::plugin::actor::{
+            PureActorFrameDraw, PurePaneOutput, PureRenderError, PureRenderResult,
+        };
+
+        let state = STATE.lock().map_err(|_| PureRenderError::Failed)?;
+        let phase = if state.subscribed {
+            Duration::from_nanos(request.target_presentation_time_ns).as_secs_f32()
+                * core::f32::consts::TAU
+        } else {
+            state.phase
+        };
+        let mut panes = Vec::with_capacity(request.panes.len());
+        for target in &request.panes {
+            let mut pane = *state
+                .panes
+                .iter()
+                .find(|pane| pane.pane == target.pane)
+                .ok_or(PureRenderError::InvalidRequest)?;
+            pane.width = target.logical_width.max(1.0);
+            pane.height = target.logical_height.max(1.0);
+            let packet = build_scene(pane, phase, state.active_palette)
+                .encode()
+                .map_err(|_| PureRenderError::Failed)?;
+            panes.push((
+                target.pane,
+                PurePaneOutput::Draw(PureActorFrameDraw {
+                    pane: target.pane,
+                    packet,
+                }),
+            ));
+        }
+        Ok(PureRenderResult {
+            token: request.token,
+            dirty_revision: request.dirty_revision,
+            panes,
+            request_next_frame: state.subscribed,
+        })
+    }
 }
 
 fn create_checker_image(pane: u64) -> Result<u64, String> {

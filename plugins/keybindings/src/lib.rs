@@ -197,6 +197,7 @@ static STATE: Mutex<Option<KeybindingsState>> = Mutex::new(None);
 struct KeybindingsActor;
 
 impl Guest for KeybindingsActor {
+    fn render(_request: brood_plugin_sdk::exports::brood::plugin::actor::PureRenderRequest) -> Result<brood_plugin_sdk::exports::brood::plugin::actor::PureRenderResult, brood_plugin_sdk::exports::brood::plugin::actor::PureRenderError> { Err(brood_plugin_sdk::exports::brood::plugin::actor::PureRenderError::Unsupported) }
     fn dispatch(event: Event) -> Vec<ActorCommand> {
         let Ok(mut slot) = STATE.lock() else {
             return Vec::new();

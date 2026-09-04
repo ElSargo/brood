@@ -1,5 +1,5 @@
 ---
-status: experiment
+status: promoted
 type: design-experiment
 authority: design
 last-reviewed: 2026-09-04
@@ -13,11 +13,11 @@ plugins send revisioned semantic UI documents to the host. Brood translates
 those documents into host-owned GPUI entities, routes semantic actions back to
 actors, and retains escape hatches for plugin-authored graphics.
 
-This is a complete alternative end state and transition plan, not the selected
-product target. The selected near-term path remains the
-[[../targets/systems/plugin-pure-renderer]]. Keeping this document as an
-experiment makes the opportunity testable without silently committing the
-plugin ABI to GPUI or weakening the pure-render work.
+This is the detailed end state and transition plan selected by
+[[../targets/systems/gpui-presentation]]. It remains here as the original design
+record; the target incorporates its ownership model, protocol, acceptance
+gates, and maintenance constraints. The pure renderer remains the custom-canvas
+escape hatch rather than the default abstraction for ordinary plugin UI.
 
 ## Decision Being Tested
 

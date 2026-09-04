@@ -303,9 +303,10 @@ See [[terminal-plugin]].
 
 ## Rendering
 
-WGPU is the only final presentation renderer. Native and web shells adapt
-window creation, input, accessibility, and external-image import without
-exposing their handles to plugins or the protocol.
+GPUI owns the sole native application and final presentation renderer as
+specified in [[gpui-presentation]]. The Brood adapter maps stable semantic UI,
+canvas packets, and imported external images into that renderer without
+exposing GPUI or Blade handles to plugins or the protocol.
 
 The client composes imported managed-window textures and local plugin scenes in
 linear color space, applies the accepted recursive layout, and owns final

@@ -182,6 +182,67 @@ pub fn render_with_hint<T>(
     Ok(value)
 }
 
+/// Run the same packet construction helpers for a host-driven render export.
+/// Unlike [`render_with_hint`], this returns packets to the export caller and
+/// performs no frame-submission host call.
+pub fn render_pure(
+    request: &actor::PureRenderRequest,
+    render: impl FnOnce() -> Result<(), String>,
+) -> Result<actor::PureRenderResult, actor::PureRenderError> {
+    let hint = actor::RenderHint {
+        token: request.token,
+        target_presentation_time_ns: request.target_presentation_time_ns,
+        submission_deadline_ns: request.submission_deadline_ns,
+        relevant_panes: request.panes.iter().map(|target| target.pane).collect(),
+        event_watermark: request.reduced_watermark,
+    };
+    {
+        let Ok(mut active) = ACTIVE_ACTOR_FRAME.lock() else {
+            return Err(actor::PureRenderError::Busy);
+        };
+        if active.is_some() {
+            return Err(actor::PureRenderError::Busy);
+        }
+        *active = Some(ActorFrame::from_render_hint(&hint));
+    }
+    if render().is_err() {
+        if let Ok(mut active) = ACTIVE_ACTOR_FRAME.lock() {
+            *active = None;
+        }
+        return Err(actor::PureRenderError::Failed);
+    }
+    let Ok(mut active) = ACTIVE_ACTOR_FRAME.lock() else {
+        return Err(actor::PureRenderError::Failed);
+    };
+    let Some(mut frame) = active.take() else {
+        return Err(actor::PureRenderError::Failed);
+    };
+    let mut draws = std::mem::take(&mut frame.draws);
+    let mut panes = Vec::with_capacity(request.panes.len());
+    for target in &request.panes {
+        let output = draws
+            .iter()
+            .position(|draw| draw.pane == target.pane)
+            .map_or(actor::PurePaneOutput::NoChange, |index| {
+                let draw = draws.swap_remove(index);
+                actor::PurePaneOutput::Draw(actor::PureActorFrameDraw {
+                    pane: draw.pane,
+                    packet: draw.packet,
+                })
+            });
+        panes.push((target.pane, output));
+    }
+    if !draws.is_empty() {
+        return Err(actor::PureRenderError::InvalidRequest);
+    }
+    Ok(actor::PureRenderResult {
+        token: request.token,
+        dirty_revision: request.dirty_revision,
+        panes,
+        request_next_frame: false,
+    })
+}
+
 /// Request one coalesced render opportunity for the current actor.
 pub fn request_render() -> Result<(), String> {
     host::render_request().map_err(|error| format!("request actor render: {error:?}"))

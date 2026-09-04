@@ -20,6 +20,10 @@ use brood_plugin_sdk::{
         SubmitSynchronizedLayout, Transform,
     },
     text::truncate_to_width,
+    ui::{
+        self, MANAGED_UI_PROTOCOL_VERSION, UiAccessibility, UiAccessibilityRole, UiColorToken,
+        UiDocument, UiNode, UiNodeKind, UiPublication, UiStateMode, UiStyle, UiTextRole,
+    },
 };
 use brood_protocol::backend_catalogue::{BackendCatalogueEntry, BackendCatalogueMessage};
 use serde::{Deserialize, Serialize};
@@ -189,6 +193,7 @@ struct SwitcherState {
     pointer_drag: Option<ShellDividerDrag>,
     hovered: Option<SwitcherTarget>,
     pressed: Option<SwitcherTarget>,
+    ui_revision: u64,
 }
 
 #[derive(Clone, Deserialize)]
@@ -659,6 +664,7 @@ impl SwitcherState {
             pointer_drag: None,
             hovered: None,
             pressed: None,
+            ui_revision: 0,
         }
     }
 
@@ -813,8 +819,28 @@ static STATE: Mutex<SwitcherState> = Mutex::new(SwitcherState::new());
 struct SessionSwitcher;
 
 impl Guest for SessionSwitcher {
+    fn render(
+        request: brood_plugin_sdk::exports::brood::plugin::actor::PureRenderRequest,
+    ) -> Result<
+        brood_plugin_sdk::exports::brood::plugin::actor::PureRenderResult,
+        brood_plugin_sdk::exports::brood::plugin::actor::PureRenderError,
+    > {
+        use brood_plugin_sdk::exports::brood::plugin::actor::PureRenderError;
+        let Ok(mut state) = STATE.lock() else {
+            return Err(PureRenderError::Busy);
+        };
+        let Some(target) = request.panes.iter().find(|target| target.pane == state.pane) else {
+            return Err(PureRenderError::InvalidRequest);
+        };
+        let prior = (state.width, state.height);
+        state.width = target.logical_width;
+        state.height = target.logical_height;
+        let result = brood_plugin_sdk::graphics::render_pure(&request, || redraw(&mut state, None));
+        (state.width, state.height) = prior;
+        result
+    }
     fn dispatch(event: Event) -> Vec<ActorCommand> {
-        match event {
+        let mut commands = match event {
             Event::Lifecycle(LifecycleEvent::Start(context)) => {
                 if context.instance_id == INIT_ACTOR_ID {
                     if let Ok(mut state) = STATE.lock() {
@@ -1020,6 +1046,9 @@ impl Guest for SessionSwitcher {
             Event::Mailbox(message) if message.sender == "pointer-policy" => {
                 handle_layout_pointer_message(&message.body)
             }
+            Event::Mailbox(message) if message.sender == "managed-ui-host" => {
+                handle_managed_action(&message.body)
+            }
             Event::Mailbox(message) if message.sender == "key-policy" => {
                 handle_key_policy_action(&message.body)
             }
@@ -1047,11 +1076,314 @@ impl Guest for SessionSwitcher {
                 handle_daemon_message(&message.sender, &message.body)
             }
             _ => Vec::new(),
+        };
+        if let Ok(mut state) = STATE.lock()
+            && state.pane != 0
+            && let Some(command) = managed_switcher_document(&mut state)
+        {
+            commands.push(command);
         }
+        commands
     }
 
     async fn worker_run(_worker: u64, _payload: Vec<u8>) -> Result<Vec<u8>, String> {
         Ok(Vec::new())
+    }
+}
+
+fn handle_managed_action(bytes: &[u8]) -> Vec<ActorCommand> {
+    let Ok(action) = serde_json::from_slice::<ui::UiAction>(bytes) else {
+        return Vec::new();
+    };
+    let Ok(mut state) = STATE.lock() else {
+        return Vec::new();
+    };
+    if action.pane != state.pane {
+        return Vec::new();
+    }
+    match (action.node, action.value) {
+        (2, ui::UiActionValue::Activate) => request_creation_backend_picker(&mut state),
+        (3, ui::UiActionValue::Text(query)) => {
+            state.query = query;
+            state.scroll = 0;
+            select_first_filtered(&mut state);
+            Vec::new()
+        }
+        (3, ui::UiActionValue::Submit) => submit(&mut state),
+        (4, ui::UiActionValue::Activate) => {
+            state.sidebar_visible = false;
+            let focus = state.workspace_focus;
+            publish_synchronized_layout(&mut state, focus, "sidebar", None)
+        }
+        (5, ui::UiActionValue::Toggle(visible)) => {
+            let Some(pane) = state.inbox_pane else {
+                return Vec::new();
+            };
+            state.inbox_visible = visible;
+            let focus = state.inbox_visible.then_some(pane).or(state.workspace_focus);
+            publish_synchronized_layout(&mut state, focus, "inbox", None)
+        }
+        (node, ui::UiActionValue::Activate) if node >= 1_000 => {
+            let position = (node - 1_000) as usize;
+            let Some(item) = state.list_items().get(position).cloned() else {
+                return Vec::new();
+            };
+            let target = match item {
+                ListItem::Project(project) => {
+                    SwitcherTarget::ProjectToggle(project.backend, project.id)
+                }
+                ListItem::Session(index) => {
+                    let session = &state.sessions[index];
+                    SwitcherTarget::Session(session.backend, session.id)
+                }
+            };
+            activate_switcher_target(&mut state, target)
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn managed_switcher_document(state: &mut SwitcherState) -> Option<ActorCommand> {
+    state.ui_revision = state.ui_revision.checked_add(1)?;
+    let items = state.list_items();
+    let visible = state.visible_item_count(&items, state.scroll).max(1);
+    let rows = items
+        .iter()
+        .enumerate()
+        .skip(state.scroll)
+        .take(visible)
+        .map(|(position, item)| match item {
+            ListItem::Project(project) => UiNode {
+                id: 1_000 + position as u64,
+                kind: UiNodeKind::SelectableRow { selected: false },
+                style: UiStyle {
+                    min_height: Some(PROJECT_ROW_HEIGHT),
+                    padding: ui::UiInsets {
+                        top: 6.0,
+                        right: 8.0,
+                        bottom: 6.0,
+                        left: 8.0,
+                    },
+                    ..UiStyle::default()
+                },
+                accessibility: UiAccessibility {
+                    role: UiAccessibilityRole::ListItem,
+                    label: Some(project.name.clone()),
+                    expanded: Some(!state
+                        .collapsed_projects
+                        .contains(&format!("{}:{}", project.backend, project.id))),
+                    ..UiAccessibility::default()
+                },
+                optional: false,
+                interaction_revision: 0,
+                children: vec![managed_text_node(
+                    100_000 + position as u64,
+                    project.name.clone(),
+                    UiTextRole::Label,
+                )],
+            },
+            ListItem::Session(index) => {
+                let session = &state.sessions[*index];
+                let detail = session.branch.clone().unwrap_or_else(|| {
+                    session
+                        .working_directory
+                        .clone()
+                        .unwrap_or_else(|| format!("{} windows", session.windows))
+                });
+                UiNode {
+                    id: 1_000 + position as u64,
+                    kind: UiNodeKind::SelectableRow {
+                        selected: state.selected == Some((session.backend, session.id)),
+                    },
+                    style: UiStyle {
+                        min_height: Some(ROW_HEIGHT),
+                        gap: 6.0,
+                        padding: ui::UiInsets {
+                            top: 5.0,
+                            right: 8.0,
+                            bottom: 5.0,
+                            left: 18.0,
+                        },
+                        ..UiStyle::default()
+                    },
+                    accessibility: UiAccessibility {
+                        role: UiAccessibilityRole::ListItem,
+                        label: Some(session.name.clone()),
+                        description: Some(detail.clone()),
+                        selected: Some(state.selected == Some((session.backend, session.id))),
+                        ..UiAccessibility::default()
+                    },
+                    optional: false,
+                    interaction_revision: 0,
+                    children: vec![
+                        managed_text_node(
+                            100_000 + position as u64 * 2,
+                            session.name.clone(),
+                            UiTextRole::Body,
+                        ),
+                        managed_text_node(
+                            100_001 + position as u64 * 2,
+                            detail,
+                            UiTextRole::Caption,
+                        ),
+                    ],
+                }
+            }
+        })
+        .collect();
+    let mode_label = match state.mode {
+        EditMode::Search => "Filter sessions",
+        EditMode::Rename(_, _) => "Rename session",
+        EditMode::CreateWorktree(_, _) => "New worktree branch",
+        EditMode::ConnectRemote => "Remote address",
+        EditMode::CreateLocalContainer | EditMode::CreateRemoteContainer => "Container name",
+    };
+    let mut header = vec![
+        managed_text_node(10, "Sessions".to_string(), UiTextRole::Heading),
+        UiNode {
+            id: 2,
+            kind: UiNodeKind::Button {
+                label: "New".to_string(),
+            },
+            style: UiStyle::default(),
+            accessibility: UiAccessibility {
+                role: UiAccessibilityRole::Button,
+                label: Some("Create session".to_string()),
+                ..UiAccessibility::default()
+            },
+            optional: false,
+            interaction_revision: 0,
+            children: Vec::new(),
+        },
+    ];
+    if state.inbox_pane.is_some() {
+        header.push(UiNode {
+            id: 5,
+            kind: UiNodeKind::Toggle {
+                label: "Inbox".to_string(),
+                value: state.inbox_visible,
+                state_mode: UiStateMode::Hybrid,
+            },
+            style: UiStyle::default(),
+            accessibility: UiAccessibility {
+                role: UiAccessibilityRole::Checkbox,
+                label: Some("Toggle inbox".to_string()),
+                ..UiAccessibility::default()
+            },
+            optional: false,
+            interaction_revision: 0,
+            children: Vec::new(),
+        });
+    }
+    ui::publish(UiPublication::Snapshot(Box::new(UiDocument {
+        protocol_version: MANAGED_UI_PROTOCOL_VERSION,
+        pane: state.pane,
+        document_revision: state.ui_revision,
+        root: UiNode {
+            id: 1,
+            kind: UiNodeKind::Column,
+            style: UiStyle {
+                grow: 1.0,
+                gap: 8.0,
+                padding: ui::UiInsets {
+                    top: 10.0,
+                    right: 10.0,
+                    bottom: 10.0,
+                    left: 10.0,
+                },
+                background: Some(UiColorToken::Background),
+                foreground: Some(UiColorToken::Foreground),
+                ..UiStyle::default()
+            },
+            accessibility: UiAccessibility {
+                label: Some("Session switcher".to_string()),
+                ..UiAccessibility::default()
+            },
+            optional: false,
+            interaction_revision: 0,
+            children: vec![
+                UiNode {
+                    id: 11,
+                    kind: UiNodeKind::Row,
+                    style: UiStyle {
+                        align: ui::UiAlignment::SpaceBetween,
+                        ..UiStyle::default()
+                    },
+                    accessibility: UiAccessibility::default(),
+                    optional: false,
+                    interaction_revision: 0,
+                    children: header,
+                },
+                UiNode {
+                    id: 3,
+                    kind: UiNodeKind::SearchField {
+                        value: state.query.clone(),
+                        placeholder: mode_label.to_string(),
+                        state_mode: UiStateMode::Hybrid,
+                    },
+                    style: UiStyle {
+                        height: Some(36.0),
+                        padding: ui::UiInsets {
+                            top: 8.0,
+                            right: 8.0,
+                            bottom: 8.0,
+                            left: 8.0,
+                        },
+                        background: Some(UiColorToken::Surface),
+                        ..UiStyle::default()
+                    },
+                    accessibility: UiAccessibility {
+                        role: UiAccessibilityRole::SearchBox,
+                        label: Some(mode_label.to_string()),
+                        ..UiAccessibility::default()
+                    },
+                    optional: false,
+                    interaction_revision: 0,
+                    children: Vec::new(),
+                },
+                UiNode {
+                    id: 20,
+                    kind: UiNodeKind::VirtualList {
+                        item_count: items.len() as u64,
+                        estimated_item_extent: ROW_HEIGHT,
+                    },
+                    style: UiStyle {
+                        grow: 1.0,
+                        ..UiStyle::default()
+                    },
+                    accessibility: UiAccessibility {
+                        role: UiAccessibilityRole::List,
+                        label: Some("Sessions".to_string()),
+                        ..UiAccessibility::default()
+                    },
+                    optional: false,
+                    interaction_revision: 0,
+                    children: rows,
+                },
+                managed_text_node(
+                    30,
+                    if state.status.is_empty() {
+                        "Enter open · F2 rename · Delete close".to_string()
+                    } else {
+                        state.status.clone()
+                    },
+                    UiTextRole::Caption,
+                ),
+            ],
+        },
+    })))
+    .ok()
+}
+
+fn managed_text_node(id: u64, text: String, role: UiTextRole) -> UiNode {
+    UiNode {
+        id,
+        kind: UiNodeKind::Text { text, role },
+        style: UiStyle::default(),
+        accessibility: UiAccessibility::default(),
+        optional: false,
+        interaction_revision: 0,
+        children: Vec::new(),
     }
 }
 

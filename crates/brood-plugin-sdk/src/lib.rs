@@ -10,6 +10,7 @@ pub mod input;
 pub mod layout;
 pub mod runtime;
 pub mod text;
+pub mod ui;
 
 /// Canonical bindings for the `brood-plugin` world.
 ///

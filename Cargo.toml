@@ -10,6 +10,7 @@ members = [
     "crates/brood-ipc",
     "crates/brood-keybindings",
     "crates/brood-layout",
+    "crates/brood-gpui",
     "crates/brood-plugin-sdk",
     "crates/brood-protocol",
     "crates/brood-profiler",
@@ -17,7 +18,6 @@ members = [
     "crates/brood-transport",
     "crates/broodd",
     "crates/brood-wasm",
-    "crates/brood-wayland-drop",
 ]
 resolver = "3"
 
@@ -26,6 +26,8 @@ edition = "2024"
 
 [workspace.dependencies]
 anyhow = "1.0.102"
+accesskit = "0.25.0"
+accesskit_unix = "0.23.0"
 base64 = "0.22.1"
 bytemuck = { version = "1.25.0", features = ["derive"] }
 calloop = "0.14.4"
@@ -34,8 +36,10 @@ cap-std = "3.4.5"
 cap-fs-ext = "3.4.5"
 clap = { version = "4.6.1", features = ["derive", "env"] }
 futures = "0.3.32"
+async-channel = "2.5.0"
 gbm = "0.18.0"
 getrandom = "0.3.4"
+gpui = { version = "=0.2.2", default-features = false, features = ["wayland", "x11"] }
 image = { version = "0.25.8", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 libc = "0.2.186"
 memmap2 = "0.9.10"
@@ -54,7 +58,6 @@ brood-plugin-sdk = { path = "crates/brood-plugin-sdk" }
 brood-protocol = { path = "crates/brood-protocol" }
 brood-profiler = { path = "crates/brood-profiler" }
 brood-transport = { path = "crates/brood-transport" }
-brood-wayland-drop = { path = "crates/brood-wayland-drop" }
 lyon_tessellation = "1.0.20"
 num-traits = "0.2.19"
 notify = "8.2.0"
@@ -83,12 +86,17 @@ wasmtime-wasi = { version = "46.0.1", default-features = false, features = ["p1"
 wiggle = "46.0.1"
 wgpu = "30.0.0"
 wgpu-hal = { version = "30.0.0", features = ["vulkan"] }
-winit = "0.30.13"
 wayland-client = { version = "0.31.14", features = ["system"] }
 wayland-protocols = { version = "0.32.12", features = ["client", "staging"] }
 wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
 zbus = { version = "5.13.2", default-features = false, features = ["blocking-api", "tokio"] }
 zstd = "0.13.3"
+
+[patch.crates-io]
+# Brood's bounded GPUI fork exposes Linux external-surface composition. Keep
+# these two crates local and audited together; no other Zed crates are forked.
+gpui = { path = "third_party/gpui" }
+blade-graphics = { path = "third_party/blade-graphics" }
 
 [profile.profiling]
 inherits = "release"

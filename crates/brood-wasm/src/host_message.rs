@@ -59,6 +59,8 @@ pub enum HostMessage {
     RequestClipboardPaste {
         pane: u64,
     },
+    /// Publish toolkit-independent managed UI for the authenticated actor.
+    PublishManagedUi(brood_protocol::managed_ui::UiPublication),
     SetResolvedLayout {
         #[serde(default)]
         lease: Option<crate::resolved_layout::LayoutLeaseToken>,

@@ -9,6 +9,10 @@ use brood_plugin_sdk::{
     graphics::{UiFrame, reuse_pane_content},
     input::BUTTON_PRIMARY as LEFT_BUTTON,
     text::one_line,
+    ui::{
+        self, MANAGED_UI_PROTOCOL_VERSION, UiAccessibility, UiAccessibilityRole, UiColorToken,
+        UiDocument, UiNode, UiNodeKind, UiPublication, UiStyle, UiTextRole,
+    },
 };
 use serde::Deserialize;
 
@@ -69,6 +73,7 @@ struct InboxState {
     hovered: Option<usize>,
     pressed: Option<usize>,
     selected: Option<usize>,
+    ui_revision: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -92,6 +97,7 @@ impl InboxState {
             hovered: None,
             pressed: None,
             selected: None,
+            ui_revision: 0,
         }
     }
 }
@@ -101,8 +107,9 @@ static STATE: Mutex<InboxState> = Mutex::new(InboxState::new());
 struct InboxPlugin;
 
 impl Guest for InboxPlugin {
+    fn render(_request: brood_plugin_sdk::exports::brood::plugin::actor::PureRenderRequest) -> Result<brood_plugin_sdk::exports::brood::plugin::actor::PureRenderResult, brood_plugin_sdk::exports::brood::plugin::actor::PureRenderError> { Err(brood_plugin_sdk::exports::brood::plugin::actor::PureRenderError::Unsupported) }
     fn dispatch(event: Event) -> Vec<Command> {
-        match event {
+        let mut commands = match event {
             Event::Lifecycle(LifecycleEvent::Start(context)) => {
                 if context.instance_id != INBOX_ACTOR_ID
                     || context.backend_id.is_some()
@@ -120,7 +127,14 @@ impl Guest for InboxPlugin {
             Event::Presentation(event) => handle_presentation(event),
             Event::Mailbox(message) => handle_mailbox(&message.sender, &message.body),
             _ => Vec::new(),
+        };
+        if let Ok(mut state) = STATE.lock()
+            && state.pane != 0
+            && let Some(command) = managed_inbox_document(&mut state)
+        {
+            commands.push(command);
         }
+        commands
     }
 
     async fn worker_run(_worker: u64, _payload: Vec<u8>) -> Result<Vec<u8>, String> {
@@ -129,11 +143,20 @@ impl Guest for InboxPlugin {
 }
 
 fn handle_mailbox(sender: &str, body: &[u8]) -> Vec<Command> {
+    if sender == "managed-ui-host"
+        && let Ok(action) = serde_json::from_slice::<ui::UiAction>(body)
+    {
+        return handle_managed_action(action);
+    }
     if sender == "key-policy" && (body == SHOW_MESSAGE || body == TOGGLE_MESSAGE) {
         let Ok(state) = STATE.lock() else {
             return Vec::new();
         };
-        return toggle_pane_commands(state.pane);
+        return if body == SHOW_MESSAGE {
+            show_pane_commands(state.pane)
+        } else {
+            toggle_pane_commands(state.pane)
+        };
     }
     let Some(item) = parse_item(sender, body) else {
         return Vec::new();
@@ -150,6 +173,184 @@ fn handle_mailbox(sender: &str, body: &[u8]) -> Vec<Command> {
     Vec::new()
 }
 
+fn handle_managed_action(action: ui::UiAction) -> Vec<Command> {
+    let Ok(mut state) = STATE.lock() else {
+        return Vec::new();
+    };
+    if action.pane != state.pane {
+        return Vec::new();
+    }
+    match (action.node, action.value) {
+        (2, ui::UiActionValue::Activate) => hide_pane_commands(state.pane),
+        (node, ui::UiActionValue::Activate) if node >= 1_000 => {
+            let index = (node - 1_000) as usize;
+            state.selected = Some(index);
+            activate_selected(&mut state)
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn managed_inbox_document(state: &mut InboxState) -> Option<Command> {
+    state.ui_revision = state.ui_revision.checked_add(1)?;
+    let rows = state
+        .items
+        .iter()
+        .enumerate()
+        .skip(state.scroll)
+        .take(visible_item_count(state))
+        .map(|(index, item)| UiNode {
+            id: 1_000 + index as u64,
+            kind: UiNodeKind::SelectableRow {
+                selected: state.selected == Some(index),
+            },
+            style: UiStyle {
+                min_height: Some(64.0),
+                gap: 4.0,
+                padding: ui::UiInsets {
+                    top: 8.0,
+                    right: 8.0,
+                    bottom: 8.0,
+                    left: 8.0,
+                },
+                background: item.failed.then_some(UiColorToken::Danger),
+                ..UiStyle::default()
+            },
+            accessibility: UiAccessibility {
+                role: UiAccessibilityRole::ListItem,
+                label: Some(item.title.clone()),
+                description: Some(item.detail.clone()),
+                selected: Some(state.selected == Some(index)),
+                ..UiAccessibility::default()
+            },
+            optional: false,
+            interaction_revision: 0,
+            children: vec![
+                UiNode {
+                    id: 100_000 + index as u64 * 2,
+                    kind: UiNodeKind::Text {
+                        text: item.title.clone(),
+                        role: UiTextRole::Label,
+                    },
+                    style: UiStyle::default(),
+                    accessibility: UiAccessibility::default(),
+                    optional: false,
+                    interaction_revision: 0,
+                    children: Vec::new(),
+                },
+                UiNode {
+                    id: 100_001 + index as u64 * 2,
+                    kind: UiNodeKind::Text {
+                        text: if item.category.is_empty() {
+                            item.detail.clone()
+                        } else {
+                            format!("{} · {}", item.category, item.detail)
+                        },
+                        role: UiTextRole::Caption,
+                    },
+                    style: UiStyle {
+                        foreground: Some(UiColorToken::MutedForeground),
+                        ..UiStyle::default()
+                    },
+                    accessibility: UiAccessibility::default(),
+                    optional: false,
+                    interaction_revision: 0,
+                    children: Vec::new(),
+                },
+            ],
+        })
+        .collect();
+    ui::publish(UiPublication::Snapshot(Box::new(UiDocument {
+        protocol_version: MANAGED_UI_PROTOCOL_VERSION,
+        pane: state.pane,
+        document_revision: state.ui_revision,
+        root: UiNode {
+            id: 1,
+            kind: UiNodeKind::Column,
+            style: UiStyle {
+                grow: 1.0,
+                gap: 8.0,
+                padding: ui::UiInsets {
+                    top: 10.0,
+                    right: 10.0,
+                    bottom: 10.0,
+                    left: 10.0,
+                },
+                background: Some(UiColorToken::Background),
+                ..UiStyle::default()
+            },
+            accessibility: UiAccessibility {
+                label: Some("Inbox".to_string()),
+                ..UiAccessibility::default()
+            },
+            optional: false,
+            interaction_revision: 0,
+            children: vec![
+                UiNode {
+                    id: 10,
+                    kind: UiNodeKind::Row,
+                    style: UiStyle {
+                        align: ui::UiAlignment::SpaceBetween,
+                        ..UiStyle::default()
+                    },
+                    accessibility: UiAccessibility::default(),
+                    optional: false,
+                    interaction_revision: 0,
+                    children: vec![
+                        UiNode {
+                            id: 11,
+                            kind: UiNodeKind::Text {
+                                text: format!("Inbox ({})", state.items.len()),
+                                role: UiTextRole::Heading,
+                            },
+                            style: UiStyle::default(),
+                            accessibility: UiAccessibility::default(),
+                            optional: false,
+                            interaction_revision: 0,
+                            children: Vec::new(),
+                        },
+                        UiNode {
+                            id: 2,
+                            kind: UiNodeKind::Button {
+                                label: "Close".to_string(),
+                            },
+                            style: UiStyle::default(),
+                            accessibility: UiAccessibility {
+                                role: UiAccessibilityRole::Button,
+                                label: Some("Close inbox".to_string()),
+                                ..UiAccessibility::default()
+                            },
+                            optional: false,
+                            interaction_revision: 0,
+                            children: Vec::new(),
+                        },
+                    ],
+                },
+                UiNode {
+                    id: 20,
+                    kind: UiNodeKind::VirtualList {
+                        item_count: state.items.len() as u64,
+                        estimated_item_extent: 72.0,
+                    },
+                    style: UiStyle {
+                        grow: 1.0,
+                        ..UiStyle::default()
+                    },
+                    accessibility: UiAccessibility {
+                        role: UiAccessibilityRole::List,
+                        label: Some("Notifications".to_string()),
+                        ..UiAccessibility::default()
+                    },
+                    optional: false,
+                    interaction_revision: 0,
+                    children: rows,
+                },
+            ],
+        },
+    })))
+    .ok()
+}
+
 fn toggle_pane_commands(pane: u64) -> Vec<Command> {
     if pane == 0 {
         return Vec::new();
@@ -157,6 +358,16 @@ fn toggle_pane_commands(pane: u64) -> Vec<Command> {
     vec![Command::SendLocalMessage(LocalActorMessage {
         actor: SHELL_ACTOR_ID.to_string(),
         body: format!(r#"{{"kind":"inbox-toggle","pane":{pane}}}"#).into_bytes(),
+    })]
+}
+
+fn show_pane_commands(pane: u64) -> Vec<Command> {
+    if pane == 0 {
+        return Vec::new();
+    }
+    vec![Command::SendLocalMessage(LocalActorMessage {
+        actor: SHELL_ACTOR_ID.to_string(),
+        body: format!(r#"{{"kind":"inbox-show","pane":{pane}}}"#).into_bytes(),
     })]
 }
 

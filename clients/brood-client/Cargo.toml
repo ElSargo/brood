@@ -5,41 +5,7 @@ edition.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-bytemuck.workspace = true
-clap.workspace = true
-cosmic-text = "0.19.0"
-brood-cli.workspace = true
-brood-computer-use.workspace = true
-brood-dmabuf = { path = "../../crates/brood-dmabuf" }
-brood-graphics.workspace = true
-brood-ipc.workspace = true
-brood-keybindings.workspace = true
-brood-layout.workspace = true
-brood-protocol.workspace = true
-brood-profiler.workspace = true
-brood-transport.workspace = true
-brood-wasm = { path = "../../crates/brood-wasm" }
-brood-wayland-drop.workspace = true
-calloop.workspace = true
-calloop-wayland-source.workspace = true
-image.workspace = true
-quinn.workspace = true
-rustix.workspace = true
-lyon_tessellation.workspace = true
-num-traits.workspace = true
-pollster.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-tokio.workspace = true
-thiserror.workspace = true
-wgpu.workspace = true
-winit.workspace = true
-wayland-client.workspace = true
-wayland-protocols.workspace = true
-wayland-protocols-wlr.workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true
+brood-gpui = { path = "../../crates/brood-gpui" }
 
 [lints]
 workspace = true

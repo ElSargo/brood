@@ -107,6 +107,17 @@ let
     strictDeps = true;
     nativeBuildInputs = [ pkgs.pkg-config ];
     buildInputs = profiles.nativeLibs;
+    # GPUI and Blade are patched path dependencies, not ordinary workspace
+    # crates. Crane must retain their real APIs in the dependency-only source;
+    # stubbing them makes registry crates such as blade-util compile against an
+    # empty local blade-graphics crate.
+    extraDummyScript = ''
+      rm -rf "$out/third_party/gpui" "$out/third_party/blade-graphics"
+      mkdir -p "$out/third_party/gpui" "$out/third_party/blade-graphics"
+      cp -R ${../third_party/gpui}/. "$out/third_party/gpui/"
+      cp -R ${../third_party/blade-graphics}/. "$out/third_party/blade-graphics/"
+      chmod -R u+w "$out/third_party"
+    '';
   };
 
   # buildDepsOnly intentionally compiles dummy versions of workspace crates.
@@ -122,7 +133,11 @@ let
       src = ../. + "/${member}";
       filter =
         path: type:
-        craneLib.filterCargoSources path type || lib.hasSuffix ".wit" path || lib.hasSuffix ".witx" path;
+        craneLib.filterCargoSources path type
+        || lib.hasSuffix ".wit" path
+        || lib.hasSuffix ".witx" path
+        || lib.hasSuffix ".wgsl" path
+        || lib.hasSuffix ".md" path;
     };
 
   mkWorkspaceSrc =
@@ -150,7 +165,6 @@ let
     "crates/brood-layout"
     "crates/brood-profiler"
     "crates/brood-protocol"
-    "crates/brood-wayland-drop"
   ];
   serviceMembers = foundationMembers ++ [
     "crates/brood-ipc"
@@ -161,6 +175,11 @@ let
     "crates/bmux"
     "crates/brood-capsuled"
     "crates/brood-cli"
+  ];
+  gpuiMembers = commandMembers ++ [
+    "crates/brood-gpui"
+    "third_party/gpui"
+    "third_party/blade-graphics"
   ];
 
   mkWorkspaceArtifactLayer =
@@ -309,7 +328,7 @@ let
 
   clientBins = mkBinaryPackage {
     name = "brood-client";
-    members = commandMembers ++ [ "clients/brood-client" ];
+    members = gpuiMembers ++ [ "clients/brood-client" ];
     cargoArtifacts = commandArtifacts;
     bins = [ "brood-client" ];
   };

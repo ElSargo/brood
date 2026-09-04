@@ -234,6 +234,7 @@ fi
 
 start_client() {
   local log="$1"
+  local client="${BROOD_TERMINAL_CLIENT:-$PACKAGE/bin/brood-client}"
   env -u brood_session \
     XDG_RUNTIME_DIR="$RUNTIME_DIR" \
     WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
@@ -245,7 +246,7 @@ start_client() {
     BROOD_TERMINAL_SCROLL_BENCH=1 \
     BROOD_TERMINAL_SCROLL_BENCH_AUTO="$WESTON_DIRECT" \
     RUST_LOG="$RUST_LOG" \
-    "$PACKAGE/bin/brood-client" \
+    "$client" \
     --config "$PACKAGE/brood.toml" \
     --dbus-destination "$DBUS_DESTINATION" \
     --dbus-address "$DBUS_SESSION_BUS_ADDRESS" \
@@ -456,22 +457,24 @@ done
 KEY_HEX="$(od -An -tx1 "$KEY_FILE" | tr -d ' \n')"
 [[ "$KEY_HEX" == "1b5b31357e1b5b313b35431b5b5a" ]]
 
-APPLICATION_KEY_FILE="$OUT/application-cursor-key.bin"
-type_line "printf '\\033[?1h'; IFS= read -r key; printf %s \"\$key\" > '$APPLICATION_KEY_FILE'; printf '\\033[?1l'; echo __APPLICATION_CURSOR_OK__"
-for _ in $(seq 1 200); do
-  APPLICATION_CURSOR="$(metric_value "$CLIENT1_LOG" application_cursor)"
-  [[ "$APPLICATION_CURSOR" == "true" ]] && break
-  sleep 0.05
-done
-[[ "$APPLICATION_CURSOR" == "true" ]]
-wayland_env "$OUT/virtual-keyboard-key" --none 103
-wayland_env "$OUT/virtual-keyboard-key" --none 28
-for _ in $(seq 1 200); do
-  [[ -s "$APPLICATION_KEY_FILE" ]] && break
-  sleep 0.05
-done
-APPLICATION_KEY_HEX="$(od -An -tx1 "$APPLICATION_KEY_FILE" | tr -d ' \n')"
-[[ "$APPLICATION_KEY_HEX" == "1b4f41" ]]
+if [[ "${BROOD_TERMINAL_INBOX_ONLY:-0}" != 1 ]]; then
+  APPLICATION_KEY_FILE="$OUT/application-cursor-key.bin"
+  type_line "printf '\\033[?1h'; IFS= read -r key; printf %s \"\$key\" > '$APPLICATION_KEY_FILE'; printf '\\033[?1l'; echo __APPLICATION_CURSOR_OK__"
+  for _ in $(seq 1 200); do
+    APPLICATION_CURSOR="$(metric_value "$CLIENT1_LOG" application_cursor)"
+    [[ "$APPLICATION_CURSOR" == "true" ]] && break
+    sleep 0.05
+  done
+  [[ "$APPLICATION_CURSOR" == "true" ]]
+  wayland_env "$OUT/virtual-keyboard-key" --none 103
+  wayland_env "$OUT/virtual-keyboard-key" --none 28
+  for _ in $(seq 1 200); do
+    [[ -s "$APPLICATION_KEY_FILE" ]] && break
+    sleep 0.05
+  done
+  APPLICATION_KEY_HEX="$(od -An -tx1 "$APPLICATION_KEY_FILE" | tr -d ' \n')"
+  [[ "$APPLICATION_KEY_HEX" == "1b4f41" ]]
+fi
 
 if [[ "${BROOD_TERMINAL_PICKER_CONSUMERS_ONLY:-0}" != 1 ]]; then
 INBOX_FOCUS_BASELINE="$(
@@ -500,7 +503,7 @@ INBOX_REVEAL_BASELINE="$(
 # authoritative proof that the retained content is ready for presentation.
 INBOX_LAYOUT_READY_BASELINE="$(
   rg -a -c \
-    'synchronized layout ready actor=session-switcher .* pane_ready=4/4 .* missing=\[\] degraded=false ' \
+    'synchronized layout ready actor=session-switcher .* pane_ready=4/4 .* missing=\[\] degraded=false' \
     "$CLIENT1_LOG" || true
 )"
 ctrl_alt_i
@@ -510,13 +513,13 @@ for _ in $(seq 1 100); do
   )"
   INBOX_LAYOUT_READY_COUNT="$(
     rg -a -c \
-      'synchronized layout ready actor=session-switcher .* pane_ready=4/4 .* missing=\[\] degraded=false ' \
+      'synchronized layout ready actor=session-switcher .* pane_ready=4/4 .* missing=\[\] degraded=false' \
       "$CLIENT1_LOG" || true
   )"
   if ((INBOX_REVEAL_COUNT > INBOX_REVEAL_BASELINE)) \
     && ((INBOX_LAYOUT_READY_COUNT > INBOX_LAYOUT_READY_BASELINE)) \
     && rg -a -q "accepted synchronized layout actor=session-switcher .* target_rects=.*${INBOX_PANE}:960:0:320:686" "$CLIENT1_LOG" \
-    && rg -a -q 'synchronized layout ready actor=session-switcher .* pane_ready=4/4 .* missing=\[\] degraded=false ' "$CLIENT1_LOG"; then
+    && rg -a -q 'synchronized layout ready actor=session-switcher .* pane_ready=4/4 .* missing=\[\] degraded=false' "$CLIENT1_LOG"; then
     break
   fi
   sleep 0.05
@@ -524,7 +527,7 @@ done
 ((INBOX_REVEAL_COUNT > INBOX_REVEAL_BASELINE))
 ((INBOX_LAYOUT_READY_COUNT > INBOX_LAYOUT_READY_BASELINE))
 rg -a -q "accepted synchronized layout actor=session-switcher .* target_rects=.*${INBOX_PANE}:960:0:320:686" "$CLIENT1_LOG"
-rg -a -q 'synchronized layout ready actor=session-switcher .* pane_ready=4/4 .* missing=\[\] degraded=false ' "$CLIENT1_LOG"
+rg -a -q 'synchronized layout ready actor=session-switcher .* pane_ready=4/4 .* missing=\[\] degraded=false' "$CLIENT1_LOG"
 INBOX_CLICK_X=$((1280 - 320 / 2))
 wayland_env "$OUT/virtual-pointer-input" click "$INBOX_CLICK_X" 100 1280 720
 for _ in $(seq 1 100); do

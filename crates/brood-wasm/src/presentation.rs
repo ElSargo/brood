@@ -62,6 +62,52 @@ pub struct RenderHint {
     pub event_watermark: u64,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct RenderPaneTarget {
+    pub pane: u64,
+    pub geometry_revision: u64,
+    pub logical_width: f32,
+    pub logical_height: f32,
+    pub physical_width: u32,
+    pub physical_height: u32,
+    pub scale: f32,
+    pub visible: bool,
+    pub focused: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PureRenderRequest {
+    pub token: RenderToken,
+    pub reduced_watermark: u64,
+    pub dirty_revision: u64,
+    pub target_presentation_time_ns: u64,
+    pub submission_deadline_ns: u64,
+    pub panes: Vec<RenderPaneTarget>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PurePaneOutput {
+    Draw(ActorFrameDraw),
+    ReplayRetainedPacket(u64),
+    NoChange,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PureRenderResult {
+    pub token: RenderToken,
+    pub dirty_revision: u64,
+    pub panes: Vec<(u64, PurePaneOutput)>,
+    pub request_next_frame: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PureRenderError {
+    Unsupported,
+    Busy,
+    InvalidRequest,
+    Failed,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FontIntent {
     Ui,
