@@ -79,6 +79,46 @@ static TEST_STATE: Mutex<()> = Mutex::new(());
 
 struct TerminalUi;
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct GridMetrics {
+    cell_width: f32,
+    line_height: f32,
+}
+
+impl GridMetrics {
+    const DEFAULT: Self = Self {
+        cell_width: CELL_WIDTH,
+        line_height: REQUESTED_LINE_HEIGHT,
+    };
+
+    fn new(cell_width: f32, line_height: f32) -> Option<Self> {
+        (cell_width.is_finite()
+            && cell_width >= 1.0
+            && line_height.is_finite()
+            && line_height >= 1.0)
+            .then_some(Self {
+                cell_width,
+                line_height,
+            })
+    }
+
+    fn grid_size(self, width: f32, height: f32) -> (u16, u16) {
+        let rows = ((height - PADDING * 2.0) / self.line_height)
+            .floor()
+            .clamp(1.0, f32::from(MAX_SNAPSHOT_ROWS)) as u16;
+        let cols = ((width - PADDING * 2.0) / self.cell_width)
+            .floor()
+            .clamp(1.0, f32::from(MAX_SNAPSHOT_COLS)) as u16;
+        (rows, cols)
+    }
+}
+
+impl Default for GridMetrics {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
 struct ReliableInput {
     sequence: u64,
     bytes: Vec<u8>,
@@ -244,13 +284,11 @@ impl UiState {
     }
 
     fn grid_size(&self) -> (u16, u16) {
-        let rows = ((self.height - PADDING * 2.0) / self.line_height)
-            .floor()
-            .clamp(1.0, 4_096.0) as u16;
-        let cols = ((self.width - PADDING * 2.0) / self.cell_width)
-            .floor()
-            .clamp(1.0, 4_096.0) as u16;
-        (rows, cols)
+        self.grid_metrics().grid_size(self.width, self.height)
+    }
+
+    fn grid_metrics(&self) -> GridMetrics {
+        GridMetrics::new(self.cell_width, self.line_height).unwrap_or_default()
     }
 
     fn session_message(&self, body: Vec<u8>) -> Command {
@@ -834,7 +872,6 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
             state.pane = created.pane;
             state.width = created.width.max(1.0);
             state.height = created.height.max(1.0);
-            #[cfg(not(feature = "pure-renderer"))]
             if let Ok(metrics) = host::graphics_layout_text(
                 state.pane,
                 "M",
@@ -851,9 +888,14 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
                     alpha: 1.0,
                 },
             ) {
-                state.cell_width = metrics.cell_width.max(1.0);
-                state.line_height = metrics.line_height.max(1.0);
-                let _ = host::graphics_drop_resource(state.pane, metrics.handle);
+                let handle = metrics.handle;
+                if let Some(grid_metrics) =
+                    GridMetrics::new(metrics.cell_width, metrics.line_height)
+                {
+                    state.cell_width = grid_metrics.cell_width;
+                    state.line_height = grid_metrics.line_height;
+                }
+                let _ = host::graphics_drop_resource(state.pane, handle);
             }
             terminal_ready_commands(state)
         }
@@ -2135,7 +2177,7 @@ mod tests {
     #[cfg(not(feature = "pure-renderer"))]
     use super::finish_cursor_blink_for_state;
     use super::{
-        Command, DEFAULT_BG, FOCUS_MESSAGE, MAX_PRESENTATION_BATCH_COMMANDS,
+        Command, DEFAULT_BG, FOCUS_MESSAGE,
         MAX_RELIABLE_INPUT_BYTES, SNAPSHOT_FULL, SNAPSHOT_MAGIC, SNAPSHOT_VERSION, STATE, UiState,
         decode_chunk, focus_commands_for_mailbox, paste_bytes, row_cells,
         terminal_focuses_on_create, terminal_ready_commands, terminal_session_actor,

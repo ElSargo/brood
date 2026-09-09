@@ -3430,7 +3430,9 @@ fn rasterize_text_layout(
         .layout_runs()
         .flat_map(|run| {
             run.glyphs.iter().map(move |glyph| {
-                let physical = glyph.physical((0.0, run.line_y), raster_scale);
+                // Cosmic's offset is already in device pixels; glyph positions
+                // and size are scaled by physical(), but the line origin is not.
+                let physical = glyph.physical((0.0, run.line_y * raster_scale), raster_scale);
                 (physical.cache_key, physical.x, physical.y)
             })
         })
@@ -3723,6 +3725,36 @@ mod tests {
         anyhow::ensure!(fractional.raster_scale.to_bits() == 1.5_f32.to_bits());
         anyhow::ensure!(raster_area(&one_x) > 0);
         anyhow::ensure!(raster_area(&fractional) > raster_area(&one_x));
+        Ok(())
+    }
+
+    #[test]
+    fn fractional_rasterization_preserves_logical_baselines_and_line_spacing() -> Result<()> {
+        let mut system = TextSystem {
+            fonts: FontSystem::new(),
+            swash: SwashCache::new(),
+            glyphs: BTreeMap::new(),
+            glyph_cache_bytes: 0,
+        };
+        let options = test_text_options();
+        let plan = create_text_layout_plan(&mut system.fonts, "B\nB", options)?;
+        let reference = rasterize_text_layout(&mut system, &plan, options, 1.0);
+        anyhow::ensure!(reference.glyphs.len() == 2);
+        for scale in [1.25, 1.5, 1.75, 2.0] {
+            let scaled = rasterize_text_layout(&mut system, &plan, options, scale);
+            anyhow::ensure!(scaled.glyphs.len() == 2);
+            for (actual, expected) in scaled.glyphs.iter().zip(reference.glyphs.iter()) {
+                anyhow::ensure!(
+                    (actual.y - expected.y).abs() <= 1.5,
+                    "glyph moved vertically at scale {scale}: {} vs {}",
+                    actual.y,
+                    expected.y
+                );
+            }
+            let spacing = scaled.glyphs.get(1).context("second glyph missing")?.y
+                - scaled.glyphs.first().context("first glyph missing")?.y;
+            anyhow::ensure!((spacing - options.line_height).abs() <= 1.0);
+        }
         Ok(())
     }
 

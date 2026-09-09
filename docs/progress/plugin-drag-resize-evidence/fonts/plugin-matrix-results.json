@@ -1,0 +1,184 @@
+[
+  {
+    "lane": "plugins",
+    "case": "shell-narrow",
+    "target": 780,
+    "final": 780,
+    "errors": []
+  },
+  {
+    "lane": "plugins",
+    "case": "shell-return",
+    "target": 860,
+    "final": 860,
+    "errors": []
+  },
+  {
+    "lane": "plugins",
+    "case": "diff-narrow",
+    "target": 250,
+    "final": 250,
+    "errors": []
+  },
+  {
+    "lane": "plugins",
+    "case": "diff-wide",
+    "target": 430,
+    "final": 430,
+    "errors": []
+  },
+  {
+    "lane": "plugins",
+    "case": "editor-narrow",
+    "target": 250,
+    "final": 250,
+    "errors": []
+  },
+  {
+    "lane": "plugins",
+    "case": "editor-wide",
+    "target": 430,
+    "final": 430,
+    "errors": []
+  },
+  {
+    "lane": "plugins",
+    "case": "agent-narrow",
+    "target": 250,
+    "final": 250,
+    "errors": []
+  },
+  {
+    "lane": "plugins",
+    "case": "agent-wide",
+    "target": 430,
+    "final": 430,
+    "errors": []
+  },
+  {
+    "lane": "plugins",
+    "case": "inbox-narrow",
+    "target": 860,
+    "final": 860,
+    "errors": []
+  },
+  {
+    "lane": "plugins",
+    "case": "inbox-wide",
+    "target": 960,
+    "final": 960,
+    "errors": []
+  },
+  {
+    "lane": "plugins",
+    "case": "status-window-narrow",
+    "target": 580,
+    "final": 580,
+    "errors": []
+  },
+  {
+    "lane": "plugins",
+    "case": "status-window-wide",
+    "target": 1280,
+    "final": 1280,
+    "errors": []
+  },
+  {
+    "lane": "plugins",
+    "case": "picker-window-narrow",
+    "target": 580,
+    "final": 580,
+    "errors": []
+  },
+  {
+    "lane": "plugins",
+    "case": "picker-window-wide",
+    "target": 1280,
+    "final": 1280,
+    "errors": []
+  },
+  {
+    "lane": "plugins",
+    "case": "keybindings-window-narrow",
+    "target": 580,
+    "final": 580,
+    "errors": []
+  },
+  {
+    "lane": "plugins",
+    "case": "keybindings-window-wide",
+    "target": 1280,
+    "final": 1280,
+    "errors": []
+  },
+  {
+    "lane": "resize-proof",
+    "case": "resize-proof-narrow",
+    "target": 300,
+    "final": 300,
+    "errors": []
+  },
+  {
+    "lane": "resize-proof",
+    "case": "resize-proof-wide",
+    "target": 480,
+    "final": 480,
+    "errors": []
+  },
+  {
+    "lane": "large-diff",
+    "case": "many-actors-root",
+    "target": 860,
+    "final": 860,
+    "errors": []
+  },
+  {
+    "lane": "large-diff",
+    "case": "many-actors-tile",
+    "target": 387,
+    "final": 387,
+    "errors": []
+  },
+  {
+    "lane": "large-diff",
+    "case": "many-actors-window-narrow",
+    "target": 880,
+    "final": 880,
+    "errors": []
+  },
+  {
+    "lane": "large-diff",
+    "case": "many-actors-window-restore",
+    "target": 1280,
+    "final": 1280,
+    "errors": []
+  },
+  {
+    "lane": "large-diff-fractional",
+    "case": "many-actors-root",
+    "target": 860,
+    "final": 860,
+    "errors": []
+  },
+  {
+    "lane": "large-diff-fractional",
+    "case": "many-actors-tile",
+    "target": 530,
+    "final": 529,
+    "errors": []
+  },
+  {
+    "lane": "large-diff-fractional",
+    "case": "many-actors-window-narrow",
+    "target": 879,
+    "final": 880,
+    "errors": []
+  },
+  {
+    "lane": "large-diff-fractional",
+    "case": "many-actors-window-restore",
+    "target": 1280,
+    "final": 1279,
+    "errors": []
+  }
+]

@@ -1,0 +1,37 @@
+[
+  {
+    "case": "helix-font-narrow",
+    "target": 840,
+    "final": 840,
+    "duration_seconds": 1.6821471669973107,
+    "post_gesture_convergence_seconds": 0.008986640008515678,
+    "visible_positions": [
+      840,
+      847,
+      854,
+      860,
+      867,
+      872,
+      880,
+      886,
+      892,
+      899,
+      906,
+      912,
+      919,
+      926,
+      932,
+      939,
+      946,
+      952,
+      959,
+      960
+    ],
+    "errors": []
+  },
+  {
+    "case": "font-scenes",
+    "notes": "real terminal font grid, Helix buffer, resized Helix, and picker query",
+    "errors": []
+  }
+]

@@ -152,6 +152,19 @@ def capture(name):
     return str(path)
 
 
+def type_text(value):
+    subprocess.run([str(out / "virtual-keyboard-key"), "--text", value], check=True)
+
+
+def wait_for_terminal_publication(offset, seconds=12):
+    wait_for(
+        lambda: bool(re.search(
+            r"facet native pair committed .*actor=terminal-ui ", text()[offset:]
+        )),
+        seconds,
+    )
+
+
 def visible_actor(prefix):
     panes = actor_panes()
     rendered = projection()
@@ -384,6 +397,43 @@ def floating_window():
     time.sleep(.5)
 
 
+def font_test_mode():
+    terminal_offset = len(text())
+    type_text("python3 font-grid.py")
+    key(28, "--none")
+    wait_for_terminal_publication(terminal_offset)
+    font_grid = capture("font-grid")
+
+    key(28, "--none")
+    helix_offset = len(text())
+    type_text("hx font-grid.py")
+    key(28, "--none")
+    wait_for_terminal_publication(helix_offset)
+    helix = capture("helix-font")
+    drag_case("helix-font-narrow", ["terminal-ui"], -120, boundary="shell")
+    helix_resized = capture("helix-font-resized")
+
+    key(1, "--none")
+    type_text(":q!")
+    key(28, "--none")
+    picker_offset = len(text())
+    key(25)
+    wait_for(lambda: visible_actor("picker"))
+    picker = capture("picker-font")
+    requests = re.findall(r"sender=session-switcher recipient=picker body=(.*)", text()[picker_offset:])
+    request = json.loads(requests[-1])
+    label = request["items"][0]["value"]["label"]
+    type_text(label[::3])
+    time.sleep(.5)
+    picker_filtered = capture("picker-font-filtered")
+    results.append({
+        "case": "font-scenes",
+        "captures": [font_grid, helix, helix_resized, picker, picker_filtered],
+        "notes": "real terminal font grid, Helix buffer, resized Helix, and picker query",
+        "errors": [],
+    })
+
+
 try:
     def shell_ready():
         panes, sizes = actor_panes(), projection()
@@ -397,7 +447,9 @@ try:
                 and sizes.get(panes.get("status-bar"), [])[1:] == [width, 34, width, 34])
     wait_for(shell_ready)
     time.sleep(.5)
-    if os.environ.get("BROOD_PLUGIN_DRAG_MANY_ACTORS") == "1":
+    if os.environ.get("BROOD_PLUGIN_FONT_TEST") == "1":
+        font_test_mode()
+    elif os.environ.get("BROOD_PLUGIN_DRAG_MANY_ACTORS") == "1":
         many_actors_mode()
     elif os.environ.get("BROOD_PLUGIN_DRAG_PROOF_ONLY") == "1":
         drag_case("resize-proof-narrow", ["resize-proof-fast"])

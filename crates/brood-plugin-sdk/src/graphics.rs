@@ -304,7 +304,11 @@ impl UiFrame {
         x: f32,
         y: f32,
     ) -> Result<host::TextLayoutResult, String> {
-        let layout = self.layout_text(text, font_size, max_width, line_height, color)?;
+        // This helper draws one clipped line, not a paragraph. Shape independently
+        // of the clipping box so a wide word cannot wrap (or alter highlighted
+        // run advances) before the host clips it. General layout_text callers
+        // retain their requested wrapping width.
+        let layout = self.layout_text(text, font_size, 4096.0, line_height, color)?;
         draw_layout_clipped(packet, layout.handle, x, y, max_width, line_height);
         Ok(layout)
     }
@@ -452,7 +456,11 @@ impl TextLayoutCache {
         x: f32,
         y: f32,
     ) -> Result<host::TextLayoutResult, String> {
-        let layout = self.layout_text(text, font_size, max_width, line_height, color)?;
+        // This helper draws one clipped line, not a paragraph. Shape independently
+        // of the clipping box so a wide word cannot wrap (or alter highlighted
+        // run advances) before the host clips it. General layout_text callers
+        // retain their requested wrapping width.
+        let layout = self.layout_text(text, font_size, 4096.0, line_height, color)?;
         draw_layout_clipped(packet, layout.handle, x, y, max_width, line_height);
         Ok(layout)
     }

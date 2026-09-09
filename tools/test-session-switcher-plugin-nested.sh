@@ -103,6 +103,37 @@ for index in $(seq 1 180); do
   printf 'changed project line %03d with enough content to exercise split diff scrolling\n' "$index"
 done > "$PROJECT/tracked.txt"
 printf 'untracked session-local diff\n' > "$PROJECT/untracked.txt"
+if [[ "${BROOD_PLUGIN_FONT_TEST:-0}" == 1 ]]; then
+  cat > "$PROJECT/font-grid.py" <<'PYFONT'
+import shutil
+import sys
+
+cols, rows = shutil.get_terminal_size()
+def at(row, col, text):
+    sys.stdout.write(f"\x1b[{row};{col}H{text}")
+
+sys.stdout.write("\x1b[?1049h\x1b[2J\x1b[?25h")
+at(1, 1, f"REAL PTY GRID {cols} columns x {rows} rows")
+for row in range(2, min(rows - 2, 22)):
+    at(row, 1, "|")
+    for col in range(2, cols):
+        # Independent style runs and whole-line runs must share one cell grid.
+        color = 36 if (col // 10) % 2 else 33
+        weight = 1 if row % 2 else 22
+        at(row, col, f"\x1b[{weight};{color}m{col % 10}")
+    at(row, cols, "\x1b[0m|")
+at(5, 3, "\x1b[0mASCII: WWWW iiii MMMM 0123456789")
+at(7, 3, "Unicode: ┌────┬────┐ 界界 λλ ⣿⣿")
+at(8, 3, "         │    │    │")
+at(9, 3, "         └────┴────┘")
+at(12, 21, "\x1b[0mX")
+at(12, 21, "")
+sys.stdout.flush()
+input()
+sys.stdout.write("\x1b[?1049l")
+sys.stdout.flush()
+PYFONT
+fi
 if [[ "${BROOD_PLUGIN_DRAG_LARGE_DIFF:-0}" == 1 ]]; then
   # Match the large implementation diff which exposed a facet fuel failure.
   python3 - "$PROJECT/implementation.patch" <<'PYFIXTURE'

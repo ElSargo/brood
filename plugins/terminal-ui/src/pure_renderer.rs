@@ -5,12 +5,13 @@ use std::collections::{HashMap, HashSet};
 const CURSOR_BLINK_NS: u64 = CURSOR_BLINK_MS * 1_000_000;
 const VIEW_MAGIC: &[u8; 4] = b"BTVW";
 const INTERACTION_MAGIC: &[u8; 4] = b"BTIM";
-const FACET_CODEC_VERSION: u8 = 1;
+const FACET_CODEC_VERSION: u8 = 2;
 
 #[derive(Clone, Debug, PartialEq)]
 struct View {
     snapshot: Option<Snapshot>,
     oversized: bool,
+    grid_metrics: GridMetrics,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
@@ -50,6 +51,15 @@ fn push_u32(bytes: &mut Vec<u8>, value: u32) {
 
 fn push_u64(bytes: &mut Vec<u8>, value: u64) {
     bytes.extend_from_slice(&value.to_le_bytes());
+}
+
+fn encode_grid_metrics(bytes: &mut Vec<u8>, metrics: GridMetrics) {
+    push_u32(bytes, metrics.cell_width.to_bits());
+    push_u32(bytes, metrics.line_height.to_bits());
+}
+
+fn decode_grid_metrics(reader: &mut Reader<'_>) -> Result<GridMetrics, ()> {
+    GridMetrics::new(f32::from_bits(reader.u32()?), f32::from_bits(reader.u32()?)).ok_or(())
 }
 
 fn style_bits(run: &Run) -> u8 {
@@ -290,10 +300,14 @@ fn decode_snapshot(reader: &mut Reader<'_>) -> Result<Snapshot, ()> {
 
 #[cfg(test)]
 fn encode_view(view: &View) -> Result<Vec<u8>, ()> {
-    encode_view_parts(view.snapshot.as_ref(), view.oversized)
+    encode_view_parts(view.snapshot.as_ref(), view.oversized, view.grid_metrics)
 }
 
-fn encode_view_parts(snapshot: Option<&Snapshot>, oversized: bool) -> Result<Vec<u8>, ()> {
+fn encode_view_parts(
+    snapshot: Option<&Snapshot>,
+    oversized: bool,
+    grid_metrics: GridMetrics,
+) -> Result<Vec<u8>, ()> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(VIEW_MAGIC);
     bytes.push(FACET_CODEC_VERSION);
@@ -304,6 +318,7 @@ fn encode_view_parts(snapshot: Option<&Snapshot>, oversized: bool) -> Result<Vec
     } else {
         0
     });
+    encode_grid_metrics(&mut bytes, grid_metrics);
     if let Some(snapshot) = snapshot.filter(|_| !oversized) {
         encode_snapshot(&mut bytes, snapshot)?;
     }
@@ -320,7 +335,9 @@ fn decode_view(bytes: &[u8]) -> Result<View, ()> {
     if reader.take(4)? != VIEW_MAGIC || reader.u8()? != FACET_CODEC_VERSION {
         return Err(());
     }
-    let (snapshot, oversized) = match reader.u8()? {
+    let kind = reader.u8()?;
+    let grid_metrics = decode_grid_metrics(&mut reader)?;
+    let (snapshot, oversized) = match kind {
         0 => (None, false),
         1 => (Some(decode_snapshot(&mut reader)?), false),
         2 => (None, true),
@@ -332,6 +349,7 @@ fn decode_view(bytes: &[u8]) -> Result<View, ()> {
     Ok(View {
         snapshot,
         oversized,
+        grid_metrics,
     })
 }
 
@@ -351,6 +369,13 @@ fn encode_interaction(map: &Interaction) -> Result<Vec<u8>, ()> {
         | ((map.mouse_tracking & 3) << 2)
         | (u8::from(map.mouse_sgr) << 4);
     bytes.push(modes);
+    encode_grid_metrics(
+        &mut bytes,
+        GridMetrics {
+            cell_width: map.cell_width,
+            line_height: map.line_height,
+        },
+    );
     push_u32(
         &mut bytes,
         u32::try_from(map.viewport_offset).map_err(|_| ())?,
@@ -378,6 +403,7 @@ fn decode_interaction(bytes: &[u8]) -> Result<Interaction, ()> {
     let rows = reader.u16()?;
     let cols = reader.u16()?;
     let modes = reader.u8()?;
+    let grid_metrics = decode_grid_metrics(&mut reader)?;
     let viewport_offset = reader.u32()? as usize;
     let max_viewport_offset = reader.u32()? as usize;
     let text_rows = reader.u16()?;
@@ -398,8 +424,8 @@ fn decode_interaction(bytes: &[u8]) -> Result<Interaction, ()> {
         revision,
         rows,
         cols,
-        cell_width: CELL_WIDTH,
-        line_height: REQUESTED_LINE_HEIGHT,
+        cell_width: grid_metrics.cell_width,
+        line_height: grid_metrics.line_height,
         application_cursor: modes & 1 != 0,
         bracketed_paste: modes & 2 != 0,
         mouse_tracking: (modes >> 2) & 3,
@@ -759,7 +785,7 @@ fn encode_actor_events(
 static PUBLICATION: Mutex<(u64, Vec<u8>)> = Mutex::new((0, Vec::new()));
 
 pub(super) fn snapshot_fits(snapshot: &Snapshot) -> bool {
-    encode_view_parts(Some(snapshot), false).is_ok()
+    encode_view_parts(Some(snapshot), false, GridMetrics::default()).is_ok()
 }
 
 pub(super) fn publish() {
@@ -769,8 +795,11 @@ pub(super) fn publish() {
     let Some(state) = guard.as_ref().filter(|state| state.pane != 0) else {
         return;
     };
-    let bytes = encode_view_parts(state.latest.as_deref(), false)
-        .unwrap_or_else(|()| encode_view_parts(None, true).unwrap_or_else(|()| Vec::new()));
+    let grid_metrics = state.grid_metrics();
+    let bytes =
+        encode_view_parts(state.latest.as_deref(), false, grid_metrics).unwrap_or_else(|()| {
+            encode_view_parts(None, true, grid_metrics).unwrap_or_else(|()| Vec::new())
+        });
     drop(guard);
     if bytes.is_empty() {
         return;
@@ -1338,11 +1367,12 @@ fn pane_packet(
     snapshot: &Snapshot,
     sequence: &Sequence,
     target_time_ns: u64,
+    grid_metrics: GridMetrics,
 ) -> (Vec<u8>, Interaction, Option<u64>) {
     let width = pane.logical_width as f32;
     let height = pane.logical_height as f32;
-    let cell_width = CELL_WIDTH;
-    let line_height = REQUESTED_LINE_HEIGHT;
+    let cell_width = grid_metrics.cell_width;
+    let line_height = grid_metrics.line_height;
     let selection = sequence.selection;
     let (blink_visible, next_frame_ns) = cursor_phase(target_time_ns, pane.focused);
     let mut text_layouts = HashMap::new();
@@ -1501,7 +1531,11 @@ fn pane_packet(
     )
 }
 
-fn placeholder_content(pane: &facets::PaneTarget, error: bool) -> facets::PaneContent {
+fn placeholder_content(
+    pane: &facets::PaneTarget,
+    error: bool,
+    grid_metrics: GridMetrics,
+) -> facets::PaneContent {
     let width = pane.logical_width as f32;
     let height = pane.logical_height as f32;
     let mut packet = Packet::new();
@@ -1515,18 +1549,13 @@ fn placeholder_content(pane: &facets::PaneTarget, error: bool) -> facets::PaneCo
             color: rgb(ashen::ERROR_RGB),
         });
     }
-    let rows = ((height - PADDING * 2.0) / REQUESTED_LINE_HEIGHT)
-        .floor()
-        .clamp(1.0, f32::from(MAX_SNAPSHOT_ROWS)) as u16;
-    let cols = ((width - PADDING * 2.0) / CELL_WIDTH)
-        .floor()
-        .clamp(1.0, f32::from(MAX_SNAPSHOT_COLS)) as u16;
+    let (rows, cols) = grid_metrics.grid_size(width, height);
     let interaction = encode_interaction(&Interaction {
         revision: 0,
         rows,
         cols,
-        cell_width: CELL_WIDTH,
-        line_height: REQUESTED_LINE_HEIGHT,
+        cell_width: grid_metrics.cell_width,
+        line_height: grid_metrics.line_height,
         application_cursor: false,
         bracketed_paste: false,
         mouse_tracking: 0,
@@ -1551,6 +1580,7 @@ impl Facets for TerminalUi {
         let view = decode_view(&request.application_view).unwrap_or(View {
             snapshot: None,
             oversized: true,
+            grid_metrics: GridMetrics::default(),
         });
         let sequence: Sequence =
             serde_json::from_slice(&request.sequence_state).unwrap_or_default();
@@ -1560,13 +1590,18 @@ impl Facets for TerminalUi {
             .iter()
             .map(|pane| {
                 let content = if view.oversized {
-                    placeholder_content(pane, true)
+                    placeholder_content(pane, true, view.grid_metrics)
                 } else {
                     view.snapshot.as_ref().map_or_else(
-                        || placeholder_content(pane, false),
+                        || placeholder_content(pane, false, view.grid_metrics),
                         |snapshot| {
-                            let (packet, interaction, next) =
-                                pane_packet(pane, snapshot, &sequence, request.target_time_ns);
+                            let (packet, interaction, next) = pane_packet(
+                                pane,
+                                snapshot,
+                                &sequence,
+                                request.target_time_ns,
+                                view.grid_metrics,
+                            );
                             next_frame_ns = match (next_frame_ns, next) {
                                 (Some(current), Some(next)) => Some(current.min(next)),
                                 (None, next) => next,
@@ -1581,7 +1616,7 @@ impl Facets for TerminalUi {
                                     Err(()) => true,
                                 }
                             {
-                                placeholder_content(pane, true)
+                                placeholder_content(pane, true, view.grid_metrics)
                             } else {
                                 facets::PaneContent::Draw {
                                     packet,
@@ -1845,17 +1880,22 @@ mod tests {
 
     #[test]
     fn actor_grid_and_frame_map_share_cell_boundaries() {
+        let grid_metrics = GridMetrics::new(9.625, 21.5).expect("valid measured grid");
         let mut actor = UiState::new(2, 7, "terminal-ui-b2-s7");
-        actor.width = PADDING * 2.0 + CELL_WIDTH * 4.0;
-        actor.height = PADDING * 2.0 + REQUESTED_LINE_HEIGHT * 2.0;
+        actor.cell_width = grid_metrics.cell_width;
+        actor.line_height = grid_metrics.line_height;
+        actor.width = PADDING * 2.0 + grid_metrics.cell_width * 4.0;
+        actor.height = PADDING * 2.0 + grid_metrics.line_height * 2.0;
         assert_eq!(actor.grid_size(), (2, 4));
 
-        let map = map(0);
+        let mut map = map(0);
+        map.cell_width = grid_metrics.cell_width;
+        map.line_height = grid_metrics.line_height;
         assert_eq!(
             pointer_cell(
                 &map,
-                f64::from(PADDING + CELL_WIDTH * 3.0),
-                f64::from(PADDING + REQUESTED_LINE_HEIGHT)
+                f64::from(PADDING + grid_metrics.cell_width * 3.0),
+                f64::from(PADDING + grid_metrics.line_height)
             ),
             CellPoint { row: 1, col: 3 }
         );
@@ -1947,10 +1987,11 @@ mod tests {
             .map(|run| run.text.len())
             .sum::<usize>();
         let runs = snapshot.rows_data.iter().map(Vec::len).sum::<usize>();
-        let expected = 67 + usize::from(snapshot.rows) * 2 + runs * 15 + text_bytes;
+        let expected = 75 + usize::from(snapshot.rows) * 2 + runs * 15 + text_bytes;
         let view = View {
             snapshot: Some(snapshot),
             oversized: false,
+            grid_metrics: GridMetrics::new(9.625, 21.5).expect("valid measured grid"),
         };
         let bytes = encode_view(&view).expect("compact view");
         assert_eq!(bytes.len(), expected);
@@ -2001,7 +2042,8 @@ mod tests {
         assert_eq!(layout_unit_count(&snapshot), Some(1_920));
         assert_eq!(layout_key_count(&snapshot), Some(1_920));
         assert!(snapshot_fits(&snapshot));
-        let bytes = encode_view_parts(Some(&snapshot), false).expect("dense terminal view");
+        let bytes = encode_view_parts(Some(&snapshot), false, GridMetrics::default())
+            .expect("dense terminal view");
         assert!(bytes.len() < MAX_SNAPSHOT_ENCODED_BYTES);
     }
 
@@ -2062,7 +2104,7 @@ mod tests {
         let facets::PaneContent::Draw {
             packet,
             interaction,
-        } = placeholder_content(&pane, true)
+        } = placeholder_content(&pane, true, GridMetrics::default())
         else {
             panic!("fallback must establish visible pane content");
         };
@@ -2089,7 +2131,7 @@ mod tests {
         let facets::PaneContent::Draw {
             packet,
             interaction,
-        } = placeholder_content(&pane, false)
+        } = placeholder_content(&pane, false, GridMetrics::default())
         else {
             panic!("startup must establish concrete pane content");
         };
