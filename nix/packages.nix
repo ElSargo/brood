@@ -75,6 +75,8 @@ let
     craneLib.vendorMultipleCargoDeps {
       cargoLockList = builtins.filter builtins.pathExists [
         "${src}/examples/wasm-component-actor/Cargo.lock"
+        "${src}/examples/wasm-facet-probe/Cargo.lock"
+        "${src}/examples/wasm-paired-facet-probe/Cargo.lock"
         "${src}/examples/wasm-init-actor/Cargo.lock"
         "${src}/examples/wasm-init-child/Cargo.lock"
         "${src}/examples/wasm-plugin-graphics/Cargo.lock"
@@ -399,6 +401,12 @@ let
         # The raw core module is an intermediate input to the Component Model
         # encoder. Only its validated component is a runnable plugin artifact.
         if [[ "$wasm" == "examples/wasm-component-actor/target/wasm32-unknown-unknown/release/brood_component_actor_example.wasm" ]]; then
+          continue
+        fi
+        if [[ "$wasm" == "examples/wasm-facet-probe/target/wasm32-unknown-unknown/release/brood_component_facet_probe.wasm" ]]; then
+          continue
+        fi
+        if [[ "$wasm" == "examples/wasm-paired-facet-probe/target/wasm32-unknown-unknown/release/brood_paired_facet_probe.wasm" ]]; then
           continue
         fi
         if [[ "$wasm" == "examples/wasm-plugin-graphics/target/wasm32-unknown-unknown/release/brood_plugin_graphics_example.wasm" ]]; then

@@ -5,6 +5,8 @@
 //! codecs for these types; neither carrier defines presentation behavior.
 
 pub mod backend_catalogue;
+pub mod facet_codec;
+pub mod facets;
 
 use std::{fmt, str::FromStr};
 

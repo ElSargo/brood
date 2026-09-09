@@ -4,6 +4,19 @@ This deterministic Component is the pane workload for the synchronized-resize
 harness. Load the same component directly under one of these presentation actor
 instance IDs; the lifecycle instance ID selects its deterministic behavior:
 
+The default `pure-renderer` build publishes the actor-selected proof mode and frame identity, then draws
+the complete host-provided pane set at its exact logical size and scale. Pointer
+proof controls are interpreted against the committed frame identity and returned
+to the actor as semantic events. Build with `--no-default-features` to exercise
+the legacy asynchronous actor packets.
+
+The pure facet contract can re-render the last published identity at new geometry
+while an actor delay is pending, and its render request does not contain the
+legacy resize epoch. Consequently, slow and stall modes retain their actor gate
+and publication timing but do not assert that rendering itself was withheld for
+a particular resize epoch. Diagnostics in this mode report
+`facet-publication-pending`; host acceptance and commit remain separate events.
+
 - `resize-proof-fast` submits epoch-tagged content in the resize dispatch.
 - `resize-proof-slow` waits 90 ms in an SDK timer worker before submitting.
   The burst proof runs one obsolete cycle and one coalesced final cycle, leaving

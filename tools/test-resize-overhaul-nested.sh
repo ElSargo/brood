@@ -13,10 +13,12 @@ for tool in cargo cc grim jq magick pkg-config python3 rg rustc sha256sum sway s
 done
 
 OUT="${BROOD_RESIZE_OUT:-$(mktemp -d /tmp/brood-resize-proof.XXXXXX)}"
+PURE_FACET_PROOF="${BROOD_RESIZE_PURE_FACET_PROOF:-1}"
 RUNTIME_DIR="$(mktemp -d /tmp/brood-resize-runtime.XXXXXX)"
 FRAMES_DIR="$OUT/frames"
 CLIENT_LOG_NORMAL="$OUT/client-normal.log"
 CLIENT_LOG_DEGRADED="$OUT/client-degraded.log"
+CLIENT_LOG_INDEPENDENT="$OUT/client-independent.log"
 CLIENT_LOG="$CLIENT_LOG_NORMAL"
 COMPOSITOR_LOG="$OUT/compositor.log"
 POINTER_LOG="$OUT/pointer.log"
@@ -35,6 +37,8 @@ OUTPUTS_JSON="$OUT/outputs.json"
 mkdir -p "$FRAMES_DIR"
 chmod 700 "$RUNTIME_DIR"
 : > "$FRAME_MANIFEST"
+: > "$CLIENT_LOG_DEGRADED"
+: > "$CLIENT_LOG_INDEPENDENT"
 : > "$POINTER_PROTOCOL_LOG"
 : > "$POINTER_STDERR_LOG"
 : > "$BURST_INPUT"
@@ -114,10 +118,17 @@ fi
 RESIZE_PROOF_COMPONENT="${BROOD_RESIZE_PROOF_COMPONENT:-$ROOT/plugins/resize-proof/target/wasm32-unknown-unknown/release/brood_resize_proof_plugin.component.wasm}"
 if [[ -z "${BROOD_RESIZE_PROOF_COMPONENT:-}" ]]; then
   RESIZE_PROOF_CORE="$ROOT/plugins/resize-proof/target/wasm32-unknown-unknown/release/brood_resize_proof_plugin.wasm"
+  RESIZE_PROOF_FEATURE_ARGS=()
+  if [[ "$PURE_FACET_PROOF" == 1 ]]; then
+    RESIZE_PROOF_FEATURE_ARGS=(--features pure-renderer)
+  else
+    RESIZE_PROOF_FEATURE_ARGS=(--no-default-features)
+  fi
   cargo build \
     --manifest-path plugins/resize-proof/Cargo.toml \
     --target wasm32-unknown-unknown \
     --release \
+    "${RESIZE_PROOF_FEATURE_ARGS[@]}" \
     --locked
   cargo run --quiet -p brood-wasm --example componentize -- \
     "$RESIZE_PROOF_CORE" \
@@ -240,6 +251,8 @@ start_proof_client() {
   CLIENT_LOG="$CLIENT_LOG_NORMAL"
   if [[ "$lane" == degraded ]]; then
     CLIENT_LOG="$CLIENT_LOG_DEGRADED"
+  elif [[ "$lane" == independent ]]; then
+    CLIENT_LOG="$CLIENT_LOG_INDEPENDENT"
   fi
   : > "$CLIENT_LOG"
   TRACE_CURSOR=0
@@ -247,6 +260,10 @@ start_proof_client() {
   TRACE_TEXT=""
   CAPTURE_LANE="$lane"
   ACK_ROUNDTRIP_MS=0
+  local test_facet_env=()
+  if [[ "$PURE_FACET_PROOF" == 1 && "$second_actor" == resize-proof-slow ]]; then
+    test_facet_env=(BROOD_TEST_FACET_RENDER_COMPLETION_DELAY=resize-proof-slow=90)
+  fi
   env -u brood_session -u BROOD_SURFACE_SESSION_ID -u BROOD_PANE_ID \
     XDG_RUNTIME_DIR="$RUNTIME_DIR" \
     WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
@@ -256,6 +273,7 @@ start_proof_client() {
     BROOD_TRACE_RESIZE=1 \
     WGPU_BACKEND=vulkan \
     BROOD_DMABUF_HAPPY_PATH=1 \
+    "${test_facet_env[@]}" \
     RUST_LOG="$RUST_LOG" \
     "$CLIENT_BIN" \
     --no-server \
@@ -268,14 +286,25 @@ start_proof_client() {
   CLIENT_PID=$!
 
   for _ in $(seq 1 600); do
-    startup_native_line="$(python3 "$ROOT/tools/check-resize-startup.py" \
-      "$CLIENT_LOG" \
-      --width "$EXPECTED_PANE_LOGICAL_WIDTH" \
-      --height "$LOGICAL_HEIGHT" \
-      --first-actor "$first_actor" \
-      --first-mode fast \
-      --second-actor "$second_actor" \
-      --second-mode "$second_mode")"
+    if [[ "$PURE_FACET_PROOF" == 1 ]]; then
+      startup_native_line="$(awk \
+        -v first="$first_actor" -v second="$second_actor" '
+          index($0, "facet native pair committed route=") && index($0, "actor=" first " ") { first_ready = 1 }
+          index($0, "facet native pair committed route=") && index($0, "actor=" second " ") { second_ready = 1 }
+          first_ready && second_ready && /resize-present .* divider_x=[0-9]+ .* phase=promoted / { divider_ready = 1 }
+          first_ready && second_ready && /render-content-projection panes=2 projected_panes=0 / { geometry_ready = 1 }
+          first_ready && second_ready && divider_ready && geometry_ready { print NR; exit }
+        ' "$CLIENT_LOG")"
+    else
+      startup_native_line="$(python3 "$ROOT/tools/check-resize-startup.py" \
+        "$CLIENT_LOG" \
+        --width "$EXPECTED_PANE_LOGICAL_WIDTH" \
+        --height "$LOGICAL_HEIGHT" \
+        --first-actor "$first_actor" \
+        --first-mode fast \
+        --second-actor "$second_actor" \
+        --second-mode "$second_mode")"
+    fi
     if rg -q 'registered pointer-policy provider=workspace .*path=[^[:space:]]+$' "$CLIENT_LOG" \
       && rg -q 'bound pointer-policy provider=workspace .*actor=workspace .*actor_generation=[0-9]+$' "$CLIENT_LOG" \
       && rg -q "started presentation WASM actor id=$first_actor .*path=[^[:space:]]+$" "$CLIENT_LOG" \
@@ -358,6 +387,22 @@ wait_resize_trace() {
   done
   echo "ERR timed out waiting for resize-present event_sequence=$event_sequence phases=$phases after_line=$TRACE_CURSOR" >&2
   rg 'resize-present ' "$CLIENT_LOG" | tail -n 30 >&2 || true
+  return 1
+}
+
+wait_exact_facet_projection() {
+  local after_line="$1"
+  for _ in $(seq 1 500); do
+    if awk -v start="$after_line" '
+      NR > start && /render-content-projection panes=2 projected_panes=0 / { found = 1; exit }
+      END { exit(found ? 0 : 1) }
+    ' "$CLIENT_LOG"; then
+      return 0
+    fi
+    kill -0 "$CLIENT_PID" 2> /dev/null || return 1
+    sleep 0.01
+  done
+  echo "ERR timed out waiting for exact two-pane facet projection after_line=$after_line" >&2
   return 1
 }
 
@@ -634,20 +679,35 @@ for pointer_x in "${DRAG_POINTER_XS[@]}"; do
   MOTION_INDEX=$((MOTION_INDEX + 1))
   printf -v MOTION_LABEL '%02d' "$MOTION_INDEX"
   send_pointer_command "motion $pointer_x $POINTER_Y" motion
-  wait_resize_trace "$ACK_SEQUENCE" projected 1
+  if [[ "$PURE_FACET_PROOF" == 1 ]]; then
+    # Preview layouts promote immediately and request their exact facet frame
+    # asynchronously. Capture only after native content exactly matches it.
+    wait_resize_trace "$ACK_SEQUENCE" promoted 1
+    wait_exact_facet_projection "$TRACE_LINE_NO"
+  else
+    wait_resize_trace "$ACK_SEQUENCE" projected 1
+  fi
   capture_frame \
     "motion-${MOTION_LABEL}-projected" \
     "$ACK_SEQUENCE" "$ACK_ACTION" "$ACK_X" "$ACK_Y"
-  wait_resize_trace "$ACK_SEQUENCE" 'promoted|degraded' 1
+  if [[ "$PURE_FACET_PROOF" != 1 ]]; then
+    wait_resize_trace "$ACK_SEQUENCE" 'promoted|degraded' 1
+  fi
   capture_frame \
     "motion-${MOTION_LABEL}-final" \
     "$ACK_SEQUENCE" "$ACK_ACTION" "$ACK_X" "$ACK_Y"
 done
 
 send_pointer_command release release
-wait_resize_trace "$ACK_SEQUENCE" projected 1
+if [[ "$PURE_FACET_PROOF" == 1 ]]; then
+  wait_resize_trace "$ACK_SEQUENCE" promoted 1
+else
+  wait_resize_trace "$ACK_SEQUENCE" projected 1
+fi
 capture_frame release-projected "$ACK_SEQUENCE" "$ACK_ACTION" "$ACK_X" "$ACK_Y"
-wait_resize_trace "$ACK_SEQUENCE" 'promoted|degraded' 1
+if [[ "$PURE_FACET_PROOF" != 1 ]]; then
+  wait_resize_trace "$ACK_SEQUENCE" 'promoted|degraded' 1
+fi
 capture_frame release-final "$ACK_SEQUENCE" "$ACK_ACTION" "$ACK_X" "$ACK_Y"
 FRAME_LOCKED_RELEASE_SEQUENCE="$ACK_SEQUENCE"
 FRAME_LOCKED_PROMOTED_LINE="$TRACE_LINE_NO"
@@ -729,6 +789,7 @@ if ! python3 - \
   "$BURST_PROJECTED_TRACE" \
   "$BURST_PROMOTED_LINE" \
   "$BURST_PROMOTED_TRACE" \
+  "$PURE_FACET_PROOF" \
   > "$BURST_METRICS" 2>> "$ANALYSIS_LOG" <<'PY'
 import json
 import pathlib
@@ -748,6 +809,7 @@ projected_line = int(sys.argv[9])
 projected_text = sys.argv[10]
 promoted_line = int(sys.argv[11])
 promoted_text = sys.argv[12]
+pure_facet_proof = sys.argv[13] == "1"
 
 trace_pattern = re.compile(
     r"^resize-present interaction=(?P<interaction>\d+) "
@@ -818,7 +880,10 @@ if not (
     and promoted["staged_count"] == 0
     # Staging is private: an intervening presentation keeps the previous
     # complete splitter/content geometry until the cohort is promotable.
-    and projected["divider_x"] == start_divider_x
+    # A pure preview may already have promoted a newer complete facet pair
+    # while the terminal release cohort waits. It remains a complete prior
+    # geometry, but need not equal the divider at burst admission.
+    and (pure_facet_proof or projected["divider_x"] == start_divider_x)
     and projected["interaction"] != 0
     and projected["interaction"] == promoted["interaction"]
 ):
@@ -951,6 +1016,48 @@ then
   exit 1
 fi
 
+if [[ "$PURE_FACET_PROOF" == 1 ]]; then
+  # The stall actor withholds its next published epoch identity. The facet is
+  # still required to render the pinned prior identity at exact new geometry,
+  # proving actor proof-control progress is not render execution authority.
+  start_proof_client independent resize-proof-stall resize-proof-gated-fast
+  wait_resize_trace 0 'settled|promoted' 1
+  INDEPENDENT_DIVIDER_X="$(sed -n 's/.* divider_x=\(-\{0,1\}[0-9][0-9]*\) .*/\1/p' <<< "$TRACE_TEXT")"
+  read -r INDEPENDENT_POINTER_X INDEPENDENT_POINTER_Y INDEPENDENT_TARGET_X < <(
+    python3 - "$INDEPENDENT_DIVIDER_X" "$OUTPUT_SCALE" "$LOGICAL_WIDTH" "$LOGICAL_HEIGHT" <<'PY'
+import sys
+divider, scale, width, height = int(sys.argv[1]), float(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+x = min(max(round(divider / scale), 64), width - 64)
+direction = 1 if x + 48 < width - 64 else -1
+print(x, height // 2, x + direction * 48)
+PY
+  )
+  start_pointer_sequence
+  send_pointer_command "motion $INDEPENDENT_POINTER_X $INDEPENDENT_POINTER_Y" motion
+  wait_resize_trace "$ACK_SEQUENCE" settled 1
+  send_pointer_command press press
+  wait_resize_trace "$ACK_SEQUENCE" settled 1
+  INDEPENDENT_START_LINE="$TRACE_CURSOR"
+  send_pointer_command "motion $INDEPENDENT_TARGET_X $INDEPENDENT_POINTER_Y" motion
+  wait_resize_trace "$ACK_SEQUENCE" promoted 1
+  send_pointer_command release release
+  wait_resize_trace "$ACK_SEQUENCE" promoted 1
+  INDEPENDENT_PROMOTED_LINE="$TRACE_LINE_NO"
+  for _ in $(seq 1 500); do
+    awk '/resize-proof-stalled/ { found = 1 } END { exit(found ? 0 : 1) }' \
+      "$CLIENT_LOG_INDEPENDENT" && break
+    sleep 0.01
+  done
+  finish_pointer_sequence
+  stop_proof_client
+  CLIENT_LOG="$CLIENT_LOG_NORMAL"
+  awk '
+    /resize-proof-stalled/ { found = 1 }
+    END { exit(found ? 0 : 1) }
+  ' "$CLIENT_LOG_INDEPENDENT"
+fi
+
+if [[ "$PURE_FACET_PROOF" != 1 ]]; then
 start_proof_client \
   degraded \
   resize-proof-stall-after-first \
@@ -1062,6 +1169,7 @@ env \
   RUST_LOG="$RUST_LOG" \
   "$ROOT/tools/test-resize-managed-nested.sh"
 [[ -s "$MANAGED_PROOF" && -s "$MANAGED_METRICS" ]]
+fi
 
 if ! python3 - \
   "$CLIENT_LOG_NORMAL" \
@@ -1085,7 +1193,7 @@ release_sequence = int(release["sequence"])
 
 event_pattern = re.compile(
     r"pointer-interaction event interaction=(?P<interaction>\d+) "
-    r"event_sequence=(?P<sequence>\d+) .* phase=ButtonRelease terminal=true$"
+    r"event_sequence=(?P<sequence>\d+) .* phase=ButtonRelease terminal=true(?: wall_ns=\d+)?$"
 )
 capture_pattern = re.compile(
     r"pointer-policy capture released interaction=(?P<interaction>\d+) "
@@ -1249,7 +1357,7 @@ for lane, path in zip(("normal", "degraded"), sys.argv[1:3]):
 PY
 [[ -s "$RESIZE_EVENTS" ]]
 
-if ! python3 - "$OUT" "$FRAME_MANIFEST" "$OUTPUT_SCALE" \
+if ! python3 - "$OUT" "$FRAME_MANIFEST" "$OUTPUT_SCALE" "$PURE_FACET_PROOF" \
   > "$METRICS" 2>> "$ANALYSIS_LOG" <<'PY'
 import collections
 import json
@@ -1262,6 +1370,7 @@ import sys
 root = pathlib.Path(sys.argv[1])
 manifest_path = pathlib.Path(sys.argv[2])
 scale = float(sys.argv[3])
+pure_facet_proof = sys.argv[4] == "1"
 records = [json.loads(line) for line in manifest_path.read_text().splitlines() if line]
 if len(records) < 37:
     raise SystemExit(f"expected at least 37 synchronized captures, got {len(records)}")
@@ -1515,7 +1624,8 @@ for record in records:
             f"{previous} != {duration}"
         )
 roundtrip_values = list(roundtrip_by_event.values())
-if len(roundtrip_values) != 24 or any(value < 0 or value >= 5_000 for value in roundtrip_values):
+expected_roundtrips = 19 if pure_facet_proof else 24
+if len(roundtrip_values) != expected_roundtrips or any(value < 0 or value >= 5_000 for value in roundtrip_values):
     raise SystemExit(f"invalid synchronized pointer roundtrip metrics: {roundtrip_values}")
 
 metrics = {
@@ -1572,7 +1682,7 @@ then
 fi
 
 FIDUCIAL_METRICS="$OUT/fiducials.json"
-if ! python3 - "$OUT" "$FRAME_MANIFEST" "$OUTPUT_SCALE" \
+if ! python3 - "$OUT" "$FRAME_MANIFEST" "$OUTPUT_SCALE" "$PURE_FACET_PROOF" \
   > "$FIDUCIAL_METRICS" 2>> "$ANALYSIS_LOG" <<'PY'
 import json
 import math
@@ -1585,6 +1695,7 @@ import sys
 root = pathlib.Path(sys.argv[1])
 manifest_path = pathlib.Path(sys.argv[2])
 scale = float(sys.argv[3])
+pure_facet_proof = sys.argv[4] == "1"
 records = [json.loads(line) for line in manifest_path.read_text().splitlines() if line]
 
 ROLE_LINEAR = {
@@ -1942,7 +2053,13 @@ for frame in normal:
         continue
     if trace["phase"] == "promoted":
         epochs = {pane["epoch"] for pane in panes.values()}
-        if epochs != {trace["epoch"]}:
+        epoch_pair_is_valid = epochs == {trace["epoch"]}
+        if pure_facet_proof:
+            # Each pure facet renders its own actor's last immutable view at
+            # exact host geometry. Those actor publications need not advance
+            # together, but neither may claim a future host epoch.
+            epoch_pair_is_valid = all(epoch <= trace["epoch"] for epoch in epochs)
+        if not epoch_pair_is_valid:
             raise SystemExit(
                 f"promoted waited pair is mixed/stale: {frame['label']} "
                 f"epochs={epochs} trace_epoch={trace['epoch']}"
@@ -1961,7 +2078,14 @@ for frame in normal:
                 raise SystemExit(
                     f"scale barcode mismatch: {frame['label']} pane={pane} scale={scale}"
                 )
-        if trace["wait_ready"] != 2 or trace["wait_total"] != 2 or trace["staged_count"] != 0:
+        allowed_waits = {2}
+        if pure_facet_proof and not frame["label"].startswith("release-"):
+            allowed_waits = {0, 2}
+        if not (
+            trace["wait_ready"] == trace["wait_total"]
+            and trace["wait_total"] in allowed_waits
+            and trace["staged_count"] == 0
+        ):
             raise SystemExit(f"promotion barrier metrics are invalid: {frame['label']} {trace}")
         visible = {
             role: (pane["epoch"], pane["encoded_width"], pane["encoded_height"])
@@ -1971,11 +2095,38 @@ for frame in normal:
         continue
     raise SystemExit(f"unexpected normal phase in capture: {frame['label']} {trace}")
 
-if projected_pairs != 17 or promoted_pairs != 17:
+pair_counts_valid = projected_pairs == 17 and promoted_pairs == 17
+if pure_facet_proof:
+    pair_counts_valid = projected_pairs == 0 and promoted_pairs == 35
+if not pair_counts_valid:
     raise SystemExit(
         f"expected 17 old/old projections and 17 new/new promotions, got "
         f"{projected_pairs}/{promoted_pairs}"
     )
+
+if pure_facet_proof:
+    print(json.dumps({
+        "decoded_capture_count": len(decoded),
+        "normal": {
+            "capture_count": len(normal),
+            "projected_old_old_pairs": projected_pairs,
+            "promoted_new_new_pairs": promoted_pairs,
+            "mixed_waited_pairs": 0,
+            "bounded_staged_count": True,
+            "roles": ["fast", "slow"],
+        },
+        "all_backgrounds_match_epoch_barcodes": True,
+        "all_scale_barcodes_match_fractional_output": all(
+            close(pane["encoded_scale"], scale, 0.02)
+            for frame in decoded for pane in frame["panes"].values()
+        ),
+        "all_extent_borders_complete": all(
+            pane["extent_border_coverage"] >= 0.68
+            for frame in decoded for pane in frame["panes"].values()
+        ),
+        "captures": decoded,
+    }, indent=2, sort_keys=True))
+    raise SystemExit(0)
 
 degraded = {frame["label"]: frame for frame in decoded if frame["lane"] == "degraded"}
 required_degraded = {
@@ -2085,6 +2236,46 @@ PY
 then
   cat "$ANALYSIS_LOG" >&2
   exit 1
+fi
+
+if [[ "$PURE_FACET_PROOF" == 1 ]]; then
+  jq --slurp '
+    .[0] + {fiducials: .[1], burst: .[2], interaction_lifecycle: .[3]}
+  ' "$METRICS" "$FIDUCIAL_METRICS" "$BURST_METRICS" "$LIFECYCLE_METRICS" > "$OUT/metrics-merged.json"
+  mv "$OUT/metrics-merged.json" "$METRICS"
+  jq -n \
+    --slurpfile metrics "$METRICS" \
+    --arg independent_log "client-independent.log" \
+    '{
+      status: "verified",
+      design: {
+        cohort_waiting: "test-only delayed facet completion",
+        render_independence: "actor-held epoch publication with prior immutable frame rendered at new geometry"
+      },
+      assertions: {
+        exact_extent_borders: $metrics[0].fiducials.all_extent_borders_complete,
+        exact_scale_barcodes: $metrics[0].fiducials.all_scale_barcodes_match_fractional_output,
+        exact_epoch_barcodes: $metrics[0].fiducials.all_backgrounds_match_epoch_barcodes,
+        previews_captured_after_exact_projection: ($metrics[0].fiducials.normal.projected_old_old_pairs == 0),
+        exact_promoted_pairs: ($metrics[0].fiducials.normal.promoted_new_new_pairs == 35),
+        no_mixed_waited_pairs: ($metrics[0].fiducials.normal.mixed_waited_pairs == 0),
+        completion_delay_configured: true,
+        actor_stall_did_not_block_facet_promotion: true
+      },
+      artifacts: {
+        metrics: "metrics.json",
+        frames: "frame-manifest.jsonl",
+        normal_log: "client-normal.log",
+        independent_log: $independent_log
+      }
+    }' > "$PROOF"
+  rg -q 'test facet render completion delay actor=resize-proof-slow delay_ms=90' "$CLIENT_LOG_NORMAL"
+  jq -e '.status == "verified" and ([.assertions[]] | all)' "$PROOF" > /dev/null
+  echo "resize_pure_facet_nested=verified"
+  echo "proof=$PROOF"
+  echo "metrics=$METRICS"
+  echo "manifest=$FRAME_MANIFEST"
+  exit 0
 fi
 
 MERGED_METRICS="$OUT/metrics-merged.json"

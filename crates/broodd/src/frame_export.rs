@@ -235,6 +235,9 @@ pub fn request_redraw(state: &mut Brood) {
         return;
     }
     if fast_path.managed_resizes.ordinary_recovery_commit_pending() {
+        if std::env::var_os("BROOD_TRACE_RESIZE").is_some() {
+            eprintln!("managed export waiting reason=ordinary-recovery-commit");
+        }
         // An untagged recovery resize retired old epoch authority. Keep the
         // last complete scene until the addressed pane supplies a later
         // ordinary commit; exporting its current surface here could mix a
@@ -246,6 +249,9 @@ pub fn request_redraw(state: &mut Brood) {
         .managed_resizes
         .tagged_snapshot_cohort_incomplete()
     {
+        if std::env::var_os("BROOD_TRACE_RESIZE").is_some() {
+            eprintln!("managed export waiting reason=tagged-snapshot-cohort");
+        }
         // Configured tagged panes are one atomic export cohort. Publishing a
         // configure-only scene or the first ready pane would consume the
         // single in-flight slot and delay the complete tagged scene behind its
@@ -996,6 +1002,26 @@ fn shared_image_resource(
         ordinary_resources.insert(pane, resource);
     }
     Ok(resource)
+}
+
+pub fn send_resize_frame_callback(state: &mut Brood, pane: u64) {
+    let Some(window) = state.presentation_window_for_pane(pane) else {
+        return;
+    };
+    let output = state.session_output.clone();
+    window.send_frame(
+        &output,
+        state.start_time.elapsed(),
+        Some(Duration::ZERO),
+        |_, _| Some(output.clone()),
+    );
+    state.stats.record_client_frame_callbacks(1);
+    if let Err(error) = state.display_handle.flush_clients() {
+        warn!(
+            ?error,
+            pane, "flush client after resize frame callback failed"
+        );
+    }
 }
 
 pub fn send_external_client_frame_callbacks(state: &mut Brood) -> u64 {

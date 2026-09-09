@@ -86,6 +86,10 @@ use wasmtime::{
     component::{Component, GuestTaskId, HasSelf, Linker, Resource},
 };
 
+use crate::facet_publication::{self, FacetPublication};
+use crate::snapshot_reclaimer::BackgroundSnapshotReclaimer;
+use crate::snapshot_store::SnapshotStoreLimits;
+
 static NEXT_REPLACE_TEMP: AtomicU64 = AtomicU64::new(1);
 
 /// An actor-private worker identity.
@@ -368,6 +372,8 @@ pub struct ComponentActorConfig {
     pub max_notifications: usize,
     pub max_pollables: usize,
     pub max_wait_set: usize,
+    /// Optional immutable facet-view publication capability.
+    pub facet_publication: Option<FacetPublicationConfig>,
     /// Generation-owned process, PTY, socket, stream, and timer policy.
     pub runtime_io: RuntimeIoConfig,
     /// Executor for subprocess, stream, timer, and filesystem I/O. Hosts which
@@ -423,6 +429,7 @@ impl Default for ComponentActorConfig {
             max_notifications: 64,
             max_pollables: 256,
             max_wait_set: 64,
+            facet_publication: None,
             runtime_io: RuntimeIoConfig::default(),
             io_runtime: None,
             presentation: None,
@@ -438,6 +445,12 @@ impl Default for ComponentActorConfig {
             limits: WasmResourceLimits::default(),
         }
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct FacetPublicationConfig {
+    pub reclaimer: Arc<BackgroundSnapshotReclaimer>,
+    pub limits: SnapshotStoreLimits,
 }
 
 fn validate_capability_path(path: &Path) -> std::result::Result<PathBuf, CompletionIoError> {
@@ -610,6 +623,8 @@ struct ActorStore {
     filesystem_watches: FilesystemWatchHub,
     runtime_io: RuntimeIoHub,
     actor_generation: u64,
+    facet_publication: Option<Arc<FacetPublication>>,
+    actor_dispatch_task: Option<GuestTaskId>,
     presentation: Option<Arc<dyn PresentationHost>>,
     worker_filesystem: Option<WorkerFilesystem>,
     worker_cancellations: WorkerCancellationRegistry,
@@ -2037,6 +2052,11 @@ fn component_ready_pollable(
 
 #[derive(Debug)]
 enum RuntimeCommand {
+    FacetInput {
+        batch: bindings::exports::brood::plugin::actor::FacetInputBatch,
+        permit: OwnedSemaphorePermit,
+        byte_permit: GenerationBytePermit,
+    },
     Mailbox {
         sender: String,
         body: Vec<u8>,
@@ -2086,6 +2106,8 @@ pub struct ComponentActor {
     limits: WasmResourceLimits,
     observer_result_bytes: Arc<Mutex<HashMap<WorkerId, GenerationBytePermit>>>,
     dispatcher_returned_pending: Arc<AtomicBool>,
+    facet_publication: Option<Arc<FacetPublication>>,
+    has_facets: bool,
 }
 
 impl ComponentActor {
@@ -2171,9 +2193,48 @@ impl ComponentActor {
         let epoch_ticker = EpochTicker::start(engine.clone(), config.epoch_tick_interval)?;
         let component = Component::from_file(&engine, path)
             .map_err(|error| anyhow::anyhow!("load component actor {}: {error}", path.display()))?;
+        let has_facets = component
+            .component_type()
+            .exports(&engine)
+            .any(|(name, _)| name == crate::facet_runtime::FACETS_INTERFACE);
+        let facet_publication = config
+            .facet_publication
+            .as_ref()
+            .filter(|_| {
+                component
+                    .component_type()
+                    .imports(&engine)
+                    .any(|(name, _)| name == crate::facet_publication::RENDER_PUBLICATION_INTERFACE)
+            })
+            .map(|publication| {
+                publication
+                    .reclaimer
+                    .register(generation, publication.limits)
+                    .map(|store| {
+                        let publication = FacetPublication::new(store);
+                        if let Some(waker) = config.event_waker.clone() {
+                            publication.with_waker(move || waker.wake())
+                        } else {
+                            publication
+                        }
+                    })
+                    .map(Arc::new)
+            })
+            .transpose()
+            .map_err(|error| anyhow::anyhow!("register facet publication: {error}"))?;
         let mut linker = Linker::<ActorStore>::new(&engine);
         bindings::BroodPlugin::add_to_linker::<_, HasSelf<_>>(&mut linker, |store| store)
             .map_err(|error| anyhow::anyhow!("link Brood component actor imports: {error}"))?;
+        facet_publication::add_to_linker(&mut linker, |caller| {
+            let dispatch_task = caller.data().actor_dispatch_task;
+            let authorized = dispatch_task.is_some_and(|dispatch_task| {
+                caller.async_call_stack().any(|task| task == dispatch_task)
+            });
+            authorized
+                .then(|| caller.data().facet_publication.as_ref().map(Arc::clone))
+                .flatten()
+        })
+        .map_err(|error| anyhow::anyhow!("link facet publication import: {error}"))?;
 
         let worker_filesystem = open_worker_filesystem(&config)?;
         // Start owned background work only after all fallible static loading
@@ -2200,6 +2261,8 @@ impl ComponentActor {
                 filesystem_watches,
                 runtime_io: runtime_io.clone(),
                 actor_generation: generation,
+                facet_publication: facet_publication.as_ref().map(Arc::clone),
+                actor_dispatch_task: None,
                 presentation: config.presentation.clone(),
                 worker_filesystem,
                 worker_cancellations: WorkerCancellationRegistry::default(),
@@ -2276,7 +2339,20 @@ impl ComponentActor {
             limits,
             observer_result_bytes,
             dispatcher_returned_pending,
+            facet_publication,
+            has_facets,
         })
+    }
+
+    /// Both facet signatures are validated by the isolated runtime before use.
+    #[must_use]
+    pub const fn has_facets(&self) -> bool {
+        self.has_facets
+    }
+
+    #[must_use]
+    pub fn facet_publication(&self) -> Option<Arc<FacetPublication>> {
+        self.facet_publication.as_ref().map(Arc::clone)
     }
 
     pub const fn generation(&self) -> u64 {
@@ -2325,6 +2401,68 @@ impl ComponentActor {
             self.limits,
             self.kernel.byte_budget(),
         )
+    }
+
+    /// Reserve the complete semantic batch before copying or enqueueing it.
+    /// Callers acknowledge the input coordinator only after this succeeds.
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the command permit must be reserved before payload copies and is consumed by send"
+    )]
+    pub fn try_send_facet_input(
+        &self,
+        batch: &crate::facet_input::AdmittedInputBatch,
+    ) -> Result<()> {
+        ensure!(
+            batch.token.scope.actor_generation == self.generation(),
+            "foreign facet input actor generation"
+        );
+        ensure!(
+            batch.events.len() <= 1024,
+            "facet semantic event count exceeded"
+        );
+        let bytes = batch.events.iter().try_fold(0usize, |total, event| {
+            total
+                .checked_add(event.bytes()?.len())
+                .ok_or_else(|| anyhow::anyhow!("facet semantic byte count overflow"))
+        })?;
+        ensure!(
+            bytes <= self.limits.mailbox_body_bytes,
+            "facet semantic batch exceeds actor payload limit"
+        );
+        let storage = bytes
+            .checked_add(batch.events.len() * std::mem::size_of::<Vec<u8>>())
+            .ok_or_else(|| anyhow::anyhow!("facet semantic storage overflow"))?;
+        let byte_permit = self.kernel.byte_budget().try_reserve(storage)?;
+        let permit = Arc::clone(&self.mailbox_slots)
+            .try_acquire_owned()
+            .map_err(|_full| anyhow::anyhow!("actor semantic backlog is full"))?;
+        let command = self.commands.try_reserve().map_err(|error| {
+            anyhow::anyhow!("actor semantic command queue unavailable: {error}")
+        })?;
+        let events = batch
+            .events
+            .iter()
+            .map(|event| event.bytes().map(<[u8]>::to_vec))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let token = &batch.token;
+        command.send(RuntimeCommand::FacetInput {
+            batch: bindings::exports::brood::plugin::actor::FacetInputBatch {
+                client_generation: token.scope.client_generation,
+                actor_generation: token.scope.actor_generation,
+                facet_generation: token.scope.facet_generation,
+                input_sequence: token.input_sequence,
+                frame: token.frame,
+                pane: token.pane,
+                snapshot_revision: token.snapshot_revision,
+                sequence_revision: token.sequence_revision,
+                events,
+            },
+            permit,
+            byte_permit,
+        });
+        increment_saturating(&self.mailbox_enqueued);
+        Ok(())
     }
 
     /// Whether the actor runtime has stopped receiving mailbox commands.
@@ -2514,6 +2652,9 @@ impl ComponentActor {
     }
 
     pub async fn shutdown(&mut self) -> Result<()> {
+        if let Some(publication) = &self.facet_publication {
+            publication.invalidate();
+        }
         self.shutdown_requested.store(true, Ordering::Release);
         self.completion_io.stop();
         self.kernel.shutdown().await;
@@ -2634,6 +2775,9 @@ fn try_enqueue_mailbox(
 
 impl Drop for ComponentActor {
     fn drop(&mut self) {
+        if let Some(publication) = &self.facet_publication {
+            publication.invalidate();
+        }
         self.shutdown_requested.store(true, Ordering::Release);
         self.completion_io.stop();
         self.kernel.stop();
@@ -2760,6 +2904,9 @@ async fn run_component_actor(
             .await
         }))
         .await;
+    if let Some(publication) = &store.data().facet_publication {
+        publication.invalidate();
+    }
     // Retire watch notifications and native subscriptions before the
     // generation can report termination or a replacement becomes reachable.
     store.data().filesystem_watches.stop();
@@ -2838,6 +2985,10 @@ async fn run_component_event_loop(
             )?;
             if let Some((event, mailbox_permit, byte_permit, context)) = event {
                 dispatcher_busy = true;
+                let dispatch_input_sequence = match &event {
+                    abi::Event::FacetInput(batch) => Some(batch.input_sequence),
+                    _ => None,
+                };
                 if context.profile_id != 0 {
                     brood_profiler::flow(
                         brood_profiler::Kind::FlowStep,
@@ -2847,8 +2998,22 @@ async fn run_component_event_loop(
                         Vec::new(),
                     );
                 }
-                let call = accessor
-                    .with(|mut access| dispatch.start_call_concurrent(&mut access, (event,)))?;
+                let call = accessor.with(|mut access| {
+                    if let Some(publication) = &access.get().facet_publication {
+                        publication.set_dispatch_input_sequence(dispatch_input_sequence);
+                    }
+                    let call = match dispatch.start_call_concurrent(&mut access, (event,)) {
+                        Ok(call) => call,
+                        Err(error) => {
+                            if let Some(publication) = &access.get().facet_publication {
+                                publication.set_dispatch_input_sequence(None);
+                            }
+                            return Err(error);
+                        }
+                    };
+                    access.get().actor_dispatch_task = Some(call.task());
+                    Ok::<_, wasmtime::Error>(call)
+                })?;
                 calls.push(
                     async move {
                         let _profile_span = brood_profiler::Span::asynchronous(
@@ -2906,6 +3071,9 @@ async fn run_component_event_loop(
                         byte_permit,
                         profile_id,
                     ));
+                }
+                Some(RuntimeCommand::FacetInput { batch, permit, byte_permit }) => {
+                    mailbox_queue.push_back((abi::Event::FacetInput(batch), permit, byte_permit, 0));
                 }
                 Some(RuntimeCommand::SpawnWorker { worker, payload, byte_permit }) => {
                     let started = start_worker(
@@ -2996,6 +3164,12 @@ async fn run_component_event_loop(
                 let Some(outcome) = outcome else { continue; };
                 match outcome {
                     GuestCallOutcome::Dispatch { result, context } => {
+                        accessor.with(|mut access| {
+                            access.get().actor_dispatch_task = None;
+                            if let Some(publication) = &access.get().facet_publication {
+                                publication.set_dispatch_input_sequence(None);
+                            }
+                        });
                         dispatcher_busy = false;
                         if context.profile_id != 0 {
                             brood_profiler::flow(

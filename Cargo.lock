@@ -503,6 +503,7 @@ name = "brood-plugin-sdk"
 version = "0.1.0"
 dependencies = [
  "brood-graphics",
+ "brood-protocol",
  "serde",
  "wit-bindgen 0.57.1",
 ]
@@ -566,6 +567,7 @@ name = "brood-wasm"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "brood-graphics",
  "brood-profiler",
  "brood-protocol",
  "cap-fs-ext",

@@ -91,12 +91,27 @@ find_component() {
   readlink -f "$path"
 }
 
-GRAPHICS_COMPONENT="$(find_component brood_plugin_graphics_example.component.wasm)"
+if [[ -n "${BROOD_RENDER_SCHEDULING_GRAPHICS_COMPONENT:-}" ]]; then
+  GRAPHICS_COMPONENT="$(readlink -f "$BROOD_RENDER_SCHEDULING_GRAPHICS_COMPONENT")"
+  [[ -s "$GRAPHICS_COMPONENT" ]] || {
+    echo "ERR supplied graphics component is missing: $GRAPHICS_COMPONENT" >&2
+    exit 2
+  }
+else
+  GRAPHICS_COMPONENT="$(find_component brood_plugin_graphics_example.component.wasm)"
+fi
 CPU_COMPONENT="$(find_component brood_component_actor_example.component.wasm)"
 WATCH_COMPONENT="$(find_component brood_component_workspace_watch_plugin.component.wasm)"
 BACKEND_INIT="$(find_component brood_worktree_manager_plugin.component.wasm)"
 SESSION_INIT="$(find_component brood_wasm_init_actor_example.component.wasm)"
 CLIENT_INIT="$(find_component brood_session_switcher_plugin.component.wasm)"
+# The init actor opens these shell children from its package. Verify them
+# before starting the workload, including when a caller supplies the package.
+for shell_component in brood_picker_plugin.component.wasm \
+  brood_keybindings_plugin.component.wasm brood_inbox_plugin.component.wasm \
+  brood_status_bar_plugin.component.wasm; do
+  find_component "$shell_component" >/dev/null
+done
 
 read -r -a WAYLAND_BUILD_FLAGS <<< "$(pkg-config --cflags --libs wayland-client xkbcommon)"
 cc -std=c11 -Wall -Wextra -Werror \
@@ -108,11 +123,11 @@ cc -std=c11 -Wall -Wextra -Werror \
 
 # This focused ignored test prints the virtual-clock observations themselves;
 # a generic test exit is deliberately not translated into zero counters.
-nix develop --command cargo test -p brood-client --release \
+env -u BROOD_TRACE_RENDER_PROTOCOL -u BROOD_PROFILE_DIR nix develop --command cargo test -p brood-client --release \
   render_scheduler::tests -- --nocapture --test-threads=1 > "$DETERMINISTIC_LOG" 2>&1
-nix develop --command cargo test -p brood-client --release \
+env -u BROOD_TRACE_RENDER_PROTOCOL -u BROOD_PROFILE_DIR nix develop --command cargo test -p brood-client --release \
   plugin_graphics::tests -- --nocapture --test-threads=1 >> "$DETERMINISTIC_LOG" 2>&1
-nix develop --command cargo test -p brood-client --release \
+env -u BROOD_TRACE_RENDER_PROTOCOL -u BROOD_PROFILE_DIR nix develop --command cargo test -p brood-client --release \
   actor_runtime::tests -- --nocapture --test-threads=1 >> "$DETERMINISTIC_LOG" 2>&1
 [[ "$(rg -c 'render scheduling deterministic [{]' "$DETERMINISTIC_LOG" || true)" -eq 4 ]] || {
   echo "ERR deterministic scheduler test did not emit machine observations" >&2
@@ -435,7 +450,12 @@ wait_for_saturated_layout() {
   local log="$1"
   for _ in $(seq 1 600); do
     if rg -q 'accepted synchronized layout .* wait=6 affected=6 .* target_rects=\[1:960:0:320:720,18446744073709551611:0:0:320:360,18446744073709551612:320:0:320:360,18446744073709551613:640:0:320:360,18446744073709551614:0:360:480:360,18446744073709551615:480:360:480:360\]' "$log" \
-      && rg -q 'finalized native window resize .* epoch=1 size=1280x720 ' "$log" \
+      && awk '/accepted synchronized layout .* wait=6 affected=6 / {
+           for (i = 1; i <= NF; i++) if ($i ~ /^epoch=/) epoch = $i
+         }
+         /finalized native window resize / && epoch != "" &&
+           index($0, " " epoch " size=1280x720 " ) { found = 1 }
+         END { exit !found }' "$log" \
       && rg -q '^presentation layout source changed source=actor$' "$log"; then
       return
     fi
@@ -460,8 +480,11 @@ toggle_actor_subscription() {
   for _ in $(seq 1 600); do
     if awk -v first="$first_new_line" -v actor="$actor" -v pane="$pane" \
       -v require_promotion="$require_promotion" '
+        /focused local plugin pane=/ {
+          focused = index($0, "focused local plugin pane=" pane) != 0
+        }
+        /focused backend-managed window=/ { focused = 0 }
         NR < first { next }
-        index($0, "focused local plugin pane=" pane) { focused = 1 }
         focused && /plugin keyboard input logical="F8" .* state=Pressed/ { keyed = 1 }
         keyed && index($0, "render scheduling actor-frame promoted actor=" actor " ") {
           promoted = 1
@@ -548,6 +571,40 @@ wait_for_renderer_recovery_and_actor_frame() {
   return 1
 }
 
+wait_for_facet_visibility_commit() {
+  local log="$1"
+  local first_new_line="$2"
+  local visible_count="$3"
+  for _ in $(seq 1 600); do
+    if awk -v first="$first_new_line" -v expected="$visible_count" '
+      NR < first { next }
+      /^facet bridge accepted token=[0-9]+ revision=[0-9]+ visible=\{[0-9]+(, [0-9]+)?\}$/ {
+        visible = $0
+        sub(/^.* visible=\{/, "", visible)
+        sub(/\}$/, "", visible)
+        count = split(visible, panes, /, /)
+        if (count == expected) {
+          revision = $0
+          sub(/^.* revision=/, "", revision)
+          sub(/ .*/, "", revision)
+        }
+        next
+      }
+      revision != "" && /^facet native pair committed route=ordinary actor=render-proof / &&
+        index($0, " native_revision=" revision " ") && index($0, " pane_count=2 ") {
+        found = 1
+      }
+      END { exit !found }
+    ' "$log"; then
+      return
+    fi
+    kill -0 "$CLIENT_PID" 2> /dev/null || break
+    sleep 0.025
+  done
+  echo "ERR facet visibility change lacked an atomic two-pane commit for a visible_count=$visible_count candidate" >&2
+  return 1
+}
+
 run_scenario() {
   local lane="$1"
   local refresh="$2"
@@ -623,12 +680,12 @@ run_scenario() {
   if [[ "$saturated" == 1 ]]; then
     exercise_smithay_driver_after_reset "$log"
   fi
-  # One uninterrupted 1 ms stream exercises deadline cutoff while input is
-  # continuously readable. All 260 presses begin after the scheduler-owned
-  # presentation warm-up marker and therefore belong to the measured set.
+  # Sample well over 100 refresh cycles rather than a short phase-sensitive
+  # burst. Keep all 2080 presses below the 4096-entry correlation history and
+  # preserve the same uninterrupted 1 ms input load and acceptance thresholds.
   local key_stream
-  key_stream='abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz'
-  [[ "${#key_stream}" -eq 260 ]]
+  printf -v key_stream '%.0sabcdefghijklmnopqrstuvwxyz' {1..80}
+  [[ "${#key_stream}" -eq 2080 ]]
   wayland_env "$OUT/virtual-keyboard-key" --text "$key_stream"
 
   if [[ "$lane" == unsaturated_60hz ]]; then
@@ -647,16 +704,25 @@ run_scenario() {
     [[ -s "$OUT/captures/$lane-recovered.png" ]]
     # Proof-only F10 routes through the client's ordinary layout eligibility
     # path, hiding one owned pane without hiding the OS window.
+    local visibility_log_start
+    visibility_log_start=$(($(wc -l < "$log") + 1))
     wayland_env "$OUT/virtual-keyboard-key" --plain 68
+    wait_for_facet_visibility_commit "$log" "$visibility_log_start" 1
     sleep 0.5
     capture_screen "$OUT/captures/$lane-one-pane-hidden.png" left-full-right-hidden
     [[ -s "$OUT/captures/$lane-one-pane-hidden.png" ]]
+    visibility_log_start=$(($(wc -l < "$log") + 1))
     wayland_env "$OUT/virtual-keyboard-key" --plain 68
+    wait_for_facet_visibility_commit "$log" "$visibility_log_start" 2
     sleep 0.5
     capture_screen "$OUT/captures/$lane-visible-after.png" bilateral-full
     [[ -s "$OUT/captures/$lane-visible-after.png" ]]
   fi
   sleep "$settle_seconds"
+
+  # Freeze cadence evidence at the explicit end of active measurement, before
+  # screenshot capture and idle-control input can add non-animation intervals.
+  wayland_env "$OUT/virtual-keyboard-key" --plain 88
   capture_screen "$OUT/captures/$lane.png" bilateral-full
   [[ -s "$OUT/captures/$lane.png" ]]
 
@@ -671,12 +737,10 @@ run_scenario() {
     wayland_env "$OUT/virtual-keyboard-key" --plain 66
   fi
   sleep 0.5
-  # Linux input code 88 is F12. The proof hook snapshots counters here.
-  wayland_env "$OUT/virtual-keyboard-key" --plain 88
-  sleep 5.5
-  # F11 closes the measurement interval before frontend shutdown can add
-  # lifecycle work to the idle deltas.
-  wayland_env "$OUT/virtual-keyboard-key" --plain 87
+  # Keep one virtual keyboard alive across the F12/F11 proof boundaries.
+  # Creating or destroying a keyboard can itself generate focus/reset traffic,
+  # which must remain outside the measured idle interval.
+  wayland_env "$OUT/virtual-keyboard-key" --idle-proof 5500
   sleep 0.1
   ctl close-frontend > /dev/null
   for _ in $(seq 1 300); do
@@ -710,6 +774,14 @@ tools/assemble-render-scheduling-report.py \
   --component "$GRAPHICS_COMPONENT" \
   --artifact-directory "$OUT" \
   --output "$REPORT"
+python3 - "$REPORT" <<'PY_SAMPLE_COUNT'
+import json
+import sys
+report = json.load(open(sys.argv[1]))
+for lane in ("unsaturated_60hz", "saturated_60hz"):
+    samples = report[lane]["key_to_present"]["samples"]
+    assert 2080 <= samples < 4096, (lane, "incomplete or rolled-over input sample", samples)
+PY_SAMPLE_COUNT
 tools/analyze-render-scheduling.py "$REPORT"
 
 echo "render_scheduling_report=$REPORT"

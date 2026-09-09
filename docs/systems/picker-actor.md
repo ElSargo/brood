@@ -39,11 +39,13 @@ A caller creates work by sending:
   "title": "Open file",
   "placeholder": "Type a path…",
   "items": [
-    "README.md",
     {
-      "label": "docs/architecture.md",
-      "detail": "Architecture overview",
-      "value": {"path": "docs/architecture.md"}
+      "id": "file:README.md",
+      "value": {"label": "README.md", "detail": "Project overview", "path": "README.md"}
+    },
+    {
+      "id": "file:docs/architecture.md",
+      "value": {"label": "docs/architecture.md", "detail": "Architecture overview", "path": "docs/architecture.md"}
     }
   ]
 }
@@ -54,8 +56,10 @@ short `loading_label`. The picker is visible and accepts a query immediately;
 it renders a progress spinner until the owner publishes the discovered items.
 
 `request` is optional caller-owned JSON used only for correlating the reply.
-Items are either strings or objects with a string `label`. Object items may
-contain an optional string `detail` and any other caller-owned JSON.
+Every item is an envelope of `{ "id": string, "value": JSON }`. IDs are
+UTF-8 strings of 1–8192 bytes and must be unique within the complete item set.
+The inner value is either a string or an object with a string `label`, optional
+string `detail`, and any other caller-owned JSON.
 
 The picker immediately allocates a monotonic ID and replies:
 
@@ -81,20 +85,22 @@ results without replacing existing entries:
   "type": "picker-add",
   "picker": 7,
   "items": [
-    {"label": "src/main.rs", "value": {"path": "src/main.rs"}}
+    {"id": "file:src/main.rs", "value": {"label": "src/main.rs", "path": "src/main.rs"}}
   ]
 }
 ```
 
 When a discovery result is a fresh snapshot rather than an append-only stream,
-the owner replaces the items and completes the loading state in one update:
+the owner replaces the items and completes the loading state in one update.
+The complete proposed set is validated transactionally; malformed or duplicate
+IDs return `picker-error` and preserve the previous items:
 
 ```json
 {
   "type": "picker-update",
   "picker": 7,
   "items": [
-    {"label": "Local", "value": {"backend": 1}}
+    {"id": "backend:1", "value": {"label": "Local", "backend": 1}}
   ],
   "loading": false
 }
@@ -107,10 +113,15 @@ order, independent of the current fuzzy ranking:
 {
   "type": "picker-selected",
   "picker": 7,
-  "result": {"label": "src/main.rs", "value": {"path": "src/main.rs"}},
+  "item_id": "file:src/main.rs",
+  "result": {"label": "src/main.rs", "path": "src/main.rs"},
   "index": 2
 }
 ```
+
+`item_id` is the stable identity from the displayed item. `index` is the
+zero-based append order for diagnostics and compatibility; callers use
+`item_id` and validate the returned value against current domain state.
 
 An owner may cancel active or queued work with `picker-cancel`. Escape produces
 the same `picker-cancelled` reply. Invalid messages, unknown IDs, malformed
@@ -127,7 +138,9 @@ a late worker event cannot mutate its replacement.
 
 Matching is case-insensitive subsequence matching with bonuses for contiguous
 characters and word boundaries. Ties retain append order. An empty query shows
-all items in append order. The matching characters are highlighted in each
+all items in append order. Replacing or reordering items preserves the current
+selection when its `item_id` remains present; otherwise selection falls back to
+the first visible item. The matching characters are highlighted in each
 visible label. Query editing has a Unicode-safe insertion point with Left/Right,
 Home/End, Backspace, and Delete. Pointer hover moves the same selection used by
 the keyboard, while a click activates only after press and release on the same

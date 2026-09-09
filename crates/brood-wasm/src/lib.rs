@@ -14,6 +14,16 @@ pub mod component_actor;
 pub mod computer_use_js;
 pub mod coordination;
 mod epoch_clock;
+pub mod facet_executor;
+pub mod facet_frames;
+pub mod facet_graphics;
+pub mod facet_input;
+pub mod facet_linker;
+pub mod facet_probe;
+pub mod facet_publication;
+pub mod facet_resources;
+pub mod facet_runtime;
+pub mod facet_wire;
 mod filesystem_watch;
 pub mod global_key_policy;
 mod global_key_policy_link;
@@ -34,6 +44,9 @@ pub mod resize;
 pub mod resolved_layout;
 mod resource_limits;
 pub mod runtime_io;
+pub mod snapshot_budget;
+pub mod snapshot_reclaimer;
+pub mod snapshot_store;
 mod test_harness;
 
 pub use actor::{
@@ -58,7 +71,8 @@ pub use completion_io::{
 pub use component_actor::{
     ComponentActor, ComponentActorConfig, ComponentActorEvent, ComponentActorEventWaker,
     ComponentActorMailboxStats, ComponentActorPresentationEnvelopeSendError,
-    ComponentActorSendError, ComponentAppEvent, ComponentChildEvent, PresentationScope, WorkerId,
+    ComponentActorSendError, ComponentAppEvent, ComponentChildEvent, FacetPublicationConfig,
+    PresentationScope, WorkerId,
 };
 pub use computer_use_js::{
     ComputerUseJsConfig, ComputerUseJsExecution, ComputerUseJsIsolate, ComputerUseJsMetrics,

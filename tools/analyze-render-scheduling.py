@@ -429,6 +429,11 @@ def self_test() -> None:
         "too few panes": ("nested_behavior", "owned_visible_panes"),
         "idle polling": ("idle", "periodic_actor_polls"),
         "deadline regression": ("unsaturated_60hz", "render_hint_deadline_misses"),
+        "short active cadence window": (
+            "direct_120hz",
+            "presented_frame_intervals",
+            "samples",
+        ),
         "hot-path regression": ("hot_paths", "winit", "p99_us"),
         "callback retention rollover": ("hot_paths", "winit", "callbacks_lifetime"),
         "unexercised invariant": ("behavior_invariants", "full_correlation_stages", "exercised"),
@@ -454,6 +459,8 @@ def self_test() -> None:
             parent[field] = 1
         elif label == "deadline regression":
             parent[field] = 7
+        elif label == "short active cadence window":
+            parent[field] = 598
         elif label in ("unexercised invariant", "unexercised scheduler probe"):
             parent[field] = 0
         else:

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
@@ -8,6 +8,13 @@ SSH_TARGET="${BROOD_CODING_AGENT_SSH_TARGET:-}"
 COMPUTER_USE="${BROOD_CODING_AGENT_COMPUTER_USE:-}"
 CREATE_AGENT_ONLY="${BROOD_CODING_AGENT_CREATE_ONLY:-}"
 STYLE_ONLY="${BROOD_CODING_AGENT_STYLE_ONLY:-}"
+OFFLINE="${BROOD_CODING_AGENT_OFFLINE:-}"
+PURE_RENDERER_ARGS=()
+if [[ "${BROOD_CODING_AGENT_PURE_RENDERER:-1}" == 1 ]]; then
+  PURE_RENDERER_ARGS=(--features pure-renderer)
+else
+  PURE_RENDERER_ARGS=(--no-default-features)
+fi
 REMOTE_IMAGE_MARKER="REMOTE_IMAGE_PROOF: red green"
 FIRST_CU_MARKER="BROOD_BUILTIN_CU_FIRST_OK"
 SECOND_CU_MARKER="BROOD_BUILTIN_CU_SECOND_OK"
@@ -71,6 +78,14 @@ for event in events:
 EOF
   chmod +x "$OUT/bin/brood-agent"
 fi
+if [[ -n "$OFFLINE" && -n "$STYLE_ONLY$CREATE_AGENT_ONLY$COMPUTER_USE$SSH_TARGET" ]]; then
+  echo "ERR offline worker verification requires the local full coding-agent lane" >&2
+  exit 2
+fi
+if [[ -n "$OFFLINE" ]]; then
+  cp "$ROOT/tools/coding-agent-offline-fixture.py" "$OUT/bin/brood-agent"
+  chmod +x "$OUT/bin/brood-agent"
+fi
 
 CLIENT_PID=""
 SERVER_PID=""
@@ -79,6 +94,15 @@ DRAG_PID=""
 cleanup() {
   local result=$?
   set +e
+  if ((result != 0)) && [[ -n "${WAYLAND_SOCKET:-}" ]]; then
+    env XDG_RUNTIME_DIR="$RUNTIME_DIR" WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+      grim "$OUT/failure.png"
+    local failure_sway_socket
+    failure_sway_socket="$(find "$RUNTIME_DIR" -maxdepth 1 -type s -name 'sway-ipc.*.sock' | head -1)"
+    if [[ -n "$failure_sway_socket" ]]; then
+      env SWAYSOCK="$failure_sway_socket" swaymsg -t get_tree -r > "$OUT/failure-tree.json"
+    fi
+  fi
   terminate_process_bounded "$DRAG_PID"
   terminate_process_bounded "$CLIENT_PID"
   terminate_process_bounded "$SERVER_PID"
@@ -94,7 +118,13 @@ cleanup() {
   return "$result"
 }
 trap cleanup EXIT
+trap 'echo "ERR coding-agent line=$LINENO command=$BASH_COMMAND callers=${BASH_LINENO[*]}" >&2' ERR
 
+# Cargo unlocks a core artifact before componentization. Serialize this build
+# and copy phase with other nested gates so feature variants cannot race.
+mkdir -p "$ROOT/target"
+exec 9>"$ROOT/target/brood-plugin-artifacts.lock"
+flock 9
 cargo build -p broodd -p brood-client --bins
 if [[ -n "$COMPUTER_USE" ]]; then
   cargo build \
@@ -108,6 +138,7 @@ if [[ -n "$SSH_TARGET" ]]; then
 fi
 cargo build \
   --manifest-path plugins/coding-agent/Cargo.toml \
+  "${PURE_RENDERER_ARGS[@]}" \
   --target wasm32-unknown-unknown \
   --release \
   --locked
@@ -117,6 +148,7 @@ wasm-tools component new \
 wasm-tools validate "$PACKAGE/brood_coding_agent_plugin.component.wasm"
 cargo build \
   --manifest-path plugins/terminal-ui/Cargo.toml \
+  "${PURE_RENDERER_ARGS[@]}" \
   --target wasm32-unknown-unknown \
   --release \
   --locked
@@ -135,6 +167,7 @@ wasm-tools component new \
 wasm-tools validate "$PACKAGE/brood_wasm_init_actor_example.component.wasm"
 cargo build \
   --manifest-path plugins/session-switcher/Cargo.toml \
+  "${PURE_RENDERER_ARGS[@]}" \
   --target wasm32-unknown-unknown \
   --release \
   --locked
@@ -144,6 +177,7 @@ wasm-tools component new \
 wasm-tools validate "$PACKAGE/brood_session_switcher_plugin.component.wasm"
 cargo build \
   --manifest-path plugins/status-bar/Cargo.toml \
+  "${PURE_RENDERER_ARGS[@]}" \
   --target wasm32-unknown-unknown \
   --release \
   --locked
@@ -153,6 +187,7 @@ wasm-tools component new \
 wasm-tools validate "$PACKAGE/brood_status_bar_plugin.component.wasm"
 cargo build \
   --manifest-path plugins/inbox/Cargo.toml \
+  "${PURE_RENDERER_ARGS[@]}" \
   --target wasm32-unknown-unknown \
   --release \
   --locked
@@ -162,6 +197,7 @@ wasm-tools component new \
 wasm-tools validate "$PACKAGE/brood_inbox_plugin.component.wasm"
 cargo build \
   --manifest-path plugins/picker/Cargo.toml \
+  "${PURE_RENDERER_ARGS[@]}" \
   --target wasm32-unknown-unknown \
   --release \
   --locked
@@ -171,6 +207,7 @@ wasm-tools component new \
 wasm-tools validate "$PACKAGE/brood_picker_plugin.component.wasm"
 cargo build \
   --manifest-path plugins/keybindings/Cargo.toml \
+  "${PURE_RENDERER_ARGS[@]}" \
   --target wasm32-unknown-unknown \
   --release \
   --locked
@@ -243,6 +280,9 @@ client = "$PACKAGE/brood_session_switcher_plugin.component.wasm"
 provider = "workspace"
 path = "$ROOT/plugins/default-workspace/target/wasm32-unknown-unknown/release/brood_default_workspace_plugin.wasm"
 EOF
+
+flock -u 9
+exec 9>&-
 
 RUST_LOG="${RUST_LOG:-broodd=info,brood_client=info,smithay=warn,wgpu_core=warn,wgpu_hal=warn}"
 if [[ -z "$SSH_TARGET" ]]; then
@@ -331,6 +371,8 @@ if [[ -n "$SSH_TARGET" ]]; then
     BROOD_DMABUF_HAPPY_PATH=1 \
     BROOD_TRACE_PLUGIN_INPUT=1 \
     BROOD_TRACE_PLUGIN_TEXT=1 \
+    BROOD_TRACE_RESIZE=1 \
+    WAYLAND_DEBUG="${BROOD_TEST_WAYLAND_DEBUG:-0}" \
     RUST_LOG="$RUST_LOG" \
     target/release/brood-remote ssh \
     --session-package "coding-agent-image-test=$PACKAGE/brood_wasm_init_actor_example.component.wasm" \
@@ -347,6 +389,8 @@ else
     BROOD_DMABUF_HAPPY_PATH=1 \
     BROOD_TRACE_PLUGIN_INPUT=1 \
     BROOD_TRACE_PLUGIN_TEXT=1 \
+    BROOD_TRACE_RESIZE=1 \
+    WAYLAND_DEBUG="${BROOD_TEST_WAYLAND_DEBUG:-0}" \
     RUST_LOG="$RUST_LOG" \
     target/debug/brood-client \
     --config "$CONFIG" \
@@ -371,7 +415,7 @@ backend_ready() {
 STARTUP_ATTEMPTS=300
 [[ -z "$SSH_TARGET" ]] || STARTUP_ATTEMPTS=3600
 for _ in $(seq 1 "$STARTUP_ATTEMPTS"); do
-  if rg -q "compiled plugin GPU scene" "$CLIENT_LOG" \
+  if rg -q "compiled plugin GPU scene|facet native pair committed" "$CLIENT_LOG" \
     && backend_ready; then
     break
   fi
@@ -381,31 +425,28 @@ for _ in $(seq 1 "$STARTUP_ATTEMPTS"); do
   }
   sleep 0.1
 done
-rg -q "compiled plugin GPU scene" "$CLIENT_LOG"
+rg -q "compiled plugin GPU scene|facet native pair committed" "$CLIENT_LOG"
 if [[ -n "$SSH_TARGET" ]]; then
   rg -q 'backend actor message .*"id":"coding-agent-1"' "$CLIENT_LOG"
 else
   backend_ready
 fi
 
-# Wait for the initial workspace to be committed, then open the picker using
-# the real global shortcut. The rest of this proof continues through real
-# pointer and keyboard input inside the picker and agent UI.
-REQUIRED_LAYOUT_COMMITS=2
-[[ -z "$COMPUTER_USE" && -z "$CREATE_AGENT_ONLY" && -z "$STYLE_ONLY" ]] \
-  || REQUIRED_LAYOUT_COMMITS=1
+# Wait for the actual initial shell frame, not an earlier quiescent layout.
+# Startup publishes the terminal and sidebar in separate native transactions;
+# injecting short-lived devices between those transactions can lose their
+# capability events while the first GPU scenes are still being prepared.
+startup_frame_ready() {
+  rg -a 'render-content-projection panes=3 projected_panes=0 ' "$CLIENT_LOG" \
+    | rg ':960:686:960:686' \
+    | rg -q ':320:686:320:686'
+}
 for _ in $(seq 1 300); do
-  if [[ "$(rg -a -c 'presented committed layout revision' "$CLIENT_LOG" || true)" -ge "$REQUIRED_LAYOUT_COMMITS" ]]; then
-    break
-  fi
+  startup_frame_ready && break
+  kill -0 "$CLIENT_PID" 2>/dev/null || break
   sleep 0.1
 done
-[[ "$(rg -a -c 'presented committed layout revision' "$CLIENT_LOG" || true)" -ge "$REQUIRED_LAYOUT_COMMITS" ]]
-for _ in $(seq 1 300); do
-  rg -q 'finalized native window resize' "$CLIENT_LOG" && break
-  sleep 0.1
-done
-rg -q 'finalized native window resize' "$CLIENT_LOG"
+startup_frame_ready
 click_at 640 360
 sleep 0.2
 PICKER_PANE="$(
@@ -642,13 +683,35 @@ if [[ -n "$STYLE_ONLY" ]]; then
     exit 1
   fi
   kill -0 "$CLIENT_PID"
+  # Exercise image delivery through the isolated interpreter without a provider.
+  magick -size 192x128 xc:red "$OUT/style-pasted-image.png"
+  env XDG_RUNTIME_DIR="$RUNTIME_DIR" WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+    wl-copy --type image/png < "$OUT/style-pasted-image.png"
+  sleep 0.2
+  focus_agent_prompt
+  env XDG_RUNTIME_DIR="$RUNTIME_DIR" WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+    "$OUT/virtual-keyboard-key" --ctrl-only 47
+  IMAGE_PIXELS=0
+  for _ in $(seq 1 100); do
+    capture "$OUT/agent-style-image.png"
+    IMAGE_PIXELS="$(magick "$OUT/agent-style-image.png" -format %c histogram:info:- | awk '/#FF0000/ { gsub(":", "", $1); total += $1 } END { print total + 0 }')"
+    ((IMAGE_PIXELS >= 500)) && break
+    kill -0 "$CLIENT_PID"
+    sleep 0.1
+  done
+  ((IMAGE_PIXELS >= 500)) || { echo "ERR clipboard image did not reach the rendered preview" >&2; exit 1; }
+  if rg -a -q 'visual facet .*failed|facet invocation failed' "$CLIENT_LOG"; then
+    echo "ERR a facet failed during the coding-agent workload" >&2
+    exit 1
+  fi
   cat > "$OUT/proof.md" <<EOF
 # Coding agent pane style proof
 
 - input: real Wayland text editing, cursor navigation, shortcut, wheel, and pointer-drag events
 - output: Markdown headings, list, quote, code block, status, and tool events crossed the normal agent stream
 - interaction: transcript scrolling, Ctrl+F search, and tab drag each changed the rendered pane
-- stability: the presentation client remained alive throughout the workload
+- attachment: a real clipboard PNG crossed the input facet and rendered a red preview with at least 500 pixels
+- stability: the presentation client remained alive throughout the workload; no facet failure was logged
 - captures: agent-idle.png, agent-editor.png, agent-markdown.png, agent-scrolled.png, agent-search.png, agent-tabs-before-drag.png, and agent-tabs-after-drag.png
 EOF
   echo "coding_agent_style=verified"
@@ -740,7 +803,8 @@ done
 rg -q "delivering clipboard image .*mime=image/png" "$CLIENT_LOG"
 capture "$OUT/agent-image-attached.png"
 
-env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+env GDK_BACKEND=wayland GTK_A11Y=none NO_AT_BRIDGE=1 \
+  XDG_RUNTIME_DIR="$RUNTIME_DIR" \
   WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
   "$OUT/image-drag-source" "$OUT/dropped-image.png" \
   > "$OUT/image-drag-source.log" 2>&1 &
@@ -1054,6 +1118,10 @@ EOF
   exit 0
 else
   for _ in $(seq 1 900); do
+    if rg -q "component actor worker failed" "$SERVER_LOG"; then
+      echo "ERR coding-agent worker failed; inspect $CLIENT_LOG and $SERVER_LOG" >&2
+      exit 1
+    fi
     if [[ -f "$WORKSPACE/.brood/agent-actor-proof.txt" ]] \
       && rg -qx "actor-ui-worker-ok" "$WORKSPACE/.brood/agent-actor-proof.txt" \
       && [[ -f "$WORKSPACE/.brood/image-proof.txt" ]] \
@@ -1111,6 +1179,9 @@ INBOX_PANE="$(
     | head -1
 )"
 [[ -n "$INBOX_PANE" ]]
+inbox_frame_ready() {
+  rg -q "render-content-projection .*${INBOX_PANE}:[0-9]+:320:686:320:686" "$CLIENT_LOG"
+}
 INBOX_SHORTCUT_BASELINE="$(
   rg -c 'sent key-policy actor message actor=inbox' "$CLIENT_LOG" || true
 )"
@@ -1122,13 +1193,13 @@ for _ in $(seq 1 100); do
     rg -c 'sent key-policy actor message actor=inbox' "$CLIENT_LOG" || true
   )"
   if ((INBOX_SHORTCUT_COUNT > INBOX_SHORTCUT_BASELINE)) \
-    && rg -q "sent plugin pane resize pane=$INBOX_PANE logical_size=320x686 " "$CLIENT_LOG"; then
+    && inbox_frame_ready; then
     break
   fi
   sleep 0.05
 done
 ((INBOX_SHORTCUT_COUNT > INBOX_SHORTCUT_BASELINE))
-rg -q "sent plugin pane resize pane=$INBOX_PANE logical_size=320x686 " "$CLIENT_LOG"
+inbox_frame_ready
 capture "$OUT/agent-finished-inbox.png"
 
 INBOX_CLICK_X=$((1280 - 320 / 2))
@@ -1200,15 +1271,17 @@ STATUS="$(ctl status)"
 rg -q "presentation=Attached" <<< "$STATUS"
 rg -q "session-to-presentation" "$SERVER_LOG"
 
+WORKER_DESCRIPTION="the live headless Brood agent"
+[[ -z "$OFFLINE" ]] || WORKER_DESCRIPTION="a deterministic brood-agent fixture (external model service replaced)"
 cat > "$OUT/proof.md" <<EOF
 # Coding agent actor proof
 
 - input: real text and Enter events through a headless Sway presentation
 - UI: Ctrl+Alt+A opened the session agent picker and Enter launched a session-scoped client-realm canvas actor for its selected agent
 - agent: one independently addressed session-realm actor selected through the UI
-- work: a private actor worker launched the headless Brood agent with workspace-write authority
+- work: a private actor worker launched $WORKER_DESCRIPTION in the test workspace
 - result: .brood/agent-actor-proof.txt contains actor-ui-worker-ok
-- image: real compositor clipboard and desktop drag/drop PNGs were attached, transferred to the session actor, interpreted by the Brood agent as $IMAGE_EXPECTED, and removed after the turn
+- image: real compositor clipboard and desktop drag/drop PNGs were attached, transferred to the session actor, validated by $WORKER_DESCRIPTION as $IMAGE_EXPECTED, and removed after the turn
 - inbox: agent completion created a global queue item and clicking it focused the originating agent pane
 - survival: the focused UI accepted a model change after the completed turn
 - captures: agent-idle.png, agent-image-attached.png, agent-images-attached.png, agent-finished-inbox.png, and agent-complete.png

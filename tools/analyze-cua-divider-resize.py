@@ -368,6 +368,44 @@ def main() -> int:
             for sample in element_samples[1:]
             if sample["interval_us"] > 0
         ]
+        changed_element_indices = [
+            index
+            for index in range(1, len(element_samples))
+            if element_samples[index]["target_rect"]
+            != element_samples[index - 1]["target_rect"]
+        ]
+        if changed_element_indices:
+            gesture_element_samples = element_samples[
+                max(0, changed_element_indices[0] - 1) : changed_element_indices[-1] + 1
+            ]
+        else:
+            gesture_element_samples = []
+        max_repeated_committed_frame_run = 0
+        max_repeated_committed_frame_duration_us = 0.0
+        repeated_start_ns = None
+        repeated_sequence = None
+        repeated_count = 0
+        for sample in gesture_element_samples:
+            if sample["sequence"] == repeated_sequence:
+                repeated_count += 1
+            else:
+                repeated_sequence = sample["sequence"]
+                repeated_count = 1
+                repeated_start_ns = sample["time_ns"]
+            max_repeated_committed_frame_run = max(
+                max_repeated_committed_frame_run, repeated_count
+            )
+            max_repeated_committed_frame_duration_us = max(
+                max_repeated_committed_frame_duration_us,
+                (sample["time_ns"] - repeated_start_ns) / 1e3,
+            )
+        if (
+            len(gesture_element_samples) > 1
+            and max_repeated_committed_frame_run == len(gesture_element_samples)
+        ):
+            hard_failures.append(
+                f"run {run_number}: every committed facet frame during the gesture repeated sequence {repeated_sequence}"
+            )
         max_element_position_error = max(
             (max(abs(sample["error"][0]), abs(sample["error"][1])) for sample in element_samples),
             default=0.0,
@@ -569,6 +607,21 @@ def main() -> int:
             if item["actual_progress"] is not None and item["during_gesture"]
         ]
         if valid:
+            distance_px = abs(int(run["target_x"]) - int(run["start_x"]))
+            geometry_lag_px = [
+                abs(item["actual_progress"] - item["expected_progress"]) * distance_px
+                for item in valid
+            ]
+            repeated_frame_runs = []
+            repeated_run = 0
+            previous_detected = None
+            for item in valid:
+                if item["detected_x"] == previous_detected:
+                    repeated_run += 1
+                else:
+                    repeated_run = 1
+                    previous_detected = item["detected_x"]
+                repeated_frame_runs.append(repeated_run)
             rmse = math.sqrt(
                 statistics.fmean(
                     (item["actual_progress"] - item["expected_progress"]) ** 2
@@ -593,10 +646,18 @@ def main() -> int:
                 + 0.25 * movement_ratio
             )
         else:
+            geometry_lag_px = []
+            repeated_frame_runs = []
             rmse = 1.0
             unique_ratio = 0.0
             movement_ratio = 0.0
             visual_score = 0.0
+
+        max_repeated_frame_run = max(repeated_frame_runs, default=0)
+        if len(valid) > 1 and max_repeated_frame_run == len(valid):
+            hard_failures.append(
+                f"run {run_number}: every observed gesture frame repeated the same divider position"
+            )
 
         protocol_efficiency = clamp(1.0 - supersessions / max(1, motion_events))
         protocol_score = 20.0 * protocol_efficiency
@@ -735,6 +796,11 @@ def main() -> int:
                     "present_interval_us_p95": nearest_rank(element_intervals, 0.95),
                     "present_interval_us_p99": nearest_rank(element_intervals, 0.99),
                     "present_interval_us_max": max(element_intervals, default=None),
+                    "gesture_samples": len(gesture_element_samples),
+                    "max_repeated_committed_frame_run": max_repeated_committed_frame_run,
+                    "max_repeated_committed_frame_duration_us": round(
+                        max_repeated_committed_frame_duration_us, 3
+                    ),
                     "frames": element_samples,
                 },
                 "resize_pipeline": resize_pipeline,
@@ -743,6 +809,14 @@ def main() -> int:
                 "final_error_px": final_error,
                 "completion_us": completion_us,
                 "tracking_rmse": round(rmse, 5),
+                "desired_vs_committed_geometry_lag_px": {
+                    "samples": len(geometry_lag_px),
+                    "p50": nearest_rank(geometry_lag_px, 0.50),
+                    "p95": nearest_rank(geometry_lag_px, 0.95),
+                    "p99": nearest_rank(geometry_lag_px, 0.99),
+                    "max": max(geometry_lag_px, default=None),
+                },
+                "max_repeated_frame_run": max_repeated_frame_run,
                 "unique_position_ratio": round(unique_ratio, 5),
                 "moving_sample_ratio": round(movement_ratio, 5),
                 "scores": {

@@ -1,17 +1,21 @@
 use std::{collections::BTreeMap, sync::Mutex};
 
 use brood_graphics::{Color, Command, Packet, Rect};
+#[cfg(not(feature = "pure-renderer"))]
+use brood_plugin_sdk::bindings;
+#[cfg(not(feature = "pure-renderer"))]
+use brood_plugin_sdk::graphics::{queue_packet, queue_tagged_packet};
+#[cfg(feature = "pure-renderer")]
+use brood_plugin_sdk::{Facets, export_visual_plugin, facet_codec, facets};
 use brood_plugin_sdk::{
     actor::{send_local, start_global_actor},
-    bindings,
     exports::brood::plugin::actor::{
         Command as ActorCommand, Event, Guest, LifecycleEvent, PresentationEvent, WorkerEvent,
         WorkerRequest,
     },
-    graphics::{queue_packet, queue_tagged_packet},
     runtime::sleep,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 const INIT_ACTOR_ID: &str = "brood.client-init";
 const FAST_ACTOR_ID: &str = "resize-proof-fast";
@@ -50,7 +54,7 @@ const FAST_MARKER: Color = Color::rgba(0.04, 0.82, 0.92, 1.0);
 const SLOW_MARKER: Color = Color::rgba(0.92, 0.12, 0.72, 1.0);
 const STALL_MARKER: Color = Color::rgba(0.96, 0.58, 0.08, 1.0);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 enum ProofMode {
     Fast,
     GatedFast,
@@ -211,13 +215,14 @@ struct PendingLayoutRegion {
     has_rest: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 enum FrameIdentity {
     Initial,
     Recovery,
     Epoch(u64),
 }
 
+#[cfg(not(feature = "pure-renderer"))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum PendingDraw {
     Tagged(PaintTarget),
@@ -395,6 +400,7 @@ struct ProofState {
     recovery_delayed: bool,
     tagged_observed: bool,
     first_tagged_submitted: bool,
+    #[cfg(not(feature = "pure-renderer"))]
     last_submitted: Option<PaintTarget>,
     error: Option<String>,
     layout: Option<ProofLayoutContext>,
@@ -402,7 +408,14 @@ struct ProofState {
     region_proof_armed: bool,
     region_proof_arm_count: u64,
     pending_layout_regions: BTreeMap<u64, PendingLayoutRegion>,
+    #[cfg(not(feature = "pure-renderer"))]
     pending_draw: Option<PendingDraw>,
+    #[cfg(feature = "pure-renderer")]
+    frame_identity: FrameIdentity,
+    #[cfg(feature = "pure-renderer")]
+    publication_revision: u64,
+    #[cfg(feature = "pure-renderer")]
+    published_view: Vec<u8>,
 }
 
 impl ProofState {
@@ -422,6 +435,7 @@ impl ProofState {
             recovery_delayed: false,
             tagged_observed: false,
             first_tagged_submitted: false,
+            #[cfg(not(feature = "pure-renderer"))]
             last_submitted: None,
             error: None,
             layout: None,
@@ -429,7 +443,14 @@ impl ProofState {
             region_proof_armed: false,
             region_proof_arm_count: 0,
             pending_layout_regions: BTreeMap::new(),
+            #[cfg(not(feature = "pure-renderer"))]
             pending_draw: None,
+            #[cfg(feature = "pure-renderer")]
+            frame_identity: FrameIdentity::Initial,
+            #[cfg(feature = "pure-renderer")]
+            publication_revision: 0,
+            #[cfg(feature = "pure-renderer")]
+            published_view: Vec::new(),
         }
     }
 
@@ -496,10 +517,78 @@ impl ProofState {
 
 static STATE: Mutex<ProofState> = Mutex::new(ProofState::new(ProofMode::Fast));
 
+#[cfg(feature = "pure-renderer")]
+#[derive(Clone, Copy, Deserialize, Serialize)]
+struct RenderView {
+    mode: ProofMode,
+    identity: FrameIdentity,
+}
+
+#[cfg(feature = "pure-renderer")]
+#[derive(Deserialize, Serialize)]
+struct InteractionMap {
+    pane: u64,
+    mode: ProofMode,
+    identity: FrameIdentity,
+}
+
+#[cfg(feature = "pure-renderer")]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+enum FacetIntent {
+    ArmWindowGate {
+        pane: u64,
+        mode: ProofMode,
+        identity: FrameIdentity,
+    },
+    ReleaseWindowGate {
+        pane: u64,
+        mode: ProofMode,
+        identity: FrameIdentity,
+    },
+    ArmRegionProof {
+        pane: u64,
+        mode: ProofMode,
+        identity: FrameIdentity,
+    },
+}
+
+#[cfg(feature = "pure-renderer")]
+struct PublicationTurn;
+
+#[cfg(feature = "pure-renderer")]
+impl Drop for PublicationTurn {
+    fn drop(&mut self) {
+        publish_render_view();
+    }
+}
+
+#[cfg(feature = "pure-renderer")]
+fn publish_render_view() {
+    let Ok(mut state) = STATE.lock() else { return };
+    if state.pane == 0 {
+        return;
+    }
+    let bytes = serde_json::to_vec(&RenderView {
+        mode: state.mode,
+        identity: state.frame_identity,
+    })
+    .expect("serialize resize proof render view");
+    if bytes == state.published_view {
+        return;
+    }
+    let revision = state.publication_revision.saturating_add(1).max(1);
+    if brood_plugin_sdk::publication::publish(revision, &bytes).is_ok() {
+        state.publication_revision = revision;
+        state.published_view = bytes;
+    }
+}
+
 struct ResizeProof;
 
 impl Guest for ResizeProof {
     fn dispatch(event: Event) -> Vec<ActorCommand> {
+        #[cfg(feature = "pure-renderer")]
+        let _publication_turn = PublicationTurn;
         match event {
             Event::Lifecycle(LifecycleEvent::Start(context)) => handle_start(&context.instance_id),
             Event::Lifecycle(LifecycleEvent::Stop(_)) => {
@@ -516,6 +605,8 @@ impl Guest for ResizeProof {
                 handle_window_gate_control(&message.body)
             }
             Event::Worker(event) => handle_worker(event),
+            #[cfg(feature = "pure-renderer")]
+            Event::FacetInput(batch) => handle_facet_input(batch.events),
             _ => Vec::new(),
         }
     }
@@ -829,6 +920,7 @@ fn layout_region_diagnostic(
 
 fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
     match event {
+        #[cfg(not(feature = "pure-renderer"))]
         PresentationEvent::RenderHint(hint) => {
             let Ok(mut state) = STATE.lock() else {
                 return Vec::new();
@@ -881,20 +973,36 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
             state.height = created.height.max(1.0);
             state.scale = created.scale.max(0.01);
             let mode = state.mode;
-            let (pane, width, height, scale) = (state.pane, state.width, state.height, state.scale);
-            drop(state);
-            let result = submit_untagged_frame(pane, width, height, scale, mode);
-            record_untagged_result(&result);
-            vec![diagnostic_command(
+            let pane = state.pane;
+            #[cfg(feature = "pure-renderer")]
+            return vec![facet_diagnostic_command(
                 "resize-proof-initial",
                 mode,
                 pane,
                 None,
-                width,
-                height,
-                result.is_ok(),
-            )]
+                FrameIdentity::Initial,
+                state.width,
+                state.height,
+                state.scale,
+            )];
+            #[cfg(not(feature = "pure-renderer"))]
+            {
+                let (width, height, scale) = (state.width, state.height, state.scale);
+                drop(state);
+                let result = submit_untagged_frame(pane, width, height, scale, mode);
+                record_untagged_result(&result);
+                vec![diagnostic_command(
+                    "resize-proof-initial",
+                    mode,
+                    pane,
+                    None,
+                    width,
+                    height,
+                    result.is_ok(),
+                )]
+            }
         }
+        #[cfg(not(feature = "pure-renderer"))]
         PresentationEvent::PointerButton(button) => {
             let Ok(mut state) = STATE.lock() else {
                 return Vec::new();
@@ -1012,15 +1120,34 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
                 }
                 let cancelled = state.delay.reset();
                 state.stalled = None;
-                let (pane, width, height, scale) =
-                    (state.pane, state.width, state.height, state.scale);
+                let pane = state.pane;
+                let (width, height, scale) = (state.width, state.height, state.scale);
+                #[cfg(feature = "pure-renderer")]
+                {
+                    state.frame_identity = FrameIdentity::Initial;
+                    state.error = None;
+                }
                 drop(state);
+                #[cfg(not(feature = "pure-renderer"))]
                 let result = submit_untagged_frame(pane, width, height, scale, mode);
+                #[cfg(not(feature = "pure-renderer"))]
                 record_untagged_result(&result);
                 let mut commands = cancelled
                     .map(ActorCommand::CancelWorker)
                     .into_iter()
                     .collect::<Vec<_>>();
+                #[cfg(feature = "pure-renderer")]
+                commands.push(facet_diagnostic_command(
+                    "resize-proof-untagged-resize",
+                    mode,
+                    pane,
+                    None,
+                    FrameIdentity::Initial,
+                    width,
+                    height,
+                    scale,
+                ));
+                #[cfg(not(feature = "pure-renderer"))]
                 commands.push(diagnostic_command(
                     "resize-proof-untagged-resize",
                     mode,
@@ -1198,6 +1325,7 @@ fn apply_delay_action(action: DelayAction, mode: ProofMode) -> Vec<ActorCommand>
     }
 }
 
+#[cfg(not(feature = "pure-renderer"))]
 fn submit_target(target: PaintTarget, mode: ProofMode) -> Vec<ActorCommand> {
     if !brood_plugin_sdk::graphics::render_is_active() {
         let result =
@@ -1246,6 +1374,25 @@ fn submit_target(target: PaintTarget, mode: ProofMode) -> Vec<ActorCommand> {
     )]
 }
 
+#[cfg(feature = "pure-renderer")]
+fn submit_target(target: PaintTarget, mode: ProofMode) -> Vec<ActorCommand> {
+    if let Ok(mut state) = STATE.lock() {
+        state.frame_identity = FrameIdentity::Epoch(target.epoch);
+        state.error = None;
+    }
+    vec![facet_diagnostic_command(
+        "resize-proof-tagged",
+        mode,
+        target.pane,
+        Some(target.epoch),
+        FrameIdentity::Epoch(target.epoch),
+        target.width,
+        target.height,
+        target.scale,
+    )]
+}
+
+#[cfg(not(feature = "pure-renderer"))]
 fn submit_recovery(target: UntaggedTarget, mode: ProofMode) -> Vec<ActorCommand> {
     if !brood_plugin_sdk::graphics::render_is_active() {
         let result = brood_plugin_sdk::graphics::request_render();
@@ -1287,6 +1434,25 @@ fn submit_recovery(target: UntaggedTarget, mode: ProofMode) -> Vec<ActorCommand>
     )]
 }
 
+#[cfg(feature = "pure-renderer")]
+fn submit_recovery(target: UntaggedTarget, mode: ProofMode) -> Vec<ActorCommand> {
+    if let Ok(mut state) = STATE.lock() {
+        state.frame_identity = FrameIdentity::Recovery;
+        state.error = None;
+    }
+    vec![facet_diagnostic_command(
+        "resize-proof-recovery",
+        mode,
+        target.pane,
+        None,
+        FrameIdentity::Recovery,
+        target.width,
+        target.height,
+        target.scale,
+    )]
+}
+
+#[cfg(not(feature = "pure-renderer"))]
 fn submit_untagged_frame(
     pane: u64,
     width: f32,
@@ -1316,6 +1482,7 @@ fn submit_untagged_frame(
     Ok(0)
 }
 
+#[cfg(not(feature = "pure-renderer"))]
 fn record_untagged_result<T>(result: &Result<T, String>) {
     if let Ok(mut state) = STATE.lock() {
         match result {
@@ -1328,6 +1495,39 @@ fn record_untagged_result<T>(result: &Result<T, String>) {
     }
 }
 
+#[cfg(feature = "pure-renderer")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "diagnostic payload mirrors the resize-proof protocol fields"
+)]
+fn facet_diagnostic_command(
+    kind: &str,
+    mode: ProofMode,
+    pane: u64,
+    epoch: Option<u64>,
+    identity: FrameIdentity,
+    width: f32,
+    height: f32,
+    scale: f32,
+) -> ActorCommand {
+    send_local(
+        mode.actor_id(),
+        serde_json::to_string(&serde_json::json!({
+            "kind": kind,
+            "mode": mode.label(),
+            "pane": pane,
+            "epoch": epoch,
+            "identity": identity,
+            "width": width,
+            "height": height,
+            "scale": scale,
+            "production": "facet-publication-pending"
+        }))
+        .unwrap_or_default(),
+    )
+}
+
+#[cfg(not(feature = "pure-renderer"))]
 fn diagnostic_command(
     kind: &str,
     mode: ProofMode,
@@ -1344,6 +1544,31 @@ fn diagnostic_command(
             r#"{{"kind":"{kind}","mode":"{}","pane":{pane},"epoch":{epoch},"width":{width:.3},"height":{height:.3},"success":{success}}}"#,
             mode.label()
         ),
+    )
+}
+
+#[cfg(feature = "pure-renderer")]
+fn diagnostic_command(
+    kind: &str,
+    mode: ProofMode,
+    pane: u64,
+    epoch: Option<u64>,
+    width: f32,
+    height: f32,
+    _success: bool,
+) -> ActorCommand {
+    send_local(
+        mode.actor_id(),
+        serde_json::to_string(&serde_json::json!({
+            "kind": kind,
+            "mode": mode.label(),
+            "pane": pane,
+            "epoch": epoch,
+            "width": width,
+            "height": height,
+            "production": "actor-control-updated"
+        }))
+        .unwrap_or_default(),
     )
 }
 
@@ -1541,6 +1766,191 @@ fn epoch_channel(epoch: u64, shift: u32) -> f32 {
     f32::from(bits).mul_add(0.20, 0.22)
 }
 
+#[cfg(feature = "pure-renderer")]
+fn handle_facet_input(events: Vec<Vec<u8>>) -> Vec<ActorCommand> {
+    let mut commands = Vec::new();
+    for bytes in events {
+        let Ok(intent) = serde_json::from_slice::<FacetIntent>(&bytes) else {
+            continue;
+        };
+        let (pane, mode, identity) = match intent {
+            FacetIntent::ArmWindowGate {
+                pane,
+                mode,
+                identity,
+            }
+            | FacetIntent::ReleaseWindowGate {
+                pane,
+                mode,
+                identity,
+            }
+            | FacetIntent::ArmRegionProof {
+                pane,
+                mode,
+                identity,
+            } => (pane, mode, identity),
+        };
+        let Ok(mut state) = STATE.lock() else {
+            continue;
+        };
+        if pane != state.pane || mode != state.mode {
+            continue;
+        }
+        match intent {
+            FacetIntent::ArmWindowGate { .. } if mode == ProofMode::WindowSlow => {
+                if state.window_capture_gate.arm() {
+                    commands.push(facet_control_diagnostic(
+                        "resize-proof-window-gate-armed",
+                        mode,
+                        pane,
+                        identity,
+                    ));
+                }
+            }
+            FacetIntent::ReleaseWindowGate { .. } if mode == ProofMode::WindowSlow => {
+                let target = state.window_capture_gate.release();
+                drop(state);
+                commands.extend(target.map_or_else(Vec::new, window_gate_release_commands));
+                continue;
+            }
+            FacetIntent::ArmRegionProof { .. } if mode == ProofMode::LeafLayout => {
+                drop(state);
+                commands.push(send_local(
+                    MIDDLE_LAYOUT_ACTOR_ID,
+                    r#"{"kind":"arm-resize-region-proof"}"#.to_string(),
+                ));
+                continue;
+            }
+            _ => {}
+        }
+    }
+    commands
+}
+
+#[cfg(feature = "pure-renderer")]
+fn facet_control_diagnostic(
+    kind: &str,
+    mode: ProofMode,
+    pane: u64,
+    identity: FrameIdentity,
+) -> ActorCommand {
+    send_local(
+        mode.actor_id(),
+        serde_json::to_string(&serde_json::json!({
+            "kind": kind,
+            "pane": pane,
+            "source_frame_identity": identity
+        }))
+        .unwrap_or_default(),
+    )
+}
+
+#[cfg(feature = "pure-renderer")]
+fn facet_decode_limits(len: usize) -> facet_codec::DecodeLimits {
+    facet_codec::DecodeLimits {
+        max_wire_bytes: len,
+        max_allocated_bytes: len.saturating_mul(4).max(4096),
+        max_allocations: 4096,
+    }
+}
+
+#[cfg(feature = "pure-renderer")]
+impl Facets for ResizeProof {
+    fn render(input: Vec<u8>) -> Vec<u8> {
+        let request = facet_codec::decode_render_request(&input, facet_decode_limits(input.len()))
+            .expect("valid resize proof render request");
+        let view: RenderView = serde_json::from_slice(&request.application_view)
+            .expect("valid immutable resize proof view");
+        let panes = request
+            .panes
+            .iter()
+            .map(|pane| facets::PaneOutput {
+                pane: pane.pane,
+                content: facets::PaneContent::Draw {
+                    packet: proof_packet(
+                        pane.logical_width as f32,
+                        pane.logical_height as f32,
+                        pane.scale as f32,
+                        view.mode,
+                        view.identity,
+                    )
+                    .encode()
+                    .expect("valid resize proof packet"),
+                    interaction: serde_json::to_vec(&InteractionMap {
+                        pane: pane.pane,
+                        mode: view.mode,
+                        identity: view.identity,
+                    })
+                    .expect("resize proof interaction map"),
+                },
+            })
+            .collect();
+        facet_codec::encode_render_response_owned(
+            &facets::RenderResponse {
+                token: request.token,
+                panes,
+                next_frame_ns: None,
+            },
+            request.limits.max_output_bytes as usize,
+        )
+        .expect("bounded resize proof render response")
+    }
+
+    fn interpret(input: Vec<u8>) -> Vec<u8> {
+        let request = facet_codec::decode_input_request(&input, facet_decode_limits(input.len()))
+            .expect("valid resize proof input request");
+        let map: InteractionMap = serde_json::from_slice(&request.interaction)
+            .expect("valid resize proof interaction map");
+        let intent = match request.event {
+            facets::InputEvent::PointerButton {
+                button: RIGHT_POINTER_BUTTON,
+                pressed: true,
+                ..
+            } if map.mode == ProofMode::WindowSlow => Some(FacetIntent::ArmWindowGate {
+                pane: map.pane,
+                mode: map.mode,
+                identity: map.identity,
+            }),
+            facets::InputEvent::PointerButton {
+                button: LEFT_POINTER_BUTTON,
+                pressed: true,
+                ..
+            } if map.mode == ProofMode::WindowSlow => Some(FacetIntent::ReleaseWindowGate {
+                pane: map.pane,
+                mode: map.mode,
+                identity: map.identity,
+            }),
+            facets::InputEvent::PointerButton { pressed: true, .. }
+                if map.mode == ProofMode::LeafLayout =>
+            {
+                Some(FacetIntent::ArmRegionProof {
+                    pane: map.pane,
+                    mode: map.mode,
+                    identity: map.identity,
+                })
+            }
+            _ => None,
+        };
+        let events = intent
+            .map(|intent| serde_json::to_vec(&intent).expect("resize proof semantic intent"))
+            .into_iter()
+            .collect();
+        facet_codec::encode_input_response_owned(
+            &facets::InputResponse {
+                token: request.token,
+                next_sequence_state: request.sequence_state,
+                events,
+                requests: Vec::new(),
+            },
+            request.limits.max_output_bytes as usize,
+        )
+        .expect("bounded resize proof input response")
+    }
+}
+
+#[cfg(feature = "pure-renderer")]
+export_visual_plugin!(ResizeProof);
+#[cfg(not(feature = "pure-renderer"))]
 bindings::export!(ResizeProof with_types_in bindings);
 
 #[cfg(test)]
@@ -1955,5 +2365,183 @@ mod tests {
         assert_ne!(initial.commands, tagged.commands);
         assert_eq!(initial.commands.len(), tagged.commands.len());
         assert!(initial.commands.len() > 160);
+    }
+
+    #[cfg(feature = "pure-renderer")]
+    fn facet_limits() -> facets::InvocationLimits {
+        facets::InvocationLimits {
+            max_output_bytes: 128 * 1024,
+            max_packet_bytes: 64 * 1024,
+            max_interaction_bytes: 1024,
+            max_sequence_bytes: 1024,
+            max_events: 4,
+            max_event_bytes: 1024,
+            max_host_requests: 2,
+            max_resources: 0,
+            max_resource_bytes: 0,
+        }
+    }
+
+    #[cfg(feature = "pure-renderer")]
+    fn facet_scope() -> facets::Scope {
+        facets::Scope {
+            client_generation: 1,
+            actor_generation: 2,
+            facet_generation: 3,
+        }
+    }
+
+    #[cfg(feature = "pure-renderer")]
+    fn facet_pane(pane: u64, width: f64, height: f64, scale: f64) -> facets::PaneTarget {
+        facets::PaneTarget {
+            pane,
+            logical_width: width,
+            logical_height: height,
+            physical_width: (width * scale) as u32,
+            physical_height: (height * scale) as u32,
+            scale,
+            clip: [0.0, 0.0, width, height],
+            visible: true,
+            focused: pane == 7,
+        }
+    }
+
+    #[cfg(feature = "pure-renderer")]
+    #[test]
+    fn facet_retry_preserves_exact_pane_set_geometry_scale_and_identity() {
+        let token = facets::RenderToken {
+            scope: facet_scope(),
+            invocation: 4,
+            snapshot_revision: 5,
+            candidate: 6,
+            pane_membership_revision: 7,
+            geometry_revision: 8,
+            host_configuration_revision: 9,
+            renderer_generation: 10,
+            interaction_revision: 11,
+        };
+        let targets = vec![
+            facet_pane(7, 333.0, 217.0, 1.25),
+            facet_pane(9, 481.0, 302.0, 2.0),
+        ];
+        let request = facets::RenderRequest {
+            token: token.clone(),
+            panes: targets.clone(),
+            target_time_ns: 123,
+            cutoff_ns: 456,
+            configuration: Vec::new(),
+            application_view: serde_json::to_vec(&RenderView {
+                mode: ProofMode::Slow,
+                identity: FrameIdentity::Epoch(77),
+            })
+            .unwrap(),
+            sequence_state: vec![4, 5],
+            limits: facet_limits(),
+        };
+        let mut wire = vec![0; 4096];
+        let len = facet_codec::encode_render_request(&request, &mut wire).unwrap();
+        wire.truncate(len);
+        let first = ResizeProof::render(wire.clone());
+        assert_eq!(first, ResizeProof::render(wire));
+        let reply =
+            facet_codec::decode_render_response(&first, facet_decode_limits(first.len())).unwrap();
+        assert_eq!(reply.token, token);
+        assert_eq!(reply.panes.len(), 2);
+        for (output, target) in reply.panes.iter().zip(targets) {
+            assert_eq!(output.pane, target.pane);
+            let facets::PaneContent::Draw {
+                packet,
+                interaction,
+            } = &output.content
+            else {
+                panic!("resize proof must draw every requested pane")
+            };
+            assert_eq!(
+                *packet,
+                proof_packet(
+                    target.logical_width as f32,
+                    target.logical_height as f32,
+                    target.scale as f32,
+                    ProofMode::Slow,
+                    FrameIdentity::Epoch(77),
+                )
+                .encode()
+                .unwrap()
+            );
+            let map: InteractionMap = serde_json::from_slice(interaction).unwrap();
+            assert_eq!(map.pane, target.pane);
+            assert_eq!(map.identity, FrameIdentity::Epoch(77));
+        }
+    }
+
+    #[cfg(feature = "pure-renderer")]
+    #[test]
+    fn facet_pointer_intent_is_bound_to_pinned_proof_identity_and_preserves_sequence() {
+        let token = facets::InputToken {
+            scope: facet_scope(),
+            input_sequence: 12,
+            frame: 13,
+            pane: 7,
+            snapshot_revision: 14,
+            sequence_revision: 15,
+        };
+        let request = facets::InputRequest {
+            token: token.clone(),
+            geometry: facet_pane(7, 400.0, 300.0, 1.0),
+            event: facets::InputEvent::PointerButton {
+                x: 20.0,
+                y: 30.0,
+                button: RIGHT_POINTER_BUTTON,
+                pressed: true,
+                modifiers: 0,
+            },
+            interaction: serde_json::to_vec(&InteractionMap {
+                pane: 7,
+                mode: ProofMode::WindowSlow,
+                identity: FrameIdentity::Epoch(91),
+            })
+            .unwrap(),
+            sequence_state: vec![8, 9, 10],
+            limits: facet_limits(),
+        };
+        let mut wire = vec![0; 4096];
+        let len = facet_codec::encode_input_request(&request, &mut wire).unwrap();
+        wire.truncate(len);
+        let first = ResizeProof::interpret(wire.clone());
+        assert_eq!(first, ResizeProof::interpret(wire));
+        let reply =
+            facet_codec::decode_input_response(&first, facet_decode_limits(first.len())).unwrap();
+        assert_eq!(reply.token, token);
+        assert_eq!(reply.next_sequence_state, vec![8, 9, 10]);
+        assert!(reply.requests.is_empty());
+        assert_eq!(
+            serde_json::from_slice::<FacetIntent>(&reply.events[0]).unwrap(),
+            FacetIntent::ArmWindowGate {
+                pane: 7,
+                mode: ProofMode::WindowSlow,
+                identity: FrameIdentity::Epoch(91),
+            }
+        );
+    }
+
+    #[cfg(feature = "pure-renderer")]
+    #[test]
+    fn facet_readiness_diagnostic_does_not_claim_host_commit() {
+        let ActorCommand::SendLocalMessage(message) = facet_diagnostic_command(
+            "resize-proof-tagged",
+            ProofMode::Fast,
+            7,
+            Some(44),
+            FrameIdentity::Epoch(44),
+            640.0,
+            480.0,
+            1.25,
+        ) else {
+            panic!("facet diagnostic must remain actor-local")
+        };
+        let value: serde_json::Value = serde_json::from_slice(&message.body).unwrap();
+        assert_eq!(value["production"], "facet-publication-pending");
+        assert!(value.get("success").is_none());
+        assert!(value.get("committed").is_none());
     }
 }

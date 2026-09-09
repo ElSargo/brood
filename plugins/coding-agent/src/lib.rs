@@ -6,17 +6,20 @@ use std::{
 use brood_graphics::{Color, Command, Packet, Rect, theme::ashen};
 use brood_plugin_sdk::{
     actor::{send_local, send_presentation, send_session, start_global_actor, start_session_actor},
-    bindings,
     brood::plugin::host,
     exports::brood::plugin::actor::{
         ChildEvent, Command as ActorCommand, Event, Guest, LifecycleEvent, PresentationEvent,
         WorkerEvent, WorkerRequest,
     },
-    graphics::{TextLayoutCache, drop_resources},
+    graphics::TextLayoutCache,
     input::BUTTON_PRIMARY as LEFT_BUTTON,
     runtime::write_all,
 };
+#[cfg(not(feature = "pure-renderer"))]
+use brood_plugin_sdk::{bindings, graphics::drop_resources};
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "pure-renderer")]
+mod pure_renderer;
 
 const COMPONENT_FILE: &str = "brood_coding_agent_plugin.component.wasm";
 const CLIENT_INIT_ID: &str = "brood.client-init";
@@ -138,6 +141,8 @@ struct ImageAttachment {
 }
 
 struct ImagePreview {
+    #[cfg(feature = "pure-renderer")]
+    rgba: Vec<u8>,
     handle: u64,
     width: u32,
     height: u32,
@@ -150,7 +155,7 @@ struct IncomingImage {
     bytes: Vec<u8>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Deserialize, Serialize)]
 struct LogLine {
     kind: String,
     text: String,
@@ -214,7 +219,7 @@ impl AgentState {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Deserialize, Serialize)]
 struct AgentView {
     status: String,
     model: String,
@@ -245,6 +250,7 @@ enum UiTarget {
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "pure-renderer", allow(dead_code))]
 struct TabDrag {
     agent: String,
     start_x: f32,
@@ -252,6 +258,7 @@ struct TabDrag {
 }
 
 #[derive(Clone, Copy, Debug)]
+#[cfg_attr(feature = "pure-renderer", allow(dead_code))]
 struct ScrollbarDrag {
     pointer_offset: f32,
 }
@@ -287,10 +294,12 @@ struct UiState {
     tab_drag: Option<TabDrag>,
     images: Vec<ImageAttachment>,
     image_previews: BTreeMap<u64, ImagePreview>,
+    #[cfg_attr(feature = "pure-renderer", allow(dead_code))]
     retired_image_previews: Vec<u64>,
     next_image: u64,
     suppressed_text: Option<String>,
     paste_key_pressed: bool,
+    #[cfg_attr(feature = "pure-renderer", allow(dead_code))]
     text_cache: Option<TextLayoutCache>,
     draw_error: Option<String>,
     updates_since_draw: usize,
@@ -371,7 +380,9 @@ struct CodingAgentPlugin;
 
 impl Guest for CodingAgentPlugin {
     fn dispatch(event: Event) -> Vec<ActorCommand> {
-        match event {
+        let commands = match event {
+            #[cfg(feature = "pure-renderer")]
+            Event::FacetInput(batch) => pure_renderer::handle_input(batch.events),
             Event::Lifecycle(event) => handle_lifecycle(event),
             Event::Child(event) => handle_child(event),
             Event::Presentation(event) => handle_presentation(event),
@@ -381,7 +392,10 @@ impl Guest for CodingAgentPlugin {
             }
             Event::Worker(event) => handle_worker_event(event),
             _ => Vec::new(),
-        }
+        };
+        #[cfg(feature = "pure-renderer")]
+        pure_renderer::publish();
+        commands
     }
 
     async fn worker_run(_worker: u64, payload: Vec<u8>) -> Result<Vec<u8>, String> {
@@ -1126,6 +1140,7 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
             }
             (Vec::new(), true)
         }
+        #[cfg(not(feature = "pure-renderer"))]
         PresentationEvent::Key(key) if key.pane == ui.pane => {
             let should_redraw = matches!(
                 key.logical_key.as_str(),
@@ -1155,6 +1170,7 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
                 should_redraw,
             )
         }
+        #[cfg(not(feature = "pure-renderer"))]
         PresentationEvent::Text(text) if text.pane == ui.pane => {
             if ui
                 .suppressed_text
@@ -1166,10 +1182,12 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
             insert_ui_text(ui, &text.text);
             (Vec::new(), true)
         }
+        #[cfg(not(feature = "pure-renderer"))]
         PresentationEvent::Paste(paste) if paste.pane == ui.pane => {
             insert_ui_text(ui, &paste.text);
             (Vec::new(), true)
         }
+        #[cfg(not(feature = "pure-renderer"))]
         PresentationEvent::Image(image) if image.pane == ui.pane => {
             if let Err(error) = attach_ui_image(
                 ui,
@@ -1184,6 +1202,7 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
             }
             (Vec::new(), true)
         }
+        #[cfg(not(feature = "pure-renderer"))]
         PresentationEvent::PointerMoved(moved) if moved.pane == ui.pane => {
             let hovered = ui_target_at(ui, moved.x, moved.y);
             let mut changed = ui.hovered != hovered;
@@ -1198,6 +1217,7 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
             ui.scrollbar_hovered = scrollbar_hovered;
             (Vec::new(), changed)
         }
+        #[cfg(not(feature = "pure-renderer"))]
         PresentationEvent::PointerLeft(left) if left.pane == ui.pane => {
             let changed = ui.hovered.take().is_some()
                 || ui.pressed.take().is_some()
@@ -1207,6 +1227,7 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
             ui.scrollbar_hovered = false;
             (Vec::new(), changed)
         }
+        #[cfg(not(feature = "pure-renderer"))]
         PresentationEvent::PointerButton(button)
             if button.pane == ui.pane && button.button == LEFT_BUTTON =>
         {
@@ -1250,10 +1271,12 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
                 }
             }
         }
+        #[cfg(not(feature = "pure-renderer"))]
         PresentationEvent::PointerScroll(scroll) if scroll.pane == ui.pane => {
             let changed = scroll_transcript(ui, -scroll.vertical);
             (Vec::new(), changed)
         }
+        #[cfg(not(feature = "pure-renderer"))]
         PresentationEvent::RenderHint(hint) => {
             if let Err(error) = brood_plugin_sdk::graphics::render_with_hint(&hint, || {
                 redraw_ui_for_resize(ui, None);
@@ -1770,6 +1793,7 @@ fn request_clipboard_paste_command(pane: u64) -> ActorCommand {
     )
 }
 
+#[cfg(not(feature = "pure-renderer"))]
 fn ui_target_at(ui: &UiState, x: f32, y: f32) -> Option<UiTarget> {
     if !x.is_finite() || !y.is_finite() {
         return None;
@@ -1869,6 +1893,7 @@ fn send_button_rect(ui: &UiState) -> Rect {
     Rect::new(ui.width - 94.0, prompt.y + prompt.height - 38.0, 70.0, 28.0)
 }
 
+#[cfg(not(feature = "pure-renderer"))]
 fn rect_contains(rect: Rect, x: f32, y: f32) -> bool {
     x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
 }
@@ -1966,6 +1991,7 @@ fn scrollbar_geometry(ui: &UiState) -> Option<(f32, f32, f32, f32)> {
     Some((track_top, track_height, thumb_y, thumb_height))
 }
 
+#[cfg(not(feature = "pure-renderer"))]
 fn scrollbar_hit(ui: &UiState, x: f32, y: f32) -> bool {
     let Some((track_top, track_height, _, _)) = scrollbar_geometry(ui) else {
         return false;
@@ -1978,6 +2004,7 @@ fn scrollbar_hit(ui: &UiState, x: f32, y: f32) -> bool {
         && y <= track_top + track_height
 }
 
+#[cfg(not(feature = "pure-renderer"))]
 fn begin_scrollbar_drag(ui: &mut UiState, x: f32, y: f32) -> bool {
     if !scrollbar_hit(ui, x, y) {
         return false;
@@ -1996,6 +2023,7 @@ fn begin_scrollbar_drag(ui: &mut UiState, x: f32, y: f32) -> bool {
     true
 }
 
+#[cfg(not(feature = "pure-renderer"))]
 fn set_scroll_from_pointer(ui: &mut UiState, pointer_y: f32, pointer_offset: f32) -> bool {
     if !pointer_y.is_finite() {
         return false;
@@ -2015,6 +2043,7 @@ fn set_scroll_from_pointer(ui: &mut UiState, pointer_y: f32, pointer_offset: f32
     changed
 }
 
+#[cfg(any(test, not(feature = "pure-renderer")))]
 fn update_tab_drag(ui: &mut UiState, x: f32) -> bool {
     let Some(drag) = ui.tab_drag.as_mut() else {
         return false;
@@ -2091,9 +2120,12 @@ fn attach_ui_image(
     if preview_width == 0 || preview_height == 0 || expected_preview_bytes != preview_rgba8.len() {
         return Err("Image preview pixels are invalid".to_string());
     }
+    #[cfg(not(feature = "pure-renderer"))]
     let preview_handle =
         host::graphics_create_image_rgba8(ui.pane, preview_width, preview_height, &preview_rgba8)
             .map_err(|error| format!("Create image preview: {error:?}"))?;
+    #[cfg(feature = "pure-renderer")]
+    let preview_handle = 0;
     let id = ui.pane.rotate_left(32) ^ ui.next_image.max(1);
     ui.next_image = ui.next_image.saturating_add(1);
     ui.images.push(ImageAttachment {
@@ -2105,6 +2137,8 @@ fn attach_ui_image(
     ui.image_previews.insert(
         id,
         ImagePreview {
+            #[cfg(feature = "pure-renderer")]
+            rgba: preview_rgba8,
             handle: preview_handle,
             width: preview_width,
             height: preview_height,
@@ -2116,7 +2150,10 @@ fn attach_ui_image(
 
 fn retire_image_preview(ui: &mut UiState, image_id: u64) {
     if let Some(preview) = ui.image_previews.remove(&image_id) {
+        #[cfg(not(feature = "pure-renderer"))]
         ui.retired_image_previews.push(preview.handle);
+        #[cfg(feature = "pure-renderer")]
+        drop(preview);
     }
 }
 
@@ -2356,6 +2393,10 @@ fn redraw_ui(ui: &mut UiState) {
     redraw_ui_for_resize(ui, None);
 }
 
+#[cfg(feature = "pure-renderer")]
+fn redraw_ui_for_resize(_ui: &mut UiState, _epoch: Option<u64>) {}
+
+#[cfg(not(feature = "pure-renderer"))]
 fn redraw_ui_for_resize(ui: &mut UiState, resize_epoch: Option<u64>) {
     if ui.pane == 0 {
         return;
@@ -2374,17 +2415,7 @@ fn redraw_ui_for_resize(ui: &mut UiState, resize_epoch: Option<u64>) {
         .unwrap_or_else(|| TextLayoutCache::new(ui.pane));
     text_cache.set_pane(ui.pane);
     text_cache.begin_frame();
-    ui.draw_error = None;
-    let mut packet = Packet::new();
-    packet.push(Command::FillRect {
-        rect: Rect::new(0.0, 0.0, ui.width, ui.height),
-        color: BG,
-    });
-    draw_agent_tabs(ui, &mut text_cache, &mut packet);
-    draw_toolbar(ui, &mut text_cache, &mut packet);
-    draw_search(ui, &mut text_cache, &mut packet);
-    draw_transcript(ui, &mut text_cache, &mut packet);
-    draw_prompt(ui, &mut text_cache, &mut packet);
+    let packet = build_ui_packet(ui, &mut text_cache);
     let submitted = if let Some(error) = ui.draw_error.take() {
         text_cache.abort_frame();
         Err(error)
@@ -2401,6 +2432,21 @@ fn redraw_ui_for_resize(ui: &mut UiState, resize_epoch: Option<u64>) {
         }
     }
     ui.text_cache = Some(text_cache);
+}
+
+fn build_ui_packet(ui: &mut UiState, text_cache: &mut TextLayoutCache) -> Packet {
+    ui.draw_error = None;
+    let mut packet = Packet::new();
+    packet.push(Command::FillRect {
+        rect: Rect::new(0.0, 0.0, ui.width, ui.height),
+        color: BG,
+    });
+    draw_agent_tabs(ui, text_cache, &mut packet);
+    draw_toolbar(ui, text_cache, &mut packet);
+    draw_search(ui, text_cache, &mut packet);
+    draw_transcript(ui, text_cache, &mut packet);
+    draw_prompt(ui, text_cache, &mut packet);
+    packet
 }
 
 fn draw_agent_tabs(ui: &mut UiState, text_cache: &mut TextLayoutCache, packet: &mut Packet) {
@@ -4124,4 +4170,7 @@ mod tests {
     }
 }
 
+#[cfg(not(feature = "pure-renderer"))]
 bindings::export!(CodingAgentPlugin with_types_in bindings);
+#[cfg(feature = "pure-renderer")]
+brood_plugin_sdk::export_visual_plugin!(CodingAgentPlugin);

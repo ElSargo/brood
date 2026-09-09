@@ -207,3 +207,24 @@ is stored separately from durable state, tied to one operation, and either
 confirmed by a named commit revision or rolled back by the matching failure.
 It must not overwrite the catalogue or pretend that completion order is source
 order.
+
+## Non-yielding Component dispatch can starve an independent worker task
+
+During the pure-renderer publication authority probe on 2026-09-05, a worker
+which was already active and yielding did not resume within ten seconds while
+the same Component instance's synchronous actor dispatch spun. Ordinary dispatch
+publication and standalone worker denial passed; the overlap diagnostic could
+not establish worker progress and was removed from the passing probe rather
+than represented as a successful overlap test.
+
+Wasmtime 46 documents `StoreContextMut::async_call_stack()` as the current task's
+youngest-to-root ancestry. The publication resolver checks for the current
+actor dispatch task, so an independently started worker does not inherit that
+authority. The failed overlap is liveness evidence, not an observed publication
+permission leak.
+
+This is a constraint on shared-instance actor/worker scheduling. The pure-renderer
+target deliberately requires separately reachable facet execution while actor
+work is busy; its separate-instance probes must continue to establish that
+independence. This observation does not silently redefine actor-worker fairness
+or count a suspended worker as a progress result.

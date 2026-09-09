@@ -194,36 +194,73 @@ def scenario_gate(value: dict[str, Any], *, direct: bool = False) -> dict[str, A
     scheduler = field(graphics, "render_scheduler", context)
     if not isinstance(scheduler, dict):
         raise EvidenceError(f"{context}: render_scheduler must be an object")
-    interval_samples = field(graphics, "measured_frame_intervals_ns", context)
+    active = field(value, "active_measurement", context)
+    if not isinstance(active, dict):
+        raise EvidenceError(f"{context}: active_measurement must be an object")
+    final_interval_samples = field(graphics, "measured_frame_intervals_ns", context)
+    if not isinstance(final_interval_samples, list) or not all(
+        isinstance(item, int) and not isinstance(item, bool) and item > 0
+        for item in final_interval_samples
+    ):
+        raise EvidenceError(f"{context}: active frame_intervals_ns must contain positive integers")
+    final_interval_summary = sample_summary(
+        final_interval_samples, context=f"{context} final frame intervals"
+    )
+    for raw_name, summary_name in (
+        ("frame_interval_p95_ns", "p95_ns"),
+        ("frame_interval_p99_ns", "p99_ns"),
+    ):
+        if field(graphics, raw_name, context) != final_interval_summary[summary_name]:
+            raise EvidenceError(f"{context}: {raw_name} disagrees with chronological raw samples")
+    interval_samples = field(active, "frame_intervals_ns", context)
     if not isinstance(interval_samples, list) or not all(
         isinstance(item, int) and not isinstance(item, bool) and item > 0 for item in interval_samples
     ):
         raise EvidenceError(f"{context}: measured_frame_intervals_ns must contain positive integers")
     interval_summary = sample_summary(interval_samples, context=f"{context} frame intervals")
-    for raw_name, summary_name in (
-        ("frame_interval_p95_ns", "p95_ns"),
-        ("frame_interval_p99_ns", "p99_ns"),
-    ):
-        if field(graphics, raw_name, context) != interval_summary[summary_name]:
-            raise EvidenceError(f"{context}: {raw_name} disagrees with chronological raw samples")
+    if final_interval_samples[: len(interval_samples)] != interval_samples:
+        raise EvidenceError(f"{context}: active cadence snapshot is not a prefix of final samples")
     intervals = {
         "samples": len(interval_samples),
         "p95_us": (int(interval_summary["p95_ns"]) + 999) // 1_000,
         "p99_us": (int(interval_summary["p99_ns"]) + 999) // 1_000,
     }
+    active_opportunities = field(active, "opportunities", context)
+    active_deadline_misses = field(active, "deadline_misses", context)
+    active_target_misses = field(active, "target_misses", context)
+    if not all(
+        isinstance(item, int) and not isinstance(item, bool) and item >= 0
+        for item in (active_opportunities, active_deadline_misses, active_target_misses)
+    ):
+        raise EvidenceError(f"{context}: active measurement counters must be non-negative integers")
+    for active_value, final_name in (
+        (active_opportunities, "measured_opportunities"),
+        (active_deadline_misses, "measured_deadline_misses"),
+        (active_target_misses, "measured_target_misses"),
+    ):
+        if active_value > field(graphics, final_name, context):
+            raise EvidenceError(f"{context}: active counter exceeds final {final_name}")
+    if active_opportunities == 0:
+        raise EvidenceError(f"{context}: active measurement has no opportunities")
     common = {
         "warmup_opportunities": field(graphics, "warmup_opportunities", context),
-        "measured_opportunities": field(graphics, "measured_opportunities", context),
-        "intended_target_misses": field(graphics, "measured_target_misses", context),
+        "measured_opportunities": active_opportunities,
+        "intended_target_misses": active_target_misses,
+        "render_hint_deadline_misses": active_deadline_misses,
         "presented_frame_intervals": intervals,
     }
     if direct:
+        if not interval_samples:
+            raise EvidenceError(f"{context}: active cadence snapshot is empty")
         elapsed_ns = sum(interval_samples)
         if elapsed_ns <= 0:
             raise EvidenceError(f"{context}: frame interval duration is zero")
         common.update(
             {
-                "frames_per_second_milli": len(interval_samples) * 1_000_000_000_000 // elapsed_ns,
+                "frames_per_second_milli": len(interval_samples)
+                * 1_000_000_000_000
+                // elapsed_ns,
+                "active_presented_frame_intervals": len(interval_samples),
                 "catch_up_bursts": field(scheduler, "catch_up_bursts", context),
             }
         )
@@ -254,7 +291,6 @@ def scenario_gate(value: dict[str, Any], *, direct: bool = False) -> dict[str, A
                 "maximum_us": (int(key_summary["maximum_ns"]) + 999) // 1_000,
                 "stddev_us": key_summary["stddev_ns"] / 1_000.0,
             },
-            "render_hint_deadline_misses": field(graphics, "measured_deadline_misses", context),
             "reliable_transition_drops": field(value, "reliable_transition_drops", context),
             "actor_failures": field(value, "actor_failures", context),
             "renderer_failures": field(value, "renderer_failures", context),

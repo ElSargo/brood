@@ -28,6 +28,8 @@ const INBOX_ID: &str = "inbox";
 const INITIAL_ROWS: u16 = 24;
 const INITIAL_COLS: u16 = 80;
 const MAX_PENDING_INPUT: usize = 64 * 1024;
+const RELIABLE_INPUT_RESERVE: usize = 32 * 1024;
+const MAX_PENDING_INPUT_WITH_RESERVE: usize = MAX_PENDING_INPUT + RELIABLE_INPUT_RESERVE;
 const MAX_PENDING_EDITOR_CONTROLS: usize = 32;
 const MAX_EDITOR_PATH_BYTES: usize = 4 * 1024;
 const MAX_EDITOR_OSC_JSON_BYTES: usize = 8 * 1024;
@@ -58,6 +60,7 @@ struct TerminalSession;
 struct PendingInputBoundary {
     sequence: u64,
     remaining: usize,
+    reliable_ack: Option<(u64, u64, u64)>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -83,6 +86,13 @@ struct SessionState {
     pending_input_boundaries: VecDeque<PendingInputBoundary>,
     last_written_input_sequence: u64,
     snapshot_input_sequence: u64,
+    input_stream_serial: u64,
+    active_input_stream: Option<(u64, u64)>,
+    pending_input_stream_offer: bool,
+    last_reliable_chunk: u64,
+    last_written_reliable_chunk: u64,
+    reliable_logical_sequence: Option<u64>,
+    pending_input_acks: VecDeque<(u64, u64, u64)>,
     pending_editor_controls: VecDeque<EditorOpen>,
     active_editor_control: Option<(u64, EditorOpen)>,
     editor_probe_pending: bool,
@@ -130,6 +140,13 @@ impl SessionState {
             pending_input_boundaries: VecDeque::new(),
             last_written_input_sequence: 0,
             snapshot_input_sequence: 0,
+            input_stream_serial: 0,
+            active_input_stream: None,
+            pending_input_stream_offer: false,
+            last_reliable_chunk: 0,
+            last_written_reliable_chunk: 0,
+            reliable_logical_sequence: None,
+            pending_input_acks: VecDeque::new(),
             pending_editor_controls: VecDeque::new(),
             active_editor_control: None,
             editor_probe_pending: false,
@@ -164,24 +181,77 @@ impl SessionState {
         let _ = host::notification_signal(self.snapshot_notification, self.snapshot_generation);
     }
 
-    fn queue_input(&mut self, sequence: u64, bytes: &[u8]) {
+    fn queue_input(&mut self, sequence: u64, bytes: &[u8]) -> bool {
+        if bytes.is_empty() {
+            return true;
+        }
         let available = MAX_PENDING_INPUT.saturating_sub(self.pending_input.len());
-        let accepted = bytes.len().min(available);
-        self.pending_input
-            .extend(bytes.iter().copied().take(accepted));
-        if accepted > 0 {
-            self.screen.record_submitted_input(&bytes[..accepted]);
+        if bytes.len() <= available {
+            self.pending_input.extend(bytes.iter().copied());
+            self.screen.record_submitted_input(bytes);
             self.pending_input_boundaries
                 .push_back(PendingInputBoundary {
                     sequence,
-                    remaining: accepted,
+                    remaining: bytes.len(),
+                    reliable_ack: None,
                 });
-        }
-        self.interactive_flush_pending |= accepted > 0;
-        if available < bytes.len() {
+            self.interactive_flush_pending |= !bytes.is_empty();
+            true
+        } else {
             self.error = Some("terminal input queue reached its bounded capacity".to_string());
             self.mark_changed();
+            false
         }
+    }
+
+    fn queue_reliable_input(
+        &mut self,
+        logical_sequence: u64,
+        epoch: (u64, u64),
+        chunk_sequence: u64,
+        first: bool,
+        last: bool,
+        bytes: &[u8],
+    ) -> bool {
+        let (incarnation, stream) = epoch;
+        if chunk_sequence == 0 || self.active_input_stream != Some((incarnation, stream)) {
+            return false;
+        }
+        if chunk_sequence <= self.last_reliable_chunk {
+            if chunk_sequence <= self.last_written_reliable_chunk {
+                self.pending_input_acks
+                    .push_back((incarnation, stream, chunk_sequence));
+            }
+            return true;
+        }
+        let logical_ordered = if first {
+            self.reliable_logical_sequence.is_none()
+                && logical_sequence > self.last_written_input_sequence
+        } else {
+            self.reliable_logical_sequence == Some(logical_sequence)
+        };
+        if chunk_sequence != self.last_reliable_chunk.saturating_add(1)
+            || bytes.is_empty()
+            || bytes.len() > RELIABLE_INPUT_RESERVE
+            || !logical_ordered
+            || self.pending_input.len().saturating_add(bytes.len()) > MAX_PENDING_INPUT_WITH_RESERVE
+        {
+            self.error = Some("reliable terminal input record was rejected".to_string());
+            self.mark_changed();
+            return false;
+        }
+        self.pending_input.extend(bytes.iter().copied());
+        self.screen.record_submitted_input(bytes);
+        self.pending_input_boundaries
+            .push_back(PendingInputBoundary {
+                sequence: if last { logical_sequence } else { 0 },
+                remaining: bytes.len(),
+                reliable_ack: Some((incarnation, stream, chunk_sequence)),
+            });
+        self.last_reliable_chunk = chunk_sequence;
+        self.reliable_logical_sequence = (!last).then_some(logical_sequence);
+        self.interactive_flush_pending |= !bytes.is_empty();
+        true
     }
 
     fn flush_input(&mut self) {
@@ -223,9 +293,18 @@ impl SessionState {
             boundary.remaining = boundary.remaining.saturating_sub(consumed);
             written = written.saturating_sub(consumed);
             if boundary.remaining == 0 {
-                self.last_written_input_sequence =
-                    self.last_written_input_sequence.max(boundary.sequence);
-                self.pending_input_boundaries.pop_front();
+                let boundary = self
+                    .pending_input_boundaries
+                    .pop_front()
+                    .expect("checked boundary");
+                if boundary.sequence != 0 {
+                    self.last_written_input_sequence =
+                        self.last_written_input_sequence.max(boundary.sequence);
+                }
+                if let Some(ack) = boundary.reliable_ack {
+                    self.last_written_reliable_chunk = self.last_written_reliable_chunk.max(ack.2);
+                    self.pending_input_acks.push_back(ack);
+                }
             }
         }
     }
@@ -253,6 +332,32 @@ impl SessionState {
             );
         }
         if let Some(actor) = self.subscriber.clone() {
+            if self.pending_input_stream_offer && self.pending_input.is_empty() {
+                self.pending_input_stream_offer = false;
+                let (incarnation, stream) = self.active_input_stream.expect("pending stream offer");
+                let mut body = Vec::with_capacity(25);
+                body.push(b'C');
+                body.extend_from_slice(&incarnation.to_le_bytes());
+                body.extend_from_slice(&stream.to_le_bytes());
+                body.extend_from_slice(&self.last_written_input_sequence.to_le_bytes());
+                commands.push(Command::SendPresentationMessage(PresentationActorMessage {
+                    actor: actor.clone(),
+                    body,
+                }));
+            }
+            commands.extend(self.pending_input_acks.drain(..).map(
+                |(incarnation, stream, sequence)| {
+                    let mut body = Vec::with_capacity(25);
+                    body.push(b'K');
+                    body.extend_from_slice(&incarnation.to_le_bytes());
+                    body.extend_from_slice(&stream.to_le_bytes());
+                    body.extend_from_slice(&sequence.to_le_bytes());
+                    Command::SendPresentationMessage(PresentationActorMessage {
+                        actor: actor.clone(),
+                        body,
+                    })
+                },
+            ));
             let chunks = encode_snapshot(self);
             self.snapshots_published = self.snapshots_published.saturating_add(chunks.len() as u64);
             commands.extend(chunks.into_iter().map(|body| {
@@ -382,6 +487,22 @@ fn terminal_inbox_message(target_actor: &str, status: i32) -> Command {
         "status": if failed { "failed" } else { "completed" },
     }))
     .unwrap_or_else(|_| br#"{"kind":"inbox-push","title":"Command finished"}"#.to_vec());
+    Command::SendPresentationMessage(PresentationActorMessage {
+        actor: INBOX_ID.to_string(),
+        body,
+    })
+}
+
+fn terminal_input_error_message(detail: &str) -> Command {
+    let detail = detail.chars().take(512).collect::<String>();
+    let body = serde_json::to_vec(&serde_json::json!({
+        "kind": "inbox-push",
+        "category": "terminal",
+        "title": "Terminal input rejected",
+        "detail": detail,
+        "status": "failed",
+    }))
+    .unwrap_or_else(|_| br#"{"kind":"inbox-push","title":"Terminal input rejected"}"#.to_vec());
     Command::SendPresentationMessage(PresentationActorMessage {
         actor: INBOX_ID.to_string(),
         body,
@@ -523,6 +644,26 @@ fn handle_mailbox(sender: &str, body: &[u8]) -> Vec<Command> {
             state.force_full_snapshot = true;
             state.snapshot_commands()
         }
+        Some(b'B') if sender.starts_with("presentation:") && body.len() == 1 => {
+            state.subscriber = sender.strip_prefix("presentation:").map(str::to_string);
+            let interrupted = state.reliable_logical_sequence.is_some();
+            state.input_stream_serial = state.input_stream_serial.saturating_add(1).max(1);
+            let incarnation = state.snapshot_notification;
+            let stream = state.input_stream_serial;
+            state.active_input_stream = Some((incarnation, stream));
+            state.last_reliable_chunk = 0;
+            state.last_written_reliable_chunk = 0;
+            state.reliable_logical_sequence = None;
+            state.pending_input_acks.clear();
+            state.pending_input_stream_offer = true;
+            let mut commands = state.snapshot_commands();
+            if interrupted {
+                commands.push(terminal_input_error_message(
+                    "terminal input was interrupted when its presentation reconnected",
+                ));
+            }
+            commands
+        }
         Some(b'I') if trusted_input_sender(sender) => {
             let revision = state.revision;
             state.viewport_offset = 0;
@@ -536,13 +677,64 @@ fn handle_mailbox(sender: &str, body: &[u8]) -> Vec<Command> {
             } else {
                 (0, body.get(1..).unwrap_or_default())
             };
-            state.queue_input(sequence, bytes);
+            let accepted = state.queue_input(sequence, bytes);
             state.flush_input();
-            if state.revision != revision {
-                state.snapshot_commands()
+            if state.revision != revision || !state.pending_input_acks.is_empty() {
+                let mut commands = state.snapshot_commands();
+                if !accepted {
+                    commands.push(terminal_input_error_message(
+                        "terminal input queue reached its bounded capacity",
+                    ));
+                }
+                commands
             } else {
                 Vec::new()
             }
+        }
+        Some(b'J') if sender.starts_with("presentation:") && body.len() >= 34 => {
+            let logical_sequence =
+                u64::from_le_bytes(body[1..9].try_into().expect("fixed logical sequence"));
+            let incarnation =
+                u64::from_le_bytes(body[9..17].try_into().expect("fixed incarnation"));
+            let stream = u64::from_le_bytes(body[17..25].try_into().expect("fixed stream"));
+            let chunk_sequence =
+                u64::from_le_bytes(body[25..33].try_into().expect("fixed chunk sequence"));
+            let flags = body[33];
+            let revision = state.revision;
+            let accepted = flags & !3 == 0
+                && state.queue_reliable_input(
+                    logical_sequence,
+                    (incarnation, stream),
+                    chunk_sequence,
+                    flags & 1 != 0,
+                    flags & 2 != 0,
+                    &body[34..],
+                );
+            if accepted {
+                state.flush_input();
+            }
+            if state.revision != revision || !state.pending_input_acks.is_empty() {
+                let mut commands = state.snapshot_commands();
+                if !accepted {
+                    commands.push(terminal_input_error_message(
+                        "reliable terminal input record was rejected",
+                    ));
+                }
+                commands
+            } else {
+                Vec::new()
+            }
+        }
+        Some(b'E') if sender.starts_with("presentation:") => {
+            let error = std::str::from_utf8(&body[1..])
+                .ok()
+                .map(str::to_owned)
+                .unwrap_or_else(|| "terminal input was rejected".to_string());
+            state.error = Some(error.clone());
+            state.mark_changed();
+            let mut commands = state.snapshot_commands();
+            commands.push(terminal_input_error_message(&error));
+            commands
         }
         Some(b'R') if sender.starts_with("presentation:") && body.len() == 5 => {
             let rows = u16::from_le_bytes([body[1], body[2]]);
@@ -929,7 +1121,13 @@ fn handle_notification(event: NotificationEvent) -> Vec<Command> {
         STREAM_TOKEN if Some(event.notification) == state.stream_notification => {
             state.stream_generation = state.stream_generation.max(event.generation);
             state.flush_input();
-            Vec::new()
+            if state.pending_input_acks.is_empty()
+                && !(state.pending_input_stream_offer && state.pending_input.is_empty())
+            {
+                Vec::new()
+            } else {
+                state.snapshot_commands()
+            }
         }
         _ => Vec::new(),
     }
@@ -2364,11 +2562,11 @@ bindings::export!(TerminalSession with_types_in bindings);
 #[cfg(test)]
 mod tests {
     use super::{
-        Cell, EditorOpen, MAX_PENDING_EDITOR_CONTROLS, SNAPSHOT_FULL, SNAPSHOT_VERSION, Screen,
-        SessionState, Style, decode_editor_control, editor_cursor_arguments,
-        editor_remote_arguments, editor_socket_path, editor_worker_finished_message, encode_row,
-        encode_snapshot, is_editor_session_instance, parse_editor_open, route_editor_action,
-        trusted_input_sender,
+        Cell, EditorOpen, MAX_PENDING_EDITOR_CONTROLS, MAX_PENDING_INPUT, RELIABLE_INPUT_RESERVE,
+        SNAPSHOT_FULL, SNAPSHOT_VERSION, Screen, SessionState, Style, decode_editor_control,
+        editor_cursor_arguments, editor_remote_arguments, editor_socket_path,
+        editor_worker_finished_message, encode_row, encode_snapshot, is_editor_session_instance,
+        parse_editor_open, route_editor_action, trusted_input_sender,
     };
     use brood_plugin_sdk::exports::brood::plugin::actor::Command;
     use serde_json::Value;
@@ -2550,8 +2748,8 @@ mod tests {
     #[test]
     fn snapshot_acknowledges_only_fully_written_terminal_inputs() -> Result<(), String> {
         let mut state = SessionState::new(1, 1, false, None, "terminal-session");
-        state.queue_input(7, b"ab");
-        state.queue_input(8, b"c");
+        assert!(state.queue_input(7, b"ab"));
+        assert!(state.queue_input(8, b"c"));
         state.record_written_input(2);
         state.snapshot_input_sequence = state.last_written_input_sequence;
         let first = encode_snapshot(&mut state);
@@ -2568,6 +2766,59 @@ mod tests {
             .map_err(|_| "second snapshot acknowledgement is truncated")?;
         assert_eq!(u64::from_le_bytes(second_ack), 8);
         Ok(())
+    }
+
+    #[test]
+    fn reliable_input_is_atomic_and_acknowledges_only_complete_chunks() {
+        let mut state = SessionState::new(1, 41, false, None, "terminal-session");
+        state.active_input_stream = Some((41, 2));
+        assert!(state.queue_reliable_input(9, (41, 2), 1, true, true, b"abc"));
+        state.pending_input.drain(..2);
+        state.record_written_input(2);
+        assert!(state.pending_input_acks.is_empty());
+        assert_eq!(state.last_written_input_sequence, 0);
+        assert!(state.queue_reliable_input(9, (41, 2), 1, true, true, b"abc"));
+        assert!(state.pending_input_acks.is_empty());
+        assert_eq!(state.pending_input.len(), 1);
+        state.pending_input.drain(..1);
+        state.record_written_input(1);
+        assert_eq!(state.pending_input_acks.pop_front(), Some((41, 2, 1)));
+        assert_eq!(state.last_written_input_sequence, 9);
+
+        assert!(state.queue_reliable_input(9, (41, 2), 1, true, true, b"abc"));
+        assert_eq!(state.pending_input_acks.pop_front(), Some((41, 2, 1)));
+        assert!(state.pending_input.is_empty());
+
+        let oversized = vec![b'x'; RELIABLE_INPUT_RESERVE + 1];
+        assert!(!state.queue_reliable_input(10, (41, 2), 2, true, true, &oversized));
+        assert!(state.pending_input.is_empty());
+    }
+
+    #[test]
+    fn reliable_input_requires_one_ordered_logical_record() {
+        let mut state = SessionState::new(1, 52, false, None, "terminal-session");
+        state.active_input_stream = Some((52, 3));
+        assert!(state.queue_reliable_input(1, (52, 3), 1, true, false, b"a"));
+        assert!(!state.queue_reliable_input(2, (52, 3), 2, false, true, b"b"));
+        assert!(!state.queue_reliable_input(1, (52, 3), 2, true, true, b"b"));
+        state.record_written_input(1);
+        assert!(state.queue_reliable_input(1, (52, 3), 2, false, true, b"b"));
+        state.record_written_input(1);
+        assert_eq!(state.last_written_input_sequence, 1);
+    }
+
+    #[test]
+    fn legacy_input_rejects_the_whole_record_at_capacity() {
+        let mut state = SessionState::new(1, 1, false, None, "terminal-session");
+        assert!(state.queue_input(1, b""));
+        assert!(state.pending_input.is_empty());
+        assert!(state.pending_input_boundaries.is_empty());
+        state
+            .pending_input
+            .extend(std::iter::repeat_n(b'x', MAX_PENDING_INPUT - 1));
+        assert!(!state.queue_input(7, b"ab"));
+        assert_eq!(state.pending_input.len(), MAX_PENDING_INPUT - 1);
+        assert!(state.pending_input_boundaries.is_empty());
     }
 
     #[test]

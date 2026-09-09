@@ -309,6 +309,14 @@ impl UiFrame {
         Ok(layout)
     }
 
+    /// Transfer resource retirement to the current render facet invocation.
+    /// Call only after constructing a facet result: the host retains referenced
+    /// resources with the committed packet and reclaims discarded results.
+    #[cfg(feature = "facets")]
+    pub fn finish_facet(mut self) {
+        self.resources.clear();
+    }
+
     pub fn queue(
         mut self,
         resize_epoch: Option<u64>,

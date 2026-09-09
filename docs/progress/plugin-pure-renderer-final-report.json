@@ -1,0 +1,297 @@
+{
+  "behavior_invariants": {
+    "atomic_visible_batch": {
+      "exercised": 2,
+      "violations": 0
+    },
+    "causal_watermark": {
+      "exercised": 3,
+      "violations": 0
+    },
+    "full_correlation_stages": {
+      "exercised": 1,
+      "violations": 0
+    },
+    "generation_replay_cancellation": {
+      "exercised": 1,
+      "violations": 0
+    },
+    "late_acceptance": {
+      "exercised": 1,
+      "violations": 0
+    },
+    "one_outstanding_token_and_retarget": {
+      "exercised": 1,
+      "violations": 0
+    },
+    "reliable_and_coalesced_queues": {
+      "exercised": 1,
+      "violations": 0
+    },
+    "request_coalescing": {
+      "exercised": 1,
+      "violations": 0
+    },
+    "resize_orthogonality": {
+      "exercised": 1,
+      "violations": 0
+    },
+    "retry_empty_and_abandon": {
+      "exercised": 1,
+      "violations": 0
+    },
+    "subscription_semantics": {
+      "exercised": 1,
+      "violations": 0
+    },
+    "supersession": {
+      "exercised": 1,
+      "violations": 0
+    }
+  },
+  "deterministic_scheduler": {
+    "alternating_vrr": {
+      "armed_dispatch_checks": 10000,
+      "background_progress": 1,
+      "catch_up_burst_checks": 10000,
+      "catch_up_bursts": 0,
+      "duplicate_tokens_accepted": 0,
+      "foreign_tokens_accepted": 0,
+      "infeasible_target_step_checks": 1,
+      "infeasible_target_step_errors": 0,
+      "invalid_token_attempts": 4,
+      "latest_safe_dispatch_checks": 10000,
+      "latest_safe_dispatch_errors": 0,
+      "lost_request_revisions": 0,
+      "opportunities": 10000,
+      "out_of_order_tokens_accepted": 0,
+      "request_revision_checks": 1429,
+      "reused_tokens_accepted": 0,
+      "stale_armed_dispatches": 0
+    },
+    "cost_and_retarget": {
+      "armed_dispatch_checks": 10000,
+      "background_progress": 1,
+      "catch_up_burst_checks": 10000,
+      "catch_up_bursts": 0,
+      "duplicate_tokens_accepted": 0,
+      "foreign_tokens_accepted": 0,
+      "infeasible_target_step_checks": 1,
+      "infeasible_target_step_errors": 0,
+      "invalid_token_attempts": 4,
+      "latest_safe_dispatch_checks": 10000,
+      "latest_safe_dispatch_errors": 0,
+      "lost_request_revisions": 0,
+      "opportunities": 10000,
+      "out_of_order_tokens_accepted": 0,
+      "request_revision_checks": 1429,
+      "reused_tokens_accepted": 0,
+      "stale_armed_dispatches": 0
+    },
+    "fixed_120hz": {
+      "armed_dispatch_checks": 10000,
+      "background_progress": 1,
+      "catch_up_burst_checks": 10000,
+      "catch_up_bursts": 0,
+      "duplicate_tokens_accepted": 0,
+      "foreign_tokens_accepted": 0,
+      "infeasible_target_step_checks": 1,
+      "infeasible_target_step_errors": 0,
+      "invalid_token_attempts": 4,
+      "latest_safe_dispatch_checks": 10000,
+      "latest_safe_dispatch_errors": 0,
+      "lost_request_revisions": 0,
+      "opportunities": 10000,
+      "out_of_order_tokens_accepted": 0,
+      "request_revision_checks": 1429,
+      "reused_tokens_accepted": 0,
+      "stale_armed_dispatches": 0
+    },
+    "fixed_60hz": {
+      "armed_dispatch_checks": 10000,
+      "background_progress": 1,
+      "catch_up_burst_checks": 10000,
+      "catch_up_bursts": 0,
+      "duplicate_tokens_accepted": 0,
+      "foreign_tokens_accepted": 0,
+      "infeasible_target_step_checks": 1,
+      "infeasible_target_step_errors": 0,
+      "invalid_token_attempts": 4,
+      "latest_safe_dispatch_checks": 10000,
+      "latest_safe_dispatch_errors": 0,
+      "lost_request_revisions": 0,
+      "opportunities": 10000,
+      "out_of_order_tokens_accepted": 0,
+      "request_revision_checks": 1429,
+      "reused_tokens_accepted": 0,
+      "stale_armed_dispatches": 0
+    }
+  },
+  "direct_120hz": {
+    "active_presented_frame_intervals": 1088,
+    "catch_up_bursts": 0,
+    "frames_per_second_milli": 123993,
+    "intended_target_misses": 1,
+    "measured_opportunities": 1089,
+    "presented_frame_intervals": {
+      "p95_us": 8157,
+      "p99_us": 8257,
+      "samples": 1088
+    },
+    "render_hint_deadline_misses": 1,
+    "warmup_opportunities": 60
+  },
+  "hot_paths": {
+    "gpu_submission_wait": {
+      "calls_lifetime": 10,
+      "maximum_us": 1889,
+      "p99_us": 1336,
+      "retained_samples": 10
+    },
+    "smithay": {
+      "callbacks_lifetime": 2592,
+      "driver_present": {
+        "calls_lifetime": 8,
+        "maximum_us": 200,
+        "p99_us": 200,
+        "samples": 8
+      },
+      "driver_present_excluded": true,
+      "maximum_us": 2141,
+      "p99_us": 69,
+      "samples": 2592
+    },
+    "winit": {
+      "callback_kind_counts": {
+        "about_to_wait": 20153,
+        "user_event": 55527,
+        "window_event": 5343
+      },
+      "callbacks_lifetime": 81023,
+      "driver_present": {
+        "calls_lifetime": 1092,
+        "maximum_us": 742,
+        "p99_us": 68,
+        "samples": 1092
+      },
+      "driver_present_excluded": true,
+      "maximum_us": 6518,
+      "p99_us": 465,
+      "samples": 81023
+    }
+  },
+  "idle": {
+    "actor_render_turns": 0,
+    "duration_ms": 5500,
+    "finalized": true,
+    "periodic_actor_polls": 0,
+    "periodic_lifecycle_polls": 0,
+    "periodic_renderer_polls": 0,
+    "render_hints": 0,
+    "scheduler_deadline_wakeups": 0,
+    "scheduler_redraw_requests": 0
+  },
+  "nested_behavior": {
+    "atomic_multi_pane_batches": 1314,
+    "backend_actor_messages_enqueued": 0,
+    "owned_visible_panes": 2,
+    "partial_actor_frame_promotions": 0,
+    "real_keyboard_events": 2082,
+    "real_wasm_component": true,
+    "renderer_recreations": 1,
+    "renderer_replays": 2,
+    "smithay_hosted_content": true,
+    "visibility_changes": 5,
+    "winit_wgpu_composition": true
+  },
+  "provenance": {
+    "artifact_directory": "/tmp/brood-render-pure-reliable-final",
+    "captures": [
+      {
+        "bytes": 37348,
+        "path": "/tmp/brood-render-pure-reliable-final/captures/unsaturated_60hz.png"
+      },
+      {
+        "bytes": 37265,
+        "path": "/tmp/brood-render-pure-reliable-final/captures/unsaturated_60hz-visible-before.png"
+      },
+      {
+        "bytes": 36525,
+        "path": "/tmp/brood-render-pure-reliable-final/captures/unsaturated_60hz-recovered.png"
+      },
+      {
+        "bytes": 35335,
+        "path": "/tmp/brood-render-pure-reliable-final/captures/unsaturated_60hz-one-pane-hidden.png"
+      },
+      {
+        "bytes": 37461,
+        "path": "/tmp/brood-render-pure-reliable-final/captures/unsaturated_60hz-visible-after.png"
+      },
+      {
+        "bytes": 70598,
+        "path": "/tmp/brood-render-pure-reliable-final/captures/saturated_60hz.png"
+      },
+      {
+        "bytes": 36885,
+        "path": "/tmp/brood-render-pure-reliable-final/captures/direct_120hz.png"
+      }
+    ],
+    "client_binary": "/nix/store/c58hmbd76c7adarxf5v50bgjfinidp3s-brood/bin/brood-client",
+    "component": "/nix/store/wkq1yc8fkx0l6nyv2mr68mrq15dlfcw6-brood-runtime-files/examples/wasm-plugin-graphics/target/wasm32-unknown-unknown/release/brood_plugin_graphics_example.component.wasm",
+    "harness": "brood-test-render-scheduling",
+    "nix_development_environment": true,
+    "release_build": true
+  },
+  "saturated_60hz": {
+    "actor_failures": 0,
+    "background_actor_progress": [
+      1043,
+      1041,
+      1039
+    ],
+    "intended_target_misses": 25,
+    "key_to_present": {
+      "maximum_us": 30185,
+      "p50_us": 15089,
+      "p95_us": 22178,
+      "p99_us": 23242,
+      "samples": 2084,
+      "stddev_us": 4657.16275330497
+    },
+    "measured_opportunities": 3726,
+    "presented_frame_intervals": {
+      "p95_us": 16242,
+      "p99_us": 16564,
+      "samples": 926
+    },
+    "reliable_transition_drops": 0,
+    "render_hint_deadline_misses": 25,
+    "renderer_failures": 0,
+    "token_protocol_errors": 0,
+    "warmup_opportunities": 60
+  },
+  "schema_version": 1,
+  "unsaturated_60hz": {
+    "actor_failures": 0,
+    "intended_target_misses": 9,
+    "key_to_present": {
+      "maximum_us": 20194,
+      "p50_us": 11023,
+      "p95_us": 18239,
+      "p99_us": 18915,
+      "samples": 2081,
+      "stddev_us": 4625.338121854458
+    },
+    "measured_opportunities": 1221,
+    "presented_frame_intervals": {
+      "p95_us": 16305,
+      "p99_us": 16643,
+      "samples": 1213
+    },
+    "reliable_transition_drops": 0,
+    "render_hint_deadline_misses": 3,
+    "renderer_failures": 0,
+    "token_protocol_errors": 0,
+    "warmup_opportunities": 60
+  }
+}

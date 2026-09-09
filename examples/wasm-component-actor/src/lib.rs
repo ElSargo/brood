@@ -1,12 +1,13 @@
 wit_bindgen::generate!({
-    path: "../../crates/brood-wasm/wit",
-    world: "brood-plugin",
+    path: ["../../crates/brood-wasm/wit", "wit"],
+    world: "brood:actor-facet-probe/probe",
+    generate_all,
 });
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use brood::plugin::host;
-use exports::brood::plugin::actor::{Command, Event, Guest, WorkerRequest};
+use brood::plugin::{host, render_publication};
+use exports::brood::plugin::actor::{Command, Event, Guest as ActorGuest, WorkerRequest};
 
 static INPUT_NOTIFICATION: AtomicU64 = AtomicU64::new(0);
 static RESULT_NOTIFICATION: AtomicU64 = AtomicU64::new(0);
@@ -21,12 +22,33 @@ const RUBE_WORKER_BASE: u64 = 1_u64 << 40;
 
 struct ExampleActor;
 
+// The host loads this export in an independent instance of the actor artifact.
+// It receives all render data explicitly and never reads the actor statics.
 impl Guest for ExampleActor {
+    fn render(input: Vec<u8>) -> Vec<u8> {
+        if input == b"oversized-output-probe" {
+            return vec![0; 5 * 1024 * 1024];
+        }
+        let checksum = input
+            .iter()
+            .fold(0_u64, |sum, byte| sum.wrapping_add(u64::from(*byte)));
+        let mut output = Vec::with_capacity(16);
+        output.extend_from_slice(&checksum.to_le_bytes());
+        output.extend_from_slice(&u64::try_from(input.len()).unwrap_or(u64::MAX).to_le_bytes());
+        output
+    }
+}
+
+impl ActorGuest for ExampleActor {
     fn dispatch(event: Event) -> Vec<Command> {
         if matches!(
             &event,
             Event::Mailbox(message) if message.body == b"spin-dispatch"
         ) {
+            // Optional probe checkpoint: runtimes without a filesystem grant
+            // still enter the loop, while the facet isolation probe grants one
+            // and observes this exact completion before invoking its facet.
+            let _checkpoint = host::submit_write("dispatch-spin-entered", 0, b"yes");
             // The host's epoch scheduler must keep yielding this otherwise
             // non-cooperative dispatcher without terminating its actor.
             loop {
@@ -65,6 +87,16 @@ impl Guest for ExampleActor {
                 vec![Command::SpawnWorker(WorkerRequest {
                     worker: 900,
                     payload: b"__spin__".to_vec(),
+                })]
+            }
+            Event::Mailbox(message) if message.body == b"publication-dispatch" => {
+                let _published = render_publication::publish(1, b"actor-dispatch");
+                Vec::new()
+            }
+            Event::Mailbox(message) if message.body == b"publication-worker" => {
+                vec![Command::SpawnWorker(WorkerRequest {
+                    worker: 910,
+                    payload: b"__publication__".to_vec(),
                 })]
             }
             Event::Mailbox(message) if message.body == b"completion-read" => {
@@ -150,6 +182,11 @@ impl Guest for ExampleActor {
         if worker == 801 {
             return Ok(payload);
         }
+        if payload == b"__publication__" {
+            return Ok(publication_result(render_publication::publish(
+                90, b"worker",
+            )));
+        }
         if payload == b"__notification_wait__" {
             let input = INPUT_NOTIFICATION.load(Ordering::Acquire);
             let pollable =
@@ -210,6 +247,16 @@ impl Guest for ExampleActor {
             let _ = host::submit_write("cancelled-worker-survived", 0, b"bad");
         }
         Ok(bytes)
+    }
+}
+
+fn publication_result(result: Result<(), render_publication::PublicationError>) -> Vec<u8> {
+    match result {
+        Ok(()) => b"published".to_vec(),
+        Err(render_publication::PublicationError::Unavailable) => b"unavailable".to_vec(),
+        Err(render_publication::PublicationError::InvalidRevision) => b"invalid-revision".to_vec(),
+        Err(render_publication::PublicationError::LimitReached) => b"limit-reached".to_vec(),
+        Err(render_publication::PublicationError::Invalidated) => b"invalidated".to_vec(),
     }
 }
 

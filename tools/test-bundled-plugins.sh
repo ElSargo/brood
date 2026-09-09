@@ -19,13 +19,14 @@ die() {
 }
 
 declare -A LANE_COMMANDS=(
+  [divider-drags]='BROOD_SESSION_SWITCHER_PACKAGE="$SUITE_PACKAGE" BROOD_PLUGIN_DRAG_OUT="$LANE_OUT" bash tools/test-plugin-divider-drags.sh'
   [coding-agent]='BROOD_CODING_AGENT_OUT="$LANE_OUT" bash tools/test-coding-agent-nested.sh'
   [editor]='BROOD_EDITOR_PACKAGE="$SUITE_PACKAGE" cargo run --quiet -- test editor --out-dir "$LANE_OUT"'
-  [keybindings-narrow]='BROOD_SESSION_SWITCHER_OUT="$LANE_OUT" BROOD_KEYBINDINGS_ONLY=1 BROOD_KEYBINDINGS_TEST_OUTPUT_MODE=360x320 bash tools/test-session-switcher-plugin-nested.sh'
+  [keybindings-narrow]='BROOD_SESSION_SWITCHER_PACKAGE="$SUITE_PACKAGE" BROOD_SESSION_SWITCHER_OUT="$LANE_OUT" BROOD_KEYBINDINGS_ONLY=1 BROOD_KEYBINDINGS_TEST_OUTPUT_MODE=360x320 bash tools/test-session-switcher-plugin-nested.sh'
   [runtime-io]='BROOD_TERMINAL_PACKAGE="$SUITE_PACKAGE" BROOD_RUNTIME_PLUGIN_ONLY=1 BROOD_RUNTIME_PLUGIN_OUT="$LANE_OUT" cargo run --quiet -- test nested'
   [resize]='cargo run --quiet -- test resize --out-dir "$LANE_OUT"'
-  [session-shell]='BROOD_SESSION_SWITCHER_OUT="$LANE_OUT" bash tools/test-session-switcher-plugin-nested.sh'
-  [startup-empty]='BROOD_EMPTY_STARTUP_ONLY=1 BROOD_SESSION_SWITCHER_OUT="$LANE_OUT" bash tools/test-session-switcher-plugin-nested.sh'
+  [session-shell]='BROOD_SESSION_SWITCHER_PACKAGE="$SUITE_PACKAGE" BROOD_SESSION_SWITCHER_OUT="$LANE_OUT" bash tools/test-session-switcher-plugin-nested.sh'
+  [startup-empty]='BROOD_EMPTY_STARTUP_ONLY=1 BROOD_SESSION_SWITCHER_PACKAGE="$SUITE_PACKAGE" BROOD_SESSION_SWITCHER_OUT="$LANE_OUT" bash tools/test-session-switcher-plugin-nested.sh'
   [terminal]='BROOD_TERMINAL_PACKAGE="$SUITE_PACKAGE" cargo run --quiet -- test nested --out-dir "$LANE_OUT"'
   [workspace-watch]='BROOD_TERMINAL_PACKAGE="$SUITE_PACKAGE" BROOD_RUNTIME_PLUGIN_ONLY=1 BROOD_RUNTIME_PLUGIN_WATCH_ONLY=1 BROOD_RUNTIME_PLUGIN_OUT="$LANE_OUT" cargo run --quiet -- test nested'
   [worktree]='BROOD_WORKTREE_MANAGER_OUT="$LANE_OUT" bash tools/test-worktree-manager.sh'
@@ -52,8 +53,20 @@ audit_matrix() {
   missing_shell_sidecars="$(
     rg -l 'brood_session_switcher_plugin\.component\.wasm' "$ROOT/tools" -g '*.sh' |
       while IFS= read -r script; do
+        # The build assembles the manifest's complete artifact plan; it does
+        # not spell out each output filename in shell code.
+        if [[ "$script" == "$ROOT/tools/brood-build.sh" ]]; then
+          for sidecar in picker keybindings inbox status_bar; do
+            rg -q "^placement = \"brood_${sidecar}_plugin\\.component\\.wasm\"$" \
+              "$ROOT/packages/default-client.brood-package.toml" \
+              || printf '%s missing=%s\n' "packages/default-client.brood-package.toml" "$sidecar"
+          done
+          continue
+        fi
         for sidecar in picker keybindings inbox status_bar; do
-          rg -q "brood_${sidecar}_plugin\\.component\\.wasm" "$script" \
+          # Manual assemblers also pass a stem to componentize_plugin,
+          # which appends .component.wasm itself.
+          rg -q "brood_${sidecar}_plugin\\.component\\.wasm|^[[:space:]]*componentize_plugin[[:space:]]+${sidecar//_/-}[[:space:]]+brood_${sidecar}_plugin[[:space:]]*$" "$script" \
             || printf '%s missing=%s\n' "${script#"$ROOT/"}" "$sidecar"
         done
       done
@@ -133,7 +146,7 @@ case "$MODE" in
   all)
     mkdir -p "$OUT"
     if [[ -z "$SUITE_PACKAGE" ]]; then
-      nix build .#brood -o "$OUT/package-result"
+      nix build path:.#brood -o "$OUT/package-result"
       SUITE_PACKAGE="$(readlink -f "$OUT/package-result")"
     fi
     [[ -x "$SUITE_PACKAGE/bin/brood-client" ]] \

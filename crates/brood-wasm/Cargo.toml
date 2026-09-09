@@ -12,6 +12,7 @@ anyhow.workspace = true
 cap-std.workspace = true
 cap-fs-ext.workspace = true
 brood-protocol.workspace = true
+brood-graphics.workspace = true
 brood-profiler.workspace = true
 futures.workspace = true
 notify.workspace = true

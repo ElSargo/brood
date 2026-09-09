@@ -578,8 +578,8 @@ int main(int argc, char **argv) {
         }
         usleep(20000);
         for (uint32_t step = 1; step <= steps; ++step) {
-            uint32_t next_x = x + (end_x - x) * step / steps;
-            uint32_t next_y = y + (end_y - y) * step / steps;
+            uint32_t next_x = (uint32_t)((int64_t)x + ((int64_t)end_x - x) * step / steps);
+            uint32_t next_y = (uint32_t)((int64_t)y + ((int64_t)end_y - y) * step / steps);
             absolute_motion(pointer, next_x, next_y, extent_x, extent_y);
             if (wl_display_roundtrip(display) < 0) {
                 fail("the compositor rejected pointer drag motion");

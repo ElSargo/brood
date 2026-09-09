@@ -47,7 +47,10 @@ def exact_tagged_message(
         and body.get("epoch") == epoch
         and body.get("width") == float(width)
         and body.get("height") == float(height)
-        and body.get("success") is True
+        and (
+            body.get("success") is True
+            or body.get("production") == "facet-publication-pending"
+        )
         and isinstance(body.get("pane"), int)
     ):
         return None

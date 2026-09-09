@@ -105,14 +105,14 @@ trap cleanup EXIT
 SERVER_PID=$!
 
 ctl() {
-  env -u brood_session "$PACKAGE/bin/brood" ctl \
+  env -u brood_session RUST_LOG=warn "$PACKAGE/bin/brood" ctl \
     --dbus-destination "$DBUS_DESTINATION" \
     --dbus-address "$DBUS_SESSION_BUS_ADDRESS" \
     "$@"
 }
 
 plug() {
-  env -u brood_session "$PACKAGE/bin/brood" plug \
+  env -u brood_session RUST_LOG=warn "$PACKAGE/bin/brood" plug \
     --dbus-destination "$DBUS_DESTINATION" \
     --dbus-address "$DBUS_SESSION_BUS_ADDRESS" \
     "$@"
@@ -282,13 +282,24 @@ jq -e '
   and .hosted_runtime_io_buffered_outgoing_bytes == 0
 ' <<< "$FINAL_STATUS" > /dev/null
 
-# Hot replacement must synchronously retire the Component generation's WIT
-# watch, notification, and pollable before publishing its successor. The two
-# Preview 1 subscriptions remain alive throughout. A manual hot plug does not
-# inherit the configured actor's filesystem grant, so the replacement is left
-# quiescent rather than manufacturing a different capability contract.
+# Hot replacement is an asynchronous request; once its candidate commits, the
+# old Component generation's WIT watch, notification, and pollable must be
+# synchronously retired. The two Preview 1 subscriptions remain alive
+# throughout. A manual hot plug does not inherit the configured actor's
+# filesystem grant, so the replacement is left quiescent rather than
+# manufacturing a different capability contract.
 plug --id component-workspace-watch "$WATCH_COMPONENT" > /dev/null
-REPLACED_STATUS="$(ctl status-json)"
+for _ in $(seq 1 300); do
+  REPLACED_STATUS="$(ctl status-json)"
+  if jq -e '
+    .plugin_actor_failures == 0
+    and .filesystem_watcher_registrations == 1
+    and .filesystem_watcher_subscriptions == 2
+  ' <<< "$REPLACED_STATUS" > /dev/null; then
+    break
+  fi
+  sleep 0.05
+done
 jq -e '
   .plugin_actor_failures == 0
   and .filesystem_watcher_registrations == 1

@@ -271,7 +271,7 @@ for run in $(seq 1 "$DRAG_REPEATS"); do
     jq -cn \
       --argjson run "$run" \
       --argjson sample "$sample" \
-      --arg file "${CAPTURE#$OUT/}" \
+      --arg file "${CAPTURE#"$OUT"/}" \
       --argjson captured_ns "$CAPTURE_NS" \
       --argjson drag_started_ns "$START_NS" \
       --argjson duration_ms "$DRAG_DURATION_MS" \
@@ -315,7 +315,7 @@ for run in $(seq 1 "$DRAG_REPEATS"); do
     --argjson final_x "$FINAL_DIVIDER" \
     --argjson drag_result "$DRAG_RESULT" \
     --argjson client_alive "$CLIENT_ALIVE" \
-    --arg final_file "${FINAL_CAPTURE#$OUT/}" \
+    --arg final_file "${FINAL_CAPTURE#"$OUT"/}" \
     '{run:$run,start_line:$start_line,end_line:$end_line,started_ns:$started_ns,ended_ns:$ended_ns,duration_ms:$duration_ms,target_frame_rate_hz:$target_frame_rate_hz,steps:$steps,start_x:$start_x,target_x:$target_x,final_x:$final_x,drag_result:$drag_result,client_alive:$client_alive,final_file:$final_file}' \
     >> "$RUNS"
 done

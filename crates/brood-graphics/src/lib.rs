@@ -338,6 +338,7 @@ impl Packet {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, PacketError> {
+        Self::decode_allocation_bound(bytes)?;
         if bytes.len() > MAX_PACKET_BYTES {
             return Err(PacketError::Limit("packet byte limit exceeded"));
         }
@@ -379,6 +380,55 @@ impl Packet {
         let packet = Self { commands };
         packet.validate()?;
         Ok(packet)
+    }
+
+    /// Upper bound for decoded command/path storage and validation scratch.
+    ///
+    /// Scans borrowed wire data before any list allocation. Callers can reserve
+    /// this bound and retain it with the decoded packet's allocation lifetime.
+    pub fn decode_allocation_bound(bytes: &[u8]) -> Result<usize, PacketError> {
+        if bytes.len() > MAX_PACKET_BYTES {
+            return Err(PacketError::Limit("packet byte limit exceeded"));
+        }
+        let mut reader = Reader::new(bytes);
+        if reader.take(4)? != MAGIC || reader.u16()? != PACKET_VERSION || reader.u16()? != 0 {
+            return Err(PacketError::Invalid("invalid packet header"));
+        }
+        let commands = usize::try_from(reader.u32()?)
+            .map_err(|_count| PacketError::Limit("command count overflow"))?;
+        let declared = usize::try_from(reader.u32()?)
+            .map_err(|_size| PacketError::Limit("packet size overflow"))?;
+        if declared != bytes.len()
+            || commands > MAX_COMMANDS
+            || commands > bytes.len().saturating_sub(HEADER_BYTES) / 8
+        {
+            return Err(PacketError::Invalid("inconsistent packet counts"));
+        }
+        let mut bound = commands * std::mem::size_of::<Command>()
+            + MAX_SAVED_STATES * std::mem::size_of::<usize>();
+        for _ in 0..commands {
+            let opcode = reader.u8()?;
+            if reader.take(3)? != [0, 0, 0] {
+                return Err(PacketError::Invalid("command reserved field must be zero"));
+            }
+            let length = usize::try_from(reader.u32()?)
+                .map_err(|_size| PacketError::Limit("command size overflow"))?;
+            let payload = reader.take(length)?;
+            if matches!(opcode, 7 | 12 | 13) {
+                let count = usize::try_from(Reader::new(payload).u32()?)
+                    .map_err(|_size| PacketError::Limit("path count overflow"))?;
+                if count > MAX_PATH_SEGMENTS || count > payload.len().saturating_sub(4) {
+                    return Err(PacketError::Invalid("inconsistent path segment count"));
+                }
+                bound = bound
+                    .checked_add(count * std::mem::size_of::<PathSegment>())
+                    .ok_or(PacketError::Limit("decoded packet size overflow"))?;
+            }
+        }
+        if !reader.is_empty() {
+            return Err(PacketError::Invalid("packet contains trailing bytes"));
+        }
+        Ok(bound)
     }
 
     pub fn validate(&self) -> Result<(), PacketError> {

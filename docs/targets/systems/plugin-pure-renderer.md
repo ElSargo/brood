@@ -154,6 +154,13 @@ frame/application revisions, and validates them against current state. A removed
 item may cause the actor to reject the intent; it must not activate a different
 item now occupying the same coordinates.
 
+Generic picker rows carry caller-supplied stable item IDs, unique within each
+picker. Callers preserve these IDs across reorder and replacement updates;
+duplicate IDs reject the update atomically. Selection replies retain the item ID
+and the displayed value. Positional indices are informational and must not
+identify semantic actions. The receiving actor validates the selected identity
+against its current domain state before acting.
+
 The host serializes interpretation within an interaction sequence and commits
 its returned sequence state and admitted event batch exactly once. Retrying a
 pure interpretation must not duplicate actor actions. Reserve bounded delivery
@@ -177,6 +184,16 @@ immutable, revisioned input rather than a hidden mutable read. Such changes
 invalidate visual demand just as other host visual inputs do.
 
 ## Execution And Capabilities
+
+Plugins are trusted code. Facet isolation aims to contain ordinary plugin
+failures and preserve peer progress; it is not a security boundary against
+hostile plugins. The same compiled component may be instantiated separately
+for actor and facet roles, with forbidden facet imports linked to traps.
+Component Model argument lifting can allocate host memory before a dynamic
+trap runs. That allocation-amplification risk is accepted and does not require
+separate artifacts or a pre-lifting denial adapter. This exception does not
+remove normal guest memory/execution limits, snapshot/result admission,
+resource accounting, or the requirement to retire failed facet contexts.
 
 Facets execute on bounded host-controlled executors, never Winit or Smithay.
 They must not require draining the actor mailbox, waiting for an actor handler,

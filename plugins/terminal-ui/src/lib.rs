@@ -1,28 +1,44 @@
+#[cfg(not(feature = "pure-renderer"))]
+use std::collections::{HashMap, hash_map::Entry};
 use std::{
-    collections::{HashMap, hash_map::Entry},
+    collections::VecDeque,
     sync::{Arc, Mutex},
 };
 
 use brood_graphics::{Color, Command as DrawCommand, Packet, Rect, theme::ashen};
+#[cfg(feature = "pure-renderer")]
+mod pure_renderer;
+#[cfg(not(feature = "pure-renderer"))]
+use brood_plugin_sdk::{bindings, graphics::queue_encoded_packet_for_resize_with_state_watermark};
 use brood_plugin_sdk::{
-    bindings,
     brood::plugin::host,
     exports::brood::plugin::actor::{
         Command, Event, Guest, LifecycleEvent, PresentationEvent, SessionActorMessage, WorkerEvent,
         WorkerRequest,
     },
-    graphics::queue_encoded_packet_for_resize_with_state_watermark,
     input::{
         BUTTON_MIDDLE as MIDDLE_BUTTON, BUTTON_PRIMARY as LEFT_BUTTON, MOD_ALT, MOD_CTRL, MOD_SHIFT,
     },
     runtime::sleep as wait_timer,
 };
+use serde::{Deserialize, Serialize};
 use unicode_width::UnicodeWidthChar;
 
 const SNAPSHOT_MAGIC: &[u8; 4] = b"BTRM";
 const SNAPSHOT_VERSION: u8 = 4;
 const SNAPSHOT_FULL: u8 = 1;
+const MAX_SNAPSHOT_ROWS: u16 = 4_096;
+const MAX_SNAPSHOT_COLS: u16 = 4_096;
+const MAX_SNAPSHOT_CHUNKS: u16 = 256;
+const MAX_SNAPSHOT_RUNS: usize = 16_384;
+#[cfg(feature = "pure-renderer")]
+const MAX_SNAPSHOT_LAYOUT_UNITS: usize = 16_384;
+const MAX_SNAPSHOT_ENCODED_BYTES: usize = 2 * 1_024 * 1_024;
+const MAX_SNAPSHOT_LOGICAL_BYTES: usize = MAX_SNAPSHOT_ENCODED_BYTES
+    + MAX_SNAPSHOT_RUNS * std::mem::size_of::<Run>()
+    + MAX_SNAPSHOT_ROWS as usize * std::mem::size_of::<Vec<Run>>();
 const FONT_SIZE: f32 = 16.0;
+const CELL_WIDTH: f32 = 9.0;
 const REQUESTED_LINE_HEIGHT: f32 = 20.0;
 const PADDING: f32 = 8.0;
 const DEFAULT_BG: u32 = ashen::BACKGROUND_RGB;
@@ -30,6 +46,7 @@ const CURSOR: u32 = ashen::CURSOR_RGB;
 const SELECTION_BG: u32 = ashen::SELECTION_RGB;
 const SCROLL_PIXELS_PER_LINE: f32 = 5.0;
 const MOUSE_WHEEL_PIXELS_PER_CLICK: f32 = 15.0;
+#[cfg(not(feature = "pure-renderer"))]
 const MAX_CACHED_LAYOUTS: usize = 512;
 // Presentation events are already latest-state coalesced and render requests
 // are paced by host hints. Keep only a minimal burst guard here so live resize
@@ -37,23 +54,35 @@ const MAX_CACHED_LAYOUTS: usize = 512;
 const RESIZE_DEBOUNCE_MS: u64 = 1;
 const RESIZE_WORKER_PAYLOAD: &[u8] = b"terminal-resize-debounce";
 const CURSOR_BLINK_MS: u64 = 530;
+#[cfg(not(feature = "pure-renderer"))]
 const CURSOR_BLINK_WORKER_PAYLOAD: &[u8] = b"terminal-cursor-blink";
 const PRESENTATION_BATCH_LIMIT: u8 = 16;
 // `focus_commands_for_mailbox` is not a presentation reducer. Every branch in
-// `handle_presentation` returns at most three commands, including clipboard
+// `handle_presentation` returns at most four commands, including clipboard
 // and resize paths, so one opted-in batch remains below the host's aggregate
 // 64-command dispatch ceiling.
-const MAX_PRESENTATION_COMMANDS_PER_EVENT: usize = 3;
+const MAX_PRESENTATION_COMMANDS_PER_EVENT: usize = 4;
 const MAX_PRESENTATION_BATCH_COMMANDS: usize =
     PRESENTATION_BATCH_LIMIT as usize * MAX_PRESENTATION_COMMANDS_PER_EVENT;
 const _: () = assert!(MAX_PRESENTATION_BATCH_COMMANDS <= 64);
 const CLIENT_INIT_ID: &str = "brood.client-init";
 const INBOX_ID: &str = "inbox";
 const FOCUS_MESSAGE: &[u8] = br#"{"kind":"focus"}"#;
+const RELIABLE_INPUT_CHUNK_BYTES: usize = 32 * 1024;
+const MAX_RELIABLE_INPUT_BYTES: usize = 256 * 1024 + 12 + 64 * 1024;
 
 static STATE: Mutex<Option<UiState>> = Mutex::new(None);
 
+// Native tests share the Wasm actor singleton; serialize complete fixture lifetimes.
+#[cfg(test)]
+static TEST_STATE: Mutex<()> = Mutex::new(());
+
 struct TerminalUi;
+
+struct ReliableInput {
+    sequence: u64,
+    bytes: Vec<u8>,
+}
 
 struct UiState {
     pane: u64,
@@ -68,37 +97,66 @@ struct UiState {
     assembly: Option<SnapshotAssembly>,
     latest: Option<Arc<Snapshot>>,
     next_worker: u64,
+    #[cfg(not(feature = "pure-renderer"))]
     cache: HashMap<RunKey, CachedLayout>,
+    #[cfg(not(feature = "pure-renderer"))]
     layouts_created: u64,
+    #[cfg(not(feature = "pure-renderer"))]
     layouts_reused: u64,
+    #[cfg(not(feature = "pure-renderer"))]
     layouts_dropped: u64,
+    #[cfg(not(feature = "pure-renderer"))]
     packets: u64,
     snapshots_received: u64,
     snapshot_chunks_received: u64,
     snapshot_bytes_received: u64,
     snapshot_rows_received: u64,
     full_snapshots_received: u64,
+    #[cfg(not(feature = "pure-renderer"))]
     metric_application_cursor: Option<bool>,
+    #[cfg(not(feature = "pure-renderer"))]
     metric_bracketed_paste: Option<bool>,
+    #[cfg(not(feature = "pure-renderer"))]
     metric_resizes: u64,
+    #[cfg(not(feature = "pure-renderer"))]
     metric_viewport_offset: usize,
+    #[cfg(not(feature = "pure-renderer"))]
     metric_bytes_read: u64,
+    #[cfg(not(feature = "pure-renderer"))]
     metric_exited: bool,
+    #[cfg(not(feature = "pure-renderer"))]
     max_packet_bytes: usize,
+    #[cfg(not(feature = "pure-renderer"))]
     max_commands: usize,
     requested_viewport: usize,
+    #[cfg(not(feature = "pure-renderer"))]
     selection: Option<Selection>,
+    #[cfg(not(feature = "pure-renderer"))]
     pressed_mouse_button: Option<u8>,
+    #[cfg(not(feature = "pure-renderer"))]
     mouse_modifiers: u32,
+    #[cfg(not(feature = "pure-renderer"))]
     scroll_accumulator: f32,
+    #[cfg(not(feature = "pure-renderer"))]
     mouse_wheel_accumulator: f32,
+    #[cfg(not(feature = "pure-renderer"))]
     suppressed_text: Option<String>,
     resize_worker_pending: bool,
     last_sent_grid_size: Option<(u16, u16)>,
     next_input_sequence: u64,
+    input_stream: Option<(u64, u64)>,
+    input_stream_requested: bool,
+    reliable_input: VecDeque<ReliableInput>,
+    reliable_input_bytes: usize,
+    reliable_input_offset: usize,
+    next_input_chunk_sequence: u64,
+    reliable_input_in_flight: Option<u64>,
     pending_resize_epoch: Option<u64>,
+    #[cfg(not(feature = "pure-renderer"))]
     focused: bool,
+    #[cfg(not(feature = "pure-renderer"))]
     cursor_blink_on: bool,
+    #[cfg(not(feature = "pure-renderer"))]
     cursor_blink_worker: Option<u64>,
 }
 
@@ -113,45 +171,74 @@ impl UiState {
             session_actor,
             width: 640.0,
             height: 480.0,
-            cell_width: 9.0,
+            cell_width: CELL_WIDTH,
             line_height: REQUESTED_LINE_HEIGHT,
             assembly: None,
             latest: None,
             next_worker: 1,
+            #[cfg(not(feature = "pure-renderer"))]
             cache: HashMap::new(),
+            #[cfg(not(feature = "pure-renderer"))]
             layouts_created: 0,
+            #[cfg(not(feature = "pure-renderer"))]
             layouts_reused: 0,
+            #[cfg(not(feature = "pure-renderer"))]
             layouts_dropped: 0,
+            #[cfg(not(feature = "pure-renderer"))]
             packets: 0,
             snapshots_received: 0,
             snapshot_chunks_received: 0,
             snapshot_bytes_received: 0,
             snapshot_rows_received: 0,
             full_snapshots_received: 0,
+            #[cfg(not(feature = "pure-renderer"))]
             metric_application_cursor: None,
+            #[cfg(not(feature = "pure-renderer"))]
             metric_bracketed_paste: None,
+            #[cfg(not(feature = "pure-renderer"))]
             metric_resizes: 0,
+            #[cfg(not(feature = "pure-renderer"))]
             metric_viewport_offset: 0,
+            #[cfg(not(feature = "pure-renderer"))]
             metric_bytes_read: 0,
+            #[cfg(not(feature = "pure-renderer"))]
             metric_exited: false,
+            #[cfg(not(feature = "pure-renderer"))]
             max_packet_bytes: 0,
+            #[cfg(not(feature = "pure-renderer"))]
             max_commands: 0,
             requested_viewport: 0,
+            #[cfg(not(feature = "pure-renderer"))]
             selection: None,
+            #[cfg(not(feature = "pure-renderer"))]
             pressed_mouse_button: None,
+            #[cfg(not(feature = "pure-renderer"))]
             mouse_modifiers: 0,
+            #[cfg(not(feature = "pure-renderer"))]
             scroll_accumulator: 0.0,
+            #[cfg(not(feature = "pure-renderer"))]
             mouse_wheel_accumulator: 0.0,
+            #[cfg(not(feature = "pure-renderer"))]
             suppressed_text: None,
             resize_worker_pending: false,
             last_sent_grid_size: None,
             next_input_sequence: 0,
+            input_stream: None,
+            input_stream_requested: false,
+            reliable_input: VecDeque::new(),
+            reliable_input_bytes: 0,
+            reliable_input_offset: 0,
+            next_input_chunk_sequence: 0,
+            reliable_input_in_flight: None,
             pending_resize_epoch: None,
             // Focus authority arrives through PaneFocused. Assuming focus here
             // makes every background terminal schedule blink renders during
             // startup, before the compositor has selected a pane.
+            #[cfg(not(feature = "pure-renderer"))]
             focused: false,
+            #[cfg(not(feature = "pure-renderer"))]
             cursor_blink_on: true,
+            #[cfg(not(feature = "pure-renderer"))]
             cursor_blink_worker: None,
         }
     }
@@ -175,13 +262,116 @@ impl UiState {
         })
     }
 
-    fn input_command(&mut self, bytes: &[u8]) -> Command {
-        self.next_input_sequence = self.next_input_sequence.saturating_add(1).max(1);
-        let mut body = Vec::with_capacity(bytes.len() + 9);
-        body.push(b'I');
-        body.extend_from_slice(&self.next_input_sequence.to_le_bytes());
-        body.extend_from_slice(bytes);
-        self.session_message(body)
+    fn input_commands(&mut self, bytes: &[u8]) -> Vec<Command> {
+        if bytes.is_empty() {
+            return Vec::new();
+        }
+        let Some(total) = self.reliable_input_bytes.checked_add(bytes.len()) else {
+            return vec![self.input_overload_command()];
+        };
+        if total > MAX_RELIABLE_INPUT_BYTES {
+            return vec![self.input_overload_command()];
+        }
+        self.reliable_input.push_back(ReliableInput {
+            sequence: 0,
+            bytes: bytes.to_vec(),
+        });
+        self.reliable_input_bytes = total;
+        self.drive_reliable_input()
+    }
+
+    fn input_overload_command(&self) -> Command {
+        self.session_message(
+            b"Eterminal input rejected: reliable input queue reached its bounded capacity".to_vec(),
+        )
+    }
+
+    fn drive_reliable_input(&mut self) -> Vec<Command> {
+        if self.reliable_input_in_flight.is_some() || self.reliable_input.is_empty() {
+            return Vec::new();
+        }
+        let Some((incarnation, stream)) = self.input_stream else {
+            if self.input_stream_requested {
+                return Vec::new();
+            }
+            self.input_stream_requested = true;
+            return vec![self.session_message(vec![b'B'])];
+        };
+        let record = self
+            .reliable_input
+            .front_mut()
+            .expect("checked nonempty input queue");
+        if record.sequence == 0 {
+            self.next_input_sequence = self.next_input_sequence.saturating_add(1).max(1);
+            record.sequence = self.next_input_sequence;
+        }
+        let end = self
+            .reliable_input_offset
+            .saturating_add(RELIABLE_INPUT_CHUNK_BYTES)
+            .min(record.bytes.len());
+        self.next_input_chunk_sequence = self.next_input_chunk_sequence.saturating_add(1).max(1);
+        let chunk_sequence = self.next_input_chunk_sequence;
+        let mut body = Vec::with_capacity(34 + end - self.reliable_input_offset);
+        body.push(b'J');
+        body.extend_from_slice(&record.sequence.to_le_bytes());
+        body.extend_from_slice(&incarnation.to_le_bytes());
+        body.extend_from_slice(&stream.to_le_bytes());
+        body.extend_from_slice(&chunk_sequence.to_le_bytes());
+        body.push(
+            u8::from(self.reliable_input_offset == 0) | (u8::from(end == record.bytes.len()) << 1),
+        );
+        body.extend_from_slice(&record.bytes[self.reliable_input_offset..end]);
+        self.reliable_input_offset = end;
+        self.reliable_input_in_flight = Some(chunk_sequence);
+        vec![self.session_message(body)]
+    }
+
+    fn accept_input_control(&mut self, body: &[u8]) -> Vec<Command> {
+        match body.first().copied() {
+            Some(b'C')
+                if body.len() == 25
+                    && self.input_stream_requested
+                    && self.reliable_input_in_flight.is_none() =>
+            {
+                let incarnation =
+                    u64::from_le_bytes(body[1..9].try_into().expect("fixed input incarnation"));
+                let stream =
+                    u64::from_le_bytes(body[9..17].try_into().expect("fixed input stream"));
+                let logical_base =
+                    u64::from_le_bytes(body[17..25].try_into().expect("fixed logical base"));
+                self.input_stream = Some((incarnation, stream));
+                self.input_stream_requested = false;
+                self.reliable_input_in_flight = None;
+                self.next_input_chunk_sequence = 0;
+                self.next_input_sequence = logical_base;
+                self.drive_reliable_input()
+            }
+            Some(b'K') if body.len() == 25 => {
+                let incarnation =
+                    u64::from_le_bytes(body[1..9].try_into().expect("fixed input incarnation"));
+                let stream =
+                    u64::from_le_bytes(body[9..17].try_into().expect("fixed input stream"));
+                let sequence =
+                    u64::from_le_bytes(body[17..25].try_into().expect("fixed input sequence"));
+                if self.input_stream != Some((incarnation, stream))
+                    || self.reliable_input_in_flight != Some(sequence)
+                {
+                    return Vec::new();
+                }
+                self.reliable_input_in_flight = None;
+                if let Some(completed) = self
+                    .reliable_input
+                    .pop_front_if(|record| self.reliable_input_offset == record.bytes.len())
+                {
+                    self.reliable_input_bytes = self
+                        .reliable_input_bytes
+                        .saturating_sub(completed.bytes.len());
+                    self.reliable_input_offset = 0;
+                }
+                self.drive_reliable_input()
+            }
+            _ => Vec::new(),
+        }
     }
 
     fn resize_command(
@@ -230,6 +420,7 @@ impl UiState {
         }))
     }
 
+    #[cfg(not(feature = "pure-renderer"))]
     fn schedule_cursor_blink(&mut self) -> Option<Command> {
         if self.cursor_blink_worker.is_some() || !self.focused {
             return None;
@@ -243,10 +434,12 @@ impl UiState {
         }))
     }
 
+    #[cfg(not(feature = "pure-renderer"))]
     fn cancel_cursor_blink(&mut self) -> Option<Command> {
         self.cursor_blink_worker.take().map(Command::CancelWorker)
     }
 
+    #[cfg(not(feature = "pure-renderer"))]
     fn restart_cursor_blink(&mut self) -> Vec<Command> {
         let mut commands = self.cancel_cursor_blink().into_iter().collect::<Vec<_>>();
         if !self.cursor_blink_on {
@@ -263,6 +456,7 @@ impl UiState {
         self.session_message(body)
     }
 
+    #[cfg(not(feature = "pure-renderer"))]
     fn metrics_command_if_due(&mut self, payload: Vec<u8>) -> Option<Command> {
         let snapshot = self.latest.as_ref()?;
         let state_changed = self.metric_application_cursor != Some(snapshot.application_cursor)
@@ -315,6 +509,7 @@ fn terminal_focuses_on_create(instance_id: &str) -> bool {
         && terminal_session_actor(instance_id) != "terminal-session"
 }
 
+#[derive(Clone, Debug, PartialEq)]
 struct Snapshot {
     revision: u64,
     input_sequence: u64,
@@ -340,6 +535,9 @@ struct Snapshot {
 struct SnapshotAssembly {
     header: SnapshotHeader,
     chunks: Vec<Option<SnapshotRowsChunk>>,
+    encoded_bytes: usize,
+    logical_bytes: usize,
+    runs: usize,
 }
 
 type SnapshotRowsChunk = Vec<(u16, Vec<Run>)>;
@@ -367,7 +565,7 @@ struct SnapshotHeader {
     max_viewport_offset: usize,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 struct Run {
     start: u16,
     cells: u16,
@@ -381,13 +579,13 @@ struct Run {
     text: String,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 struct CellPoint {
     row: u16,
     col: u16,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct Selection {
     anchor: CellPoint,
     extent: CellPoint,
@@ -404,6 +602,7 @@ struct RunKey {
     text: String,
 }
 
+#[cfg(not(feature = "pure-renderer"))]
 struct CachedLayout {
     handle: u64,
     last_used_revision: u64,
@@ -427,6 +626,7 @@ fn terminal_text_clusters(text: &str) -> Vec<(u16, u16, String)> {
     clusters
 }
 
+#[cfg(not(feature = "pure-renderer"))]
 #[allow(
     clippy::too_many_arguments,
     reason = "terminal text style and geometry define one immutable cached layout"
@@ -496,7 +696,9 @@ fn terminal_text_layout(
 
 impl Guest for TerminalUi {
     fn dispatch(event: Event) -> Vec<Command> {
-        match event {
+        let commands = match event {
+            #[cfg(feature = "pure-renderer")]
+            Event::FacetInput(batch) => pure_renderer::handle_input(batch.events),
             Event::Lifecycle(LifecycleEvent::Start(context)) => {
                 let Some(backend_id) = context.backend_id else {
                     return vec![Command::LifecycleComplete(Err(
@@ -529,6 +731,20 @@ impl Guest for TerminalUi {
             {
                 handle_snapshot_chunk(&message.body)
             }
+            Event::Mailbox(message)
+                if message.sender.starts_with("session:")
+                    && matches!(message.body.first(), Some(b'C' | b'K')) =>
+            {
+                STATE
+                    .lock()
+                    .ok()
+                    .and_then(|mut state| {
+                        state
+                            .as_mut()
+                            .map(|state| state.accept_input_control(&message.body))
+                    })
+                    .unwrap_or_default()
+            }
             Event::Mailbox(message) => focus_commands_for_mailbox(&message.sender, &message.body),
             Event::Worker(WorkerEvent::Finished(finished))
                 if finished.output == RESIZE_WORKER_PAYLOAD =>
@@ -540,22 +756,28 @@ impl Guest for TerminalUi {
             {
                 finish_resize_debounce()
             }
+            #[cfg(not(feature = "pure-renderer"))]
             Event::Worker(WorkerEvent::Finished(finished))
                 if finished.output == CURSOR_BLINK_WORKER_PAYLOAD =>
             {
                 finish_cursor_blink(finished.worker)
             }
+            #[cfg(not(feature = "pure-renderer"))]
             Event::Worker(WorkerEvent::Failed(failed))
                 if failed.message.starts_with("terminal cursor blink:") =>
             {
                 finish_cursor_blink(failed.worker)
             }
+            #[cfg(not(feature = "pure-renderer"))]
             Event::Worker(WorkerEvent::Cancelled(worker)) => cancel_cursor_blink_finished(worker),
             Event::Worker(WorkerEvent::Finished(_)) | Event::Worker(WorkerEvent::Failed(_)) => {
                 Vec::new()
             }
             _ => Vec::new(),
-        }
+        };
+        #[cfg(feature = "pure-renderer")]
+        pure_renderer::publish();
+        commands
     }
 
     async fn worker_run(_worker: u64, payload: Vec<u8>) -> Result<Vec<u8>, String> {
@@ -563,7 +785,9 @@ impl Guest for TerminalUi {
             wait_timer(RESIZE_DEBOUNCE_MS)
                 .await
                 .map_err(|error| format!("terminal resize debounce: {error}"))?;
-        } else if payload == CURSOR_BLINK_WORKER_PAYLOAD {
+        }
+        #[cfg(not(feature = "pure-renderer"))]
+        if payload == CURSOR_BLINK_WORKER_PAYLOAD {
             wait_timer(CURSOR_BLINK_MS)
                 .await
                 .map_err(|error| format!("terminal cursor blink: {error}"))?;
@@ -610,6 +834,7 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
             state.pane = created.pane;
             state.width = created.width.max(1.0);
             state.height = created.height.max(1.0);
+            #[cfg(not(feature = "pure-renderer"))]
             if let Ok(metrics) = host::graphics_layout_text(
                 state.pane,
                 "M",
@@ -637,6 +862,7 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
             state.height = resized.height.max(1.0);
             state.pending_resize_epoch = resized.resize_epoch;
             let commands = state.schedule_resize().into_iter().collect();
+            #[cfg(not(feature = "pure-renderer"))]
             if state.latest.is_some() {
                 let _ignored = brood_plugin_sdk::graphics::request_render_for_resize(
                     state.pane,
@@ -645,6 +871,7 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
             }
             commands
         }
+        #[cfg(not(feature = "pure-renderer"))]
         PresentationEvent::PaneFocused(focused) if focused.pane == state.pane => {
             let mut commands = state.cancel_cursor_blink().into_iter().collect::<Vec<_>>();
             state.focused = focused.focused;
@@ -653,6 +880,7 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
             commands.extend(state.schedule_cursor_blink());
             commands
         }
+        #[cfg(not(feature = "pure-renderer"))]
         PresentationEvent::Key(key) if key.pane == state.pane && key.pressed => {
             let mut commands = state.restart_cursor_blink();
             state.suppressed_text = ((key.modifiers & (MOD_CTRL | MOD_ALT)) != 0
@@ -705,15 +933,14 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
                 .latest
                 .as_ref()
                 .is_some_and(|snapshot| snapshot.application_cursor);
-            commands.extend(
-                key_bytes(&key.logical_key, key.modifiers, application_cursor).map(|bytes| {
-                    state.selection = None;
-                    state.requested_viewport = 0;
-                    state.input_command(&bytes)
-                }),
-            );
+            if let Some(bytes) = key_bytes(&key.logical_key, key.modifiers, application_cursor) {
+                state.selection = None;
+                state.requested_viewport = 0;
+                commands.extend(state.input_commands(&bytes));
+            }
             commands
         }
+        #[cfg(not(feature = "pure-renderer"))]
         PresentationEvent::Text(text) if text.pane == state.pane && !text.text.is_empty() => {
             let mut commands = state.restart_cursor_blink();
             if state
@@ -733,10 +960,11 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
             } else {
                 state.selection = None;
                 state.requested_viewport = 0;
-                commands.push(state.input_command(printable.as_bytes()));
+                commands.extend(state.input_commands(printable.as_bytes()));
                 commands
             }
         }
+        #[cfg(not(feature = "pure-renderer"))]
         PresentationEvent::Paste(paste) if paste.pane == state.pane && !paste.text.is_empty() => {
             let mut commands = state.restart_cursor_blink();
             let bracketed = state
@@ -745,9 +973,10 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
                 .is_some_and(|snapshot| snapshot.bracketed_paste);
             state.selection = None;
             state.requested_viewport = 0;
-            commands.push(state.input_command(&paste_bytes(&paste.text, bracketed)));
+            commands.extend(state.input_commands(&paste_bytes(&paste.text, bracketed)));
             commands
         }
+        #[cfg(not(feature = "pure-renderer"))]
         PresentationEvent::PointerMoved(moved) if moved.pane == state.pane => {
             if state
                 .selection
@@ -781,10 +1010,9 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
                 state.mouse_modifiers,
                 snapshot.mouse_sgr,
             )
-            .map(|bytes| state.input_command(&bytes))
-            .into_iter()
-            .collect()
+            .map_or_else(Vec::new, |bytes| state.input_commands(&bytes))
         }
+        #[cfg(not(feature = "pure-renderer"))]
         PresentationEvent::PointerButton(button) if button.pane == state.pane => {
             let tracking = state
                 .latest
@@ -839,10 +1067,9 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
                 button.modifiers,
                 mouse_sgr,
             )
-            .map(|bytes| state.input_command(&bytes))
-            .into_iter()
-            .collect()
+            .map_or_else(Vec::new, |bytes| state.input_commands(&bytes))
         }
+        #[cfg(not(feature = "pure-renderer"))]
         PresentationEvent::PointerScroll(scroll) if scroll.pane == state.pane => {
             let Some(snapshot) = state.latest.as_ref() else {
                 return Vec::new();
@@ -864,10 +1091,11 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
                         bytes.extend_from_slice(&report);
                     }
                 }
-                return (!bytes.is_empty())
-                    .then(|| state.input_command(&bytes))
-                    .into_iter()
-                    .collect();
+                return if bytes.is_empty() {
+                    Vec::new()
+                } else {
+                    state.input_commands(&bytes)
+                };
             }
             state.scroll_accumulator += scroll.vertical / SCROLL_PIXELS_PER_LINE;
             let delta = state.scroll_accumulator.trunc() as isize;
@@ -886,6 +1114,7 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
                 vec![state.viewport_command(next)]
             }
         }
+        #[cfg(not(feature = "pure-renderer"))]
         PresentationEvent::RenderHint(hint) => {
             drop(guard);
             let Ok(metrics) = brood_plugin_sdk::graphics::render_with_hint(&hint, || {
@@ -901,18 +1130,22 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
             };
             state.metrics_command_if_due(metrics).into_iter().collect()
         }
+        #[cfg(feature = "pure-renderer")]
+        PresentationEvent::RenderHint(_) => Vec::new(),
         _ => Vec::new(),
     }
 }
 
 fn terminal_ready_commands(state: &mut UiState) -> Vec<Command> {
-    let mut commands = Vec::with_capacity(3);
+    let mut commands = Vec::with_capacity(4);
     if state.focus_on_create {
         commands.push(Command::SendHostMessage(
             format!(r#"{{"type":"focus-pane","pane":{}}}"#, state.pane).into_bytes(),
         ));
     }
     commands.push(state.session_message(vec![b'A']));
+    state.input_stream_requested = true;
+    commands.push(state.session_message(vec![b'B']));
     commands.push(
         state
             .send_resize_if_changed()
@@ -929,9 +1162,14 @@ fn finish_resize_debounce() -> Vec<Command> {
         return Vec::new();
     };
     state.resize_worker_pending = false;
+    #[cfg(feature = "pure-renderer")]
+    {
+        state.pending_resize_epoch = None;
+    }
     state.send_resize_if_changed().into_iter().collect()
 }
 
+#[cfg(not(feature = "pure-renderer"))]
 fn finish_cursor_blink(worker: u64) -> Vec<Command> {
     let Ok(mut guard) = STATE.lock() else {
         return Vec::new();
@@ -946,6 +1184,7 @@ fn finish_cursor_blink(worker: u64) -> Vec<Command> {
     commands
 }
 
+#[cfg(not(feature = "pure-renderer"))]
 fn finish_cursor_blink_for_state(state: &mut UiState, worker: u64) -> (bool, Vec<Command>) {
     if state.cursor_blink_worker != Some(worker) {
         return (false, Vec::new());
@@ -960,6 +1199,7 @@ fn finish_cursor_blink_for_state(state: &mut UiState, worker: u64) -> (bool, Vec
     (true, state.schedule_cursor_blink().into_iter().collect())
 }
 
+#[cfg(not(feature = "pure-renderer"))]
 fn cancel_cursor_blink_finished(worker: u64) -> Vec<Command> {
     let Ok(mut guard) = STATE.lock() else {
         return Vec::new();
@@ -988,6 +1228,7 @@ fn request_clipboard_paste_command(pane: u64) -> Command {
     )
 }
 
+#[cfg(any(not(feature = "pure-renderer"), test))]
 fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
     let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
     if bracketed {
@@ -1001,6 +1242,7 @@ fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
     }
 }
 
+#[cfg(not(feature = "pure-renderer"))]
 fn pointer_cell(state: &UiState, x: f32, y: f32) -> CellPoint {
     let (rows, cols) = state.latest.as_ref().map_or_else(
         || state.grid_size(),
@@ -1054,6 +1296,7 @@ fn mouse_report(
     ])
 }
 
+#[cfg(not(feature = "pure-renderer"))]
 fn selection_text(snapshot: Option<&Snapshot>, selection: Selection) -> Option<String> {
     let snapshot = snapshot?;
     let (start, end) = normalized_selection(selection);
@@ -1078,6 +1321,7 @@ fn selection_text(snapshot: Option<&Snapshot>, selection: Selection) -> Option<S
     (!text.is_empty()).then_some(text)
 }
 
+#[cfg(not(feature = "pure-renderer"))]
 fn snapshot_row_cells(snapshot: &Snapshot, row: u16) -> Vec<String> {
     let Some(runs) = snapshot.rows_data.get(usize::from(row)) else {
         return vec![" ".to_string(); usize::from(snapshot.cols)];
@@ -1231,6 +1475,10 @@ fn key_bytes(logical: &str, modifiers: u32, application_cursor: bool) -> Option<
     }
 }
 
+#[allow(
+    clippy::needless_return,
+    reason = "the return keeps the separately compiled legacy and facet branches type-correct"
+)]
 fn handle_snapshot_chunk(body: &[u8]) -> Vec<Command> {
     let Ok((header, chunk_index, chunk_count, row_start, rows)) = decode_chunk(body) else {
         return Vec::new();
@@ -1271,6 +1519,9 @@ fn handle_snapshot_chunk(body: &[u8]) -> Vec<Command> {
         state.assembly = Some(SnapshotAssembly {
             header,
             chunks: vec![None; usize::from(chunk_count)],
+            encoded_bytes: 0,
+            logical_bytes: 0,
+            runs: 0,
         });
     }
     let Some(assembly) = state.assembly.as_mut() else {
@@ -1282,6 +1533,37 @@ fn handle_snapshot_chunk(body: &[u8]) -> Vec<Command> {
         state.assembly = None;
         return Vec::new();
     }
+    if assembly.chunks[usize::from(chunk_index)].is_some() {
+        return Vec::new();
+    }
+    let chunk_runs = rows.iter().map(Vec::len).sum::<usize>();
+    let logical_bytes = rows
+        .iter()
+        .try_fold(0_usize, |total, runs| {
+            runs.iter().try_fold(
+                total.saturating_add(std::mem::size_of::<Vec<Run>>()),
+                |total, run| {
+                    total
+                        .checked_add(std::mem::size_of::<Run>())
+                        .and_then(|total| total.checked_add(run.text.len()))
+                },
+            )
+        })
+        .unwrap_or(usize::MAX);
+    let next_encoded = assembly.encoded_bytes.saturating_add(body.len());
+    let next_logical = assembly.logical_bytes.saturating_add(logical_bytes);
+    let next_runs = assembly.runs.saturating_add(chunk_runs);
+    if cfg!(feature = "pure-renderer")
+        && (next_encoded > MAX_SNAPSHOT_ENCODED_BYTES
+            || next_logical > MAX_SNAPSHOT_LOGICAL_BYTES
+            || next_runs > MAX_SNAPSHOT_RUNS)
+    {
+        state.assembly = None;
+        return Vec::new();
+    }
+    assembly.encoded_bytes = next_encoded;
+    assembly.logical_bytes = next_logical;
+    assembly.runs = next_runs;
     assembly.chunks[usize::from(chunk_index)] = Some(
         rows.into_iter()
             .enumerate()
@@ -1316,7 +1598,7 @@ fn handle_snapshot_chunk(body: &[u8]) -> Vec<Command> {
     if header.full && updated.iter().any(|updated| !updated) {
         return Vec::new();
     }
-    state.latest = Some(Arc::new(Snapshot {
+    let snapshot = Snapshot {
         revision: header.revision,
         input_sequence: header.input_sequence,
         rows: header.rows,
@@ -1336,17 +1618,29 @@ fn handle_snapshot_chunk(body: &[u8]) -> Vec<Command> {
         viewport_offset: header.viewport_offset,
         max_viewport_offset: header.max_viewport_offset,
         rows_data,
-    }));
+    };
+    #[cfg(feature = "pure-renderer")]
+    if !pure_renderer::snapshot_fits(&snapshot) {
+        return Vec::new();
+    }
+    state.latest = Some(Arc::new(snapshot));
     state.snapshots_received = state.snapshots_received.saturating_add(1);
     state.full_snapshots_received = state
         .full_snapshots_received
         .saturating_add(u64::from(header.full));
     state.requested_viewport = header.viewport_offset;
-    let resize_epoch = state.pending_resize_epoch;
-    let _ignored = brood_plugin_sdk::graphics::request_render_for_resize(state.pane, resize_epoch);
-    state.schedule_cursor_blink().into_iter().collect()
+    #[cfg(not(feature = "pure-renderer"))]
+    {
+        let resize_epoch = state.pending_resize_epoch;
+        let _ignored =
+            brood_plugin_sdk::graphics::request_render_for_resize(state.pane, resize_epoch);
+        return state.schedule_cursor_blink().into_iter().collect();
+    }
+    #[cfg(feature = "pure-renderer")]
+    Vec::new()
 }
 
+#[cfg(not(feature = "pure-renderer"))]
 fn render_latest_snapshot(resize_epoch: Option<u64>) -> Result<Vec<u8>, String> {
     let (
         pane,
@@ -1653,6 +1947,9 @@ fn render_latest_snapshot(resize_epoch: Option<u64>) -> Result<Vec<u8>, String> 
 type DecodedChunk = (SnapshotHeader, u16, u16, u16, Vec<Vec<Run>>);
 
 fn decode_chunk(bytes: &[u8]) -> Result<DecodedChunk, ()> {
+    if cfg!(feature = "pure-renderer") && bytes.len() > MAX_SNAPSHOT_ENCODED_BYTES {
+        return Err(());
+    }
     let mut reader = Reader::new(bytes);
     if reader.take(4)? != SNAPSHOT_MAGIC || reader.u8()? != SNAPSHOT_VERSION {
         return Err(());
@@ -1682,15 +1979,24 @@ fn decode_chunk(bytes: &[u8]) -> Result<DecodedChunk, ()> {
     let max_viewport_offset = reader.u32()? as usize;
     if rows == 0
         || cols == 0
+        || rows > MAX_SNAPSHOT_ROWS
+        || cols > MAX_SNAPSHOT_COLS
         || chunk_count == 0
+        || (cfg!(feature = "pure-renderer") && chunk_count > MAX_SNAPSHOT_CHUNKS)
         || chunk_index >= chunk_count
+        || row_start.saturating_add(row_count) > rows
         || viewport_offset > max_viewport_offset
     {
         return Err(());
     }
     let mut decoded_rows = Vec::with_capacity(usize::from(row_count));
+    let mut decoded_runs = 0_usize;
     for _ in 0..row_count {
         let run_count = reader.u16()?;
+        decoded_runs = decoded_runs.saturating_add(usize::from(run_count));
+        if cfg!(feature = "pure-renderer") && decoded_runs > MAX_SNAPSHOT_RUNS {
+            return Err(());
+        }
         let mut runs = Vec::with_capacity(usize::from(run_count));
         for _ in 0..run_count {
             let start = reader.u16()?;
@@ -1702,7 +2008,7 @@ fn decode_chunk(bytes: &[u8]) -> Result<DecodedChunk, ()> {
             let text = std::str::from_utf8(reader.take(usize::from(text_len))?)
                 .map_err(|_| ())?
                 .to_string();
-            if start.saturating_add(cells) > cols {
+            if cells == 0 || start.saturating_add(cells) > cols {
                 return Err(());
             }
             runs.push(Run {
@@ -1819,18 +2125,113 @@ fn rgb_channels(value: u32) -> [f32; 3] {
     ]
 }
 
+#[cfg(feature = "pure-renderer")]
+brood_plugin_sdk::export_visual_plugin!(TerminalUi);
+#[cfg(not(feature = "pure-renderer"))]
 bindings::export!(TerminalUi with_types_in bindings);
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(feature = "pure-renderer"))]
+    use super::finish_cursor_blink_for_state;
     use super::{
-        Command, DEFAULT_BG, FOCUS_MESSAGE, MAX_PRESENTATION_BATCH_COMMANDS, SNAPSHOT_FULL,
-        SNAPSHOT_MAGIC, SNAPSHOT_VERSION, STATE, UiState, decode_chunk,
-        finish_cursor_blink_for_state, focus_commands_for_mailbox, paste_bytes, row_cells,
+        Command, DEFAULT_BG, FOCUS_MESSAGE, MAX_PRESENTATION_BATCH_COMMANDS,
+        MAX_RELIABLE_INPUT_BYTES, SNAPSHOT_FULL, SNAPSHOT_MAGIC, SNAPSHOT_VERSION, STATE, UiState,
+        decode_chunk, focus_commands_for_mailbox, paste_bytes, row_cells,
         terminal_focuses_on_create, terminal_ready_commands, terminal_session_actor,
         terminal_text_clusters,
     };
     use brood_graphics::theme::ashen;
+
+    fn session_body(commands: Vec<Command>) -> Vec<u8> {
+        let [Command::SendSessionMessage(message)] = commands.as_slice() else {
+            panic!("expected one session message");
+        };
+        message.body.clone()
+    }
+
+    fn stream_offer(incarnation: u64, stream: u64, logical_base: u64) -> Vec<u8> {
+        let mut body = vec![b'C'];
+        body.extend_from_slice(&incarnation.to_le_bytes());
+        body.extend_from_slice(&stream.to_le_bytes());
+        body.extend_from_slice(&logical_base.to_le_bytes());
+        body
+    }
+
+    fn written_ack(j: &[u8]) -> Vec<u8> {
+        let mut body = vec![b'K'];
+        body.extend_from_slice(&j[9..33]);
+        body
+    }
+
+    #[test]
+    fn reliable_sender_serializes_a_large_paste_before_a_queued_key() {
+        let mut state = UiState::new(1, 2, "terminal-ui");
+        let paste = vec![b'p'; 256 * 1024];
+        assert_eq!(session_body(state.input_commands(&paste)), b"B");
+        assert!(state.input_commands(b"z").is_empty());
+
+        let mut command = session_body(state.accept_input_control(&stream_offer(7, 3, 90)));
+        let mut output = Vec::new();
+        let mut logical_sequences = Vec::new();
+        loop {
+            assert_eq!(command[0], b'J');
+            logical_sequences.push(u64::from_le_bytes(
+                command[1..9].try_into().expect("logical sequence"),
+            ));
+            output.extend_from_slice(&command[34..]);
+            let next = state.accept_input_control(&written_ack(&command));
+            if next.is_empty() {
+                break;
+            }
+            command = session_body(next);
+        }
+        assert_eq!(&output[..paste.len()], paste.as_slice());
+        assert_eq!(&output[paste.len()..], b"z");
+        assert!(
+            logical_sequences[..8]
+                .iter()
+                .all(|sequence| *sequence == 91)
+        );
+        assert_eq!(logical_sequences.last(), Some(&92));
+    }
+
+    #[test]
+    fn reliable_sender_rejects_a_whole_over_capacity_batch() {
+        let mut state = UiState::new(1, 2, "terminal-ui");
+        let admitted = vec![b'a'; MAX_RELIABLE_INPUT_BYTES];
+        assert_eq!(session_body(state.input_commands(&admitted)), b"B");
+        let queued_before = state.reliable_input_bytes;
+        let rejected = session_body(state.input_commands(b"x"));
+        assert_eq!(rejected[0], b'E');
+        assert_eq!(state.reliable_input_bytes, queued_before);
+        assert_eq!(state.reliable_input.len(), 1);
+    }
+
+    #[test]
+    fn reliable_sender_ignores_stale_controls_and_uses_the_offered_logical_base() {
+        let mut state = UiState::new(1, 2, "terminal-ui");
+        assert_eq!(session_body(state.input_commands(b"abc")), b"B");
+        let first = state.accept_input_control(&stream_offer(7, 3, 40));
+        assert!(!first.is_empty());
+        let in_flight = state.reliable_input_in_flight.expect("in-flight chunk");
+        assert!(
+            state
+                .accept_input_control(&stream_offer(8, 4, 900))
+                .is_empty()
+        );
+        assert_eq!(state.reliable_input_in_flight, Some(in_flight));
+        let mut stale = vec![b'K'];
+        stale.extend_from_slice(&8_u64.to_le_bytes());
+        stale.extend_from_slice(&4_u64.to_le_bytes());
+        stale.extend_from_slice(&in_flight.to_le_bytes());
+        assert!(state.accept_input_control(&stale).is_empty());
+        assert_eq!(state.reliable_input_in_flight, Some(in_flight));
+        assert_eq!(
+            state.reliable_input.front().map(|input| input.sequence),
+            Some(41)
+        );
+    }
 
     fn one_row_snapshot(cols: u16, run_cells: u16, text: &str) -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -1886,11 +2287,6 @@ mod tests {
     }
 
     #[test]
-    fn opted_in_presentation_batch_stays_within_host_command_capacity() {
-        assert_eq!(MAX_PRESENTATION_BATCH_COMMANDS, 48);
-    }
-
-    #[test]
     fn backend_scoped_default_ui_targets_default_terminal() {
         assert_eq!(
             terminal_session_actor("terminal-ui-b2-s7"),
@@ -1941,6 +2337,7 @@ mod tests {
 
     #[test]
     fn trusted_client_chrome_can_focus_an_existing_terminal_pane() {
+        let _fixture = crate::TEST_STATE.lock().expect("terminal state fixture");
         *STATE.lock().expect("terminal UI state") = Some(UiState::new(2, 7, "neovim-ui-b2-s7"));
         STATE
             .lock()
@@ -1969,6 +2366,7 @@ mod tests {
             .unwrap()
             .pane = 0;
         assert!(focus_commands_for_mailbox("brood.client-init", FOCUS_MESSAGE).is_empty());
+        STATE.lock().expect("terminal UI state").take();
     }
 
     #[test]
@@ -1992,6 +2390,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "pure-renderer"))]
     fn cursor_blink_worker_is_single_flight_and_stops_while_unfocused() {
         let mut state = UiState::new(2, 7, "terminal-ui-b2-s7");
         assert!(state.schedule_cursor_blink().is_none());
@@ -2007,6 +2406,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "pure-renderer"))]
     fn cursor_input_restarts_the_blink_deadline_and_ignores_the_stale_timer() {
         let mut state = UiState::new(2, 7, "terminal-ui-b2-s7");
         state.focused = true;

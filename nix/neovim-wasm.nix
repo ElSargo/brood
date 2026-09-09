@@ -35,6 +35,14 @@ let
 
         runHook unpackPhase
         cd "$sourceRoot"
+
+        # Codeberg's smart-Git endpoint is not reliable in the Nix builder,
+        # while its immutable archive endpoint serves the exact same package
+        # contents. Seed both packages by their declared Zig content hashes so
+        # the dependency walk never needs to negotiate the Git protocol.
+        zig fetch "https://codeberg.org/allyourcodebase/uncrustify/archive/2cdf880e4ffbe438a7946368cd45fca2df9f0f7a.tar.gz"
+        zig fetch "https://codeberg.org/ziglang/translate-c/archive/46b5609b5ac4c0a896217d1d984f3ae50e4810b5.tar.gz"
+
         zig build nvim_bin \
           -Dtarget=wasm32-emscripten \
           -Dhost=native \

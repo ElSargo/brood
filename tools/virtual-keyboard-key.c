@@ -253,6 +253,7 @@ int main(int argc, char **argv) {
     const char *keycode = NULL;
     const char *repeat_count_value = NULL;
     const char *repeat_interval_value = NULL;
+    const char *idle_proof_duration_value = NULL;
     if (argc == 2) {
         keycode = argv[1];
     } else if (argc == 3 && strcmp(argv[1], "--ctrl-only") == 0) {
@@ -273,6 +274,9 @@ int main(int argc, char **argv) {
     } else if (argc == 3 && strcmp(argv[1], "--text") == 0) {
         modifier_mode = MODIFIERS_NONE;
         text_input = argv[2];
+    } else if (argc == 3 && strcmp(argv[1], "--idle-proof") == 0) {
+        modifier_mode = MODIFIERS_NONE;
+        idle_proof_duration_value = argv[2];
     } else if (argc == 5 && strcmp(argv[1], "--repeat") == 0) {
         modifier_mode = MODIFIERS_NONE;
         repeat_count_value = argv[2];
@@ -284,6 +288,7 @@ int main(int argc, char **argv) {
             "[--ctrl-only|--ctrl-shift-only|--shift-only|--none|--plain] "
             "<linux-evdev-keycode> "
             "| --repeat <count> <interval-us> <linux-evdev-keycode> "
+            "| --idle-proof <duration-ms> "
             "| --text <ascii-text>"
         );
     }
@@ -297,6 +302,7 @@ int main(int argc, char **argv) {
     }
     unsigned long repeat_count = 1;
     unsigned long repeat_interval_us = 0;
+    unsigned long idle_proof_duration_ms = 0;
     if (repeat_count_value != NULL) {
         repeat_count = strtoul(repeat_count_value, &end, 10);
         if (end == repeat_count_value || *end != '\0' || repeat_count == 0) {
@@ -305,6 +311,15 @@ int main(int argc, char **argv) {
         repeat_interval_us = strtoul(repeat_interval_value, &end, 10);
         if (end == repeat_interval_value || *end != '\0' || repeat_interval_us == 0) {
             fail("repeat interval must be a positive number of microseconds");
+        }
+    }
+    if (idle_proof_duration_value != NULL) {
+        idle_proof_duration_ms = strtoul(idle_proof_duration_value, &end, 10);
+        if (
+            end == idle_proof_duration_value || *end != '\0' ||
+            idle_proof_duration_ms == 0 || idle_proof_duration_ms > UINT32_MAX
+        ) {
+            fail("idle proof duration must be a positive 32-bit millisecond value");
         }
     }
 
@@ -380,7 +395,26 @@ int main(int argc, char **argv) {
         fail("the compositor rejected the virtual keyboard modifiers");
     }
     usleep(10000);
-    if (text_input != NULL) {
+    if (idle_proof_duration_value != NULL) {
+        // Keep one virtual-keyboard device alive across both proof boundaries.
+        // Device/keymap setup and teardown can generate focus/reset traffic, so
+        // neither belongs inside the interval that is asserting true idleness.
+        usleep(500000);
+        send_key(keyboard, 88);
+        if (wl_display_roundtrip(display) < 0) {
+            fail("the virtual keyboard idle proof start failed");
+        }
+        struct timespec delay = {
+            .tv_sec = (time_t)(idle_proof_duration_ms / 1000),
+            .tv_nsec = (long)(idle_proof_duration_ms % 1000) * 1000000L,
+        };
+        while (nanosleep(&delay, &delay) < 0 && errno == EINTR) {
+        }
+        send_key(keyboard, 87);
+        if (wl_display_flush(display) < 0) {
+            fail("the virtual keyboard idle proof finish failed");
+        }
+    } else if (text_input != NULL) {
         uint32_t shift_mask = modifier_mask(keymap, XKB_MOD_NAME_SHIFT);
         int shift_active = 0;
         for (const unsigned char *cursor = (const unsigned char *)text_input; *cursor; cursor++) {

@@ -1,7 +1,9 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque, hash_map::DefaultHasher},
+    hash::{Hash, Hasher},
     mem,
     ops::Range,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -19,7 +21,7 @@ use lyon_tessellation::{
 use thiserror::Error;
 use wgpu::util::DeviceExt;
 
-use crate::plugin_graphics::{GlyphCacheKey, GlyphImageResource, GraphicsSnapshot, ImageResource};
+use crate::plugin_graphics::{GlyphCacheKey, GlyphImageResource, GraphicsSnapshot};
 
 const CANVAS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 const RESOURCE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
@@ -33,6 +35,9 @@ const MAX_SCENE_INDICES: usize = 786_432;
 const TARGET_CURVE_ERROR_PIXELS: f32 = 0.25;
 const MIN_TESSELLATION_TOLERANCE: f32 = 0.01;
 const MAX_TESSELLATION_SCALE: f32 = 8.0;
+const IMAGE_BACKING_CACHE_ENTRIES: usize = 64;
+const IMAGE_BACKING_CACHE_CPU_BYTES: usize = 16 * 1_024 * 1_024;
+const IMAGE_BACKING_CACHE_GPU_BYTES: usize = 16 * 1_024 * 1_024;
 
 #[derive(Debug, Error)]
 enum SceneCompileError {
@@ -127,6 +132,93 @@ struct GpuTexture {
     bind_group: wgpu::BindGroup,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ImageBackingIdentity {
+    width: u32,
+    height: u32,
+    digest: u64,
+}
+
+#[derive(Clone)]
+struct ImmutableCacheEntry<T> {
+    identity: ImageBackingIdentity,
+    bytes: Arc<[u8]>,
+    gpu_bytes: usize,
+    value: T,
+}
+
+struct BoundedImmutableCache<T> {
+    entries: VecDeque<ImmutableCacheEntry<T>>,
+    cpu_bytes: usize,
+    gpu_bytes: usize,
+    max_entries: usize,
+    max_cpu_bytes: usize,
+    max_gpu_bytes: usize,
+    hits: u64,
+    misses: u64,
+}
+
+impl<T: Clone> BoundedImmutableCache<T> {
+    const fn new(max_entries: usize, max_cpu_bytes: usize, max_gpu_bytes: usize) -> Self {
+        Self {
+            entries: VecDeque::new(),
+            cpu_bytes: 0,
+            gpu_bytes: 0,
+            max_entries,
+            max_cpu_bytes,
+            max_gpu_bytes,
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    fn get_or_insert_with(
+        &mut self,
+        identity: ImageBackingIdentity,
+        bytes: Arc<[u8]>,
+        gpu_bytes: usize,
+        create: impl FnOnce() -> T,
+    ) -> T {
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.identity == identity && entry.bytes.as_ref() == bytes.as_ref())
+            && let Some(entry) = self.entries.remove(index)
+        {
+            let value = entry.value.clone();
+            self.hits = self.hits.saturating_add(1);
+            self.entries.push_back(entry);
+            return value;
+        }
+        self.misses = self.misses.saturating_add(1);
+        let value = create();
+        let cpu_bytes = bytes.len();
+        if self.max_entries == 0 || cpu_bytes > self.max_cpu_bytes || gpu_bytes > self.max_gpu_bytes
+        {
+            return value;
+        }
+        while self.entries.len() >= self.max_entries
+            || self.cpu_bytes.saturating_add(cpu_bytes) > self.max_cpu_bytes
+            || self.gpu_bytes.saturating_add(gpu_bytes) > self.max_gpu_bytes
+        {
+            let Some(evicted) = self.entries.pop_front() else {
+                break;
+            };
+            self.cpu_bytes = self.cpu_bytes.saturating_sub(evicted.bytes.len());
+            self.gpu_bytes = self.gpu_bytes.saturating_sub(evicted.gpu_bytes);
+        }
+        self.cpu_bytes = self.cpu_bytes.saturating_add(cpu_bytes);
+        self.gpu_bytes = self.gpu_bytes.saturating_add(gpu_bytes);
+        self.entries.push_back(ImmutableCacheEntry {
+            identity,
+            bytes,
+            gpu_bytes,
+            value: value.clone(),
+        });
+        value
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct GlyphAtlasEntry {
     page: usize,
@@ -182,6 +274,10 @@ pub struct GpuCanvasScene {
     /// Resize diagnostics use the original draw command rather than
     /// reconstructing the element from pane geometry.
     pub header_button_source_rect: Option<Rect>,
+    // The exact budgeted CPU snapshot used to compile this native scene.
+    // Pure-facet retirement and GPU recovery must replay this accepted
+    // sequence rather than whichever publication happens to be newest.
+    replay_snapshot: Option<GraphicsSnapshot>,
     canvas_clear: Option<wgpu::Color>,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
@@ -209,6 +305,7 @@ pub struct PreparedCanvasScene {
     source_painted_extent: Option<(u32, u32)>,
     header_button_source_rect: Option<Rect>,
     canvas_clear: Option<wgpu::Color>,
+    image_identities: BTreeMap<u64, ImageBackingIdentity>,
     vertices: Vec<CanvasVertex>,
     indices: Vec<u32>,
     ops: Vec<CanvasOp>,
@@ -225,6 +322,10 @@ impl GpuCanvasScene {
     pub const fn output_bind_group(&self) -> &wgpu::BindGroup {
         &self.root.bind_group
     }
+
+    pub const fn replay_snapshot(&self) -> Option<&GraphicsSnapshot> {
+        self.replay_snapshot.as_ref()
+    }
 }
 
 pub struct GpuCanvasRenderer {
@@ -233,6 +334,7 @@ pub struct GpuCanvasRenderer {
     white: GpuTexture,
     glyph_atlas: GpuGlyphAtlas,
     clip_pipeline: wgpu::RenderPipeline,
+    clip_decrement_pipeline: wgpu::RenderPipeline,
     source_over_pipeline: wgpu::RenderPipeline,
     screen_pipeline: wgpu::RenderPipeline,
     plus_pipeline: wgpu::RenderPipeline,
@@ -241,6 +343,7 @@ pub struct GpuCanvasRenderer {
     darken_pipeline: wgpu::RenderPipeline,
     lighten_pipeline: wgpu::RenderPipeline,
     difference_pipeline: wgpu::RenderPipeline,
+    image_backings: BoundedImmutableCache<GpuTexture>,
 }
 
 pub fn validate_snapshot_lowering(
@@ -447,8 +550,17 @@ impl GpuCanvasRenderer {
     ) -> Result<PreparedCanvasScene> {
         let started = Instant::now();
         let (width, height, scale) = extent;
-        let opaque_canvas = opaque_canvas_fill(&snapshot.packet, scale);
-        let source_painted_extent = opaque_canvas.map(|(extent, _color)| extent);
+        let opaque_canvas = opaque_canvas_fill(&snapshot.packet, scale).filter(|(extent, _)| {
+            snapshot
+                .facet_extent
+                .is_none_or(|expected| expected == *extent)
+        });
+        // Facet geometry describes the complete output, including transparent
+        // pixels. Inferring coverage from opaque commands rejects valid rounded
+        // overlays and can deadlock their first native presentation.
+        let source_painted_extent = snapshot
+            .facet_extent
+            .or_else(|| opaque_canvas.map(|(extent, _color)| extent));
         let header_button_source_rect = rightmost_header_button_rect(&snapshot.packet);
         let painted_extent = source_painted_extent.map(|_| (width, height));
         let canvas_clear = opaque_canvas.map(|(_extent, color)| wgpu::Color {
@@ -457,6 +569,20 @@ impl GpuCanvasRenderer {
             b: f64::from(srgb_to_linear(color.b)),
             a: f64::from(color.a),
         });
+        let image_identities = snapshot
+            .images
+            .iter()
+            .map(|(handle, image)| {
+                (
+                    *handle,
+                    image_backing_identity(
+                        image.width,
+                        image.height,
+                        &image.linear_premultiplied_rgba8,
+                    ),
+                )
+            })
+            .collect();
         let mut compiler = SceneCompiler::new_projected(
             width,
             height,
@@ -480,6 +606,7 @@ impl GpuCanvasRenderer {
             source_painted_extent,
             header_button_source_rect,
             canvas_clear,
+            image_identities,
             vertices,
             indices,
             ops,
@@ -521,6 +648,15 @@ impl GpuCanvasRenderer {
             None,
             StencilKind::Increment,
             "plugin GPU canvas clip pipeline",
+        );
+        let clip_decrement_pipeline = create_pipeline(
+            device,
+            &shader,
+            &clip_layout,
+            Some("fragment_clip"),
+            None,
+            StencilKind::Decrement,
+            "plugin GPU canvas clip decrement pipeline",
         );
         let source_over_pipeline = create_pipeline(
             device,
@@ -609,6 +745,7 @@ impl GpuCanvasRenderer {
             white,
             glyph_atlas: GpuGlyphAtlas::default(),
             clip_pipeline,
+            clip_decrement_pipeline,
             source_over_pipeline,
             screen_pipeline,
             plus_pipeline,
@@ -617,11 +754,16 @@ impl GpuCanvasRenderer {
             darken_pipeline,
             lighten_pipeline,
             difference_pipeline,
+            image_backings: BoundedImmutableCache::new(
+                IMAGE_BACKING_CACHE_ENTRIES,
+                IMAGE_BACKING_CACHE_CPU_BYTES,
+                IMAGE_BACKING_CACHE_GPU_BYTES,
+            ),
         }
     }
 
     pub fn finish_prepared(
-        &self,
+        &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         prepared: PreparedCanvasScene,
@@ -637,6 +779,7 @@ impl GpuCanvasRenderer {
             source_painted_extent,
             header_button_source_rect,
             canvas_clear,
+            image_identities,
             vertices,
             indices,
             ops,
@@ -666,13 +809,41 @@ impl GpuCanvasRenderer {
             usage: wgpu::BufferUsages::INDEX,
         });
         let mut resources = BTreeMap::new();
+        let texture_layout = &self.texture_layout;
+        let sampler = &self.sampler;
         for (handle, resource) in &snapshot.images {
+            let gpu_bytes =
+                image_backing_byte_len(resource.width, resource.height).unwrap_or(usize::MAX);
             resources.insert(
                 *handle,
                 previous
                     .and_then(|scene| scene.resources.get(handle))
                     .cloned()
-                    .unwrap_or_else(|| self.upload_image(device, queue, *handle, resource)),
+                    .unwrap_or_else(|| {
+                        let upload = || {
+                            upload_texture(
+                                device,
+                                queue,
+                                texture_layout,
+                                sampler,
+                                (resource.width, resource.height),
+                                &resource.linear_premultiplied_rgba8,
+                                &format!("plugin GPU image {handle}"),
+                            )
+                        };
+                        // Missing preparation metadata must not hash image bytes
+                        // on the event loop. The uncached upload remains correct.
+                        image_identities
+                            .get(handle)
+                            .map_or_else(upload, |identity| {
+                                self.image_backings.get_or_insert_with(
+                                    *identity,
+                                    Arc::clone(&resource.linear_premultiplied_rgba8),
+                                    gpu_bytes,
+                                    upload,
+                                )
+                            })
+                    }),
             );
         }
         let reusable = previous.filter(|scene| scene.width == width && scene.height == height);
@@ -708,7 +879,7 @@ impl GpuCanvasRenderer {
         if snapshot.sequence <= 3 || snapshot.sequence.is_multiple_of(120) || elapsed >= SLOW_FRAME
         {
             eprintln!(
-                "compiled plugin GPU scene pane={} sequence={} commands={} draws={} vertices={} indices={} layers={} glyph_atlas_pages={} cached_glyphs={} preparation_us={} gpu_finish_us={}",
+                "compiled plugin GPU scene pane={} sequence={} commands={} draws={} vertices={} indices={} layers={} glyph_atlas_pages={} cached_glyphs={} preparation_us={} gpu_finish_us={} image_cache_hits={} image_cache_misses={} image_cache_entries={}",
                 snapshot.pane,
                 snapshot.sequence,
                 snapshot.packet.commands.len(),
@@ -722,8 +893,15 @@ impl GpuCanvasRenderer {
                 self.glyph_atlas.entries.len(),
                 preparation_us,
                 elapsed.as_micros(),
+                self.image_backings.hits,
+                self.image_backings.misses,
+                self.image_backings.entries.len(),
             );
         }
+        let replay_snapshot = snapshot
+            .facet_frame_lease
+            .is_some()
+            .then(|| snapshot.clone());
         GpuCanvasScene {
             pane: snapshot.pane,
             sequence: snapshot.sequence,
@@ -733,6 +911,7 @@ impl GpuCanvasRenderer {
             painted_extent,
             source_painted_extent,
             header_button_source_rect,
+            replay_snapshot,
             canvas_clear,
             vertex_buffer,
             index_buffer,
@@ -765,49 +944,82 @@ impl GpuCanvasRenderer {
         if simple {
             self.encode_simple_scene(encoder, scene)?;
         } else {
-            clear_target(
-                encoder,
-                &scene.root,
-                scene.canvas_clear.unwrap_or(wgpu::Color::TRANSPARENT),
-                "plugin GPU canvas clear root",
-            );
-            let mut target_stack = vec![TargetId::Root];
-            for op in &scene.ops {
+            let root_clear = scene.canvas_clear.unwrap_or(wgpu::Color::TRANSPARENT);
+            let root_pending_clear = initial_clear_folds_into(&scene.ops, 0);
+            if !root_pending_clear {
+                clear_target(
+                    encoder,
+                    &scene.root,
+                    root_clear,
+                    "plugin GPU canvas clear root",
+                );
+            }
+            let mut target_stack = vec![(TargetId::Root, root_pending_clear.then_some(root_clear))];
+            let mut op_index = 0;
+            while let Some(op) = scene.ops.get(op_index) {
                 match op {
                     CanvasOp::Draw(draw) => {
-                        let target = *target_stack
-                            .last()
+                        let (target, pending_clear) = target_stack
+                            .last_mut()
                             .context("plugin GPU canvas lost current target")?;
-                        self.encode_draw(encoder, scene, target, draw)?;
+                        if is_advanced_blend(draw.blend_mode) {
+                            self.encode_draw(encoder, scene, *target, draw)?;
+                            op_index += 1;
+                        } else {
+                            let batch_len = ordinary_draw_batch_len(&scene.ops, op_index);
+                            let batch = scene
+                                .ops
+                                .get(op_index..op_index.saturating_add(batch_len))
+                                .context("plugin GPU canvas draw batch exceeded its scene")?;
+                            self.encode_draw_batch(
+                                encoder,
+                                scene,
+                                *target,
+                                batch,
+                                pending_clear.take(),
+                            )?;
+                            op_index += batch_len;
+                        }
                     }
                     CanvasOp::BeginLayer(layer) => {
                         let target = scene
                             .layers
                             .get(*layer)
                             .context("plugin GPU canvas lost layer target")?;
-                        clear_target(
-                            encoder,
-                            target,
-                            wgpu::Color::TRANSPARENT,
-                            "plugin GPU canvas clear layer",
-                        );
-                        target_stack.push(TargetId::Layer(*layer));
+                        let pending_clear =
+                            initial_clear_folds_into(&scene.ops, op_index.saturating_add(1));
+                        if !pending_clear {
+                            clear_target(
+                                encoder,
+                                target,
+                                wgpu::Color::TRANSPARENT,
+                                "plugin GPU canvas clear layer",
+                            );
+                        }
+                        target_stack.push((
+                            TargetId::Layer(*layer),
+                            pending_clear.then_some(wgpu::Color::TRANSPARENT),
+                        ));
+                        op_index += 1;
                     }
                     CanvasOp::EndLayer { layer, draw } => {
                         let popped = target_stack
                             .pop()
                             .context("plugin GPU canvas layer stack underflow")?;
-                        if popped != TargetId::Layer(*layer) {
+                        if popped.0 != TargetId::Layer(*layer) {
                             return Err(anyhow!("plugin GPU canvas layer order changed"));
                         }
-                        let target = *target_stack
+                        let target = target_stack
                             .last()
                             .context("plugin GPU canvas layer lost parent")?;
-                        self.encode_draw(encoder, scene, target, draw)?;
+                        self.encode_draw(encoder, scene, target.0, draw)?;
+                        op_index += 1;
                     }
                 }
             }
-            if target_stack != [TargetId::Root] {
+            if target_stack.len() != 1
+                || target_stack.first().map(|target| target.0) != Some(TargetId::Root)
+            {
                 return Err(anyhow!("plugin GPU canvas layer stack remained open"));
             }
         }
@@ -941,6 +1153,94 @@ impl GpuCanvasRenderer {
         Ok(())
     }
 
+    fn encode_draw_batch(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        scene: &GpuCanvasScene,
+        target_id: TargetId,
+        ops: &[CanvasOp],
+        initial_clear: Option<wgpu::Color>,
+    ) -> Result<()> {
+        let Some(CanvasOp::Draw(first)) = ops.first() else {
+            return Err(anyhow!("plugin GPU canvas draw batch is empty"));
+        };
+        if is_advanced_blend(first.blend_mode) {
+            return Err(anyhow!("plugin GPU canvas batched an advanced blend"));
+        }
+        let target = target(scene, target_id)?;
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("plugin GPU canvas draw batch"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &target.multisample_view,
+                resolve_target: Some(&target.view),
+                depth_slice: None,
+                ops: wgpu::Operations {
+                    load: initial_clear.map_or(wgpu::LoadOp::Load, wgpu::LoadOp::Clear),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &scene.stencil.view,
+                depth_ops: None,
+                stencil_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(0),
+                    store: wgpu::StoreOp::Discard,
+                }),
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_vertex_buffer(0, scene.vertex_buffer.slice(..));
+        pass.set_index_buffer(scene.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+        let mut current_clips: &[Geometry] = &[];
+        let mut first_draw = true;
+        for op in ops {
+            let CanvasOp::Draw(draw) = op else {
+                return Err(anyhow!("plugin GPU canvas draw batch crossed a layer"));
+            };
+            if is_advanced_blend(draw.blend_mode) {
+                return Err(anyhow!("plugin GPU canvas batched an advanced blend"));
+            }
+            let common = common_clip_prefix_len(current_clips, &draw.clips);
+            if !first_draw
+                && current_clips != draw.clips
+                && (current_clips.len() >= u8::MAX as usize || draw.clips.len() >= u8::MAX as usize)
+            {
+                return Err(anyhow!(
+                    "plugin GPU canvas batched a saturated clip transition"
+                ));
+            }
+            if common < current_clips.len() {
+                pass.set_pipeline(&self.clip_decrement_pipeline);
+                for depth in (common..current_clips.len()).rev() {
+                    pass.set_stencil_reference(
+                        u32::try_from(depth.saturating_add(1)).unwrap_or(u32::MAX),
+                    );
+                    let clip = current_clips
+                        .get(depth)
+                        .context("plugin GPU canvas clip transition lost its prior geometry")?;
+                    pass.draw_indexed(clip.indices.clone(), 0, 0..1);
+                }
+            }
+            if common < draw.clips.len() {
+                pass.set_pipeline(&self.clip_pipeline);
+                for (depth, clip) in draw.clips.iter().enumerate().skip(common) {
+                    pass.set_stencil_reference(u32::try_from(depth).unwrap_or(u32::MAX));
+                    pass.draw_indexed(clip.indices.clone(), 0, 0..1);
+                }
+            }
+            pass.set_pipeline(self.pipeline(draw.blend_mode));
+            pass.set_stencil_reference(u32::try_from(draw.clips.len()).unwrap_or(u32::MAX));
+            pass.set_bind_group(0, self.source_bind_group(scene, &draw.source)?, &[]);
+            pass.draw_indexed(draw.geometry.indices.clone(), 0, 0..1);
+            current_clips = &draw.clips;
+            first_draw = false;
+        }
+        drop(pass);
+        Ok(())
+    }
+
     fn source_bind_group<'a>(
         &'a self,
         scene: &'a GpuCanvasScene,
@@ -976,24 +1276,6 @@ impl GpuCanvasRenderer {
             BlendMode::Difference => &self.difference_pipeline,
             BlendMode::Plus => &self.plus_pipeline,
         }
-    }
-
-    fn upload_image(
-        &self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        handle: u64,
-        resource: &ImageResource,
-    ) -> GpuTexture {
-        upload_texture(
-            device,
-            queue,
-            &self.texture_layout,
-            &self.sampler,
-            (resource.width, resource.height),
-            &resource.linear_premultiplied_rgba8,
-            &format!("plugin GPU image {handle}"),
-        )
     }
 
     fn create_target(
@@ -1728,6 +2010,10 @@ fn ndc(width: u32, height: u32, scale: f32, logical: [f32; 2]) -> [f32; 2] {
     ]
 }
 
+#[allow(
+    clippy::float_cmp,
+    reason = "full-canvas opaque coverage requires an exact zero origin and unit alpha, not approximate coverage"
+)]
 fn opaque_canvas_fill(packet: &brood_graphics::Packet, scale: f32) -> Option<((u32, u32), Color)> {
     if !scale.is_finite() || scale <= 0.0 {
         return None;
@@ -1790,6 +2076,66 @@ const fn is_advanced_blend(mode: BlendMode) -> bool {
             | BlendMode::Lighten
             | BlendMode::Difference
     )
+}
+
+fn ordinary_draw_batch_len(ops: &[CanvasOp], start: usize) -> usize {
+    let Some(CanvasOp::Draw(first)) = ops.get(start) else {
+        return 0;
+    };
+    if is_advanced_blend(first.blend_mode) {
+        return 0;
+    }
+    let mut count = 1;
+    let mut previous_clips = first.clips.as_slice();
+    for op in ops.get(start.saturating_add(1)..).unwrap_or_default() {
+        let CanvasOp::Draw(draw) = op else {
+            break;
+        };
+        if is_advanced_blend(draw.blend_mode) {
+            break;
+        }
+        if previous_clips != draw.clips
+            && (previous_clips.len() >= u8::MAX as usize || draw.clips.len() >= u8::MAX as usize)
+        {
+            break;
+        }
+        count += 1;
+        previous_clips = &draw.clips;
+    }
+    count
+}
+
+fn common_clip_prefix_len(left: &[Geometry], right: &[Geometry]) -> usize {
+    left.iter()
+        .zip(right)
+        .take_while(|(left, right)| left == right)
+        .count()
+}
+
+fn initial_clear_folds_into(ops: &[CanvasOp], start: usize) -> bool {
+    matches!(
+        ops.get(start),
+        Some(CanvasOp::Draw(draw)) if !is_advanced_blend(draw.blend_mode)
+    )
+}
+
+fn image_backing_identity(width: u32, height: u32, bytes: &[u8]) -> ImageBackingIdentity {
+    let mut hasher = DefaultHasher::new();
+    width.hash(&mut hasher);
+    height.hash(&mut hasher);
+    bytes.hash(&mut hasher);
+    ImageBackingIdentity {
+        width,
+        height,
+        digest: hasher.finish(),
+    }
+}
+
+fn image_backing_byte_len(width: u32, height: u32) -> Option<usize> {
+    usize::try_from(width)
+        .ok()?
+        .checked_mul(usize::try_from(height).ok()?)?
+        .checked_mul(4)
 }
 
 fn upload_texture(
@@ -1928,6 +2274,7 @@ fn clear_target(
 #[derive(Clone, Copy)]
 enum StencilKind {
     Increment,
+    Decrement,
     Test,
 }
 
@@ -1947,6 +2294,12 @@ fn create_pipeline(
             depth_fail_op: wgpu::StencilOperation::Keep,
             pass_op: wgpu::StencilOperation::IncrementClamp,
         },
+        StencilKind::Decrement => wgpu::StencilFaceState {
+            compare: wgpu::CompareFunction::Equal,
+            fail_op: wgpu::StencilOperation::Keep,
+            depth_fail_op: wgpu::StencilOperation::Keep,
+            pass_op: wgpu::StencilOperation::DecrementClamp,
+        },
         StencilKind::Test => wgpu::StencilFaceState {
             compare: wgpu::CompareFunction::Equal,
             fail_op: wgpu::StencilOperation::Keep,
@@ -1957,7 +2310,10 @@ fn create_pipeline(
     let color_targets = [Some(wgpu::ColorTargetState {
         format: CANVAS_FORMAT,
         blend,
-        write_mask: if matches!(stencil_kind, StencilKind::Increment) {
+        write_mask: if matches!(
+            stencil_kind,
+            StencilKind::Increment | StencilKind::Decrement
+        ) {
             wgpu::ColorWrites::empty()
         } else {
             wgpu::ColorWrites::ALL
@@ -1988,7 +2344,10 @@ fn create_pipeline(
                 front: stencil_face,
                 back: stencil_face,
                 read_mask: u32::MAX,
-                write_mask: if matches!(stencil_kind, StencilKind::Increment) {
+                write_mask: if matches!(
+                    stencil_kind,
+                    StencilKind::Increment | StencilKind::Decrement
+                ) {
                     u32::MAX
                 } else {
                     0
@@ -2171,6 +2530,57 @@ mod tests {
     }
 
     #[test]
+    fn paired_transparent_canvas_has_exact_extent_without_opaque_clear() -> Result<()> {
+        let mut packet = brood_graphics::Packet::new();
+        packet.push(Command::FillRoundedRect {
+            rect: Rect::new(0.0, 0.0, 720.0, 480.0),
+            radius: 12.0,
+            color: Color::rgba(0.1, 0.2, 0.3, 1.0),
+        });
+        // A header at the origin must not become a full-canvas clear or the
+        // inferred dimensions of an otherwise transparent overlay.
+        packet.push(Command::FillRect {
+            rect: Rect::new(0.0, 0.0, 720.0, 40.0),
+            color: Color::rgba(0.3, 0.2, 0.1, 1.0),
+        });
+        let snapshot = GraphicsSnapshot {
+            facet_extent: Some((720, 480)),
+            pane: 7,
+            sequence: 1,
+            resize_epoch: None,
+            packet: packet.into(),
+            images: BTreeMap::new(),
+            text_layouts: BTreeMap::new(),
+            glyphs: BTreeMap::new(),
+            facet_frame_lease: None,
+        };
+        let prepared = GpuCanvasRenderer::prepare(
+            snapshot,
+            (720, 480, 1.0),
+            &GpuCanvasPreparationContext {
+                glyph_atlas: BTreeMap::new(),
+            },
+        )?;
+        anyhow::ensure!(
+            prepared.source_painted_extent == Some((720, 480)),
+            "incorrect source extent"
+        );
+        anyhow::ensure!(
+            prepared.painted_extent == Some((720, 480)),
+            "incorrect painted extent"
+        );
+        anyhow::ensure!(
+            prepared.canvas_clear.is_none(),
+            "partial header became a canvas clear"
+        );
+        anyhow::ensure!(
+            !prepared.vertices.is_empty(),
+            "transparent canvas lost its geometry"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn opaque_canvas_extent_tracks_the_packet_painted_size() {
         let mut packet = brood_graphics::Packet::new();
         packet.push(Command::FillRect {
@@ -2190,8 +2600,14 @@ mod tests {
     #[test]
     fn stale_canvas_extent_projects_to_the_complete_gpu_target() {
         let compiler = SceneCompiler::new_projected(516, 686, 1.0, (514, 686));
-        assert_eq!(compiler.ndc([0.0, 0.0]), [-1.0, -1.0]);
-        assert_eq!(compiler.ndc([514.0, 686.0]), [1.0, 1.0]);
+        assert_eq!(
+            compiler.ndc([0.0, 0.0]).map(f32::to_bits),
+            [-1.0_f32, -1.0].map(f32::to_bits)
+        );
+        assert_eq!(
+            compiler.ndc([514.0, 686.0]).map(f32::to_bits),
+            [1.0_f32, 1.0].map(f32::to_bits)
+        );
     }
 
     #[test]
@@ -2260,5 +2676,266 @@ mod tests {
             "advanced blend draws were coalesced"
         );
         Ok(())
+    }
+
+    #[test]
+    fn ordinary_draw_batches_cross_sources_and_pipelines_but_stop_at_state_boundaries() {
+        let draw = |start, clips: Vec<Geometry>, source, blend_mode| {
+            CanvasOp::Draw(DrawOp {
+                geometry: Geometry {
+                    indices: start..start + 6,
+                },
+                clips,
+                source,
+                blend_mode,
+            })
+        };
+        let clip = Geometry { indices: 60..66 };
+        let ops = vec![
+            draw(
+                0,
+                vec![clip.clone()],
+                DrawSource::White,
+                BlendMode::SourceOver,
+            ),
+            draw(6, vec![clip], DrawSource::Resource(7), BlendMode::Plus),
+            draw(12, Vec::new(), DrawSource::White, BlendMode::SourceOver),
+            CanvasOp::BeginLayer(0),
+            draw(18, Vec::new(), DrawSource::White, BlendMode::SourceOver),
+            draw(24, Vec::new(), DrawSource::White, BlendMode::Multiply),
+        ];
+
+        assert_eq!(ordinary_draw_batch_len(&ops, 0), 3);
+        assert_eq!(ordinary_draw_batch_len(&ops, 2), 1);
+        assert_eq!(ordinary_draw_batch_len(&ops, 3), 0);
+        assert_eq!(ordinary_draw_batch_len(&ops, 4), 1);
+        assert_eq!(ordinary_draw_batch_len(&ops, 5), 0);
+    }
+
+    #[test]
+    fn clip_transition_batches_nested_disjoint_and_common_prefix_stacks() {
+        let geometry = |id| Geometry {
+            indices: id..id + 1,
+        };
+        let a = geometry(0);
+        let b = geometry(1);
+        let c = geometry(2);
+        let d = geometry(3);
+        assert_eq!(
+            common_clip_prefix_len(&[a.clone(), b.clone()], &[a.clone(), c.clone()]),
+            1
+        );
+        assert_eq!(
+            common_clip_prefix_len(&[a.clone(), b.clone()], &[c.clone(), d]),
+            0
+        );
+        assert_eq!(
+            common_clip_prefix_len(&[a.clone(), b.clone(), c], &[a, b]),
+            2
+        );
+
+        // Model one MSAA sample. Increment and decrement both compare against
+        // the current stack depth, exactly matching the two stencil pipelines.
+        for membership in 0_u8..16 {
+            for (old, new) in [
+                (
+                    vec![geometry(0), geometry(1), geometry(2)],
+                    vec![geometry(0)],
+                ),
+                (
+                    vec![geometry(0), geometry(1)],
+                    vec![geometry(2), geometry(3)],
+                ),
+                (
+                    vec![geometry(0), geometry(1), geometry(2)],
+                    vec![geometry(0), geometry(1), geometry(3)],
+                ),
+            ] {
+                let inside = |clip: &Geometry| membership & (1 << clip.indices.start) != 0;
+                let prefix_depth =
+                    |clips: &[Geometry]| clips.iter().take_while(|clip| inside(clip)).count();
+                let common = common_clip_prefix_len(&old, &new);
+                let mut depth = prefix_depth(&old);
+                for clip_depth in (common..old.len()).rev() {
+                    if depth == clip_depth + 1 && old.get(clip_depth).is_some_and(&inside) {
+                        depth -= 1;
+                    }
+                }
+                for (clip_depth, clip) in new.iter().enumerate().skip(common) {
+                    if depth == clip_depth && inside(clip) {
+                        depth += 1;
+                    }
+                }
+                assert_eq!(depth, prefix_depth(&new));
+            }
+        }
+    }
+
+    #[test]
+    fn saturated_clip_depth_keeps_the_previous_pass_boundary() {
+        let clips = (0..usize::from(u8::MAX))
+            .map(|index| Geometry {
+                indices: u32::try_from(index).unwrap_or(u32::MAX)
+                    ..u32::try_from(index.saturating_add(1)).unwrap_or(u32::MAX),
+            })
+            .collect::<Vec<_>>();
+        let draw = |clips| {
+            CanvasOp::Draw(DrawOp {
+                geometry: Geometry { indices: 300..306 },
+                clips,
+                source: DrawSource::White,
+                blend_mode: BlendMode::SourceOver,
+            })
+        };
+        let ops = vec![draw(clips.clone()), draw(clips), draw(Vec::new())];
+        assert_eq!(ordinary_draw_batch_len(&ops, 0), 2);
+        assert_eq!(ordinary_draw_batch_len(&ops, 2), 1);
+    }
+
+    #[test]
+    fn initial_clear_folds_only_before_an_ordinary_draw() {
+        let draw = |blend_mode| {
+            CanvasOp::Draw(DrawOp {
+                geometry: Geometry { indices: 0..6 },
+                clips: Vec::new(),
+                source: DrawSource::White,
+                blend_mode,
+            })
+        };
+        let ops = vec![
+            draw(BlendMode::SourceOver),
+            CanvasOp::BeginLayer(0),
+            draw(BlendMode::Plus),
+            CanvasOp::EndLayer {
+                layer: 0,
+                draw: DrawOp {
+                    geometry: Geometry { indices: 6..12 },
+                    clips: Vec::new(),
+                    source: DrawSource::Layer(0),
+                    blend_mode: BlendMode::SourceOver,
+                },
+            },
+            CanvasOp::BeginLayer(1),
+            draw(BlendMode::Multiply),
+            CanvasOp::EndLayer {
+                layer: 1,
+                draw: DrawOp {
+                    geometry: Geometry { indices: 12..18 },
+                    clips: Vec::new(),
+                    source: DrawSource::Layer(1),
+                    blend_mode: BlendMode::SourceOver,
+                },
+            },
+            CanvasOp::BeginLayer(2),
+            CanvasOp::EndLayer {
+                layer: 2,
+                draw: DrawOp {
+                    geometry: Geometry { indices: 18..24 },
+                    clips: Vec::new(),
+                    source: DrawSource::Layer(2),
+                    blend_mode: BlendMode::SourceOver,
+                },
+            },
+        ];
+
+        assert!(initial_clear_folds_into(&ops, 0));
+        assert!(initial_clear_folds_into(&ops, 2));
+        assert!(!initial_clear_folds_into(&ops, 5));
+        assert!(!initial_clear_folds_into(&ops, 8));
+
+        assert!(!initial_clear_folds_into(&ops, 1));
+        assert!(!initial_clear_folds_into(&[], 0));
+    }
+
+    #[test]
+    fn immutable_gpu_image_bytes_reuse_one_backing_across_fresh_handles() {
+        let bytes: Arc<[u8]> = vec![1, 2, 3, 4].into();
+        let identity = image_backing_identity(1, 1, &bytes);
+        let mut cache = BoundedImmutableCache::new(4, 16, 16);
+        let first = cache.get_or_insert_with(identity, Arc::clone(&bytes), 4, || Arc::new(7_u64));
+        let second = cache.get_or_insert_with(identity, bytes, 4, || Arc::new(8_u64));
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.cpu_bytes, 4);
+        assert_eq!(cache.gpu_bytes, 4);
+    }
+
+    #[test]
+    fn gpu_image_cache_verifies_bytes_and_dimensions_beyond_the_digest() {
+        let collision = ImageBackingIdentity {
+            width: 1,
+            height: 1,
+            digest: 9,
+        };
+        let mut cache = BoundedImmutableCache::new(4, 32, 32);
+        let first = cache.get_or_insert_with(collision, vec![1, 2, 3, 4].into(), 4, || 1_u64);
+        let collision_value =
+            cache.get_or_insert_with(collision, vec![4, 3, 2, 1].into(), 4, || 2_u64);
+        let different_dimensions = ImageBackingIdentity {
+            width: 2,
+            ..collision
+        };
+        let dimension_value =
+            cache.get_or_insert_with(different_dimensions, vec![1, 2, 3, 4].into(), 8, || 3_u64);
+
+        assert_eq!((first, collision_value, dimension_value), (1, 2, 3));
+        assert_eq!(cache.entries.len(), 3);
+    }
+
+    #[test]
+    fn gpu_image_cache_eviction_bounds_bytes_without_invalidating_users() {
+        let mut cache = BoundedImmutableCache::new(2, 8, 8);
+        let retained = cache.get_or_insert_with(
+            image_backing_identity(1, 1, &[1; 4]),
+            vec![1; 4].into(),
+            4,
+            || Arc::new(1_u64),
+        );
+        cache.get_or_insert_with(
+            image_backing_identity(1, 1, &[2; 4]),
+            vec![2; 4].into(),
+            4,
+            || Arc::new(2_u64),
+        );
+        cache.get_or_insert_with(
+            image_backing_identity(1, 1, &[3; 4]),
+            vec![3; 4].into(),
+            4,
+            || Arc::new(3_u64),
+        );
+
+        assert_eq!(*retained, 1);
+        assert_eq!(cache.entries.len(), 2);
+        assert_eq!(cache.cpu_bytes, 8);
+        assert_eq!(cache.gpu_bytes, 8);
+        assert!(
+            cache
+                .entries
+                .iter()
+                .all(|entry| entry.bytes.as_ref() != [1; 4])
+        );
+    }
+    #[test]
+    fn image_cache_enforces_each_bound_and_bypasses_oversized_entries() {
+        for limits in [(2, 100, 100), (100, 8, 100), (100, 100, 8)] {
+            let mut cache = BoundedImmutableCache::new(limits.0, limits.1, limits.2);
+            for value in 0..3 {
+                let bytes: Arc<[u8]> = vec![value; 4].into();
+                cache.get_or_insert_with(image_backing_identity(1, 1, &bytes), bytes, 4, || value);
+            }
+            assert_eq!(cache.entries.len(), 2);
+            assert_eq!((cache.cpu_bytes, cache.gpu_bytes), (8, 8));
+        }
+        for limits in [(0, 100, 100), (100, 3, 100), (100, 100, 3)] {
+            let mut cache = BoundedImmutableCache::new(limits.0, limits.1, limits.2);
+            let bytes: Arc<[u8]> = vec![1; 4].into();
+            assert_eq!(
+                cache.get_or_insert_with(image_backing_identity(1, 1, &bytes), bytes, 4, || 7),
+                7
+            );
+            assert!(cache.entries.is_empty());
+            assert_eq!((cache.cpu_bytes, cache.gpu_bytes), (0, 0));
+        }
     }
 }

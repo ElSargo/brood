@@ -4,9 +4,12 @@ use std::{
 };
 
 use brood_graphics::{Color, Command, Packet, Rect, theme::ashen};
+#[cfg(not(feature = "pure-renderer"))]
+use brood_plugin_sdk::bindings;
+#[cfg(feature = "pure-renderer")]
+use brood_plugin_sdk::{Facets, export_visual_plugin, facet_codec, facets};
 use brood_plugin_sdk::{
     actor::{start_global_actor, start_session_actor},
-    bindings,
     exports::brood::plugin::actor::{
         ChildEvent, Command as ActorCommand, DaemonActorMessage, Event, Guest, LifecycleEvent,
         LocalActorMessage, PresentationEvent, SessionActorMessage, SessionCommand,
@@ -80,7 +83,7 @@ const MUTED: Color = ashen::MUTED;
 const YELLOW: Color = ashen::ACCENT;
 const RED: Color = ashen::ERROR;
 
-#[derive(Clone)]
+#[derive(Clone, Deserialize, Serialize)]
 struct ViewSession {
     backend: u64,
     id: u64,
@@ -95,7 +98,7 @@ struct ViewSession {
     git: bool,
 }
 
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 enum EditMode {
     Search,
     Rename(u64, u64),
@@ -121,13 +124,144 @@ enum ListItem {
     Session(usize),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 enum SwitcherTarget {
     NewSession,
     ProjectToggle(u64, String),
     ProjectWorktree(u64, String),
     Session(u64, u64),
     SessionClose(u64, u64),
+}
+
+/// Immutable application data consumed by the pure session-switcher renderer.
+/// Host pane identity and geometry are invocation inputs rather than actor data.
+#[derive(Clone, Deserialize, Serialize)]
+struct RenderView {
+    error: bool,
+    mode: EditMode,
+    query: String,
+    pending: Option<u64>,
+    status: String,
+    sessions: Vec<ViewSession>,
+    collapsed_projects: BTreeSet<String>,
+    scroll: usize,
+    selected: Option<(u64, u64)>,
+}
+
+#[derive(Clone, Copy)]
+struct RenderGeometry {
+    pane: u64,
+    width: f32,
+    height: f32,
+}
+
+#[derive(Clone, Default, Deserialize, Serialize)]
+struct InteractionState {
+    hovered: Option<SwitcherTarget>,
+    pressed: Option<SwitcherTarget>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct InteractionRegion {
+    rect: [f32; 4],
+    target: SwitcherTarget,
+}
+
+struct RenderedSwitcher {
+    packet: Packet,
+    interactions: Vec<InteractionRegion>,
+}
+
+impl RenderView {
+    fn project_groups(&self) -> Vec<ProjectGroup> {
+        let mut groups = Vec::<ProjectGroup>::new();
+        for (index, session) in self.sessions.iter().enumerate() {
+            if let Some(group) = groups
+                .iter_mut()
+                .find(|group| group.backend == session.backend && group.id == session.project_id)
+            {
+                group.sessions.push(index);
+                group.git |= session.git;
+                let source_is_worktree = self
+                    .sessions
+                    .iter()
+                    .find(|candidate| {
+                        candidate.backend == group.backend && candidate.id == group.source_session
+                    })
+                    .is_some_and(|candidate| candidate.worktree);
+                if source_is_worktree && !session.worktree {
+                    group.source_session = session.id;
+                }
+            } else {
+                groups.push(ProjectGroup {
+                    backend: session.backend,
+                    id: session.project_id.clone(),
+                    name: session.project_name.clone(),
+                    source_session: session.id,
+                    sessions: vec![index],
+                    git: session.git,
+                });
+            }
+        }
+        groups.sort_by(|left, right| {
+            left.name
+                .to_lowercase()
+                .cmp(&right.name.to_lowercase())
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        groups
+    }
+
+    fn list_items(&self) -> Vec<ListItem> {
+        let query = (self.mode == EditMode::Search)
+            .then(|| self.query.trim().to_lowercase())
+            .filter(|query| !query.is_empty());
+        let mut items = Vec::new();
+        for mut group in self.project_groups() {
+            let project_matches = query.as_ref().is_some_and(|query| {
+                group.name.to_lowercase().contains(query) || group.id.to_lowercase().contains(query)
+            });
+            if let Some(query) = query.as_ref()
+                && !project_matches
+            {
+                group.sessions.retain(|index| {
+                    let session = &self.sessions[*index];
+                    session.name.to_lowercase().contains(query)
+                        || session
+                            .branch
+                            .as_ref()
+                            .is_some_and(|branch| branch.to_lowercase().contains(query))
+                });
+            }
+            if group.sessions.is_empty() {
+                continue;
+            }
+            let project_key = format!("{}:{}", group.backend, group.id);
+            let expanded = query.is_some() || !self.collapsed_projects.contains(&project_key);
+            items.push(ListItem::Project(group.clone()));
+            if expanded {
+                items.extend(group.sessions.into_iter().map(ListItem::Session));
+            }
+        }
+        items
+    }
+
+    fn visible_item_count(&self, items: &[ListItem], height: f32) -> usize {
+        let available = (height - HEADER_HEIGHT - FOOTER_HEIGHT).max(PROJECT_ROW_HEIGHT);
+        let mut used = 0.0;
+        items
+            .iter()
+            .skip(self.scroll)
+            .take_while(|item| {
+                let height = item_height(item);
+                if used + height > available && used > 0.0 {
+                    return false;
+                }
+                used += height;
+                true
+            })
+            .count()
+    }
 }
 
 struct SwitcherState {
@@ -168,6 +302,7 @@ struct SwitcherState {
     terminal_uis: BTreeMap<String, (u64, u64)>,
     neovim_uis_starting: BTreeMap<(u64, u64), String>,
     neovim_uis: BTreeMap<(u64, u64), String>,
+    #[cfg(not(feature = "pure-renderer"))]
     text_cache: Option<TextLayoutCache>,
     layout: Option<LayoutContext>,
     workspace_focus: Option<u64>,
@@ -189,6 +324,8 @@ struct SwitcherState {
     pointer_drag: Option<ShellDividerDrag>,
     hovered: Option<SwitcherTarget>,
     pressed: Option<SwitcherTarget>,
+    #[cfg(feature = "pure-renderer")]
+    render_revision: u64,
 }
 
 #[derive(Clone, Deserialize)]
@@ -445,6 +582,7 @@ struct PickerSelection {
     #[serde(rename = "type")]
     _message_type: serde_json_core::heapless::String<32>,
     picker: u64,
+    item_id: String,
     result: SessionPickerResult,
 }
 
@@ -537,7 +675,7 @@ struct SessionPickerRequest {
     request: Option<String>,
     title: &'static str,
     placeholder: &'static str,
-    items: Vec<SessionPickerItem>,
+    items: Vec<IdentifiedPickerItem<SessionPickerItem>>,
     loading: bool,
     loading_label: &'static str,
 }
@@ -547,9 +685,22 @@ struct SessionPickerUpdate {
     #[serde(rename = "type")]
     message_type: &'static str,
     picker: u64,
-    items: Vec<SessionPickerItem>,
+    items: Vec<IdentifiedPickerItem<SessionPickerItem>>,
     loading: bool,
     loading_label: &'static str,
+}
+
+#[derive(Serialize)]
+struct IdentifiedPickerItem<T> {
+    id: String,
+    value: T,
+}
+
+fn picker_item<T>(id: impl Into<String>, value: T) -> IdentifiedPickerItem<T> {
+    IdentifiedPickerItem {
+        id: id.into(),
+        value,
+    }
 }
 
 #[derive(Serialize)]
@@ -583,7 +734,7 @@ struct AgentPickerRequest<'a> {
     message_type: &'static str,
     title: &'static str,
     placeholder: &'static str,
-    items: Vec<AgentPickerItem<'a>>,
+    items: Vec<IdentifiedPickerItem<AgentPickerItem<'a>>>,
 }
 
 #[derive(Serialize)]
@@ -638,6 +789,7 @@ impl SwitcherState {
             terminal_uis: BTreeMap::new(),
             neovim_uis_starting: BTreeMap::new(),
             neovim_uis: BTreeMap::new(),
+            #[cfg(not(feature = "pure-renderer"))]
             text_cache: None,
             layout: None,
             workspace_focus: None,
@@ -659,6 +811,8 @@ impl SwitcherState {
             pointer_drag: None,
             hovered: None,
             pressed: None,
+            #[cfg(feature = "pure-renderer")]
+            render_revision: 0,
         }
     }
 
@@ -668,6 +822,20 @@ impl SwitcherState {
         self.error = false;
         self.status.clear();
         self.request
+    }
+
+    fn render_view(&self) -> RenderView {
+        RenderView {
+            error: self.error,
+            mode: self.mode.clone(),
+            query: self.query.clone(),
+            pending: self.pending,
+            status: self.status.clone(),
+            sessions: self.sessions.clone(),
+            collapsed_projects: self.collapsed_projects.clone(),
+            scroll: self.scroll,
+            selected: self.selected,
+        }
     }
 
     fn project_groups(&self) -> Vec<ProjectGroup> {
@@ -809,12 +977,41 @@ impl SwitcherState {
 }
 
 static STATE: Mutex<SwitcherState> = Mutex::new(SwitcherState::new());
+#[cfg(feature = "pure-renderer")]
+static PENDING_PUBLICATION: Mutex<Option<(u64, Vec<u8>)>> = Mutex::new(None);
+
+#[cfg(feature = "pure-renderer")]
+fn stage_publication(slot: &mut Option<(u64, Vec<u8>)>, revision: u64, bytes: Vec<u8>) {
+    *slot = Some((revision, bytes));
+}
+
+#[cfg(feature = "pure-renderer")]
+struct PublicationTurn;
+
+#[cfg(feature = "pure-renderer")]
+impl Drop for PublicationTurn {
+    fn drop(&mut self) {
+        let mut pending = PENDING_PUBLICATION
+            .lock()
+            .expect("publication mutex poisoned");
+        if let Some((revision, bytes)) = pending.take()
+            && brood_plugin_sdk::publication::publish(revision, &bytes).is_err()
+        {
+            // Retain the newest staged view for the next actor turn.
+            *pending = Some((revision, bytes));
+        }
+    }
+}
 
 struct SessionSwitcher;
 
 impl Guest for SessionSwitcher {
     fn dispatch(event: Event) -> Vec<ActorCommand> {
+        #[cfg(feature = "pure-renderer")]
+        let _publication_turn = PublicationTurn;
         match event {
+            #[cfg(feature = "pure-renderer")]
+            Event::FacetInput(batch) => handle_facet_input(batch.events),
             Event::Lifecycle(LifecycleEvent::Start(context)) => {
                 if context.instance_id == INIT_ACTOR_ID {
                     if let Ok(mut state) = STATE.lock() {
@@ -1533,6 +1730,9 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
             redraw_or_record_error(&mut state);
             Vec::new()
         }
+        #[cfg(feature = "pure-renderer")]
+        PresentationEvent::RenderHint(_) => Vec::new(),
+        #[cfg(not(feature = "pure-renderer"))]
         PresentationEvent::RenderHint(hint) => {
             if let Err(error) =
                 brood_plugin_sdk::graphics::render_with_hint(&hint, || redraw(&mut state, None))
@@ -1828,7 +2028,7 @@ fn apply_layout_pointer_message(
     } else {
         "inbox-resize"
     };
-    let commands = if message.phase.as_str() == "motion" {
+    let commands = if message.phase.as_str() == "motion" && !cfg!(feature = "pure-renderer") {
         let focus = state.layout.as_ref().and_then(|layout| layout.focused_pane);
         publish_layout(state, false, focus)
     } else {
@@ -2784,6 +2984,12 @@ fn apply_picker_selection(
         // replaced by a newer intent must not create or activate a session.
         return Vec::new();
     }
+    if !picker_selection_identity_matches(state, &message) {
+        state.error = true;
+        state.status = "The selected picker item is no longer available".to_string();
+        redraw_or_record_error(state);
+        return Vec::new();
+    }
     if state.backend_picker == Some(message.picker) {
         retire_backend_picker(state, message.picker);
         state.backend_picker = None;
@@ -2887,6 +3093,52 @@ fn apply_picker_selection(
     open_coding_agent_ui(state, agent)
 }
 
+fn picker_selection_identity_matches(state: &SwitcherState, message: &PickerSelection) -> bool {
+    let value = &message.result.value;
+    match value.action.as_deref() {
+        Some("create-worktree") => state.project_groups().iter().any(|project| {
+            value.backend == Some(project.backend)
+                && value.session == Some(project.source_session)
+                && message.item_id == format!("worktree:{}:{}", project.backend, project.id)
+        }),
+        Some("choose-directory") => value.backend.is_some_and(|backend| {
+            message.item_id == format!("backend:{backend}")
+                && state.backends.iter().any(|entry| entry.0 == backend)
+        }),
+        Some("create-directory") => {
+            value
+                .backend
+                .zip(value.directory.as_ref())
+                .is_some_and(|(backend, directory)| {
+                    message.item_id == format!("directory:{backend}:{directory}")
+                        && state.backends.iter().any(|entry| entry.0 == backend)
+                })
+        }
+        Some(
+            action @ ("create-local"
+            | "create-remote"
+            | "create-container-local"
+            | "create-container-remote"),
+        ) => message.item_id == action,
+        Some(_) => false,
+        None => {
+            if let Some(session) = value.session {
+                let backend = value.backend.unwrap_or_default();
+                message.item_id == format!("session:{backend}:{session}")
+                    && state
+                        .sessions
+                        .iter()
+                        .any(|entry| entry.backend == backend && entry.id == session)
+            } else if let Some(agent) = &value.agent {
+                message.item_id == format!("agent:{agent}")
+                    && state.agents.iter().any(|entry| entry.id == *agent)
+            } else {
+                false
+            }
+        }
+    }
+}
+
 fn open_coding_agent_ui(state: &mut SwitcherState, agent: String) -> Vec<ActorCommand> {
     let id = format!(
         "coding-agent-ui-b{}-s{}-{}",
@@ -2905,19 +3157,24 @@ fn open_session_picker(state: &mut SwitcherState) -> Vec<ActorCommand> {
     let items = state
         .sessions
         .iter()
-        .map(|session| SessionPickerItem {
-            label: session.name.clone(),
-            detail: if session.windows == 1 {
-                "1 window".to_string()
-            } else {
-                format!("{} windows", session.windows)
-            },
-            value: SessionPickerValueWire {
-                backend: Some(session.backend),
-                session: Some(session.id),
-                action: None,
-                directory: None,
-            },
+        .map(|session| {
+            picker_item(
+                format!("session:{}:{}", session.backend, session.id),
+                SessionPickerItem {
+                    label: session.name.clone(),
+                    detail: if session.windows == 1 {
+                        "1 window".to_string()
+                    } else {
+                        format!("{} windows", session.windows)
+                    },
+                    value: SessionPickerValueWire {
+                        backend: Some(session.backend),
+                        session: Some(session.id),
+                        action: None,
+                        directory: None,
+                    },
+                },
+            )
         })
         .collect::<Vec<_>>();
     let request = SessionPickerRequest {
@@ -2941,7 +3198,7 @@ fn open_session_picker(state: &mut SwitcherState) -> Vec<ActorCommand> {
     })]
 }
 
-fn creation_backend_items(state: &SwitcherState) -> Vec<SessionPickerItem> {
+fn creation_backend_items(state: &SwitcherState) -> Vec<IdentifiedPickerItem<SessionPickerItem>> {
     let mut picker_items = Vec::new();
     for project in state
         .project_groups()
@@ -2954,16 +3211,19 @@ fn creation_backend_items(state: &SwitcherState) -> Vec<SessionPickerItem> {
         let source_label = source
             .and_then(|session| session.branch.as_deref())
             .unwrap_or("the current checkout");
-        picker_items.push(SessionPickerItem {
-            label: format!("Worktree · {}", project.name),
-            detail: format!("Create a new branch from {source_label}"),
-            value: SessionPickerValueWire {
-                backend: Some(project.backend),
-                session: Some(project.source_session),
-                action: Some("create-worktree".to_string()),
-                directory: None,
+        picker_items.push(picker_item(
+            format!("worktree:{}:{}", project.backend, project.id),
+            SessionPickerItem {
+                label: format!("Worktree · {}", project.name),
+                detail: format!("Create a new branch from {source_label}"),
+                value: SessionPickerValueWire {
+                    backend: Some(project.backend),
+                    session: Some(project.source_session),
+                    action: Some("create-worktree".to_string()),
+                    directory: None,
+                },
             },
-        });
+        ));
     }
     for (backend, backend_label) in &state.backends {
         let label = if backend_label.is_empty() {
@@ -2971,62 +3231,78 @@ fn creation_backend_items(state: &SwitcherState) -> Vec<SessionPickerItem> {
         } else {
             backend_label.clone()
         };
-        picker_items.push(SessionPickerItem {
-            label,
-            detail: "Create a session on this backend".to_string(),
-            value: SessionPickerValueWire {
-                backend: Some(*backend),
-                session: None,
-                action: Some("choose-directory".to_string()),
-                directory: None,
+        picker_items.push(picker_item(
+            format!("backend:{backend}"),
+            SessionPickerItem {
+                label,
+                detail: "Create a session on this backend".to_string(),
+                value: SessionPickerValueWire {
+                    backend: Some(*backend),
+                    session: None,
+                    action: Some("choose-directory".to_string()),
+                    directory: None,
+                },
             },
-        });
+        ));
     }
     if state.can_create_local {
-        picker_items.push(SessionPickerItem {
-            label: "Local".to_string(),
-            detail: "Start a local backend, then create a session".to_string(),
-            value: SessionPickerValueWire {
-                backend: None,
-                session: None,
-                action: Some("create-local".to_string()),
-                directory: None,
+        picker_items.push(picker_item(
+            "create-local",
+            SessionPickerItem {
+                label: "Local".to_string(),
+                detail: "Start a local backend, then create a session".to_string(),
+                value: SessionPickerValueWire {
+                    backend: None,
+                    session: None,
+                    action: Some("create-local".to_string()),
+                    directory: None,
+                },
             },
-        });
+        ));
     }
     if state.can_connect_remote {
-        picker_items.push(SessionPickerItem {
-            label: "Connect remote backend".to_string(),
-            detail: "Deploy and connect through your OpenSSH configuration".to_string(),
-            value: SessionPickerValueWire {
-                backend: None,
-                session: None,
-                action: Some("create-remote".to_string()),
-                directory: None,
+        picker_items.push(picker_item(
+            "create-remote",
+            SessionPickerItem {
+                label: "Connect remote backend".to_string(),
+                detail: "Deploy and connect through your OpenSSH configuration".to_string(),
+                value: SessionPickerValueWire {
+                    backend: None,
+                    session: None,
+                    action: Some("create-remote".to_string()),
+                    directory: None,
+                },
             },
-        });
+        ));
     }
     if state.can_create_container {
-        picker_items.push(SessionPickerItem {
-            label: "Create container backend".to_string(),
-            detail: "Run a backend in a local Podman container with GPU auto-detection".to_string(),
-            value: SessionPickerValueWire {
-                backend: None,
-                session: None,
-                action: Some("create-container-local".to_string()),
-                directory: None,
+        picker_items.push(picker_item(
+            "create-container-local",
+            SessionPickerItem {
+                label: "Create container backend".to_string(),
+                detail: "Run a backend in a local Podman container with GPU auto-detection"
+                    .to_string(),
+                value: SessionPickerValueWire {
+                    backend: None,
+                    session: None,
+                    action: Some("create-container-local".to_string()),
+                    directory: None,
+                },
             },
-        });
-        picker_items.push(SessionPickerItem {
-            label: "Create remote container backend".to_string(),
-            detail: "Use a named remote Podman system connection".to_string(),
-            value: SessionPickerValueWire {
-                backend: None,
-                session: None,
-                action: Some("create-container-remote".to_string()),
-                directory: None,
+        ));
+        picker_items.push(picker_item(
+            "create-container-remote",
+            SessionPickerItem {
+                label: "Create remote container backend".to_string(),
+                detail: "Use a named remote Podman system connection".to_string(),
+                value: SessionPickerValueWire {
+                    backend: None,
+                    session: None,
+                    action: Some("create-container-remote".to_string()),
+                    directory: None,
+                },
             },
-        });
+        ));
     }
     picker_items
 }
@@ -3162,15 +3438,20 @@ fn show_directory_picker(
     directories.dedup();
     let items = directories
         .into_iter()
-        .map(|directory| SessionPickerItem {
-            label: directory.clone(),
-            detail: format!("Create a session on backend {backend}"),
-            value: SessionPickerValueWire {
-                backend: Some(backend),
-                session: None,
-                action: Some("create-directory".to_string()),
-                directory: Some(directory),
-            },
+        .map(|directory| {
+            picker_item(
+                format!("directory:{backend}:{directory}"),
+                SessionPickerItem {
+                    label: directory.clone(),
+                    detail: format!("Create a session on backend {backend}"),
+                    value: SessionPickerValueWire {
+                        backend: Some(backend),
+                        session: None,
+                        action: Some("create-directory".to_string()),
+                        directory: Some(directory),
+                    },
+                },
+            )
         })
         .collect();
     let request = SessionPickerRequest {
@@ -3199,10 +3480,15 @@ fn open_agent_picker(state: &mut SwitcherState) -> Vec<ActorCommand> {
     let items = state
         .agents
         .iter()
-        .map(|agent| AgentPickerItem {
-            label: &agent.id,
-            detail: format!("{} · {} · {}", agent.status, agent.model, agent.reasoning),
-            value: AgentPickerValue { agent: &agent.id },
+        .map(|agent| {
+            picker_item(
+                format!("agent:{}", agent.id),
+                AgentPickerItem {
+                    label: &agent.id,
+                    detail: format!("{} · {} · {}", agent.status, agent.model, agent.reasoning),
+                    value: AgentPickerValue { agent: &agent.id },
+                },
+            )
         })
         .collect::<Vec<_>>();
     let request = AgentPickerRequest {
@@ -3941,42 +4227,22 @@ fn switcher_target_at(state: &SwitcherState, x: f32, y: f32) -> Option<SwitcherT
     if !x.is_finite() || !y.is_finite() || x < 0.0 || x >= state.width {
         return None;
     }
-    let header = header_geometry(state.width);
-    if (10.0..42.0).contains(&y)
-        && x >= header.button_x
-        && x < header.button_x + header.button_width
-        && state.pending.is_none()
-    {
-        return Some(SwitcherTarget::NewSession);
-    }
-    if y < HEADER_HEIGHT || y >= state.height - FOOTER_HEIGHT {
-        return None;
-    }
-    let items = state.list_items();
-    let mut item_y = HEADER_HEIGHT;
-    let item = items.iter().skip(state.scroll).find(|item| {
-        let height = item_height(item);
-        let hit = y >= item_y && y < item_y + height;
-        item_y += height;
-        hit
-    });
-    let item = item.cloned()?;
-    if let ListItem::Project(project) = item {
-        if x >= state.width - 56.0 && project.git {
-            Some(SwitcherTarget::ProjectWorktree(project.backend, project.id))
-        } else {
-            Some(SwitcherTarget::ProjectToggle(project.backend, project.id))
-        }
-    } else if let ListItem::Session(index) = item {
-        let session = state.sessions[index].clone();
-        if x >= state.width - 48.0 {
-            Some(SwitcherTarget::SessionClose(session.backend, session.id))
-        } else {
-            Some(SwitcherTarget::Session(session.backend, session.id))
-        }
-    } else {
-        None
-    }
+    interaction_regions(
+        &state.render_view(),
+        RenderGeometry {
+            pane: state.pane,
+            width: state.width,
+            height: state.height,
+        },
+    )
+    .into_iter()
+    .find(|region| {
+        x >= region.rect[0]
+            && x < region.rect[0] + region.rect[2]
+            && y >= region.rect[1]
+            && y < region.rect[1] + region.rect[3]
+    })
+    .map(|region| region.target)
 }
 
 fn activate_switcher_target(
@@ -4385,6 +4651,18 @@ fn resize_paint_plan(
 }
 
 fn paint_for_resize_or_record_error(state: &mut SwitcherState, paint: ResizePaintPlan) {
+    #[cfg(feature = "pure-renderer")]
+    {
+        let resize_epoch = match paint {
+            ResizePaintPlan::OrdinaryRedraw => None,
+            ResizePaintPlan::TaggedRedraw(epoch) => Some(epoch),
+        };
+        if let Err(error) = redraw(state, resize_epoch) {
+            state.error = true;
+            state.status = error;
+        }
+    }
+    #[cfg(not(feature = "pure-renderer"))]
     if !brood_plugin_sdk::graphics::render_is_active() {
         let result = match paint {
             ResizePaintPlan::OrdinaryRedraw => brood_plugin_sdk::graphics::request_render(),
@@ -4401,6 +4679,7 @@ fn paint_for_resize_or_record_error(state: &mut SwitcherState, paint: ResizePain
         }
         return;
     }
+    #[cfg(not(feature = "pure-renderer"))]
     let result = match paint {
         ResizePaintPlan::OrdinaryRedraw => redraw(state, None),
         ResizePaintPlan::TaggedRedraw(resize_epoch) => redraw(state, Some(resize_epoch))
@@ -4409,6 +4688,7 @@ fn paint_for_resize_or_record_error(state: &mut SwitcherState, paint: ResizePain
             // valid staging target, but the pane still needs a current frame.
             .or_else(|_tagged_error| redraw(state, None)),
     };
+    #[cfg(not(feature = "pure-renderer"))]
     if let Err(error) = result {
         state.error = true;
         state.status = error;
@@ -4419,6 +4699,9 @@ fn redraw_for_resize_or_record_error(state: &mut SwitcherState, resize_epoch: Op
     if state.pane == 0 {
         return;
     }
+    #[cfg(feature = "pure-renderer")]
+    let result = redraw(state, resize_epoch);
+    #[cfg(not(feature = "pure-renderer"))]
     let result = if brood_plugin_sdk::graphics::render_is_active() {
         redraw(state, resize_epoch)
     } else {
@@ -4431,44 +4714,74 @@ fn redraw_for_resize_or_record_error(state: &mut SwitcherState, resize_epoch: Op
 }
 
 fn redraw(state: &mut SwitcherState, resize_epoch: Option<u64>) -> Result<(), String> {
-    let mut cache = state
-        .text_cache
-        .take()
-        .unwrap_or_else(|| TextLayoutCache::new(state.pane));
-    cache.set_pane(state.pane);
-    cache.begin_frame();
-    let result = redraw_with_cache(state, resize_epoch, &mut cache);
-    if result.is_err() {
-        cache.abort_frame();
+    #[cfg(feature = "pure-renderer")]
+    {
+        let _ = resize_epoch;
+        state.render_revision = state.render_revision.saturating_add(1).max(1);
+        let bytes = serde_json::to_vec(&state.render_view())
+            .map_err(|error| format!("serialize session-switcher render view: {error}"))?;
+        let mut pending = PENDING_PUBLICATION
+            .lock()
+            .map_err(|_| "session-switcher publication mutex poisoned".to_string())?;
+        stage_publication(&mut pending, state.render_revision, bytes);
+        Ok(())
     }
-    state.text_cache = Some(cache);
-    result
+    #[cfg(not(feature = "pure-renderer"))]
+    {
+        let mut cache = state
+            .text_cache
+            .take()
+            .unwrap_or_else(|| TextLayoutCache::new(state.pane));
+        cache.set_pane(state.pane);
+        cache.begin_frame();
+        let view = state.render_view();
+        let geometry = RenderGeometry {
+            pane: state.pane,
+            width: state.width,
+            height: state.height,
+        };
+        let interaction = InteractionState {
+            hovered: state.hovered.clone(),
+            pressed: state.pressed.clone(),
+        };
+        let result =
+            render_switcher(&view, geometry, &interaction, &mut cache).and_then(|rendered| {
+                let _interaction_count = rendered.interactions.len();
+                cache.queue(resize_epoch, &rendered.packet)
+            });
+        if result.is_err() {
+            cache.abort_frame();
+        }
+        state.text_cache = Some(cache);
+        result
+    }
 }
 
-fn redraw_with_cache(
-    state: &mut SwitcherState,
-    resize_epoch: Option<u64>,
-    cache: &mut TextLayoutCache,
-) -> Result<(), String> {
+fn render_switcher(
+    view: &RenderView,
+    geometry: RenderGeometry,
+    interaction: &InteractionState,
+    sink: &mut impl TextSink,
+) -> Result<RenderedSwitcher, String> {
+    sink.set_pane(geometry.pane);
     let mut packet = Packet::new();
     packet.push(Command::FillRect {
-        rect: Rect::new(0.0, 0.0, state.width, state.height),
+        rect: Rect::new(0.0, 0.0, geometry.width, geometry.height),
         color: BG,
     });
     packet.push(Command::FillRect {
-        rect: Rect::new(0.0, 0.0, state.width, HEADER_HEIGHT),
+        rect: Rect::new(0.0, 0.0, geometry.width, HEADER_HEIGHT),
         color: SURFACE,
     });
     packet.push(Command::FillRect {
-        rect: Rect::new(0.0, HEADER_HEIGHT - 1.0, state.width, 1.0),
+        rect: Rect::new(0.0, HEADER_HEIGHT - 1.0, geometry.width, 1.0),
         color: BORDER,
     });
 
-    let header = header_geometry(state.width);
+    let header = header_geometry(geometry.width);
     add_text(
-        state,
+        sink,
         &mut packet,
-        cache,
         if header.narrow_title { "S" } else { "Sessions" },
         17.0,
         TEXT,
@@ -4477,9 +4790,9 @@ fn redraw_with_cache(
         (header.input_x - SIDE_MARGIN * 2.0).max(12.0),
     )?;
 
-    let input_color = if state.error {
+    let input_color = if view.error {
         RED
-    } else if state.mode == EditMode::Search {
+    } else if view.mode == EditMode::Search {
         BORDER
     } else {
         YELLOW
@@ -4495,8 +4808,8 @@ fn redraw_with_cache(
         color: input_color,
         width: 1.0,
     });
-    let prompt = if state.query.is_empty() {
-        match &state.mode {
+    let prompt = if view.query.is_empty() {
+        match &view.mode {
             EditMode::Search if header.input_width < 132.0 => "Search…".to_string(),
             EditMode::Search => "Search or create…".to_string(),
             EditMode::Rename(..) => "New session name…".to_string(),
@@ -4506,27 +4819,26 @@ fn redraw_with_cache(
             EditMode::CreateRemoteContainer => "connection::image:tag…".to_string(),
         }
     } else {
-        format!("{}▏", state.query)
+        format!("{}▏", view.query)
     };
     add_text(
-        state,
+        sink,
         &mut packet,
-        cache,
         &truncate_to_width(&prompt, header.input_width - 16.0, 14.0),
         14.0,
-        if state.query.is_empty() { MUTED } else { FG },
+        if view.query.is_empty() { MUTED } else { FG },
         header.input_x + 8.0,
         16.0,
         header.input_width - 16.0,
     )?;
 
     let new_target = SwitcherTarget::NewSession;
-    let new_pressed = state.pressed.as_ref() == Some(&new_target);
-    let new_hovered = state.hovered.as_ref() == Some(&new_target);
+    let new_pressed = interaction.pressed.as_ref() == Some(&new_target);
+    let new_hovered = interaction.hovered.as_ref() == Some(&new_target);
     packet.push(Command::FillRoundedRect {
         rect: Rect::new(header.button_x, 10.0, header.button_width, 32.0),
         radius: 4.0,
-        color: if state.pending.is_some() {
+        color: if view.pending.is_some() {
             SURFACE_RAISED
         } else if new_pressed {
             PRESSED
@@ -4537,44 +4849,43 @@ fn redraw_with_cache(
         },
     });
     add_text(
-        state,
+        sink,
         &mut packet,
-        cache,
-        if state.pending.is_some() {
+        if view.pending.is_some() {
             "…"
-        } else if state.mode == EditMode::Search {
+        } else if view.mode == EditMode::Search {
             if header.compact_button { "+" } else { "+ New" }
         } else {
             if header.compact_button { "+" } else { "Create" }
         },
         11.0,
-        if state.pending.is_some() { MUTED } else { BG },
+        if view.pending.is_some() { MUTED } else { BG },
         header.button_x + 5.0,
         if new_pressed { 17.0 } else { 16.0 },
         header.button_width - 10.0,
     )?;
 
-    let items = state.list_items();
-    let visible = state.visible_item_count(&items, state.scroll);
+    let items = view.list_items();
+    let visible = view.visible_item_count(&items, geometry.height);
     packet.push(Command::Save);
     packet.push(Command::ClipRect(Rect::new(
         0.0,
         HEADER_HEIGHT,
-        state.width,
-        state.height - HEADER_HEIGHT - FOOTER_HEIGHT,
+        geometry.width,
+        geometry.height - HEADER_HEIGHT - FOOTER_HEIGHT,
     )));
     let mut y = HEADER_HEIGHT;
-    for item in items.iter().skip(state.scroll).take(visible) {
+    for item in items.iter().skip(view.scroll).take(visible) {
         match item {
             ListItem::Project(project) => {
                 let toggle_target =
                     SwitcherTarget::ProjectToggle(project.backend, project.id.clone());
                 let worktree_target =
                     SwitcherTarget::ProjectWorktree(project.backend, project.id.clone());
-                let toggle_pressed = state.pressed.as_ref() == Some(&toggle_target);
-                let toggle_hovered = state.hovered.as_ref() == Some(&toggle_target);
+                let toggle_pressed = interaction.pressed.as_ref() == Some(&toggle_target);
+                let toggle_hovered = interaction.hovered.as_ref() == Some(&toggle_target);
                 packet.push(Command::FillRect {
-                    rect: Rect::new(0.0, y, state.width, PROJECT_ROW_HEIGHT),
+                    rect: Rect::new(0.0, y, geometry.width, PROJECT_ROW_HEIGHT),
                     color: if toggle_pressed {
                         PRESSED
                     } else if toggle_hovered {
@@ -4584,16 +4895,15 @@ fn redraw_with_cache(
                     },
                 });
                 packet.push(Command::FillRect {
-                    rect: Rect::new(0.0, y + PROJECT_ROW_HEIGHT - 1.0, state.width, 1.0),
+                    rect: Rect::new(0.0, y + PROJECT_ROW_HEIGHT - 1.0, geometry.width, 1.0),
                     color: BORDER,
                 });
-                let collapsed = state
+                let collapsed = view
                     .collapsed_projects
                     .contains(&format!("{}:{}", project.backend, project.id));
                 add_text(
-                    state,
+                    sink,
                     &mut packet,
-                    cache,
                     if collapsed { "▸" } else { "▾" },
                     12.0,
                     MUTED,
@@ -4602,61 +4912,58 @@ fn redraw_with_cache(
                     12.0,
                 )?;
                 add_text(
-                    state,
+                    sink,
                     &mut packet,
-                    cache,
-                    &truncate_to_width(&project.name, state.width - 126.0, 13.0),
+                    &truncate_to_width(&project.name, geometry.width - 126.0, 13.0),
                     13.0,
                     TEXT,
                     SIDE_MARGIN + 16.0,
                     y + 8.0,
-                    state.width - 126.0,
+                    geometry.width - 126.0,
                 )?;
                 add_text(
-                    state,
+                    sink,
                     &mut packet,
-                    cache,
                     &project.sessions.len().to_string(),
                     10.0,
                     MUTED,
-                    state.width - 76.0,
+                    geometry.width - 76.0,
                     y + 9.0,
                     24.0,
                 )?;
                 if project.git {
-                    let worktree_pressed = state.pressed.as_ref() == Some(&worktree_target);
-                    let worktree_hovered = state.hovered.as_ref() == Some(&worktree_target);
+                    let worktree_pressed = interaction.pressed.as_ref() == Some(&worktree_target);
+                    let worktree_hovered = interaction.hovered.as_ref() == Some(&worktree_target);
                     if worktree_pressed || worktree_hovered {
                         packet.push(Command::FillRoundedRect {
-                            rect: Rect::new(state.width - 52.0, y + 4.0, 40.0, 26.0),
+                            rect: Rect::new(geometry.width - 52.0, y + 4.0, 40.0, 26.0),
                             radius: 4.0,
                             color: if worktree_pressed { PRESSED } else { HOVER },
                         });
                     }
                     add_text(
-                        state,
+                        sink,
                         &mut packet,
-                        cache,
                         "+WT",
                         11.0,
                         YELLOW,
-                        state.width - 48.0,
+                        geometry.width - 48.0,
                         y + 8.0,
                         34.0,
                     )?;
                 }
             }
             ListItem::Session(index) => {
-                let session = state.sessions[*index].clone();
-                let selected = state.selected == Some((session.backend, session.id));
+                let session = view.sessions[*index].clone();
+                let selected = view.selected == Some((session.backend, session.id));
                 let row_target = SwitcherTarget::Session(session.backend, session.id);
                 let close_target = SwitcherTarget::SessionClose(session.backend, session.id);
-                let row_pressed = state.pressed.as_ref() == Some(&row_target);
-                let row_hovered = state.hovered.as_ref() == Some(&row_target);
+                let row_pressed = interaction.pressed.as_ref() == Some(&row_target);
+                let row_hovered = interaction.hovered.as_ref() == Some(&row_target);
                 let name_x = SIDE_MARGIN + 12.0;
-                let close_x = state.width - 38.0;
-                let show_window_count = state.width >= 220.0;
-                let count_x = state.width - 116.0;
+                let close_x = geometry.width - 38.0;
+                let show_window_count = geometry.width >= 220.0;
+                let count_x = geometry.width - 116.0;
                 let name_right = if show_window_count {
                     count_x - 8.0
                 } else {
@@ -4665,7 +4972,7 @@ fn redraw_with_cache(
                 let name_width = (name_right - name_x).max(1.0);
                 if row_pressed || row_hovered || session.active || selected {
                     packet.push(Command::FillRect {
-                        rect: Rect::new(0.0, y, state.width, ROW_HEIGHT),
+                        rect: Rect::new(0.0, y, geometry.width, ROW_HEIGHT),
                         color: if row_pressed {
                             PRESSED
                         } else if row_hovered {
@@ -4684,11 +4991,11 @@ fn redraw_with_cache(
                     });
                 }
                 packet.push(Command::FillRect {
-                    rect: Rect::new(0.0, y + ROW_HEIGHT - 1.0, state.width, 1.0),
+                    rect: Rect::new(0.0, y + ROW_HEIGHT - 1.0, geometry.width, 1.0),
                     color: Color::rgba(BORDER.r, BORDER.g, BORDER.b, 0.38),
                 });
-                let close_pressed = state.pressed.as_ref() == Some(&close_target);
-                let close_hovered = state.hovered.as_ref() == Some(&close_target);
+                let close_pressed = interaction.pressed.as_ref() == Some(&close_target);
+                let close_hovered = interaction.hovered.as_ref() == Some(&close_target);
                 if close_pressed || close_hovered {
                     packet.push(Command::FillRoundedRect {
                         rect: Rect::new(close_x - 6.0, y + 3.0, 30.0, 24.0),
@@ -4697,9 +5004,8 @@ fn redraw_with_cache(
                     });
                 }
                 add_text(
-                    state,
+                    sink,
                     &mut packet,
-                    cache,
                     &truncate_to_width(&session.name, name_width, 13.0),
                     13.0,
                     FG,
@@ -4708,7 +5014,7 @@ fn redraw_with_cache(
                     name_width,
                 )?;
                 if show_window_count {
-                    let count = if state.width < 300.0 {
+                    let count = if geometry.width < 300.0 {
                         format!("{} win", session.windows)
                     } else if session.windows == 1 {
                         "1 window".to_string()
@@ -4716,9 +5022,8 @@ fn redraw_with_cache(
                         format!("{} windows", session.windows)
                     };
                     add_text(
-                        state,
+                        sink,
                         &mut packet,
-                        cache,
                         &count,
                         10.0,
                         if session.active { TEXT } else { MUTED },
@@ -4727,17 +5032,7 @@ fn redraw_with_cache(
                         70.0,
                     )?;
                 }
-                add_text(
-                    state,
-                    &mut packet,
-                    cache,
-                    "×",
-                    16.0,
-                    RED,
-                    close_x,
-                    y + 2.0,
-                    20.0,
-                )?;
+                add_text(sink, &mut packet, "×", 16.0, RED, close_x, y + 2.0, 20.0)?;
             }
         }
         y += item_height(item);
@@ -4745,14 +5040,14 @@ fn redraw_with_cache(
     packet.push(Command::Restore);
 
     if items.len() > visible {
-        let track_height = state.height - HEADER_HEIGHT - FOOTER_HEIGHT - 12.0;
+        let track_height = geometry.height - HEADER_HEIGHT - FOOTER_HEIGHT - 12.0;
         let thumb_height = (track_height * visible as f32 / items.len() as f32).max(24.0);
         let max_scroll = items.len().saturating_sub(visible).max(1);
         let thumb_y = HEADER_HEIGHT
             + 6.0
-            + (track_height - thumb_height) * state.scroll as f32 / max_scroll as f32;
+            + (track_height - thumb_height) * view.scroll as f32 / max_scroll as f32;
         packet.push(Command::FillRoundedRect {
-            rect: Rect::new(state.width - 5.0, thumb_y, 3.0, thumb_height),
+            rect: Rect::new(geometry.width - 5.0, thumb_y, 3.0, thumb_height),
             radius: 1.5,
             color: Color::rgba(FG.r, FG.g, FG.b, 0.42),
         });
@@ -4761,15 +5056,15 @@ fn redraw_with_cache(
     packet.push(Command::FillRect {
         rect: Rect::new(
             0.0,
-            state.height - FOOTER_HEIGHT,
-            state.width,
+            geometry.height - FOOTER_HEIGHT,
+            geometry.width,
             FOOTER_HEIGHT,
         ),
         color: SURFACE,
     });
-    let footer = if !state.status.is_empty() {
-        state.status.clone()
-    } else if let Some(target) = state.hovered.as_ref() {
+    let footer = if !view.status.is_empty() {
+        view.status.clone()
+    } else if let Some(target) = interaction.hovered.as_ref() {
         match target {
             SwitcherTarget::NewSession => "Create or connect a session".to_string(),
             SwitcherTarget::ProjectToggle(..) => "Expand or collapse this project".to_string(),
@@ -4785,19 +5080,20 @@ fn redraw_with_cache(
         "Enter open  ·  F2 rename  ·  Delete close".to_string()
     };
     add_text(
-        state,
+        sink,
         &mut packet,
-        cache,
-        &truncate_to_width(&footer, state.width - 28.0, 10.0),
+        &truncate_to_width(&footer, geometry.width - 28.0, 10.0),
         10.0,
-        if state.error { RED } else { MUTED },
+        if view.error { RED } else { MUTED },
         SIDE_MARGIN,
-        state.height - 21.0,
-        state.width - 28.0,
+        geometry.height - 21.0,
+        geometry.width - 28.0,
     )?;
 
-    cache.queue(resize_epoch, &packet)?;
-    Ok(())
+    Ok(RenderedSwitcher {
+        interactions: interaction_regions(view, geometry),
+        packet,
+    })
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -4834,11 +5130,93 @@ const fn item_height(item: &ListItem) -> f32 {
     }
 }
 
+trait TextSink {
+    fn set_pane(&mut self, pane: u64);
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_text(
+        &mut self,
+        packet: &mut Packet,
+        text: &str,
+        size: f32,
+        color: Color,
+        x: f32,
+        y: f32,
+        max_width: f32,
+    ) -> Result<(), String>;
+}
+
+impl TextSink for TextLayoutCache {
+    fn set_pane(&mut self, pane: u64) {
+        TextLayoutCache::set_pane(self, pane);
+    }
+
+    fn draw_text(
+        &mut self,
+        packet: &mut Packet,
+        text: &str,
+        size: f32,
+        color: Color,
+        x: f32,
+        y: f32,
+        max_width: f32,
+    ) -> Result<(), String> {
+        self.draw_text_clipped(packet, text, size, max_width, size + 4.0, color, x, y)
+            .map(|_| ())
+            .map_err(|error| format!("layout session switcher text: {error}"))
+    }
+}
+
+fn interaction_regions(view: &RenderView, geometry: RenderGeometry) -> Vec<InteractionRegion> {
+    let mut regions = Vec::new();
+    let header = header_geometry(geometry.width);
+    if view.pending.is_none() {
+        regions.push(InteractionRegion {
+            rect: [header.button_x, 10.0, header.button_width, 32.0],
+            target: SwitcherTarget::NewSession,
+        });
+    }
+    let items = view.list_items();
+    let visible = view.visible_item_count(&items, geometry.height);
+    let mut y = HEADER_HEIGHT;
+    for item in items.iter().skip(view.scroll).take(visible) {
+        match item {
+            ListItem::Project(project) => {
+                if project.git {
+                    regions.push(InteractionRegion {
+                        rect: [geometry.width - 56.0, y, 56.0, PROJECT_ROW_HEIGHT],
+                        target: SwitcherTarget::ProjectWorktree(
+                            project.backend,
+                            project.id.clone(),
+                        ),
+                    });
+                }
+                regions.push(InteractionRegion {
+                    rect: [0.0, y, geometry.width, PROJECT_ROW_HEIGHT],
+                    target: SwitcherTarget::ProjectToggle(project.backend, project.id.clone()),
+                });
+            }
+            ListItem::Session(index) => {
+                let session = &view.sessions[*index];
+                regions.push(InteractionRegion {
+                    rect: [geometry.width - 48.0, y, 48.0, ROW_HEIGHT],
+                    target: SwitcherTarget::SessionClose(session.backend, session.id),
+                });
+                regions.push(InteractionRegion {
+                    rect: [0.0, y, geometry.width, ROW_HEIGHT],
+                    target: SwitcherTarget::Session(session.backend, session.id),
+                });
+            }
+        }
+        y += item_height(item);
+    }
+    regions
+}
+
 #[allow(clippy::too_many_arguments)]
 fn add_text(
-    _state: &SwitcherState,
+    sink: &mut impl TextSink,
     packet: &mut Packet,
-    cache: &mut TextLayoutCache,
     text: &str,
     size: f32,
     color: Color,
@@ -4846,12 +5224,311 @@ fn add_text(
     y: f32,
     max_width: f32,
 ) -> Result<(), String> {
-    cache
-        .draw_text_clipped(packet, text, size, max_width, size + 4.0, color, x, y)
-        .map_err(|error| format!("layout session switcher text: {error}"))?;
-    Ok(())
+    sink.draw_text(packet, text, size, color, x, y, max_width)
 }
 
+#[cfg(feature = "pure-renderer")]
+#[derive(Deserialize, Serialize)]
+enum FacetIntent {
+    Input {
+        target: Option<SwitcherTarget>,
+        displayed: Vec<SwitcherTarget>,
+        event: facets::InputEvent,
+    },
+}
+
+#[cfg(feature = "pure-renderer")]
+fn handle_facet_input(events: Vec<Vec<u8>>) -> Vec<ActorCommand> {
+    let Ok(mut state) = STATE.lock() else {
+        return Vec::new();
+    };
+    let mut commands = Vec::new();
+    for bytes in events {
+        let Ok(FacetIntent::Input {
+            target,
+            displayed,
+            event,
+        }) = serde_json::from_slice(&bytes)
+        else {
+            state.error = true;
+            state.status = "Invalid session-switcher facet intent".to_string();
+            continue;
+        };
+        match event {
+            facets::InputEvent::PointerMotion { .. } => state.hovered = target,
+            facets::InputEvent::PointerLeave
+            | facets::InputEvent::FocusLost
+            | facets::InputEvent::CaptureLost => {
+                state.hovered = None;
+                state.pressed = None;
+            }
+            facets::InputEvent::PointerButton {
+                button, pressed, ..
+            } if button == LEFT_BUTTON => {
+                if pressed {
+                    state.hovered.clone_from(&target);
+                    state.pressed = target;
+                } else {
+                    let prior = state.pressed.take();
+                    state.hovered.clone_from(&target);
+                    if prior == target
+                        && let Some(target) = target
+                        && switcher_target_is_current(&state, &target)
+                    {
+                        commands.extend(activate_switcher_target(&mut state, target));
+                    }
+                }
+            }
+            facets::InputEvent::PointerButton {
+                button,
+                pressed: true,
+                ..
+            } if button == RIGHT_BUTTON => {
+                if let Some(
+                    SwitcherTarget::Session(backend, session)
+                    | SwitcherTarget::SessionClose(backend, session),
+                ) = target
+                    && let Some(session) = state
+                        .sessions
+                        .iter()
+                        .find(|candidate| candidate.backend == backend && candidate.id == session)
+                        .cloned()
+                {
+                    state.selected = Some((backend, session.id));
+                    begin_rename(&mut state, &session);
+                }
+            }
+            facets::InputEvent::PointerButton { .. } => {}
+            facets::InputEvent::PointerScroll { vertical, .. } => {
+                let rows = displayed
+                    .iter()
+                    .filter(|target| {
+                        matches!(
+                            target,
+                            SwitcherTarget::ProjectToggle(..) | SwitcherTarget::Session(..)
+                        )
+                    })
+                    .count();
+                let max_scroll = state.list_items().len().saturating_sub(rows.max(1));
+                if vertical < 0.0 {
+                    state.scroll = (state.scroll + 1).min(max_scroll);
+                } else if vertical > 0.0 {
+                    state.scroll = state.scroll.saturating_sub(1);
+                }
+            }
+            facets::InputEvent::Key {
+                logical_key,
+                pressed: true,
+                ..
+            } => {
+                if matches!(logical_key.as_str(), "ArrowUp" | "ArrowDown") {
+                    let ordered = displayed
+                        .iter()
+                        .filter_map(|target| match target {
+                            SwitcherTarget::Session(backend, session) => Some((*backend, *session)),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    let position = state
+                        .selected
+                        .and_then(|selected| ordered.iter().position(|item| *item == selected));
+                    let next = match (logical_key.as_str(), position) {
+                        ("ArrowUp", Some(position)) => position.saturating_sub(1),
+                        ("ArrowDown", Some(position)) => {
+                            (position + 1).min(ordered.len().saturating_sub(1))
+                        }
+                        (_, None) => 0,
+                        _ => unreachable!(),
+                    };
+                    if let Some(selected) = ordered.get(next).copied()
+                        && state
+                            .sessions
+                            .iter()
+                            .any(|session| (session.backend, session.id) == selected)
+                    {
+                        state.selected = Some(selected);
+                    }
+                } else {
+                    commands.extend(handle_key(&mut state, &logical_key));
+                }
+            }
+            facets::InputEvent::Text { text }
+            | facets::InputEvent::Paste { text }
+            | facets::InputEvent::Composition {
+                text,
+                committed: true,
+            } => {
+                state
+                    .query
+                    .extend(text.chars().filter(|character| !character.is_control()));
+                if state.mode == EditMode::Search {
+                    state.scroll = 0;
+                    select_first_filtered(&mut state);
+                }
+            }
+            facets::InputEvent::Composition {
+                committed: false, ..
+            }
+            | facets::InputEvent::Key { pressed: false, .. } => {}
+            facets::InputEvent::Image { .. } => {
+                state.error = true;
+                state.status = "Image input is unsupported by the session switcher".to_string();
+            }
+        }
+    }
+    redraw_or_record_error(&mut state);
+    commands
+}
+
+#[cfg(feature = "pure-renderer")]
+fn switcher_target_is_current(state: &SwitcherState, target: &SwitcherTarget) -> bool {
+    match target {
+        SwitcherTarget::NewSession => state.pending.is_none(),
+        SwitcherTarget::ProjectToggle(backend, project)
+        | SwitcherTarget::ProjectWorktree(backend, project) => state
+            .project_groups()
+            .iter()
+            .any(|candidate| candidate.backend == *backend && candidate.id == *project),
+        SwitcherTarget::Session(backend, session)
+        | SwitcherTarget::SessionClose(backend, session) => state
+            .sessions
+            .iter()
+            .any(|candidate| candidate.backend == *backend && candidate.id == *session),
+    }
+}
+
+#[cfg(feature = "pure-renderer")]
+impl Facets for SessionSwitcher {
+    fn render(input: Vec<u8>) -> Vec<u8> {
+        let decode = facet_codec::DecodeLimits {
+            max_wire_bytes: input.len(),
+            max_allocated_bytes: input.len().saturating_mul(4).max(4096),
+            max_allocations: 4096,
+        };
+        let request = facet_codec::decode_render_request(&input, decode)
+            .expect("valid session-switcher render request");
+        let view: RenderView = serde_json::from_slice(&request.application_view)
+            .expect("valid session-switcher render view");
+        let interaction = serde_json::from_slice(&request.sequence_state).unwrap_or_default();
+        let panes = request
+            .panes
+            .iter()
+            .map(|pane| {
+                let geometry = RenderGeometry {
+                    pane: pane.pane,
+                    width: pane.logical_width as f32,
+                    height: pane.logical_height as f32,
+                };
+                let mut sink = TextLayoutCache::new(pane.pane);
+                sink.begin_frame();
+                let rendered = render_switcher(&view, geometry, &interaction, &mut sink)
+                    .expect("bounded session-switcher rendering");
+                let packet = rendered.packet.encode().expect("valid graphics packet");
+                let interaction = serde_json::to_vec(&rendered.interactions)
+                    .expect("serialize session-switcher interaction map");
+                facets::PaneOutput {
+                    pane: pane.pane,
+                    content: facets::PaneContent::Draw {
+                        packet,
+                        interaction,
+                    },
+                }
+            })
+            .collect();
+        let response = facets::RenderResponse {
+            token: request.token,
+            panes,
+            next_frame_ns: None,
+        };
+        facet_codec::encode_render_response_owned(
+            &response,
+            request.limits.max_output_bytes as usize,
+        )
+        .expect("bounded session-switcher render response")
+    }
+
+    fn interpret(input: Vec<u8>) -> Vec<u8> {
+        let decode = facet_codec::DecodeLimits {
+            max_wire_bytes: input.len(),
+            max_allocated_bytes: input.len().saturating_mul(4).max(4096),
+            max_allocations: 4096,
+        };
+        let request = facet_codec::decode_input_request(&input, decode)
+            .expect("valid session-switcher input request");
+        let mut sequence: InteractionState =
+            serde_json::from_slice(&request.sequence_state).unwrap_or_default();
+        let regions: Vec<InteractionRegion> =
+            serde_json::from_slice(&request.interaction).expect("valid interaction map");
+        let point = match &request.event {
+            facets::InputEvent::PointerMotion { x, y }
+            | facets::InputEvent::PointerButton { x, y, .. }
+            | facets::InputEvent::PointerScroll { x, y, .. } => Some((*x as f32, *y as f32)),
+            _ => None,
+        };
+        let target = point.and_then(|(x, y)| {
+            regions
+                .iter()
+                .find(|region| {
+                    x >= region.rect[0]
+                        && x < region.rect[0] + region.rect[2]
+                        && y >= region.rect[1]
+                        && y < region.rect[1] + region.rect[3]
+                })
+                .map(|region| region.target.clone())
+        });
+        match &request.event {
+            facets::InputEvent::PointerMotion { .. } => sequence.hovered.clone_from(&target),
+            facets::InputEvent::PointerButton {
+                button,
+                pressed: true,
+                ..
+            } if *button == LEFT_BUTTON => {
+                sequence.hovered.clone_from(&target);
+                sequence.pressed.clone_from(&target);
+            }
+            facets::InputEvent::PointerButton {
+                button,
+                pressed: false,
+                ..
+            } if *button == LEFT_BUTTON => {
+                sequence.hovered.clone_from(&target);
+                sequence.pressed = None;
+            }
+            facets::InputEvent::PointerLeave
+            | facets::InputEvent::FocusLost
+            | facets::InputEvent::CaptureLost => {
+                sequence.hovered = None;
+                sequence.pressed = None;
+            }
+            _ => {}
+        }
+        let displayed = regions.iter().map(|region| region.target.clone()).collect();
+        let event = serde_json::to_vec(&FacetIntent::Input {
+            target,
+            displayed,
+            event: request.event,
+        })
+        .expect("serialize stable session-switcher intent");
+        let next_sequence_state =
+            serde_json::to_vec(&sequence).expect("serialize session-switcher sequence state");
+        assert!(next_sequence_state.len() <= request.limits.max_sequence_bytes as usize);
+        let response = facets::InputResponse {
+            token: request.token,
+            next_sequence_state,
+            events: vec![event],
+            requests: vec![facets::HostRequest::Render],
+        };
+        facet_codec::encode_input_response_owned(
+            &response,
+            request.limits.max_output_bytes as usize,
+        )
+        .expect("bounded session-switcher input response")
+    }
+}
+
+#[cfg(feature = "pure-renderer")]
+export_visual_plugin!(SessionSwitcher);
+#[cfg(not(feature = "pure-renderer"))]
 bindings::export!(SessionSwitcher with_types_in bindings);
 
 #[cfg(test)]
@@ -5466,6 +6143,11 @@ mod tests {
         );
 
         let pointer = |zone: u64, phase: &str, sequence: u64, u: f64, button: Option<u32>| {
+            let base_layout_revision = if cfg!(feature = "pure-renderer") && sequence >= 4 {
+                19
+            } else {
+                17
+            };
             serde_json::from_value::<super::LayoutPointerMessage>(serde_json::json!({
                 "type": "layout-pointer",
                 "interaction": 99,
@@ -5476,7 +6158,7 @@ mod tests {
                 "position": {"u": u, "v": 0.0},
                 "button": button,
                 "inventory_revision": 9,
-                "base_layout_revision": 17,
+                "base_layout_revision": base_layout_revision,
             }))
             .expect("pointer message")
         };
@@ -5497,13 +6179,25 @@ mod tests {
             &mut state,
             &pointer(super::SIDEBAR_DIVIDER_ZONE_ID, "motion", 2, -0.125, None),
         );
-        let motion = host_command(&motion, "set-resolved-layout");
+        let motion = host_command(
+            &motion,
+            if cfg!(feature = "pure-renderer") {
+                "submit-synchronized-layout"
+            } else {
+                "set-resolved-layout"
+            },
+        );
         let motion: serde_json::Value = serde_json::from_slice(motion).expect("motion JSON");
-        let rest_width = motion["rest"]["transform"]["size"]["u"]
+        let fragment = if cfg!(feature = "pure-renderer") {
+            &motion["fragment"]
+        } else {
+            &motion
+        };
+        let rest_width = fragment["rest"]["transform"]["size"]["u"]
             .as_f64()
             .expect("rest width")
             * 640.0;
-        let sidebar = motion["layout"]["items"]
+        let sidebar = fragment["layout"]["items"]
             .as_array()
             .expect("items")
             .iter()
@@ -5517,6 +6211,22 @@ mod tests {
         assert!((sidebar_width - 400.0).abs() < 0.01);
         assert!((state.inbox_width - 320.0).abs() < f64::EPSILON);
 
+        #[cfg(feature = "pure-renderer")]
+        {
+            assert_eq!(motion["request_id"], 1);
+            assert_eq!(motion["interaction"], 99);
+            assert_eq!(motion["event_sequence"], 2);
+            assert_eq!(motion["wait_for_panes"], serde_json::json!([1, 4, 5, 6]));
+            assert!(apply_layout_transaction_notification(
+                &mut state,
+                &super::decode_layout_transaction_notification(
+                    br#"{"type":"completed","request_id":1,"resize_epoch":{"id":31,"lease":4,"lease_generation":2,"base_layout_revision":17,"target_layout_revision":18}}"#,
+                )
+                .expect("completed motion transaction"),
+            )
+            .is_empty());
+        }
+
         let release = apply_layout_pointer_message(
             &mut state,
             &pointer(
@@ -5529,14 +6239,18 @@ mod tests {
         );
         let release = host_command(&release, "submit-synchronized-layout");
         let release: serde_json::Value = serde_json::from_slice(release).expect("release JSON");
-        assert_eq!(release["request_id"], 1);
+        assert_eq!(release["request_id"], if cfg!(feature = "pure-renderer") { 2 } else { 1 });
         assert_eq!(release["interaction"], 99);
         assert_eq!(release["event_sequence"], 3);
         assert_eq!(release["wait_for_panes"], serde_json::json!([1, 4, 5, 6]));
         assert!(apply_layout_transaction_notification(
             &mut state,
             &super::decode_layout_transaction_notification(
-                br#"{"type":"completed","request_id":1,"resize_epoch":{"id":31,"lease":4,"lease_generation":2,"base_layout_revision":17,"target_layout_revision":18}}"#,
+                if cfg!(feature = "pure-renderer") {
+                    br#"{"type":"completed","request_id":2,"resize_epoch":{"id":32,"lease":4,"lease_generation":2,"base_layout_revision":18,"target_layout_revision":19}}"#
+                } else {
+                    br#"{"type":"completed","request_id":1,"resize_epoch":{"id":31,"lease":4,"lease_generation":2,"base_layout_revision":17,"target_layout_revision":18}}"#
+                },
             )
             .expect("completed divider transaction"),
         )
@@ -5548,6 +6262,12 @@ mod tests {
                 .map(|layout| layout.sidebar_width),
             Some(400.0)
         );
+        #[cfg(feature = "pure-renderer")]
+        if let Some(layout) = state.layout.as_mut() {
+            // The host's post-commit layout-state publication advances this
+            // before the next real pointer event.
+            layout.presented_layout_revision = 19;
+        }
         assert!(
             apply_layout_pointer_message(
                 &mut state,
@@ -5565,16 +6285,28 @@ mod tests {
             &mut state,
             &pointer(super::INBOX_DIVIDER_ZONE_ID, "motion", 5, 0.625, None),
         );
-        let inbox_motion = host_command(&inbox_motion, "set-resolved-layout");
+        let inbox_motion = host_command(
+            &inbox_motion,
+            if cfg!(feature = "pure-renderer") {
+                "submit-synchronized-layout"
+            } else {
+                "set-resolved-layout"
+            },
+        );
         let inbox_motion: serde_json::Value =
             serde_json::from_slice(inbox_motion).expect("inbox motion JSON");
-        let sidebar = inbox_motion["layout"]["items"]
+        let inbox_fragment = if cfg!(feature = "pure-renderer") {
+            &inbox_motion["fragment"]
+        } else {
+            &inbox_motion
+        };
+        let sidebar = inbox_fragment["layout"]["items"]
             .as_array()
             .expect("items")
             .iter()
             .find(|item| item["id"] == 1)
             .expect("sidebar");
-        let inbox = inbox_motion["layout"]["items"]
+        let inbox = inbox_fragment["layout"]["items"]
             .as_array()
             .expect("items")
             .iter()
@@ -6176,6 +6908,30 @@ mod tests {
     }
 
     #[test]
+    fn backend_picker_ids_survive_reorder_and_label_changes() {
+        let mut state = SwitcherState::new();
+        state.backends = vec![(7, "Same".into()), (9, "Same".into())];
+        let before = super::creation_backend_items(&state);
+        assert_eq!(before[0].id, "backend:7");
+        assert_eq!(before[1].id, "backend:9");
+        state.backends.reverse();
+        state.backends[1].1 = "Renamed".into();
+        let after = super::creation_backend_items(&state);
+        assert_eq!(after[0].id, before[1].id);
+        assert_eq!(after[1].id, before[0].id);
+        let selection = serde_json::from_value::<super::PickerSelection>(serde_json::json!({
+            "type": "picker-selected", "picker": 7, "item_id": "backend:7",
+            "result": {"label": "Same", "value": {"action": "choose-directory", "backend": 7}}
+        }))
+        .unwrap();
+        assert!(super::picker_selection_identity_matches(&state, &selection));
+        state.backends.retain(|entry| entry.0 != 7);
+        assert!(!super::picker_selection_identity_matches(
+            &state, &selection
+        ));
+    }
+
+    #[test]
     fn backend_picker_exposes_local_and_remote_container_creation() {
         let mut state = SwitcherState::new();
         apply_backend_sessions(
@@ -6199,18 +6955,19 @@ mod tests {
             .as_array()
             .into_iter()
             .flatten()
-            .filter_map(|item| item["value"]["action"].as_str())
+            .filter_map(|item| item["value"]["value"]["action"].as_str())
             .collect::<Vec<_>>();
         assert!(actions.contains(&"create-container-local"));
         assert!(actions.contains(&"create-container-remote"));
         assert!(actions.contains(&"choose-directory"));
-        assert_eq!(value["items"][0]["label"], "Local");
-        assert_eq!(value["items"][0]["value"]["backend"], 7);
+        assert_eq!(value["items"][0]["value"]["label"], "Local");
+        assert_eq!(value["items"][0]["value"]["value"]["backend"], 7);
         assert!(actions.contains(&"create-local"));
         assert!(value["items"].as_array().is_some_and(|items| {
-            items
-                .iter()
-                .any(|item| item["label"] == "Local" && item["value"]["action"] == "create-local")
+            items.iter().any(|item| {
+                item["value"]["label"] == "Local"
+                    && item["value"]["value"]["action"] == "create-local"
+            })
         }));
     }
 
@@ -6239,11 +6996,17 @@ mod tests {
         let value: serde_json::Value =
             serde_json::from_slice(&message.body).unwrap_or(serde_json::Value::Null);
         assert_eq!(value["title"], "Create session");
-        assert_eq!(value["items"][0]["label"], "Worktree · brood");
-        assert_eq!(value["items"][0]["detail"], "Create a new branch from main");
-        assert_eq!(value["items"][0]["value"]["action"], "create-worktree");
-        assert_eq!(value["items"][0]["value"]["backend"], 7);
-        assert_eq!(value["items"][0]["value"]["session"], 3);
+        assert_eq!(value["items"][0]["value"]["label"], "Worktree · brood");
+        assert_eq!(
+            value["items"][0]["value"]["detail"],
+            "Create a new branch from main"
+        );
+        assert_eq!(
+            value["items"][0]["value"]["value"]["action"],
+            "create-worktree"
+        );
+        assert_eq!(value["items"][0]["value"]["value"]["backend"], 7);
+        assert_eq!(value["items"][0]["value"]["value"]["session"], 3);
 
         assert!(begin_worktree_for_source(&mut state, 7, 3));
         assert!(state.mode == EditMode::CreateWorktree(7, 3));
@@ -6275,7 +7038,7 @@ mod tests {
         assert!(
             creation_backend_items(&state)
                 .iter()
-                .any(|item| item.value.action.as_deref() == Some("create-worktree"))
+                .any(|item| item.value.value.action.as_deref() == Some("create-worktree"))
         );
     }
 
@@ -6315,7 +7078,7 @@ mod tests {
         assert!(
             creation_backend_items(&state)
                 .iter()
-                .any(|item| item.value.action.as_deref() == Some("create-worktree"))
+                .any(|item| item.value.value.action.as_deref() == Some("create-worktree"))
         );
 
         apply_backend_sessions(
@@ -6453,6 +7216,7 @@ mod tests {
         let stale_selection = serde_json::from_value::<super::PickerSelection>(serde_json::json!({
             "type": "picker-selected",
             "picker": 41,
+            "item_id": "create-remote",
             "result": {
                 "label": "SSH",
                 "detail": "Connect to a remote host",
@@ -6475,6 +7239,7 @@ mod tests {
             serde_json::from_value::<super::PickerSelection>(serde_json::json!({
                 "type": "picker-selected",
                 "picker": 42,
+                "item_id": "create-local",
                 "result": {
                     "label": "Local",
                     "detail": "Create a local backend",
@@ -6493,6 +7258,7 @@ mod tests {
             serde_json::from_value::<super::PickerSelection>(serde_json::json!({
                 "type": "picker-selected",
                 "picker": 41,
+                "item_id": "create-remote",
                 "result": {
                     "label": "SSH",
                     "detail": "Connect to a remote host",
@@ -6520,9 +7286,10 @@ mod tests {
         assert_eq!(value["picker"], 17);
         assert_eq!(value["loading"], false);
         assert!(value["items"].as_array().is_some_and(|items| {
-            items
-                .iter()
-                .any(|item| item["label"] == "Local" && item["value"]["action"] == "create-local")
+            items.iter().any(|item| {
+                item["value"]["label"] == "Local"
+                    && item["value"]["value"]["action"] == "create-local"
+            })
         }));
     }
 
@@ -6559,5 +7326,170 @@ mod tests {
         assert_eq!(value["type"], "deploy-container-backend");
         assert_eq!(value["connection"], "builder");
         assert_eq!(value["image"], "docker.io/library/alpine:latest");
+    }
+
+    #[test]
+    fn render_view_excludes_host_geometry_and_actor_runtime_state() {
+        let state = SwitcherState::new();
+        let value = serde_json::to_value(state.render_view()).expect("serialize render view");
+        assert!(value.get("pane").is_none());
+        assert!(value.get("width").is_none());
+        assert!(value.get("height").is_none());
+        assert!(value.get("text_cache").is_none());
+        assert!(value.get("request").is_none());
+        assert!(value.get("layout").is_none());
+    }
+
+    #[test]
+    fn shared_interaction_geometry_preserves_pending_button_rule() {
+        let mut state = SwitcherState::new();
+        state.pane = 9;
+        state.width = 320.0;
+        state.height = 480.0;
+        let header = header_geometry(state.width);
+        assert_eq!(
+            super::switcher_target_at(&state, header.button_x + 1.0, 11.0),
+            Some(super::SwitcherTarget::NewSession)
+        );
+        state.pending = Some(1);
+        assert_eq!(
+            super::switcher_target_at(&state, header.button_x + 1.0, 11.0),
+            None
+        );
+    }
+
+    #[cfg(feature = "pure-renderer")]
+    #[test]
+    fn facet_interpret_is_stable_across_reorder_and_retry() {
+        use brood_plugin_sdk::{Facets, facet_codec, facets};
+
+        let mut state = SwitcherState::new();
+        state.width = 320.0;
+        state.height = 480.0;
+        state.sessions = vec![
+            session(1, 101, "one"),
+            session(1, 202, "two"),
+            session(1, 303, "three"),
+        ];
+        let interaction = serde_json::to_vec(&super::interaction_regions(
+            &state.render_view(),
+            super::RenderGeometry {
+                pane: 9,
+                width: 320.0,
+                height: 480.0,
+            },
+        ))
+        .expect("interaction map");
+        state.sessions = vec![session(1, 303, "three"), session(1, 101, "one")];
+        let limits = facets::InvocationLimits {
+            max_output_bytes: 16 * 1024,
+            max_packet_bytes: 16 * 1024,
+            max_interaction_bytes: 16 * 1024,
+            max_sequence_bytes: 4096,
+            max_events: 8,
+            max_event_bytes: 4096,
+            max_host_requests: 4,
+            max_resources: 32,
+            max_resource_bytes: 1024 * 1024,
+        };
+        let request = facets::InputRequest {
+            token: facets::InputToken {
+                scope: facets::Scope {
+                    client_generation: 1,
+                    actor_generation: 2,
+                    facet_generation: 3,
+                },
+                input_sequence: 1,
+                frame: 1,
+                pane: 9,
+                snapshot_revision: 1,
+                sequence_revision: 0,
+            },
+            geometry: facets::PaneTarget {
+                pane: 9,
+                logical_width: 320.0,
+                logical_height: 480.0,
+                physical_width: 320,
+                physical_height: 480,
+                scale: 1.0,
+                clip: [0.0, 0.0, 320.0, 480.0],
+                visible: true,
+                focused: true,
+            },
+            event: facets::InputEvent::PointerButton {
+                x: 20.0,
+                y: super::HEADER_HEIGHT as f64
+                    + super::PROJECT_ROW_HEIGHT as f64
+                    + super::ROW_HEIGHT as f64
+                    + 1.0,
+                button: super::LEFT_BUTTON,
+                pressed: true,
+                modifiers: 0,
+            },
+            interaction,
+            sequence_state: Vec::new(),
+            limits,
+        };
+        let mut wire = vec![0; 16 * 1024];
+        let len = facet_codec::encode_input_request(&request, &mut wire).expect("encode request");
+        wire.truncate(len);
+        let first = <super::SessionSwitcher as Facets>::interpret(wire.clone());
+        let retry = <super::SessionSwitcher as Facets>::interpret(wire);
+        assert_eq!(first, retry, "discarded invocation retry changed output");
+        let response = facet_codec::decode_input_response(
+            &first,
+            facet_codec::DecodeLimits {
+                max_wire_bytes: first.len(),
+                max_allocated_bytes: 64 * 1024,
+                max_allocations: 64,
+            },
+        )
+        .expect("decode response");
+        let super::FacetIntent::Input { target, .. } =
+            serde_json::from_slice(&response.events[0]).expect("decode intent");
+        assert_eq!(target, Some(super::SwitcherTarget::Session(1, 202)));
+        let sequence: super::InteractionState =
+            serde_json::from_slice(&response.next_sequence_state).expect("sequence state");
+        assert_eq!(sequence.pressed, target);
+    }
+
+    #[cfg(feature = "pure-renderer")]
+    #[test]
+    fn publication_coalesces_to_last_view_in_one_turn() {
+        let mut state = SwitcherState::new();
+        state.status = "first".to_string();
+        let mut slot = None;
+        super::stage_publication(
+            &mut slot,
+            1,
+            serde_json::to_vec(&state.render_view()).expect("first view"),
+        );
+        state.status = "second".to_string();
+        super::stage_publication(
+            &mut slot,
+            2,
+            serde_json::to_vec(&state.render_view()).expect("second view"),
+        );
+        let (revision, bytes) = slot.expect("staged publication");
+        assert_eq!(revision, 2);
+        let view: super::RenderView = serde_json::from_slice(&bytes).expect("render view");
+        assert_eq!(view.status, "second");
+    }
+
+    #[cfg(feature = "pure-renderer")]
+    fn session(backend: u64, id: u64, name: &str) -> ViewSession {
+        ViewSession {
+            backend,
+            id,
+            name: name.to_string(),
+            active: false,
+            windows: 1,
+            working_directory: None,
+            project_id: "project".to_string(),
+            project_name: "Project".to_string(),
+            branch: None,
+            worktree: false,
+            git: false,
+        }
     }
 }

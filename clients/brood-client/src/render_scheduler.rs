@@ -8,6 +8,26 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use serde::Serialize;
 
+const MAX_LATE_FINISH_DIAGNOSTICS: usize = 256;
+const WAKE_TAIL_SAMPLES: usize = 512;
+const GUEST_TAIL_SAMPLES: usize = 256;
+const MAX_TIMING_OBSERVATIONS: usize = 4096;
+const MIN_SAFETY_MARGIN_NS: u64 = 500_000;
+const MAX_SAFETY_MARGIN_NS: u64 = 4_000_000;
+
+#[track_caller]
+fn record_protocol_error(metrics: &mut SchedulerMetrics, detail: std::fmt::Arguments<'_>) {
+    metrics.protocol_errors = metrics.protocol_errors.saturating_add(1);
+    if std::env::var_os("BROOD_TRACE_RENDER_PROTOCOL").is_some() {
+        let caller = std::panic::Location::caller();
+        eprintln!(
+            "render scheduler protocol error operation=scheduler-transition reason={detail} source={}:{}",
+            caller.file(),
+            caller.line()
+        );
+    }
+}
+
 fn start_input_profile(actor: &ActorScope, watermark: u64) -> u64 {
     if !brood_profiler::enabled() {
         return 0;
@@ -113,6 +133,9 @@ pub struct FramePredictor {
     last_presented_ns: Option<u64>,
     intervals_ns: VecDeque<u64>,
     safety_margin_ns: u64,
+    wake_lateness_samples_ns: [u64; WAKE_TAIL_SAMPLES],
+    wake_lateness_counts: BTreeMap<u64, u16>,
+    wake_lateness_cursor: usize,
     reanchor_next_present: bool,
 }
 
@@ -123,7 +146,13 @@ impl FramePredictor {
             fallback_interval_ns: refresh_interval_ns.clamp(MIN_INTERVAL_NS, MAX_INTERVAL_NS),
             last_presented_ns: None,
             intervals_ns: VecDeque::with_capacity(MAX_INTERVAL_HISTORY),
-            safety_margin_ns: 500_000,
+            safety_margin_ns: MIN_SAFETY_MARGIN_NS,
+            wake_lateness_samples_ns: [MIN_SAFETY_MARGIN_NS; WAKE_TAIL_SAMPLES],
+            wake_lateness_counts: BTreeMap::from([(
+                MIN_SAFETY_MARGIN_NS,
+                WAKE_TAIL_SAMPLES as u16,
+            )]),
+            wake_lateness_cursor: 0,
             reanchor_next_present: false,
         }
     }
@@ -134,14 +163,15 @@ impl FramePredictor {
         }
         self.last_presented_ns = None;
         self.intervals_ns.clear();
-        self.safety_margin_ns = 500_000;
+        self.reset_wake_lateness_tail();
         self.reanchor_next_present = false;
     }
 
     /// Advances the presentation timeline after a same-surface renderer
     /// recovery without treating the recovery pause as a cadence sample.
-    pub const fn reanchor_next_presentation(&mut self) {
+    pub fn reanchor_next_presentation(&mut self) {
         self.reanchor_next_present = true;
+        self.reset_wake_lateness_tail();
     }
 
     pub fn observe_presented(&mut self, presented_ns: u64) {
@@ -218,7 +248,7 @@ impl FramePredictor {
 
     #[must_use]
     pub fn plan(&self, now_ns: u64, guest_cost_ns: u64, host_cost_ns: u64) -> OpportunityPlan {
-        self.plan_after(now_ns, guest_cost_ns, host_cost_ns, None)
+        self.plan_after(now_ns, guest_cost_ns, host_cost_ns, None, None)
     }
 
     /// Plans the earliest feasible opportunity strictly after an actor's
@@ -233,6 +263,7 @@ impl FramePredictor {
         guest_cost_ns: u64,
         host_cost_ns: u64,
         accepted_target_ns: Option<u64>,
+        desired_target_ns: Option<u64>,
     ) -> OpportunityPlan {
         let interval = self.predicted_interval_ns();
         let total_cost = guest_cost_ns
@@ -246,14 +277,21 @@ impl FramePredictor {
         // infeasible target to zero when `total_cost > target`, which can make
         // a start-of-clock opportunity look dispatchable even though its
         // complete budget does not fit before presentation.
-        let earliest_target_ns = accepted_target_ns.map_or_else(
-            || now_ns.saturating_add(total_cost),
-            |accepted_target_ns| {
-                now_ns
-                    .saturating_add(total_cost)
-                    .max(accepted_target_ns.saturating_add(1))
-            },
-        );
+        let earliest_target_ns = accepted_target_ns
+            .map_or_else(
+                || now_ns.saturating_add(total_cost),
+                |accepted_target_ns| {
+                    now_ns
+                        .saturating_add(total_cost)
+                        .max(accepted_target_ns.saturating_add(1))
+                },
+            )
+            // A facet deadline names a desired opportunity, while the host's
+            // predictor owns the output phase. Queue-present timestamps are
+            // estimates, so use the same half-cell boundary as presentation
+            // attribution instead of inventing an off-grid target or
+            // skipping a cell after a slightly early estimate.
+            .max(desired_target_ns.map_or(0, |desired| desired.saturating_sub(interval / 2)));
         if target < earliest_target_ns {
             let shortfall = earliest_target_ns.saturating_sub(target);
             let skipped = shortfall.saturating_add(interval.saturating_sub(1)) / interval;
@@ -276,20 +314,65 @@ impl FramePredictor {
         }
     }
 
-    pub fn note_deadline_result(&mut self, missed: bool) {
-        if missed {
-            self.safety_margin_ns = self
-                .safety_margin_ns
-                .saturating_mul(2)
-                .clamp(500_000, 4_000_000);
-        } else {
-            self.safety_margin_ns = self
-                .safety_margin_ns
-                .saturating_mul(31)
-                .saturating_div(32)
-                .max(500_000);
-        }
+    fn reset_wake_lateness_tail(&mut self) {
+        self.safety_margin_ns = MIN_SAFETY_MARGIN_NS;
+        self.wake_lateness_samples_ns = [MIN_SAFETY_MARGIN_NS; WAKE_TAIL_SAMPLES];
+        self.wake_lateness_counts.clear();
+        self.wake_lateness_counts
+            .insert(MIN_SAFETY_MARGIN_NS, WAKE_TAIL_SAMPLES as u16);
+        self.wake_lateness_cursor = 0;
     }
+
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "wake_lateness_cursor is reduced modulo the fixed non-empty sample array"
+    )]
+    pub fn note_deadline_result(&mut self, observation: DeadlineObservation) {
+        let sample = observation
+            .dispatch_lateness_ns
+            .clamp(MIN_SAFETY_MARGIN_NS, MAX_SAFETY_MARGIN_NS);
+        let previous = self.wake_lateness_samples_ns[self.wake_lateness_cursor];
+        if let Some(count) = self.wake_lateness_counts.get_mut(&previous) {
+            *count -= 1;
+            if *count == 0 {
+                self.wake_lateness_counts.remove(&previous);
+            }
+        }
+        self.wake_lateness_samples_ns[self.wake_lateness_cursor] = sample;
+        self.wake_lateness_cursor = (self.wake_lateness_cursor + 1) % WAKE_TAIL_SAMPLES;
+        *self.wake_lateness_counts.entry(sample).or_default() += 1;
+
+        // The 508th order statistic of 512 observations permits four rare
+        // wake outliers instead of making a cold startup delay and one later
+        // spike advance every subsequent input. With exchangeable samples,
+        // the next observation exceeds this rank with probability 5/513
+        // (0.975%). Native gates still validate the nonstationary workload.
+        let mut cumulative = 0_usize;
+        self.safety_margin_ns = self
+            .wake_lateness_counts
+            .iter()
+            .find_map(|(value, count)| {
+                cumulative += usize::from(*count);
+                (cumulative >= 508).then_some(*value)
+            })
+            .unwrap_or(MAX_SAFETY_MARGIN_NS);
+    }
+
+    #[must_use]
+    pub const fn safety_margin_ns(&self) -> u64 {
+        self.safety_margin_ns
+    }
+
+    #[must_use]
+    pub fn wake_lateness_samples_ns(&self) -> Vec<u64> {
+        self.wake_lateness_samples_ns.to_vec()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeadlineObservation {
+    pub missed: bool,
+    pub dispatch_lateness_ns: u64,
 }
 
 impl Default for FramePredictor {
@@ -321,17 +404,28 @@ struct OutstandingOpportunity {
 #[derive(Clone, Debug)]
 struct ActorRenderState {
     subscription: bool,
+    input_correlation_requires_reduction: bool,
+    ready_input_correlations: BTreeSet<u64>,
     requested_revision: u64,
     satisfied_revision: u64,
+    /// Desired presentation target attached to the current explicit request.
+    /// The revision prevents a later immediate invalidation from inheriting a
+    /// superseded animation target.
+    desired_target: Option<(u64, u64)>,
     admitted_watermark: u64,
     reduced_watermark: u64,
     relevant_panes: BTreeSet<u64>,
     guest_cost_ns: u64,
+    guest_cost_base_ns: u64,
+    guest_cost_tail: GuestCostTail,
     host_cost_ns: u64,
     readiness_cost_ns: u64,
     abandonments: u8,
     backoff_until_ns: u64,
     pending_inputs: VecDeque<(u64, u64, u64)>,
+    // A completed frame consumed its opportunity even if native validation
+    // later discards it. Keep this floor independently of presentation state.
+    last_completed_frame_target_ns: Option<u64>,
     last_dispatch_ns: Option<u64>,
     dispatched_count: u64,
     accepted_count: u64,
@@ -343,23 +437,73 @@ impl Default for ActorRenderState {
     fn default() -> Self {
         Self {
             subscription: false,
+            input_correlation_requires_reduction: false,
+            ready_input_correlations: BTreeSet::new(),
             requested_revision: 0,
             satisfied_revision: 0,
+            desired_target: None,
             admitted_watermark: 0,
             reduced_watermark: 0,
             relevant_panes: BTreeSet::new(),
             guest_cost_ns: COLD_GUEST_COST_NS,
+            guest_cost_base_ns: COLD_GUEST_COST_NS,
+            guest_cost_tail: GuestCostTail::default(),
             host_cost_ns: COLD_HOST_COST_NS,
             readiness_cost_ns: COLD_READINESS_COST_NS,
             abandonments: 0,
             backoff_until_ns: 0,
             pending_inputs: VecDeque::with_capacity(MAX_INPUT_CORRELATIONS),
+            last_completed_frame_target_ns: None,
             last_dispatch_ns: None,
             dispatched_count: 0,
             accepted_count: 0,
             presented_count: 0,
             phase: Phase::Idle,
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct GuestCostTail {
+    samples_ns: [u64; GUEST_TAIL_SAMPLES],
+    counts: BTreeMap<u64, u16>,
+    cursor: usize,
+}
+
+impl Default for GuestCostTail {
+    fn default() -> Self {
+        Self {
+            samples_ns: [0; GUEST_TAIL_SAMPLES],
+            counts: BTreeMap::from([(0, GUEST_TAIL_SAMPLES as u16)]),
+            cursor: 0,
+        }
+    }
+}
+
+impl GuestCostTail {
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "cursor is reduced modulo the fixed non-empty sample array"
+    )]
+    fn observe(&mut self, sample: u64) -> u64 {
+        let previous = self.samples_ns[self.cursor];
+        if let Some(count) = self.counts.get_mut(&previous) {
+            *count -= 1;
+            if *count == 0 {
+                self.counts.remove(&previous);
+            }
+        }
+        self.samples_ns[self.cursor] = sample;
+        self.cursor = (self.cursor + 1) % GUEST_TAIL_SAMPLES;
+        *self.counts.entry(sample).or_default() += 1;
+        let mut cumulative = 0_usize;
+        self.counts
+            .iter()
+            .find_map(|(value, count)| {
+                cumulative += usize::from(*count);
+                (cumulative >= 255).then_some(*value)
+            })
+            .unwrap_or(sample)
     }
 }
 
@@ -432,6 +576,28 @@ pub struct AcceptedFrame {
     pub deadline_met: bool,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct LateFinishDiagnostic {
+    pub token: u64,
+    pub actor: String,
+    pub generation: u64,
+    pub covered_revision: u64,
+    pub target_ns: u64,
+    pub planned_dispatch_ns: u64,
+    pub dispatch_ns: u64,
+    pub dispatch_lateness_ns: u64,
+    pub guest_finished_ns: u64,
+    pub accepted_ns: u64,
+    pub deadline_ns: u64,
+    pub adjusted_deadline_ns: u64,
+    pub lateness_ns: u64,
+    pub planned_guest_cost_estimate_ns: u64,
+    pub updated_guest_cost_estimate_ns: u64,
+    pub host_cost_estimate_ns: u64,
+    pub readiness_cost_estimate_ns: u64,
+    pub composition_barrier_delay_ns: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FinishError {
     InvalidToken,
@@ -456,7 +622,13 @@ pub struct RenderScheduler {
     measured_accepted_opportunities: u64,
     warmup_late_baseline: Option<u64>,
     measured_target_misses: u64,
-    deadline_results: VecDeque<bool>,
+    late_finish_diagnostics: VecDeque<LateFinishDiagnostic>,
+    late_finish_diagnostics_dropped: u64,
+    // token, target, dispatch lateness excluding barrier, actual guest duration,
+    // planned guest estimate, applied wake margin, host budget. Bounded and
+    // serialized only at the diagnostic boundary, including startup samples.
+    timing_observations: VecDeque<[u64; 7]>,
+    deadline_results: VecDeque<DeadlineObservation>,
     last_dispatched: Option<ActorScope>,
     redraw_requested_through_ns: u64,
     redraw_consumed_through_ns: u64,
@@ -483,6 +655,9 @@ impl Default for RenderScheduler {
             measured_accepted_opportunities: 0,
             warmup_late_baseline: None,
             measured_target_misses: 0,
+            late_finish_diagnostics: VecDeque::with_capacity(MAX_LATE_FINISH_DIAGNOSTICS),
+            late_finish_diagnostics_dropped: 0,
+            timing_observations: VecDeque::with_capacity(MAX_TIMING_OBSERVATIONS),
             deadline_results: VecDeque::with_capacity(MAX_RENDER_ACTORS),
             last_dispatched: None,
             redraw_requested_through_ns: 0,
@@ -519,11 +694,18 @@ impl RenderScheduler {
             return true;
         }
         let Some(requested_revision) = state.requested_revision.checked_add(1) else {
-            self.metrics.protocol_errors = self.metrics.protocol_errors.saturating_add(1);
+            record_protocol_error(&mut self.metrics, format_args!("invariant rejected"));
             return false;
         };
+        if std::env::var_os("BROOD_TRACE_PLUGIN_GRAPHICS").is_some() {
+            eprintln!(
+                "render membership actor={} requested={} satisfied={} panes={panes:?}",
+                actor.name, requested_revision, state.satisfied_revision
+            );
+        }
         state.relevant_panes.clone_from(&panes);
         state.requested_revision = requested_revision;
+        state.desired_target = None;
 
         // Actor atomicity is defined over the currently visible changes.
         // Hidden batch entries remain retained by AtomicActorFrames for later
@@ -549,12 +731,12 @@ impl RenderScheduler {
     pub fn admit_event(&mut self, actor: &ActorScope, requests_render: bool) -> Option<u64> {
         let state = self.actors.get_mut(actor)?;
         let Some(admitted_watermark) = state.admitted_watermark.checked_add(1) else {
-            self.metrics.protocol_errors = self.metrics.protocol_errors.saturating_add(1);
+            record_protocol_error(&mut self.metrics, format_args!("invariant rejected"));
             return None;
         };
         let requested_revision = if requests_render {
             let Some(requested_revision) = state.requested_revision.checked_add(1) else {
-                self.metrics.protocol_errors = self.metrics.protocol_errors.saturating_add(1);
+                record_protocol_error(&mut self.metrics, format_args!("invariant rejected"));
                 return None;
             };
             Some(requested_revision)
@@ -564,6 +746,7 @@ impl RenderScheduler {
         state.admitted_watermark = admitted_watermark;
         if let Some(requested_revision) = requested_revision {
             state.requested_revision = requested_revision;
+            state.desired_target = None;
         }
         Some(state.admitted_watermark)
     }
@@ -573,10 +756,89 @@ impl RenderScheduler {
             return false;
         };
         let Some(requested_revision) = state.requested_revision.checked_add(1) else {
-            self.metrics.protocol_errors = self.metrics.protocol_errors.saturating_add(1);
+            record_protocol_error(&mut self.metrics, format_args!("invariant rejected"));
             return false;
         };
         state.requested_revision = requested_revision;
+        state.desired_target = None;
+        true
+    }
+
+    /// Requests one render for a desired presentation time. The request is
+    /// armed immediately so the predictor can dispatch before the target;
+    /// repeated committed animation targets coalesce to one bounded actor
+    /// request.
+    pub fn request_render_at(&mut self, actor: &ActorScope, target_ns: u64) -> bool {
+        let Some(state) = self.actors.get_mut(actor) else {
+            return false;
+        };
+        if state
+            .desired_target
+            .is_some_and(|(_revision, current)| current == target_ns)
+        {
+            return true;
+        }
+        // A causal input or state publication already waiting for a render is
+        // more current than the preceding frame's animation continuation.
+        // Its response will publish the continuation which follows it.
+        if state.requested_revision != state.satisfied_revision && state.desired_target.is_none() {
+            return true;
+        }
+        let Some(requested_revision) = state.requested_revision.checked_add(1) else {
+            record_protocol_error(&mut self.metrics, format_args!("invariant rejected"));
+            return false;
+        };
+        state.requested_revision = requested_revision;
+        state.desired_target = Some((requested_revision, target_ns));
+        if matches!(state.phase, Phase::Armed(_)) {
+            state.phase = Phase::Idle;
+        }
+        true
+    }
+
+    pub fn require_input_correlation_reduction(&mut self, actor: &ActorScope) -> bool {
+        let Some(state) = self.actors.get_mut(actor) else {
+            return false;
+        };
+        state.input_correlation_requires_reduction = true;
+        true
+    }
+
+    pub fn mark_input_correlation_ready(&mut self, actor: &ActorScope, watermark: u64) -> bool {
+        let Some(state) = self.actors.get_mut(actor) else {
+            return false;
+        };
+        if !state
+            .pending_inputs
+            .iter()
+            .any(|(pending, _at, _profile)| *pending == watermark)
+        {
+            return false;
+        }
+        state.ready_input_correlations.insert(watermark)
+    }
+
+    /// Marks the FIFO prefix covered by a successfully published actor state.
+    /// A later actor publication is causally downstream of earlier actor inputs,
+    /// unlike a transient interaction update, which must use the exact method.
+    pub fn mark_input_correlations_ready_through(
+        &mut self,
+        actor: &ActorScope,
+        watermark: u64,
+    ) -> bool {
+        let Some(state) = self.actors.get_mut(actor) else {
+            return false;
+        };
+        let ready = state
+            .pending_inputs
+            .iter()
+            .take_while(|(pending, _at, _profile)| *pending <= watermark)
+            .map(|(pending, _at, _profile)| *pending)
+            .collect::<Vec<_>>();
+        if ready.is_empty() {
+            return false;
+        }
+        state.ready_input_correlations.extend(ready);
         true
     }
 
@@ -586,10 +848,11 @@ impl RenderScheduler {
         };
         if enabled && !state.subscription {
             let Some(requested_revision) = state.requested_revision.checked_add(1) else {
-                self.metrics.protocol_errors = self.metrics.protocol_errors.saturating_add(1);
+                record_protocol_error(&mut self.metrics, format_args!("invariant rejected"));
                 return false;
             };
             state.requested_revision = requested_revision;
+            state.desired_target = None;
         }
         if !enabled
             && state.subscription
@@ -625,8 +888,10 @@ impl RenderScheduler {
         let Some(state) = self.actors.get_mut(actor) else {
             return false;
         };
-        if state.pending_inputs.len() == MAX_INPUT_CORRELATIONS {
-            state.pending_inputs.pop_front();
+        if state.pending_inputs.len() == MAX_INPUT_CORRELATIONS
+            && let Some((evicted, _at, _profile)) = state.pending_inputs.pop_front()
+        {
+            state.ready_input_correlations.remove(&evicted);
         }
         let profile_id = start_input_profile(actor, watermark);
         state
@@ -684,6 +949,7 @@ impl RenderScheduler {
                     .saturating_add(host_cost_ns)
                     .saturating_add(state.readiness_cost_ns),
                 accepted_target_ns,
+                state.desired_target.map(|(_revision, target)| target),
             ),
         });
         true
@@ -717,6 +983,7 @@ impl RenderScheduler {
                 .saturating_add(host_cost_ns)
                 .saturating_add(state.readiness_cost_ns),
             accepted_target_ns,
+            state.desired_target.map(|(_revision, target)| target),
         );
         // New causal work may reveal a larger cost and require an earlier
         // start, but merely servicing a continuous event stream must never
@@ -767,6 +1034,16 @@ impl RenderScheduler {
         self.token_owners.get(&token) == Some(actor)
     }
 
+    /// Returns whether this accepted token is waiting for graphics readiness
+    /// from `pane`. Acceptance establishes the initial set; hiding a pane can
+    /// release its obligation, while newly exposed panes require a fresh token.
+    #[must_use]
+    pub fn token_expects_graphics_ready(&self, token: RenderToken, pane: u64) -> bool {
+        self.active_traces
+            .get(&token)
+            .is_some_and(|trace| trace.expected_panes.contains(&pane))
+    }
+
     pub fn dispatch_due(&mut self, now_ns: u64) -> Vec<(ActorScope, RenderHint)> {
         let mut due = self
             .actors
@@ -805,7 +1082,7 @@ impl RenderScheduler {
             let token = RenderToken(self.next_token);
             let Some(next_token) = self.next_token.checked_add(1) else {
                 state.phase = Phase::Armed(armed);
-                self.metrics.protocol_errors = self.metrics.protocol_errors.saturating_add(1);
+                record_protocol_error(&mut self.metrics, format_args!("invariant rejected"));
                 break;
             };
             self.next_token = next_token;
@@ -816,11 +1093,46 @@ impl RenderScheduler {
                 event_watermark,
             };
             state.phase = Phase::Outstanding(outstanding.clone());
+            if state
+                .desired_target
+                .is_some_and(|(revision, _target)| revision <= covered_revision)
+            {
+                state.desired_target = None;
+            }
+            if std::env::var_os("BROOD_TRACE_RENDER_PROTOCOL").is_some() {
+                eprintln!(
+                    "render scheduler dispatch token={} actor={} now_ns={} planned_ns={} target_ns={} deadline_ns={} guest_cost_ns={} actor_host_cost_ns={} readiness_cost_ns={}",
+                    token.0,
+                    actor.name,
+                    now_ns,
+                    armed.plan.dispatch_ns,
+                    armed.plan.target_ns,
+                    armed.plan.deadline_ns,
+                    state.guest_cost_ns,
+                    state.host_cost_ns,
+                    state.readiness_cost_ns,
+                );
+            }
             if state.last_dispatch_ns == Some(now_ns) {
                 self.metrics.catch_up_bursts = self.metrics.catch_up_bursts.saturating_add(1);
             }
             state.last_dispatch_ns = Some(now_ns);
             state.dispatched_count = state.dispatched_count.saturating_add(1);
+            // Facet readiness is per input, not a monotonic prefix: a later
+            // transient key can be ready while an earlier application key is
+            // still waiting for publication. A binary partition would wrongly
+            // include that earlier key in the later frame's latency sample.
+            let mut input_correlations = Vec::new();
+            state.pending_inputs.retain(|input| {
+                let ready = input.0 <= outstanding.event_watermark
+                    && (!state.input_correlation_requires_reduction
+                        || state.ready_input_correlations.contains(&input.0));
+                if ready {
+                    input_correlations.push(*input);
+                    state.ready_input_correlations.remove(&input.0);
+                }
+                !ready
+            });
             self.token_owners.insert(token, actor.clone());
             self.active_traces.insert(
                 token,
@@ -842,15 +1154,7 @@ impl RenderScheduler {
                     target_presented: None,
                     settlement: None,
                     expected_panes: BTreeSet::new(),
-                    input_correlations: {
-                        let split =
-                            state
-                                .pending_inputs
-                                .partition_point(|(watermark, _at, _id)| {
-                                    *watermark <= outstanding.event_watermark
-                                });
-                        state.pending_inputs.drain(..split).collect()
-                    },
+                    input_correlations,
                     measured_opportunity: false,
                     readiness_noted: false,
                     composition_released: false,
@@ -885,7 +1189,7 @@ impl RenderScheduler {
 
     pub fn reject(&mut self, token: RenderToken) -> Result<(), FinishError> {
         if !self.token_owners.contains_key(&token) {
-            self.metrics.protocol_errors = self.metrics.protocol_errors.saturating_add(1);
+            record_protocol_error(&mut self.metrics, format_args!("invariant rejected"));
             return Err(FinishError::InvalidToken);
         }
         self.metrics.rejected = self.metrics.rejected.saturating_add(1);
@@ -910,7 +1214,7 @@ impl RenderScheduler {
     ) -> Result<Option<AcceptedFrame>, FinishError> {
         let changed_pane_limit_exceeded = changed_panes.len() > MAX_RELEVANT_PANES;
         let Some(actor) = self.token_owners.remove(&token) else {
-            self.metrics.protocol_errors = self.metrics.protocol_errors.saturating_add(1);
+            record_protocol_error(&mut self.metrics, format_args!("invariant rejected"));
             return Err(FinishError::InvalidToken);
         };
         let dispatched_ns = self
@@ -932,17 +1236,17 @@ impl RenderScheduler {
                 release_ns.saturating_sub(planned_dispatch_ns)
             });
         let Some(state) = self.actors.get_mut(&actor) else {
-            self.metrics.protocol_errors = self.metrics.protocol_errors.saturating_add(1);
+            record_protocol_error(&mut self.metrics, format_args!("invariant rejected"));
             return Err(FinishError::InvalidToken);
         };
         let Phase::Outstanding(outstanding) = std::mem::replace(&mut state.phase, Phase::Idle)
         else {
-            self.metrics.protocol_errors = self.metrics.protocol_errors.saturating_add(1);
+            record_protocol_error(&mut self.metrics, format_args!("invariant rejected"));
             return Err(FinishError::InvalidToken);
         };
         if outstanding.token != token {
             state.phase = Phase::Outstanding(outstanding);
-            self.metrics.protocol_errors = self.metrics.protocol_errors.saturating_add(1);
+            record_protocol_error(&mut self.metrics, format_args!("invariant rejected"));
             return Err(FinishError::InvalidToken);
         }
         state.satisfied_revision = state.satisfied_revision.max(outstanding.covered_revision);
@@ -956,32 +1260,88 @@ impl RenderScheduler {
         // actor toward one refresh interval and makes every following hint run
         // immediately after presentation. Deadline feedback separately grows
         // the predictor's safety margin for genuine late event-loop wakes.
+        let planned_guest_cost_estimate_ns = state.guest_cost_ns;
         let elapsed = guest_finished_ns.saturating_sub(dispatched_ns);
-        state.guest_cost_ns = if elapsed > state.guest_cost_ns {
-            elapsed
-        } else {
-            state
-                .guest_cost_ns
-                .saturating_mul(7)
-                .saturating_add(elapsed)
-                .saturating_div(8)
-                .max(1)
-        };
+        let guest_residual_ns = elapsed.saturating_sub(state.guest_cost_base_ns);
+        state.guest_cost_base_ns = state
+            .guest_cost_base_ns
+            .saturating_mul(7)
+            .saturating_add(elapsed)
+            .saturating_div(8)
+            .max(1);
+        state.guest_cost_ns = state
+            .guest_cost_base_ns
+            .saturating_add(state.guest_cost_tail.observe(guest_residual_ns));
         // A deliberately retained composition barrier is host scheduling
         // time, not actor deadline budget. Shift only that known delay; any
         // additional event-loop wake lateness still feeds the predictor's
         // safety margin.
-        let deadline_met = guest_finished_ns
-            <= outstanding
-                .plan
-                .deadline_ns
-                .saturating_add(composition_barrier_delay_ns);
+        let adjusted_deadline_ns = outstanding
+            .plan
+            .deadline_ns
+            .saturating_add(composition_barrier_delay_ns);
+        let deadline_met = guest_finished_ns <= adjusted_deadline_ns;
         self.metrics.accepted = self.metrics.accepted.saturating_add(1);
+        let measured_opportunity = self.presented_opportunities >= DIAGNOSTIC_WARMUP_OPPORTUNITIES;
         if !deadline_met {
             self.metrics.late = self.metrics.late.saturating_add(1);
+            if measured_opportunity {
+                if self.late_finish_diagnostics.len() == MAX_LATE_FINISH_DIAGNOSTICS {
+                    self.late_finish_diagnostics.pop_front();
+                    self.late_finish_diagnostics_dropped =
+                        self.late_finish_diagnostics_dropped.saturating_add(1);
+                }
+                self.late_finish_diagnostics
+                    .push_back(LateFinishDiagnostic {
+                        token: token.0,
+                        actor: actor.name.clone(),
+                        generation: actor.generation,
+                        covered_revision: outstanding.covered_revision,
+                        target_ns: outstanding.plan.target_ns,
+                        planned_dispatch_ns: outstanding.plan.dispatch_ns,
+                        dispatch_ns: dispatched_ns,
+                        dispatch_lateness_ns: dispatched_ns
+                            .saturating_sub(outstanding.plan.dispatch_ns),
+                        guest_finished_ns,
+                        accepted_ns,
+                        deadline_ns: outstanding.plan.deadline_ns,
+                        adjusted_deadline_ns,
+                        lateness_ns: guest_finished_ns.saturating_sub(adjusted_deadline_ns),
+                        planned_guest_cost_estimate_ns,
+                        updated_guest_cost_estimate_ns: state.guest_cost_ns,
+                        host_cost_estimate_ns: state.host_cost_ns,
+                        readiness_cost_estimate_ns: state.readiness_cost_ns,
+                        composition_barrier_delay_ns,
+                    });
+            }
         }
-        self.deadline_results.push_back(!deadline_met);
-        let measured_opportunity = self.presented_opportunities >= DIAGNOSTIC_WARMUP_OPPORTUNITIES;
+        if self.timing_observations.len() == MAX_TIMING_OBSERVATIONS {
+            self.timing_observations.pop_front();
+        }
+        self.timing_observations.push_back([
+            token.0,
+            outstanding.plan.target_ns,
+            dispatched_ns
+                .saturating_sub(outstanding.plan.dispatch_ns)
+                .saturating_sub(composition_barrier_delay_ns),
+            elapsed,
+            planned_guest_cost_estimate_ns,
+            outstanding
+                .plan
+                .deadline_ns
+                .saturating_sub(outstanding.plan.dispatch_ns)
+                .saturating_sub(planned_guest_cost_estimate_ns),
+            outstanding
+                .plan
+                .target_ns
+                .saturating_sub(outstanding.plan.deadline_ns),
+        ]);
+        self.deadline_results.push_back(DeadlineObservation {
+            missed: !deadline_met,
+            dispatch_lateness_ns: dispatched_ns
+                .saturating_sub(outstanding.plan.dispatch_ns)
+                .saturating_sub(composition_barrier_delay_ns),
+        });
         if measured_opportunity {
             self.measured_accepted_opportunities =
                 self.measured_accepted_opportunities.saturating_add(1);
@@ -1003,11 +1363,14 @@ impl RenderScheduler {
             }
         }
         if changed_pane_limit_exceeded {
-            self.metrics.protocol_errors = self.metrics.protocol_errors.saturating_add(1);
+            record_protocol_error(&mut self.metrics, format_args!("invariant rejected"));
             self.settle_trace(token, Settlement::Cancelled);
             return Err(FinishError::InvalidToken);
         }
         let submitted_changes = !changed_panes.is_empty();
+        if submitted_changes {
+            state.last_completed_frame_target_ns = Some(outstanding.plan.target_ns);
+        }
         let changed_panes = changed_panes
             .iter()
             .copied()
@@ -1020,7 +1383,7 @@ impl RenderScheduler {
         }
         let revision = self.next_actor_frame_revision;
         let Some(next_revision) = self.next_actor_frame_revision.checked_add(1) else {
-            self.metrics.protocol_errors = self.metrics.protocol_errors.saturating_add(1);
+            record_protocol_error(&mut self.metrics, format_args!("invariant rejected"));
             self.settle_trace(token, Settlement::Cancelled);
             return Err(FinishError::InvalidToken);
         };
@@ -1067,7 +1430,7 @@ impl RenderScheduler {
         changed_panes: &[u64],
     ) -> Result<Option<AcceptedFrame>, FinishError> {
         if !self.token_belongs_to(actor, token) {
-            self.metrics.protocol_errors = self.metrics.protocol_errors.saturating_add(1);
+            record_protocol_error(&mut self.metrics, format_args!("invariant rejected"));
             return Err(FinishError::InvalidToken);
         }
         self.finish(token, now_ns, changed_panes)
@@ -1082,7 +1445,7 @@ impl RenderScheduler {
         changed_panes: &[u64],
     ) -> Result<Option<AcceptedFrame>, FinishError> {
         if !self.token_belongs_to(actor, token) {
-            self.metrics.protocol_errors = self.metrics.protocol_errors.saturating_add(1);
+            record_protocol_error(&mut self.metrics, format_args!("invariant rejected"));
             return Err(FinishError::InvalidToken);
         }
         self.finish_timed(token, guest_finished_ns, accepted_ns, changed_panes)
@@ -1102,7 +1465,20 @@ impl RenderScheduler {
             .get_mut(&outstanding.token)
             .map(|trace| std::mem::take(&mut trace.input_correlations))
             .unwrap_or_default();
+        if state.input_correlation_requires_reduction {
+            state
+                .ready_input_correlations
+                .extend(inputs.iter().map(|(watermark, _at, _profile)| *watermark));
+        }
         Self::merge_correlations(&mut state.pending_inputs, inputs);
+        let pending_watermarks = state
+            .pending_inputs
+            .iter()
+            .map(|(watermark, _, _)| *watermark)
+            .collect::<BTreeSet<_>>();
+        state
+            .ready_input_correlations
+            .retain(|watermark| pending_watermarks.contains(watermark));
         state.abandonments = state.abandonments.saturating_add(1).min(7);
         let shift = u32::from(state.abandonments.saturating_sub(1));
         state.backoff_until_ns = now_ns.saturating_add(
@@ -1127,12 +1503,12 @@ impl RenderScheduler {
                 || trace.composition_ns.is_some()
                 || !trace.expected_panes.contains(&pane);
             if invalid_transition {
-                self.metrics.protocol_errors = self.metrics.protocol_errors.saturating_add(1);
+                record_protocol_error(&mut self.metrics, format_args!("invariant rejected"));
                 return false;
             }
             if let Some(previous_ready_ns) = trace.graphics_ready_ns.get(&pane).copied() {
                 if at_ns < previous_ready_ns {
-                    self.metrics.protocol_errors = self.metrics.protocol_errors.saturating_add(1);
+                    record_protocol_error(&mut self.metrics, format_args!("invariant rejected"));
                     return false;
                 }
                 // Recovery replay can repeat an already-observed ready pane.
@@ -1283,7 +1659,7 @@ impl RenderScheduler {
             || trace.composition_ns.is_some()
             || at_ns < ready_at_ns
         {
-            self.metrics.protocol_errors = self.metrics.protocol_errors.saturating_add(1);
+            record_protocol_error(&mut self.metrics, format_args!("invariant rejected"));
             return false;
         }
         trace.composition_ns = Some(at_ns);
@@ -1306,7 +1682,7 @@ impl RenderScheduler {
             .composition_ns
             .is_none_or(|composed_ns| trace.gpu_submission_ns.is_some() || at_ns < composed_ns)
         {
-            self.metrics.protocol_errors = self.metrics.protocol_errors.saturating_add(1);
+            record_protocol_error(&mut self.metrics, format_args!("invariant rejected"));
             return false;
         }
         trace.gpu_submission_ns = Some(at_ns);
@@ -1329,7 +1705,7 @@ impl RenderScheduler {
             .gpu_submission_ns
             .is_none_or(|submitted_ns| trace.presentation_ns.is_some() || at_ns < submitted_ns)
         {
-            self.metrics.protocol_errors = self.metrics.protocol_errors.saturating_add(1);
+            record_protocol_error(&mut self.metrics, format_args!("invariant rejected"));
             return false;
         }
         let new_presentation_opportunity = self.last_presentation_ns != Some(at_ns);
@@ -1339,6 +1715,26 @@ impl RenderScheduler {
             self.current_presentation_measured
         };
         trace.presentation_ns = Some(at_ns);
+        if std::env::var_os("BROOD_TRACE_RENDER_PROTOCOL").is_some() {
+            let graphics_ready_ns = trace.graphics_ready_ns.values().copied().max().unwrap_or(0);
+            for (watermark, started_ns, _profile_id) in &trace.input_correlations {
+                eprintln!(
+                    "render scheduler input timing token={} watermark={} started_ns={} dispatched_ns={} guest_finished_ns={} accepted_ns={} graphics_ready_ns={} composition_ns={} gpu_submission_ns={} presented_ns={} target_ns={} estimated={}",
+                    token.0,
+                    watermark,
+                    started_ns,
+                    trace.dispatched_ns,
+                    trace.guest_finished_ns.unwrap_or(0),
+                    trace.accepted_ns.unwrap_or(0),
+                    graphics_ready_ns,
+                    trace.composition_ns.unwrap_or(0),
+                    trace.gpu_submission_ns.unwrap_or(0),
+                    at_ns,
+                    trace.target_ns,
+                    estimated,
+                );
+            }
+        }
         if new_presentation_opportunity {
             if let Some(previous) = self.last_presentation_ns {
                 if self.presentation_intervals_ns.len() == MAX_INPUT_CORRELATIONS {
@@ -1432,6 +1828,57 @@ impl RenderScheduler {
         if self.newest_unpresented.get(&actor) == Some(&token) {
             self.newest_unpresented.remove(&actor);
         }
+        let inputs = self
+            .active_traces
+            .get_mut(&token)
+            .map(|trace| std::mem::take(&mut trace.input_correlations))
+            .unwrap_or_default();
+        let newer_outstanding = self.actors.get(&actor).and_then(|state| {
+            let Phase::Outstanding(outstanding) = &state.phase else {
+                return None;
+            };
+            (outstanding.token != token).then_some(outstanding.token)
+        });
+        if let Some(newer) = newer_outstanding
+            && let Some(trace) = self.active_traces.get_mut(&newer)
+        {
+            // Composition release permits the next causal revision to begin
+            // while the previous accepted frame is still awaiting native
+            // presentation. That dispatch already drained the pending queue,
+            // so attach the older inputs directly to the replacement trace.
+            Self::merge_correlations(&mut trace.input_correlations, inputs);
+        } else if let Some(state) = self.actors.get_mut(&actor) {
+            // These correlations already passed the actor's causal reduction
+            // gate before dispatch. A native stale-geometry cancellation
+            // invalidates only the frame, so return them to the bounded queue
+            // for the newer requested revision instead of losing key latency
+            // evidence with the rejected presentation.
+            state
+                .ready_input_correlations
+                .extend(inputs.iter().map(|(watermark, _at, _profile)| *watermark));
+            Self::merge_correlations(&mut state.pending_inputs, inputs);
+            let pending_watermarks = state
+                .pending_inputs
+                .iter()
+                .map(|(watermark, _, _)| *watermark)
+                .collect::<BTreeSet<_>>();
+            state
+                .ready_input_correlations
+                .retain(|watermark| pending_watermarks.contains(watermark));
+        }
+        if std::env::var_os("BROOD_TRACE_PLUGIN_GRAPHICS").is_some() {
+            eprintln!(
+                "render accepted cancellation actor={} token={} state={:?}",
+                actor.name,
+                token.0,
+                self.actors.get(&actor).map(|state| (
+                    &state.phase,
+                    state.requested_revision,
+                    state.satisfied_revision,
+                    &state.relevant_panes
+                ))
+            );
+        }
         self.metrics.cancelled = self.metrics.cancelled.saturating_add(1);
         self.settle_trace(token, Settlement::Cancelled);
         true
@@ -1490,7 +1937,22 @@ impl RenderScheduler {
         self.measured_target_misses
     }
 
-    pub fn drain_deadline_results(&mut self) -> impl Iterator<Item = bool> + '_ {
+    #[must_use]
+    pub const fn late_finish_diagnostics(&self) -> &VecDeque<LateFinishDiagnostic> {
+        &self.late_finish_diagnostics
+    }
+
+    #[must_use]
+    pub const fn late_finish_diagnostics_dropped(&self) -> u64 {
+        self.late_finish_diagnostics_dropped
+    }
+
+    #[must_use]
+    pub fn timing_observations(&self) -> Vec<[u64; 7]> {
+        self.timing_observations.iter().copied().collect()
+    }
+
+    pub fn drain_deadline_results(&mut self) -> impl Iterator<Item = DeadlineObservation> + '_ {
         self.deadline_results.drain(..)
     }
 
@@ -1515,6 +1977,11 @@ impl RenderScheduler {
             .get(actor)
             .and_then(|token| self.active_traces.get(token))
             .map(|trace| trace.target_ns)
+            .max(
+                self.actors
+                    .get(actor)
+                    .and_then(|state| state.last_completed_frame_target_ns),
+            )
     }
 
     fn actor_has_unreleased_frame(&self, actor: &ActorScope) -> bool {
@@ -1953,6 +2420,137 @@ mod tests {
     ) {
         assert!(scheduler.mark_gpu_submitted(token, at_ns.saturating_sub(1)));
         assert!(scheduler.mark_presented(token, at_ns, estimated));
+    }
+
+    #[test]
+    fn desired_targets_prearm_one_actor_at_every_sixty_hz_cell() {
+        let (mut scheduler, actor, mut predictor) = ready_scheduler();
+        scheduler.actors.get_mut(&actor).unwrap().satisfied_revision =
+            scheduler.actors.get(&actor).unwrap().requested_revision;
+        predictor.observe_presented(0);
+        let mut previous_target = 0;
+        for cell in 1..=120_u64 {
+            let desired = cell.saturating_mul(HZ_60);
+            assert!(scheduler.request_render_at(&actor, desired));
+            scheduler.arm_all(previous_target, &predictor, 1_000_000);
+            let dispatch_ns = scheduler.next_deadline_ns().unwrap();
+            assert!(dispatch_ns < desired);
+            let hints = scheduler.dispatch_due(dispatch_ns);
+            assert_eq!(hints.len(), 1);
+            let hint = &hints.first().unwrap().1;
+            assert_eq!(hint.target_presentation_time_ns, desired);
+            scheduler
+                .finish(hint.token, dispatch_ns.saturating_add(100_000), &[11, 12])
+                .unwrap();
+            assert!(scheduler.mark_graphics_ready(
+                hint.token,
+                11,
+                dispatch_ns.saturating_add(200_000)
+            ));
+            assert!(scheduler.mark_graphics_ready(
+                hint.token,
+                12,
+                dispatch_ns.saturating_add(200_000)
+            ));
+            release_and_compose(&mut scheduler, hint.token, desired.saturating_sub(200_000));
+            submit_and_present(&mut scheduler, hint.token, desired, true);
+            predictor.observe_presented(desired);
+            previous_target = desired;
+        }
+    }
+
+    #[test]
+    fn desired_time_maps_to_the_hosts_predicted_opportunity_cell() {
+        let mut predictor = FramePredictor::new(HZ_60);
+        predictor.observe_presented(0);
+        let within_cell =
+            predictor.plan_after(0, 1_000_000, 1_000_000, None, Some(HZ_60 + HZ_60 / 2));
+        assert_eq!(within_cell.target_ns, HZ_60);
+
+        let after_cell =
+            predictor.plan_after(0, 1_000_000, 1_000_000, None, Some(HZ_60 + HZ_60 / 2 + 1));
+        assert_eq!(after_cell.target_ns, 2 * HZ_60);
+
+        // An early queue-present estimate for the preceding planned target
+        // remains in that target's cell and must not halve animation cadence.
+        let mut early = FramePredictor::new(HZ_60);
+        early.observe_presented(HZ_60.saturating_sub(300_000));
+        let next = early.plan_after(HZ_60, 1_000_000, 1_000_000, None, Some(2 * HZ_60));
+        assert_eq!(next.target_ns, 2 * HZ_60 - 300_000);
+    }
+
+    #[test]
+    fn repeated_desired_target_coalesces_to_at_most_one_request() {
+        let (mut scheduler, actor, predictor) = ready_scheduler();
+        scheduler.actors.get_mut(&actor).unwrap().satisfied_revision =
+            scheduler.actors.get(&actor).unwrap().requested_revision;
+        assert!(scheduler.request_render_at(&actor, HZ_60));
+        let revision = scheduler.actors.get(&actor).unwrap().requested_revision;
+        assert!(scheduler.request_render_at(&actor, HZ_60));
+        assert_eq!(
+            scheduler.actors.get(&actor).unwrap().requested_revision,
+            revision
+        );
+        scheduler.arm_all(0, &predictor, 1_000_000);
+        let deadline = scheduler.next_deadline_ns().unwrap();
+        assert_eq!(scheduler.dispatch_due(deadline).len(), 1);
+        assert!(scheduler.dispatch_due(deadline).is_empty());
+    }
+
+    #[test]
+    fn hiding_an_actor_cancels_its_armed_animation_target() {
+        let (mut scheduler, actor, predictor) = ready_scheduler();
+        scheduler.actors.get_mut(&actor).unwrap().satisfied_revision =
+            scheduler.actors.get(&actor).unwrap().requested_revision;
+        assert!(scheduler.request_render_at(&actor, 10 * HZ_60));
+        scheduler.arm_all(0, &predictor, 1_000_000);
+        assert!(matches!(
+            scheduler.actors.get(&actor).unwrap().phase,
+            Phase::Armed(_)
+        ));
+        assert!(scheduler.set_relevant_panes(&actor, []));
+        assert!(
+            scheduler
+                .actors
+                .get(&actor)
+                .unwrap()
+                .desired_target
+                .is_none()
+        );
+        scheduler.arm_all(0, &predictor, 1_000_000);
+        let deadline = scheduler.next_deadline_ns().unwrap();
+        assert!(deadline < 10 * HZ_60);
+        let hints = scheduler.dispatch_due(deadline);
+        assert_eq!(hints.len(), 1);
+        assert!(
+            scheduler
+                .finish(
+                    hints.first().unwrap().1.token,
+                    deadline.saturating_add(100_000),
+                    &[],
+                )
+                .unwrap()
+                .is_none()
+        );
+        scheduler.arm_all(deadline.saturating_add(100_000), &predictor, 1_000_000);
+        assert!(scheduler.next_deadline_ns().is_none());
+    }
+
+    #[test]
+    fn immediate_request_supersedes_a_future_desired_target() {
+        let (mut scheduler, actor, predictor) = ready_scheduler();
+        scheduler.actors.get_mut(&actor).unwrap().satisfied_revision =
+            scheduler.actors.get(&actor).unwrap().requested_revision;
+        assert!(scheduler.request_render_at(&actor, 10 * HZ_60));
+        scheduler.arm_all(0, &predictor, 1_000_000);
+        let future_deadline = scheduler.next_deadline_ns().unwrap();
+        assert!(future_deadline > 9 * HZ_60);
+        assert!(scheduler.request_render(&actor));
+        scheduler.arm_all(0, &predictor, 1_000_000);
+        let deadline = scheduler.next_deadline_ns().unwrap();
+        let hints = scheduler.dispatch_due(deadline);
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints.first().unwrap().1.target_presentation_time_ns, HZ_60);
     }
 
     #[test]
@@ -2425,6 +3023,156 @@ mod tests {
         assert_eq!(
             scheduler.key_to_present_ns().front(),
             Some(&(HZ_60 - key_at))
+        );
+    }
+
+    #[test]
+    fn unrelated_frame_cannot_consume_an_unreduced_input_correlation() {
+        let (mut scheduler, actor, predictor) = ready_scheduler();
+        assert!(scheduler.require_input_correlation_reduction(&actor));
+        let watermark = scheduler.admit_event(&actor, false).unwrap();
+        assert!(scheduler.note_key_input(&actor, watermark, 1));
+        assert!(scheduler.request_render(&actor));
+        assert!(scheduler.arm(&actor, 0, &predictor, 1_000_000));
+        let deadline = scheduler.next_deadline_ns().unwrap();
+        let unrelated = scheduler.dispatch_due(deadline).pop().unwrap().1;
+        assert!(
+            scheduler
+                .active_traces
+                .get(&unrelated.token)
+                .unwrap()
+                .input_correlations
+                .is_empty()
+        );
+        assert!(scheduler.abandon(&actor, deadline));
+
+        // A later ordinary actor turn (for example, a resize) cannot make the
+        // earlier facet key causal merely by advancing the generic frontier.
+        let later_pointer = scheduler.admit_event(&actor, false).unwrap();
+        assert!(later_pointer > watermark);
+        assert!(!scheduler.mark_input_correlation_ready(&actor, later_pointer));
+        assert!(scheduler.mark_reduced_through(&actor, later_pointer));
+        assert!(scheduler.request_render(&actor));
+        let ordinary_rearm = scheduler.actors.get(&actor).unwrap().backoff_until_ns;
+        assert!(scheduler.arm(&actor, ordinary_rearm, &predictor, 1_000_000));
+        let ordinary_deadline = scheduler.next_deadline_ns().unwrap();
+        let ordinary = scheduler.dispatch_due(ordinary_deadline).pop().unwrap().1;
+        assert!(
+            scheduler
+                .active_traces
+                .get(&ordinary.token)
+                .unwrap()
+                .input_correlations
+                .is_empty()
+        );
+        assert!(scheduler.abandon(&actor, ordinary_deadline));
+
+        assert!(scheduler.mark_input_correlation_ready(&actor, watermark));
+        assert!(scheduler.request_render(&actor));
+        let rearm_at = scheduler.actors.get(&actor).unwrap().backoff_until_ns;
+        assert!(scheduler.arm(&actor, rearm_at, &predictor, 1_000_000));
+        let causal_deadline = scheduler.next_deadline_ns().unwrap();
+        let causal = scheduler.dispatch_due(causal_deadline).pop().unwrap().1;
+        assert_eq!(
+            scheduler
+                .active_traces
+                .get(&causal.token)
+                .unwrap()
+                .input_correlations
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn later_ready_facet_key_does_not_acknowledge_an_earlier_application_key() {
+        let (mut scheduler, actor, predictor) = ready_scheduler();
+        assert!(scheduler.require_input_correlation_reduction(&actor));
+        let application = scheduler.admit_event(&actor, false).unwrap();
+        assert!(scheduler.note_key_input(&actor, application, 1));
+        let transient = scheduler.admit_event(&actor, false).unwrap();
+        assert!(scheduler.note_key_input(&actor, transient, 2));
+        assert!(scheduler.mark_input_correlation_ready(&actor, transient));
+        assert!(scheduler.request_render(&actor));
+        assert!(scheduler.arm(&actor, 0, &predictor, 1_000_000));
+        let deadline = scheduler.next_deadline_ns().unwrap();
+        let hint = scheduler.dispatch_due(deadline).pop().unwrap().1;
+        let correlated = &scheduler
+            .active_traces
+            .get(&hint.token)
+            .unwrap()
+            .input_correlations;
+        assert_eq!(
+            correlated.iter().map(|input| input.0).collect::<Vec<_>>(),
+            vec![transient]
+        );
+        let pending = &scheduler.actors.get(&actor).unwrap().pending_inputs;
+        assert_eq!(
+            pending.iter().map(|input| input.0).collect::<Vec<_>>(),
+            vec![application]
+        );
+
+        // Discarding the speculative frame restores only its already proven
+        // correlation; it cannot acknowledge the earlier application key.
+        assert!(scheduler.abandon(&actor, deadline));
+        let state = scheduler.actors.get(&actor).unwrap();
+        assert_eq!(state.ready_input_correlations, BTreeSet::from([transient]));
+        assert_eq!(state.pending_inputs.len(), 2);
+    }
+
+    #[test]
+    fn legacy_fifo_frame_retains_pre_reduction_input_correlation() {
+        let (mut scheduler, actor, predictor) = ready_scheduler();
+        let watermark = scheduler.admit_event(&actor, false).unwrap();
+        assert!(scheduler.note_key_input(&actor, watermark, 1));
+        assert!(scheduler.request_render(&actor));
+        assert!(scheduler.arm(&actor, 0, &predictor, 1_000_000));
+        let deadline = scheduler.next_deadline_ns().unwrap();
+        let hint = scheduler.dispatch_due(deadline).pop().unwrap().1;
+        assert_eq!(
+            scheduler
+                .active_traces
+                .get(&hint.token)
+                .unwrap()
+                .input_correlations
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn facet_ready_correlations_remain_bounded_during_input_churn() {
+        let (mut scheduler, actor, _predictor) = ready_scheduler();
+        assert!(scheduler.require_input_correlation_reduction(&actor));
+        for at in 0..(MAX_INPUT_CORRELATIONS * 3) {
+            let watermark = scheduler.admit_event(&actor, false).unwrap();
+            assert!(scheduler.note_key_input(&actor, watermark, at as u64));
+            assert!(scheduler.mark_input_correlation_ready(&actor, watermark));
+        }
+        let state = scheduler.actors.get(&actor).unwrap();
+        assert_eq!(state.pending_inputs.len(), MAX_INPUT_CORRELATIONS);
+        assert_eq!(state.ready_input_correlations.len(), MAX_INPUT_CORRELATIONS);
+        assert!(state.ready_input_correlations.iter().all(|ready| {
+            state
+                .pending_inputs
+                .iter()
+                .any(|(pending, _, _)| pending == ready)
+        }));
+    }
+
+    #[test]
+    fn later_actor_publication_covers_prior_fifo_inputs() {
+        let (mut scheduler, actor, _predictor) = ready_scheduler();
+        assert!(scheduler.require_input_correlation_reduction(&actor));
+        let first = scheduler.admit_event(&actor, false).unwrap();
+        assert!(scheduler.note_key_input(&actor, first, 1));
+        let second = scheduler.admit_event(&actor, false).unwrap();
+        assert!(scheduler.note_key_input(&actor, second, 2));
+        assert!(scheduler.mark_input_correlations_ready_through(&actor, second));
+        let state = scheduler.actors.get(&actor).unwrap();
+        assert_eq!(
+            state.ready_input_correlations,
+            BTreeSet::from([first, second])
         );
     }
 
@@ -3187,6 +3935,44 @@ mod tests {
     }
 
     #[test]
+    fn readiness_expectation_excludes_hidden_batch_member_and_survives_visibility_change() {
+        let (mut scheduler, actor, predictor) = ready_scheduler();
+        assert!(scheduler.set_relevant_panes(&actor, [11]));
+        let hint = dispatch_one(&mut scheduler, &actor, &predictor, 0);
+        scheduler
+            .finish(hint.token, hint.submission_deadline_ns, &[11, 12])
+            .unwrap();
+
+        assert!(scheduler.token_expects_graphics_ready(hint.token, 11));
+        assert!(!scheduler.token_expects_graphics_ready(hint.token, 12));
+
+        // The native atomic batch retains pane 12, and it can become visible
+        // before preparation completes. This token still waits only for the
+        // pane set captured when it was accepted.
+        assert!(scheduler.set_relevant_panes(&actor, [11, 12]));
+        assert!(scheduler.token_expects_graphics_ready(hint.token, 11));
+        assert!(!scheduler.token_expects_graphics_ready(hint.token, 12));
+
+        let base_errors = scheduler.metrics().protocol_errors;
+        assert!(scheduler.mark_graphics_ready(
+            hint.token,
+            11,
+            hint.submission_deadline_ns.saturating_add(1)
+        ));
+        assert_eq!(scheduler.release_ready_composition(), vec![hint.token]);
+        assert_eq!(scheduler.metrics().protocol_errors, base_errors);
+
+        // The strict transition API still rejects an unexpected pane. The
+        // bridge avoids making this invalid call for retained hidden members.
+        assert!(!scheduler.mark_graphics_ready(
+            hint.token,
+            12,
+            hint.submission_deadline_ns.saturating_add(2)
+        ));
+        assert_eq!(scheduler.metrics().protocol_errors, base_errors + 1);
+    }
+
+    #[test]
     fn visibility_change_releases_visible_batch_and_retains_hidden_membership_for_next_frame() {
         let (mut scheduler, actor, predictor) = ready_scheduler();
         assert!(scheduler.set_subscription(&actor, true));
@@ -3260,6 +4046,247 @@ mod tests {
             &predictor,
             1_000_000
         ));
+    }
+
+    #[test]
+    fn cancelled_completed_frame_cannot_reinvoke_the_same_opportunity() {
+        let (mut scheduler, actor, mut predictor) = ready_scheduler();
+        predictor.observe_presented(0);
+        let first = dispatch_one(&mut scheduler, &actor, &predictor, 0);
+        let finished = scheduler
+            .active_traces
+            .get(&first.token)
+            .unwrap()
+            .dispatched_ns
+            + 100_000;
+        assert!(finished < first.target_presentation_time_ns);
+        scheduler.finish(first.token, finished, &[11, 12]).unwrap();
+        scheduler.set_relevant_panes(&actor, [11]);
+        assert!(scheduler.cancel_accepted(first.token));
+        assert!(scheduler.arm(&actor, finished, &predictor, 1_000_000));
+        let replacement = scheduler
+            .dispatch_due(scheduler.next_deadline_ns().unwrap())
+            .pop()
+            .unwrap()
+            .1;
+        assert!(replacement.target_presentation_time_ns > first.target_presentation_time_ns);
+
+        scheduler.cancel_generation(&actor);
+        let actor = ActorScope::new(actor.name, actor.generation + 1);
+        scheduler.register(actor.clone());
+        scheduler.set_relevant_panes(&actor, [11]);
+        assert!(scheduler.arm(&actor, 0, &predictor, 1_000_000));
+        let fresh = scheduler
+            .dispatch_due(scheduler.next_deadline_ns().unwrap())
+            .pop()
+            .unwrap()
+            .1;
+        assert_eq!(
+            fresh.target_presentation_time_ns,
+            first.target_presentation_time_ns
+        );
+    }
+
+    #[test]
+    fn accepted_cancellation_restores_reduced_keys_to_the_replacement_once() {
+        let (mut scheduler, actor, mut predictor) = ready_scheduler();
+        predictor.observe_presented(0);
+        scheduler.presented_opportunities = DIAGNOSTIC_WARMUP_OPPORTUNITIES;
+        assert!(scheduler.require_input_correlation_reduction(&actor));
+        for at_ns in [1, 2] {
+            let watermark = scheduler.admit_event(&actor, false).unwrap();
+            assert!(scheduler.note_key_input(&actor, watermark, at_ns));
+            assert!(scheduler.mark_input_correlation_ready(&actor, watermark));
+        }
+        assert!(scheduler.request_render(&actor));
+        let first = dispatch_one(&mut scheduler, &actor, &predictor, 0);
+        assert_eq!(
+            scheduler
+                .active_traces
+                .get(&first.token)
+                .unwrap()
+                .input_correlations
+                .len(),
+            2
+        );
+        scheduler
+            .finish(first.token, first.submission_deadline_ns, &[11, 12])
+            .unwrap();
+
+        assert!(scheduler.set_relevant_panes(&actor, [11]));
+        assert!(scheduler.cancel_accepted(first.token));
+        assert!(!scheduler.cancel_accepted(first.token));
+        assert!(scheduler.arm(&actor, first.submission_deadline_ns, &predictor, 1_000_000,));
+        let replacement = scheduler
+            .dispatch_due(scheduler.next_deadline_ns().unwrap())
+            .pop()
+            .unwrap()
+            .1;
+        assert!(replacement.target_presentation_time_ns > first.target_presentation_time_ns);
+        assert_eq!(
+            scheduler
+                .active_traces
+                .get(&replacement.token)
+                .unwrap()
+                .input_correlations
+                .len(),
+            2
+        );
+        scheduler
+            .finish(replacement.token, replacement.submission_deadline_ns, &[11])
+            .unwrap();
+        release_and_compose(
+            &mut scheduler,
+            replacement.token,
+            replacement.submission_deadline_ns.saturating_add(1),
+        );
+        submit_and_present(
+            &mut scheduler,
+            replacement.token,
+            replacement.target_presentation_time_ns,
+            true,
+        );
+        assert_eq!(scheduler.measured_key_to_present_ns().len(), 2);
+        assert!(!scheduler.cancel_accepted(replacement.token));
+        scheduler.cancel_generation(&actor);
+        assert_eq!(scheduler.measured_key_to_present_ns().len(), 2);
+    }
+
+    #[test]
+    fn accepted_cancellation_transfers_keys_to_an_outstanding_replacement() {
+        let (mut scheduler, actor, mut predictor) = ready_scheduler();
+        predictor.observe_presented(0);
+        scheduler.presented_opportunities = DIAGNOSTIC_WARMUP_OPPORTUNITIES;
+        assert!(scheduler.require_input_correlation_reduction(&actor));
+        for at_ns in [1, 2] {
+            let watermark = scheduler.admit_event(&actor, false).unwrap();
+            assert!(scheduler.note_key_input(&actor, watermark, at_ns));
+            assert!(scheduler.mark_input_correlation_ready(&actor, watermark));
+        }
+        assert!(scheduler.request_render(&actor));
+        let first = dispatch_one(&mut scheduler, &actor, &predictor, 0);
+        scheduler
+            .finish(first.token, first.submission_deadline_ns, &[11, 12])
+            .unwrap();
+        assert!(scheduler.mark_graphics_ready(
+            first.token,
+            11,
+            first.submission_deadline_ns.saturating_add(1),
+        ));
+        assert!(scheduler.mark_graphics_ready(
+            first.token,
+            12,
+            first.submission_deadline_ns.saturating_add(1),
+        ));
+        assert_eq!(scheduler.release_ready_composition(), vec![first.token]);
+
+        assert!(scheduler.set_relevant_panes(&actor, [11]));
+        assert!(scheduler.arm(&actor, first.submission_deadline_ns, &predictor, 1_000_000,));
+        let replacement = scheduler
+            .dispatch_due(scheduler.next_deadline_ns().unwrap())
+            .pop()
+            .unwrap()
+            .1;
+        assert!(
+            scheduler
+                .active_traces
+                .get(&replacement.token)
+                .unwrap()
+                .input_correlations
+                .is_empty()
+        );
+
+        assert!(scheduler.cancel_accepted(first.token));
+        assert!(!scheduler.cancel_accepted(first.token));
+        assert_eq!(
+            scheduler
+                .active_traces
+                .get(&replacement.token)
+                .unwrap()
+                .input_correlations
+                .len(),
+            2
+        );
+        assert!(
+            scheduler
+                .actors
+                .get(&actor)
+                .unwrap()
+                .pending_inputs
+                .is_empty()
+        );
+        scheduler
+            .finish(replacement.token, replacement.submission_deadline_ns, &[11])
+            .unwrap();
+        release_and_compose(
+            &mut scheduler,
+            replacement.token,
+            replacement.submission_deadline_ns.saturating_add(1),
+        );
+        submit_and_present(
+            &mut scheduler,
+            replacement.token,
+            replacement.target_presentation_time_ns,
+            true,
+        );
+        assert_eq!(scheduler.measured_key_to_present_ns().len(), 2);
+        assert!(!scheduler.cancel_accepted(replacement.token));
+    }
+
+    #[test]
+    fn cancelling_stale_accepted_frame_preserves_newer_membership_demand() {
+        let (mut scheduler, actor, predictor) = ready_scheduler();
+        let stale = dispatch_one(&mut scheduler, &actor, &predictor, 0);
+        scheduler
+            .finish(stale.token, stale.submission_deadline_ns, &[11, 12])
+            .unwrap();
+
+        // Visibility/layout membership changes while the accepted native
+        // frame is still pending. Cancelling that stale frame must settle only
+        // its covered revision, leaving this newer revision dispatchable.
+        assert!(scheduler.set_relevant_panes(&actor, [11]));
+        assert!(scheduler.cancel_accepted(stale.token));
+        scheduler.arm_all(stale.target_presentation_time_ns, &predictor, 1_000_000);
+        let deadline = scheduler.next_deadline_ns().unwrap();
+        let replacement = scheduler.dispatch_due(deadline);
+        assert!(matches!(
+            replacement.as_slice(),
+            [(replacement_actor, hint)]
+                if replacement_actor == &actor
+                    && hint.token != stale.token
+                    && hint.relevant_panes == vec![11]
+        ));
+    }
+
+    #[test]
+    fn measured_late_finish_records_causal_timing_and_costs() {
+        let (mut scheduler, actor, predictor) = ready_scheduler();
+        scheduler.presented_opportunities = DIAGNOSTIC_WARMUP_OPPORTUNITIES;
+        let hint = dispatch_one(&mut scheduler, &actor, &predictor, 0);
+        let finished_ns = hint.submission_deadline_ns.saturating_add(37);
+        scheduler
+            .finish_timed(hint.token, finished_ns, finished_ns, &[11, 12])
+            .unwrap();
+
+        let diagnostics = scheduler.late_finish_diagnostics();
+        assert!(matches!(
+            diagnostics.as_slices(),
+            ([record], [])
+                if record.token == hint.token.0
+                    && record.actor == actor.name
+                    && record.generation == actor.generation
+                    && record.target_ns == hint.target_presentation_time_ns
+                    && record.planned_dispatch_ns <= record.dispatch_ns
+                    && record.dispatch_lateness_ns
+                        == record.dispatch_ns.saturating_sub(record.planned_dispatch_ns)
+                    && record.guest_finished_ns == finished_ns
+                    && record.accepted_ns == finished_ns
+                    && record.deadline_ns == hint.submission_deadline_ns
+                    && record.adjusted_deadline_ns == hint.submission_deadline_ns
+                    && record.lateness_ns == 37
+                    && record.composition_barrier_delay_ns == 0
+        ));
+        assert_eq!(scheduler.late_finish_diagnostics_dropped(), 0);
     }
 
     #[test]
@@ -3587,9 +4614,10 @@ mod tests {
                     Some(scheduler.actors.get(&actor).unwrap().requested_revision);
             }
             let render_cost = if opportunity.is_multiple_of(11) {
-                hint.submission_deadline_ns
-                    .saturating_sub(dispatch)
-                    .saturating_add(1)
+                // Fixed workload spikes test prediction and recovery. Defining
+                // work as the current estimate plus one grows the workload
+                // without bound when a tail estimator correctly learns it.
+                5_000_000
             } else if opportunity.is_multiple_of(5) {
                 3_000_000
             } else {
@@ -3695,6 +4723,97 @@ mod tests {
         assert!(final_lead > COLD_GUEST_COST_NS + COLD_HOST_COST_NS + 500_000);
         assert_eq!(scheduler.metrics().late, 1);
         assert_eq!(predictor.safety_margin_ns, 500_000);
+    }
+
+    #[test]
+    fn deadline_feedback_retains_enough_margin_for_persistent_wake_jitter() {
+        let (mut scheduler, actor, mut predictor) = ready_scheduler();
+        assert!(scheduler.set_subscription(&actor, true));
+        let mut presented = 0_u64;
+        let mut measured_misses = 0_usize;
+        let mut previous_target = None;
+
+        for opportunity in 0..10_000_usize {
+            for missed in scheduler.drain_deadline_results() {
+                predictor.note_deadline_result(missed);
+            }
+            predictor.observe_presented(presented);
+            assert!(scheduler.arm(&actor, presented, &predictor, 1_000_000));
+            let planned_dispatch = scheduler.next_deadline_ns().unwrap();
+            let actual_dispatch = planned_dispatch.saturating_add(800_000);
+            let hint = scheduler.dispatch_due(actual_dispatch).pop().unwrap().1;
+            if let Some(previous) = previous_target {
+                assert_eq!(hint.target_presentation_time_ns, previous + HZ_60);
+            }
+            previous_target = Some(hint.target_presentation_time_ns);
+            let accepted_at = actual_dispatch.saturating_add(1_000_000);
+            scheduler.finish(hint.token, accepted_at, &[]).unwrap();
+            if opportunity >= DIAGNOSTIC_WARMUP_OPPORTUNITIES as usize
+                && accepted_at > hint.submission_deadline_ns
+            {
+                measured_misses += 1;
+            }
+            presented = presented.saturating_add(HZ_60);
+        }
+
+        let measured_opportunities = 10_000 - DIAGNOSTIC_WARMUP_OPPORTUNITIES as usize;
+        assert!(measured_misses * 100 <= measured_opportunities);
+        assert_eq!(scheduler.metrics().catch_up_bursts, 0);
+    }
+
+    #[test]
+    fn wake_tail_uses_finite_sample_rank_ages_and_reanchors() {
+        let mut predictor = FramePredictor::new(HZ_60);
+        let high = DeadlineObservation {
+            missed: true,
+            dispatch_lateness_ns: 3_000_000,
+        };
+        let floor = DeadlineObservation {
+            missed: false,
+            dispatch_lateness_ns: 100_000,
+        };
+
+        for _ in 0..4 {
+            predictor.note_deadline_result(high);
+            assert_eq!(predictor.safety_margin_ns, MIN_SAFETY_MARGIN_NS);
+        }
+        predictor.note_deadline_result(high);
+        assert_eq!(predictor.safety_margin_ns, 3_000_000);
+
+        for _ in 0..WAKE_TAIL_SAMPLES {
+            predictor.note_deadline_result(floor);
+        }
+        assert_eq!(predictor.safety_margin_ns, MIN_SAFETY_MARGIN_NS);
+
+        for _ in 0..5 {
+            predictor.note_deadline_result(high);
+        }
+        assert_eq!(predictor.safety_margin_ns, 3_000_000);
+        predictor.reanchor_next_presentation();
+        assert_eq!(predictor.safety_margin_ns, MIN_SAFETY_MARGIN_NS);
+        assert_eq!(
+            predictor.wake_lateness_counts,
+            BTreeMap::from([(MIN_SAFETY_MARGIN_NS, WAKE_TAIL_SAMPLES as u16)])
+        );
+    }
+
+    #[test]
+    fn guest_residual_tail_is_actor_local_and_does_not_pin_one_outlier() {
+        let mut first = ActorRenderState::default();
+        let second = ActorRenderState::default();
+        let outlier_residual = 4_000_000;
+
+        assert_eq!(first.guest_cost_tail.observe(outlier_residual), 0);
+        assert_eq!(
+            first.guest_cost_tail.observe(outlier_residual),
+            outlier_residual
+        );
+        assert_eq!(second.guest_cost_tail.counts, BTreeMap::from([(0, 256)]));
+
+        for _ in 0..GUEST_TAIL_SAMPLES {
+            first.guest_cost_tail.observe(0);
+        }
+        assert_eq!(first.guest_cost_tail.observe(0), 0);
     }
 
     #[test]

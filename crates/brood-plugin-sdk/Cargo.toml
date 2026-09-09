@@ -4,10 +4,20 @@ version = "0.1.0"
 edition.workspace = true
 publish = false
 
+[features]
+default = []
+facets = ["dep:brood-protocol"]
+
 [dependencies]
 brood-graphics.workspace = true
+brood-protocol = { workspace = true, optional = true }
 serde.workspace = true
 wit-bindgen = "0.57.1"
 
 [lints]
 workspace = true
+
+[[example]]
+name = "facets_compile"
+required-features = ["facets"]
+crate-type = ["cdylib"]

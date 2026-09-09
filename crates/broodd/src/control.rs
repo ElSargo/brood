@@ -2955,6 +2955,17 @@ fn execute_state_request(request: DbusStateRequest, state: &mut Brood) {
 fn execute_local_state_request(request: LocalStateRequest, state: &mut Brood) {
     let result =
         handle_local_state_request(request.request, state).map_err(|error| error.to_string());
+    // Local control changes the same session/window catalogue as DBus and
+    // backend IPC. Publish even when no client frame is produced afterwards.
+    if let Err(error) = crate::frame_export::publish_catalog_snapshot(state) {
+        warn!(
+            ?error,
+            "publish presentation catalog after local request failed"
+        );
+    }
+    if let Err(error) = state.display_handle.flush_clients() {
+        warn!(?error, "flush clients after local request failed");
+    }
     let _ = request.response.send(result);
 }
 
@@ -3696,6 +3707,12 @@ fn drain_fast_path_input(state: &mut Brood) {
             }
             ClientMessage::Lifecycle(ClientLifecycle::FramePresented { sequence }) => {
                 let accepted = fast_path.in_flight_sequence == Some(sequence);
+                if std::env::var_os("BROOD_TRACE_RESIZE").is_some() {
+                    eprintln!(
+                        "managed frame completion sequence={sequence} in_flight={:?} accepted={accepted} pending_redraw={}",
+                        fast_path.in_flight_sequence, fast_path.pending_redraw
+                    );
+                }
                 if accepted {
                     fast_path.last_presented_sequence = Some(sequence);
                     fast_path.in_flight_sequence = None;
@@ -3805,6 +3822,13 @@ fn drain_fast_path_input(state: &mut Brood) {
                         ),
                 };
                 if configured {
+                    // Frame callbacks grant permission to draw; they are not
+                    // presentation acknowledgements. A callback-paced client
+                    // may hold its resize commit behind the previous callback,
+                    // while the exact-scene barrier waits for that very commit.
+                    // Grant the addressed client one opportunity per accepted
+                    // configure without exporting or acknowledging a partial scene.
+                    crate::frame_export::send_resize_frame_callback(state, pane);
                     request_redraw = true;
                 }
             }

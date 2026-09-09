@@ -1,0 +1,5 @@
+package brood:facet-probe;
+
+world facet-probe {
+    export render: func(input: list<u8>) -> list<u8>;
+}

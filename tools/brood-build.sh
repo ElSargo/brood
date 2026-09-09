@@ -162,6 +162,12 @@ build_wasm_one() {
     examples/wasm-component-actor)
       core="$release_dir/brood_component_actor_example.wasm"
       ;;
+    examples/wasm-facet-probe)
+      core="$release_dir/brood_component_facet_probe.wasm"
+      ;;
+    examples/wasm-paired-facet-probe)
+      core="$release_dir/brood_paired_facet_probe.wasm"
+      ;;
     examples/wasm-plugin-graphics)
       core="$release_dir/brood_plugin_graphics_example.wasm"
       ;;

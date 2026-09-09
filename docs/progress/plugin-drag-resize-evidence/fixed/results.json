@@ -1,0 +1,7845 @@
+[
+  {
+    "case": "shell-narrow",
+    "expected_actors": [
+      "session-switcher",
+      "terminal-ui",
+      "status-bar"
+    ],
+    "fixed_actors": [
+      "status-bar"
+    ],
+    "boundary": "shell",
+    "start": 960,
+    "target": 780,
+    "final": 780,
+    "duration_seconds": 1.6818742620016565,
+    "post_gesture_convergence_seconds": 0.0027608070013229735,
+    "visible_positions": [
+      780,
+      788,
+      798,
+      808,
+      818,
+      828,
+      838,
+      848,
+      858,
+      868,
+      878,
+      888,
+      898,
+      908,
+      918,
+      928,
+      938,
+      948,
+      958,
+      960
+    ],
+    "actors": {
+      "session-switcher": {
+        "pane": "18446744073709551615",
+        "target_sizes": [
+          [
+            320,
+            686
+          ],
+          [
+            322,
+            686
+          ],
+          [
+            332,
+            686
+          ],
+          [
+            342,
+            686
+          ],
+          [
+            352,
+            686
+          ],
+          [
+            362,
+            686
+          ],
+          [
+            372,
+            686
+          ],
+          [
+            382,
+            686
+          ],
+          [
+            392,
+            686
+          ],
+          [
+            402,
+            686
+          ],
+          [
+            412,
+            686
+          ],
+          [
+            422,
+            686
+          ],
+          [
+            432,
+            686
+          ],
+          [
+            442,
+            686
+          ],
+          [
+            452,
+            686
+          ],
+          [
+            462,
+            686
+          ],
+          [
+            472,
+            686
+          ],
+          [
+            482,
+            686
+          ],
+          [
+            492,
+            686
+          ],
+          [
+            500,
+            686
+          ]
+        ],
+        "resized": true
+      },
+      "status-bar": {
+        "pane": "18446744073709551611",
+        "target_sizes": [
+          [
+            1280,
+            34
+          ]
+        ],
+        "resized": false
+      },
+      "terminal-ui": {
+        "pane": "18446744073709551610",
+        "target_sizes": [
+          [
+            780,
+            686
+          ],
+          [
+            788,
+            686
+          ],
+          [
+            798,
+            686
+          ],
+          [
+            808,
+            686
+          ],
+          [
+            818,
+            686
+          ],
+          [
+            828,
+            686
+          ],
+          [
+            838,
+            686
+          ],
+          [
+            848,
+            686
+          ],
+          [
+            858,
+            686
+          ],
+          [
+            868,
+            686
+          ],
+          [
+            878,
+            686
+          ],
+          [
+            888,
+            686
+          ],
+          [
+            898,
+            686
+          ],
+          [
+            908,
+            686
+          ],
+          [
+            918,
+            686
+          ],
+          [
+            928,
+            686
+          ],
+          [
+            938,
+            686
+          ],
+          [
+            948,
+            686
+          ],
+          [
+            958,
+            686
+          ],
+          [
+            960,
+            686
+          ]
+        ],
+        "resized": true
+      }
+    },
+    "synchronized_submissions": 182,
+    "facet_starts": 187,
+    "capture_cancellations": [],
+    "layout_rejections": [],
+    "before": "/tmp/brood-drag-fix-native1/plugins/drag-frames/shell-narrow-before.png",
+    "after": "/tmp/brood-drag-fix-native1/plugins/drag-frames/shell-narrow-after.png",
+    "errors": [],
+    "synchronized_completions": 91,
+    "synchronized_supersessions": 0,
+    "log_start_character": 69112,
+    "log_end_character": 870713,
+    "sample_count": 21,
+    "lane": "plugins"
+  },
+  {
+    "case": "shell-return",
+    "expected_actors": [
+      "session-switcher",
+      "terminal-ui"
+    ],
+    "fixed_actors": [],
+    "boundary": "shell",
+    "start": 780,
+    "target": 860,
+    "final": 860,
+    "duration_seconds": 1.6820017599966377,
+    "post_gesture_convergence_seconds": 0.004121304998989217,
+    "visible_positions": [
+      780,
+      785,
+      789,
+      794,
+      798,
+      803,
+      807,
+      812,
+      816,
+      820,
+      825,
+      829,
+      834,
+      838,
+      843,
+      847,
+      852,
+      856,
+      860
+    ],
+    "actors": {
+      "session-switcher": {
+        "pane": "18446744073709551615",
+        "target_sizes": [
+          [
+            420,
+            686
+          ],
+          [
+            424,
+            686
+          ],
+          [
+            428,
+            686
+          ],
+          [
+            433,
+            686
+          ],
+          [
+            437,
+            686
+          ],
+          [
+            442,
+            686
+          ],
+          [
+            446,
+            686
+          ],
+          [
+            451,
+            686
+          ],
+          [
+            455,
+            686
+          ],
+          [
+            460,
+            686
+          ],
+          [
+            464,
+            686
+          ],
+          [
+            468,
+            686
+          ],
+          [
+            473,
+            686
+          ],
+          [
+            477,
+            686
+          ],
+          [
+            482,
+            686
+          ],
+          [
+            486,
+            686
+          ],
+          [
+            491,
+            686
+          ],
+          [
+            495,
+            686
+          ],
+          [
+            500,
+            686
+          ]
+        ],
+        "resized": true
+      },
+      "status-bar": {
+        "pane": "18446744073709551611",
+        "target_sizes": [
+          [
+            1280,
+            34
+          ]
+        ],
+        "resized": false
+      },
+      "terminal-ui": {
+        "pane": "18446744073709551610",
+        "target_sizes": [
+          [
+            780,
+            686
+          ],
+          [
+            785,
+            686
+          ],
+          [
+            789,
+            686
+          ],
+          [
+            794,
+            686
+          ],
+          [
+            798,
+            686
+          ],
+          [
+            803,
+            686
+          ],
+          [
+            807,
+            686
+          ],
+          [
+            812,
+            686
+          ],
+          [
+            816,
+            686
+          ],
+          [
+            820,
+            686
+          ],
+          [
+            825,
+            686
+          ],
+          [
+            829,
+            686
+          ],
+          [
+            834,
+            686
+          ],
+          [
+            838,
+            686
+          ],
+          [
+            843,
+            686
+          ],
+          [
+            847,
+            686
+          ],
+          [
+            852,
+            686
+          ],
+          [
+            856,
+            686
+          ],
+          [
+            860,
+            686
+          ]
+        ],
+        "resized": true
+      }
+    },
+    "synchronized_submissions": 162,
+    "facet_starts": 185,
+    "capture_cancellations": [],
+    "layout_rejections": [],
+    "before": "/tmp/brood-drag-fix-native1/plugins/drag-frames/shell-return-before.png",
+    "after": "/tmp/brood-drag-fix-native1/plugins/drag-frames/shell-return-after.png",
+    "errors": [],
+    "synchronized_completions": 81,
+    "synchronized_supersessions": 0,
+    "log_start_character": 870713,
+    "log_end_character": 1623708,
+    "sample_count": 21,
+    "lane": "plugins"
+  },
+  {
+    "case": "diff-narrow",
+    "expected_actors": [
+      "diff-viewer",
+      "terminal-ui"
+    ],
+    "fixed_actors": [],
+    "boundary": "tile",
+    "start": 430,
+    "target": 250,
+    "final": 250,
+    "duration_seconds": 1.6819240000040736,
+    "post_gesture_convergence_seconds": 0.003398856999410782,
+    "visible_positions": [
+      250,
+      260,
+      270,
+      280,
+      290,
+      300,
+      308,
+      318,
+      328,
+      338,
+      348,
+      358,
+      368,
+      378,
+      388,
+      398,
+      408,
+      418,
+      428,
+      430
+    ],
+    "actors": {
+      "session-switcher": {
+        "pane": "18446744073709551615",
+        "target_sizes": [
+          [
+            420,
+            686
+          ]
+        ],
+        "resized": false
+      },
+      "status-bar": {
+        "pane": "18446744073709551611",
+        "target_sizes": [
+          [
+            1280,
+            34
+          ]
+        ],
+        "resized": false
+      },
+      "terminal-ui": {
+        "pane": "18446744073709551610",
+        "target_sizes": [
+          [
+            430,
+            686
+          ],
+          [
+            432,
+            686
+          ],
+          [
+            442,
+            686
+          ],
+          [
+            452,
+            686
+          ],
+          [
+            462,
+            686
+          ],
+          [
+            472,
+            686
+          ],
+          [
+            482,
+            686
+          ],
+          [
+            492,
+            686
+          ],
+          [
+            502,
+            686
+          ],
+          [
+            512,
+            686
+          ],
+          [
+            522,
+            686
+          ],
+          [
+            532,
+            686
+          ],
+          [
+            542,
+            686
+          ],
+          [
+            552,
+            686
+          ],
+          [
+            560,
+            686
+          ],
+          [
+            570,
+            686
+          ],
+          [
+            580,
+            686
+          ],
+          [
+            590,
+            686
+          ],
+          [
+            600,
+            686
+          ],
+          [
+            610,
+            686
+          ]
+        ],
+        "resized": true
+      },
+      "diff-viewer-sb1-s1": {
+        "pane": "18446744073709551608",
+        "target_sizes": [
+          [
+            250,
+            686
+          ],
+          [
+            260,
+            686
+          ],
+          [
+            270,
+            686
+          ],
+          [
+            280,
+            686
+          ],
+          [
+            290,
+            686
+          ],
+          [
+            300,
+            686
+          ],
+          [
+            308,
+            686
+          ],
+          [
+            318,
+            686
+          ],
+          [
+            328,
+            686
+          ],
+          [
+            338,
+            686
+          ],
+          [
+            348,
+            686
+          ],
+          [
+            358,
+            686
+          ],
+          [
+            368,
+            686
+          ],
+          [
+            378,
+            686
+          ],
+          [
+            388,
+            686
+          ],
+          [
+            398,
+            686
+          ],
+          [
+            408,
+            686
+          ],
+          [
+            418,
+            686
+          ],
+          [
+            428,
+            686
+          ],
+          [
+            430,
+            686
+          ]
+        ],
+        "resized": true
+      }
+    },
+    "synchronized_submissions": 172,
+    "facet_starts": 175,
+    "capture_cancellations": [],
+    "layout_rejections": [],
+    "before": "/tmp/brood-drag-fix-native1/plugins/drag-frames/diff-narrow-before.png",
+    "after": "/tmp/brood-drag-fix-native1/plugins/drag-frames/diff-narrow-after.png",
+    "errors": [],
+    "synchronized_completions": 86,
+    "synchronized_supersessions": 0,
+    "log_start_character": 1664649,
+    "log_end_character": 2405814,
+    "sample_count": 21,
+    "lane": "plugins"
+  },
+  {
+    "case": "diff-wide",
+    "expected_actors": [
+      "diff-viewer",
+      "terminal-ui"
+    ],
+    "fixed_actors": [],
+    "boundary": "tile",
+    "start": 250,
+    "target": 430,
+    "final": 430,
+    "duration_seconds": 1.6819853339984547,
+    "post_gesture_convergence_seconds": 0.003846683001029305,
+    "visible_positions": [
+      250,
+      252,
+      260,
+      270,
+      280,
+      290,
+      300,
+      310,
+      320,
+      330,
+      340,
+      350,
+      360,
+      370,
+      380,
+      390,
+      400,
+      410,
+      420,
+      430
+    ],
+    "actors": {
+      "session-switcher": {
+        "pane": "18446744073709551615",
+        "target_sizes": [
+          [
+            420,
+            686
+          ]
+        ],
+        "resized": false
+      },
+      "status-bar": {
+        "pane": "18446744073709551611",
+        "target_sizes": [
+          [
+            1280,
+            34
+          ]
+        ],
+        "resized": false
+      },
+      "terminal-ui": {
+        "pane": "18446744073709551610",
+        "target_sizes": [
+          [
+            430,
+            686
+          ],
+          [
+            440,
+            686
+          ],
+          [
+            450,
+            686
+          ],
+          [
+            460,
+            686
+          ],
+          [
+            470,
+            686
+          ],
+          [
+            480,
+            686
+          ],
+          [
+            490,
+            686
+          ],
+          [
+            500,
+            686
+          ],
+          [
+            510,
+            686
+          ],
+          [
+            520,
+            686
+          ],
+          [
+            530,
+            686
+          ],
+          [
+            540,
+            686
+          ],
+          [
+            550,
+            686
+          ],
+          [
+            560,
+            686
+          ],
+          [
+            570,
+            686
+          ],
+          [
+            580,
+            686
+          ],
+          [
+            590,
+            686
+          ],
+          [
+            600,
+            686
+          ],
+          [
+            608,
+            686
+          ],
+          [
+            610,
+            686
+          ]
+        ],
+        "resized": true
+      },
+      "diff-viewer-sb1-s1": {
+        "pane": "18446744073709551608",
+        "target_sizes": [
+          [
+            250,
+            686
+          ],
+          [
+            252,
+            686
+          ],
+          [
+            260,
+            686
+          ],
+          [
+            270,
+            686
+          ],
+          [
+            280,
+            686
+          ],
+          [
+            290,
+            686
+          ],
+          [
+            300,
+            686
+          ],
+          [
+            310,
+            686
+          ],
+          [
+            320,
+            686
+          ],
+          [
+            330,
+            686
+          ],
+          [
+            340,
+            686
+          ],
+          [
+            350,
+            686
+          ],
+          [
+            360,
+            686
+          ],
+          [
+            370,
+            686
+          ],
+          [
+            380,
+            686
+          ],
+          [
+            390,
+            686
+          ],
+          [
+            400,
+            686
+          ],
+          [
+            410,
+            686
+          ],
+          [
+            420,
+            686
+          ],
+          [
+            430,
+            686
+          ]
+        ],
+        "resized": true
+      }
+    },
+    "synchronized_submissions": 146,
+    "facet_starts": 148,
+    "capture_cancellations": [],
+    "layout_rejections": [],
+    "before": "/tmp/brood-drag-fix-native1/plugins/drag-frames/diff-wide-before.png",
+    "after": "/tmp/brood-drag-fix-native1/plugins/drag-frames/diff-wide-after.png",
+    "errors": [],
+    "synchronized_completions": 73,
+    "synchronized_supersessions": 0,
+    "log_start_character": 2405814,
+    "log_end_character": 3031972,
+    "sample_count": 21,
+    "lane": "plugins"
+  },
+  {
+    "case": "editor-narrow",
+    "expected_actors": [
+      "neovim-ui"
+    ],
+    "fixed_actors": [],
+    "boundary": "tile",
+    "start": 430,
+    "target": 250,
+    "final": 250,
+    "duration_seconds": 1.6822563040041132,
+    "post_gesture_convergence_seconds": 0.007260027996380813,
+    "visible_positions": [
+      250,
+      252,
+      262,
+      272,
+      282,
+      290,
+      300,
+      310,
+      320,
+      330,
+      340,
+      350,
+      360,
+      370,
+      380,
+      390,
+      400,
+      410,
+      420,
+      430
+    ],
+    "actors": {
+      "session-switcher": {
+        "pane": "18446744073709551615",
+        "target_sizes": [
+          [
+            420,
+            686
+          ]
+        ],
+        "resized": false
+      },
+      "status-bar": {
+        "pane": "18446744073709551611",
+        "target_sizes": [
+          [
+            1280,
+            34
+          ]
+        ],
+        "resized": false
+      },
+      "terminal-ui": {
+        "pane": "18446744073709551610",
+        "target_sizes": [
+          [
+            860,
+            343
+          ]
+        ],
+        "resized": false
+      },
+      "diff-viewer-sb1-s1": {
+        "pane": "18446744073709551608",
+        "target_sizes": [
+          [
+            430,
+            343
+          ],
+          [
+            440,
+            343
+          ],
+          [
+            450,
+            343
+          ],
+          [
+            460,
+            343
+          ],
+          [
+            470,
+            343
+          ],
+          [
+            480,
+            343
+          ],
+          [
+            490,
+            343
+          ],
+          [
+            500,
+            343
+          ],
+          [
+            510,
+            343
+          ],
+          [
+            520,
+            343
+          ],
+          [
+            530,
+            343
+          ],
+          [
+            540,
+            343
+          ],
+          [
+            550,
+            343
+          ],
+          [
+            560,
+            343
+          ],
+          [
+            570,
+            343
+          ],
+          [
+            578,
+            343
+          ],
+          [
+            588,
+            343
+          ],
+          [
+            598,
+            343
+          ],
+          [
+            608,
+            343
+          ],
+          [
+            610,
+            343
+          ]
+        ],
+        "resized": true
+      },
+      "neovim-ui-b1-s1": {
+        "pane": "18446744073709551607",
+        "target_sizes": [
+          [
+            250,
+            343
+          ],
+          [
+            252,
+            343
+          ],
+          [
+            262,
+            343
+          ],
+          [
+            272,
+            343
+          ],
+          [
+            282,
+            343
+          ],
+          [
+            290,
+            343
+          ],
+          [
+            300,
+            343
+          ],
+          [
+            310,
+            343
+          ],
+          [
+            320,
+            343
+          ],
+          [
+            330,
+            343
+          ],
+          [
+            340,
+            343
+          ],
+          [
+            350,
+            343
+          ],
+          [
+            360,
+            343
+          ],
+          [
+            370,
+            343
+          ],
+          [
+            380,
+            343
+          ],
+          [
+            390,
+            343
+          ],
+          [
+            400,
+            343
+          ],
+          [
+            410,
+            343
+          ],
+          [
+            420,
+            343
+          ],
+          [
+            430,
+            343
+          ]
+        ],
+        "resized": true
+      }
+    },
+    "synchronized_submissions": 158,
+    "facet_starts": 163,
+    "capture_cancellations": [],
+    "layout_rejections": [],
+    "before": "/tmp/brood-drag-fix-native1/plugins/drag-frames/editor-narrow-before.png",
+    "after": "/tmp/brood-drag-fix-native1/plugins/drag-frames/editor-narrow-after.png",
+    "errors": [],
+    "synchronized_completions": 79,
+    "synchronized_supersessions": 0,
+    "log_start_character": 3976293,
+    "log_end_character": 4845162,
+    "sample_count": 21,
+    "lane": "plugins"
+  },
+  {
+    "case": "editor-wide",
+    "expected_actors": [
+      "neovim-ui"
+    ],
+    "fixed_actors": [],
+    "boundary": "tile",
+    "start": 250,
+    "target": 430,
+    "final": 430,
+    "duration_seconds": 1.6822118319978472,
+    "post_gesture_convergence_seconds": 0.0064442970033269376,
+    "visible_positions": [
+      250,
+      252,
+      260,
+      270,
+      280,
+      290,
+      300,
+      310,
+      320,
+      330,
+      340,
+      350,
+      360,
+      370,
+      380,
+      390,
+      400,
+      408,
+      418,
+      428,
+      430
+    ],
+    "actors": {
+      "session-switcher": {
+        "pane": "18446744073709551615",
+        "target_sizes": [
+          [
+            420,
+            686
+          ]
+        ],
+        "resized": false
+      },
+      "status-bar": {
+        "pane": "18446744073709551611",
+        "target_sizes": [
+          [
+            1280,
+            34
+          ]
+        ],
+        "resized": false
+      },
+      "terminal-ui": {
+        "pane": "18446744073709551610",
+        "target_sizes": [
+          [
+            860,
+            343
+          ]
+        ],
+        "resized": false
+      },
+      "diff-viewer-sb1-s1": {
+        "pane": "18446744073709551608",
+        "target_sizes": [
+          [
+            430,
+            343
+          ],
+          [
+            432,
+            343
+          ],
+          [
+            442,
+            343
+          ],
+          [
+            452,
+            343
+          ],
+          [
+            460,
+            343
+          ],
+          [
+            470,
+            343
+          ],
+          [
+            480,
+            343
+          ],
+          [
+            490,
+            343
+          ],
+          [
+            500,
+            343
+          ],
+          [
+            510,
+            343
+          ],
+          [
+            520,
+            343
+          ],
+          [
+            530,
+            343
+          ],
+          [
+            540,
+            343
+          ],
+          [
+            550,
+            343
+          ],
+          [
+            560,
+            343
+          ],
+          [
+            570,
+            343
+          ],
+          [
+            580,
+            343
+          ],
+          [
+            590,
+            343
+          ],
+          [
+            600,
+            343
+          ],
+          [
+            608,
+            343
+          ],
+          [
+            610,
+            343
+          ]
+        ],
+        "resized": true
+      },
+      "neovim-ui-b1-s1": {
+        "pane": "18446744073709551607",
+        "target_sizes": [
+          [
+            250,
+            343
+          ],
+          [
+            252,
+            343
+          ],
+          [
+            260,
+            343
+          ],
+          [
+            270,
+            343
+          ],
+          [
+            280,
+            343
+          ],
+          [
+            290,
+            343
+          ],
+          [
+            300,
+            343
+          ],
+          [
+            310,
+            343
+          ],
+          [
+            320,
+            343
+          ],
+          [
+            330,
+            343
+          ],
+          [
+            340,
+            343
+          ],
+          [
+            350,
+            343
+          ],
+          [
+            360,
+            343
+          ],
+          [
+            370,
+            343
+          ],
+          [
+            380,
+            343
+          ],
+          [
+            390,
+            343
+          ],
+          [
+            400,
+            343
+          ],
+          [
+            408,
+            343
+          ],
+          [
+            418,
+            343
+          ],
+          [
+            428,
+            343
+          ],
+          [
+            430,
+            343
+          ]
+        ],
+        "resized": true
+      }
+    },
+    "synchronized_submissions": 160,
+    "facet_starts": 164,
+    "capture_cancellations": [],
+    "layout_rejections": [],
+    "before": "/tmp/brood-drag-fix-native1/plugins/drag-frames/editor-wide-before.png",
+    "after": "/tmp/brood-drag-fix-native1/plugins/drag-frames/editor-wide-after.png",
+    "errors": [],
+    "synchronized_completions": 80,
+    "synchronized_supersessions": 0,
+    "log_start_character": 4845162,
+    "log_end_character": 5691455,
+    "sample_count": 21,
+    "lane": "plugins"
+  },
+  {
+    "case": "agent-narrow",
+    "expected_actors": [
+      "coding-agent"
+    ],
+    "fixed_actors": [],
+    "boundary": "tile",
+    "start": 430,
+    "target": 250,
+    "final": 250,
+    "duration_seconds": 1.6822227299999213,
+    "post_gesture_convergence_seconds": 0.008463883001240902,
+    "visible_positions": [
+      250,
+      252,
+      262,
+      272,
+      282,
+      292,
+      302,
+      312,
+      320,
+      330,
+      340,
+      350,
+      360,
+      370,
+      380,
+      390,
+      400,
+      410,
+      420,
+      428,
+      430
+    ],
+    "actors": {
+      "session-switcher": {
+        "pane": "18446744073709551615",
+        "target_sizes": [
+          [
+            420,
+            686
+          ]
+        ],
+        "resized": false
+      },
+      "status-bar": {
+        "pane": "18446744073709551611",
+        "target_sizes": [
+          [
+            1280,
+            34
+          ]
+        ],
+        "resized": false
+      },
+      "terminal-ui": {
+        "pane": "18446744073709551610",
+        "target_sizes": [
+          [
+            430,
+            343
+          ],
+          [
+            432,
+            343
+          ],
+          [
+            440,
+            343
+          ],
+          [
+            450,
+            343
+          ],
+          [
+            460,
+            343
+          ],
+          [
+            470,
+            343
+          ],
+          [
+            480,
+            343
+          ],
+          [
+            490,
+            343
+          ],
+          [
+            500,
+            343
+          ],
+          [
+            510,
+            343
+          ],
+          [
+            520,
+            343
+          ],
+          [
+            530,
+            343
+          ],
+          [
+            540,
+            343
+          ],
+          [
+            548,
+            343
+          ],
+          [
+            558,
+            343
+          ],
+          [
+            568,
+            343
+          ],
+          [
+            578,
+            343
+          ],
+          [
+            588,
+            343
+          ],
+          [
+            598,
+            343
+          ],
+          [
+            608,
+            343
+          ],
+          [
+            610,
+            343
+          ]
+        ],
+        "resized": true
+      },
+      "diff-viewer-sb1-s1": {
+        "pane": "18446744073709551608",
+        "target_sizes": [
+          [
+            250,
+            343
+          ],
+          [
+            252,
+            343
+          ],
+          [
+            262,
+            343
+          ],
+          [
+            272,
+            343
+          ],
+          [
+            282,
+            343
+          ],
+          [
+            292,
+            343
+          ],
+          [
+            302,
+            343
+          ],
+          [
+            312,
+            343
+          ],
+          [
+            320,
+            343
+          ],
+          [
+            330,
+            343
+          ],
+          [
+            340,
+            343
+          ],
+          [
+            350,
+            343
+          ],
+          [
+            360,
+            343
+          ],
+          [
+            370,
+            343
+          ],
+          [
+            380,
+            343
+          ],
+          [
+            390,
+            343
+          ],
+          [
+            400,
+            343
+          ],
+          [
+            410,
+            343
+          ],
+          [
+            420,
+            343
+          ],
+          [
+            428,
+            343
+          ],
+          [
+            430,
+            343
+          ]
+        ],
+        "resized": true
+      },
+      "neovim-ui-b1-s1": {
+        "pane": "18446744073709551607",
+        "target_sizes": [
+          [
+            430,
+            343
+          ],
+          [
+            432,
+            343
+          ],
+          [
+            440,
+            343
+          ],
+          [
+            450,
+            343
+          ],
+          [
+            460,
+            343
+          ],
+          [
+            470,
+            343
+          ],
+          [
+            480,
+            343
+          ],
+          [
+            490,
+            343
+          ],
+          [
+            500,
+            343
+          ],
+          [
+            510,
+            343
+          ],
+          [
+            520,
+            343
+          ],
+          [
+            530,
+            343
+          ],
+          [
+            540,
+            343
+          ],
+          [
+            548,
+            343
+          ],
+          [
+            558,
+            343
+          ],
+          [
+            568,
+            343
+          ],
+          [
+            578,
+            343
+          ],
+          [
+            588,
+            343
+          ],
+          [
+            598,
+            343
+          ],
+          [
+            608,
+            343
+          ],
+          [
+            610,
+            343
+          ]
+        ],
+        "resized": true
+      },
+      "coding-agent-ui-b1-s1-2": {
+        "pane": "18446744073709551606",
+        "target_sizes": [
+          [
+            250,
+            343
+          ],
+          [
+            252,
+            343
+          ],
+          [
+            262,
+            343
+          ],
+          [
+            272,
+            343
+          ],
+          [
+            282,
+            343
+          ],
+          [
+            292,
+            343
+          ],
+          [
+            302,
+            343
+          ],
+          [
+            312,
+            343
+          ],
+          [
+            320,
+            343
+          ],
+          [
+            330,
+            343
+          ],
+          [
+            340,
+            343
+          ],
+          [
+            350,
+            343
+          ],
+          [
+            360,
+            343
+          ],
+          [
+            370,
+            343
+          ],
+          [
+            380,
+            343
+          ],
+          [
+            390,
+            343
+          ],
+          [
+            400,
+            343
+          ],
+          [
+            410,
+            343
+          ],
+          [
+            420,
+            343
+          ],
+          [
+            428,
+            343
+          ],
+          [
+            430,
+            343
+          ]
+        ],
+        "resized": true
+      }
+    },
+    "synchronized_submissions": 158,
+    "facet_starts": 320,
+    "capture_cancellations": [],
+    "layout_rejections": [],
+    "before": "/tmp/brood-drag-fix-native1/plugins/drag-frames/agent-narrow-before.png",
+    "after": "/tmp/brood-drag-fix-native1/plugins/drag-frames/agent-narrow-after.png",
+    "errors": [],
+    "synchronized_completions": 79,
+    "synchronized_supersessions": 0,
+    "log_start_character": 6170897,
+    "log_end_character": 7318117,
+    "sample_count": 21,
+    "lane": "plugins"
+  },
+  {
+    "case": "agent-wide",
+    "expected_actors": [
+      "coding-agent"
+    ],
+    "fixed_actors": [],
+    "boundary": "tile",
+    "start": 250,
+    "target": 430,
+    "final": 430,
+    "duration_seconds": 1.6823234280018369,
+    "post_gesture_convergence_seconds": 0.009263854997698218,
+    "visible_positions": [
+      250,
+      252,
+      260,
+      270,
+      280,
+      290,
+      300,
+      310,
+      320,
+      330,
+      340,
+      350,
+      360,
+      370,
+      378,
+      388,
+      398,
+      408,
+      418,
+      428,
+      430
+    ],
+    "actors": {
+      "session-switcher": {
+        "pane": "18446744073709551615",
+        "target_sizes": [
+          [
+            420,
+            686
+          ]
+        ],
+        "resized": false
+      },
+      "status-bar": {
+        "pane": "18446744073709551611",
+        "target_sizes": [
+          [
+            1280,
+            34
+          ]
+        ],
+        "resized": false
+      },
+      "terminal-ui": {
+        "pane": "18446744073709551610",
+        "target_sizes": [
+          [
+            430,
+            343
+          ],
+          [
+            432,
+            343
+          ],
+          [
+            442,
+            343
+          ],
+          [
+            452,
+            343
+          ],
+          [
+            462,
+            343
+          ],
+          [
+            472,
+            343
+          ],
+          [
+            482,
+            343
+          ],
+          [
+            490,
+            343
+          ],
+          [
+            500,
+            343
+          ],
+          [
+            510,
+            343
+          ],
+          [
+            520,
+            343
+          ],
+          [
+            530,
+            343
+          ],
+          [
+            540,
+            343
+          ],
+          [
+            550,
+            343
+          ],
+          [
+            560,
+            343
+          ],
+          [
+            570,
+            343
+          ],
+          [
+            580,
+            343
+          ],
+          [
+            590,
+            343
+          ],
+          [
+            600,
+            343
+          ],
+          [
+            608,
+            343
+          ],
+          [
+            610,
+            343
+          ]
+        ],
+        "resized": true
+      },
+      "diff-viewer-sb1-s1": {
+        "pane": "18446744073709551608",
+        "target_sizes": [
+          [
+            250,
+            343
+          ],
+          [
+            252,
+            343
+          ],
+          [
+            260,
+            343
+          ],
+          [
+            270,
+            343
+          ],
+          [
+            280,
+            343
+          ],
+          [
+            290,
+            343
+          ],
+          [
+            300,
+            343
+          ],
+          [
+            310,
+            343
+          ],
+          [
+            320,
+            343
+          ],
+          [
+            330,
+            343
+          ],
+          [
+            340,
+            343
+          ],
+          [
+            350,
+            343
+          ],
+          [
+            360,
+            343
+          ],
+          [
+            370,
+            343
+          ],
+          [
+            378,
+            343
+          ],
+          [
+            388,
+            343
+          ],
+          [
+            398,
+            343
+          ],
+          [
+            408,
+            343
+          ],
+          [
+            418,
+            343
+          ],
+          [
+            428,
+            343
+          ],
+          [
+            430,
+            343
+          ]
+        ],
+        "resized": true
+      },
+      "neovim-ui-b1-s1": {
+        "pane": "18446744073709551607",
+        "target_sizes": [
+          [
+            430,
+            343
+          ],
+          [
+            432,
+            343
+          ],
+          [
+            442,
+            343
+          ],
+          [
+            452,
+            343
+          ],
+          [
+            462,
+            343
+          ],
+          [
+            472,
+            343
+          ],
+          [
+            482,
+            343
+          ],
+          [
+            490,
+            343
+          ],
+          [
+            500,
+            343
+          ],
+          [
+            510,
+            343
+          ],
+          [
+            520,
+            343
+          ],
+          [
+            530,
+            343
+          ],
+          [
+            540,
+            343
+          ],
+          [
+            550,
+            343
+          ],
+          [
+            560,
+            343
+          ],
+          [
+            570,
+            343
+          ],
+          [
+            580,
+            343
+          ],
+          [
+            590,
+            343
+          ],
+          [
+            600,
+            343
+          ],
+          [
+            608,
+            343
+          ],
+          [
+            610,
+            343
+          ]
+        ],
+        "resized": true
+      },
+      "coding-agent-ui-b1-s1-2": {
+        "pane": "18446744073709551606",
+        "target_sizes": [
+          [
+            250,
+            343
+          ],
+          [
+            252,
+            343
+          ],
+          [
+            260,
+            343
+          ],
+          [
+            270,
+            343
+          ],
+          [
+            280,
+            343
+          ],
+          [
+            290,
+            343
+          ],
+          [
+            300,
+            343
+          ],
+          [
+            310,
+            343
+          ],
+          [
+            320,
+            343
+          ],
+          [
+            330,
+            343
+          ],
+          [
+            340,
+            343
+          ],
+          [
+            350,
+            343
+          ],
+          [
+            360,
+            343
+          ],
+          [
+            370,
+            343
+          ],
+          [
+            378,
+            343
+          ],
+          [
+            388,
+            343
+          ],
+          [
+            398,
+            343
+          ],
+          [
+            408,
+            343
+          ],
+          [
+            418,
+            343
+          ],
+          [
+            428,
+            343
+          ],
+          [
+            430,
+            343
+          ]
+        ],
+        "resized": true
+      }
+    },
+    "synchronized_submissions": 156,
+    "facet_starts": 316,
+    "capture_cancellations": [],
+    "layout_rejections": [],
+    "before": "/tmp/brood-drag-fix-native1/plugins/drag-frames/agent-wide-before.png",
+    "after": "/tmp/brood-drag-fix-native1/plugins/drag-frames/agent-wide-after.png",
+    "errors": [],
+    "synchronized_completions": 78,
+    "synchronized_supersessions": 0,
+    "log_start_character": 7318117,
+    "log_end_character": 8449790,
+    "sample_count": 21,
+    "lane": "plugins"
+  },
+  {
+    "case": "inbox-narrow",
+    "expected_actors": [
+      "inbox",
+      "session-switcher"
+    ],
+    "fixed_actors": [],
+    "boundary": "inbox",
+    "start": 960,
+    "target": 860,
+    "final": 860,
+    "duration_seconds": 1.6821249859931413,
+    "post_gesture_convergence_seconds": 0.020719028005260043,
+    "visible_positions": [
+      860,
+      867,
+      873,
+      877,
+      883,
+      888,
+      894,
+      899,
+      905,
+      910,
+      916,
+      922,
+      927,
+      933,
+      938,
+      944,
+      948,
+      954,
+      958,
+      960
+    ],
+    "actors": {
+      "inbox": {
+        "pane": "18446744073709551612",
+        "target_sizes": [
+          [
+            320,
+            686
+          ],
+          [
+            322,
+            686
+          ],
+          [
+            326,
+            686
+          ],
+          [
+            332,
+            686
+          ],
+          [
+            336,
+            686
+          ],
+          [
+            342,
+            686
+          ],
+          [
+            347,
+            686
+          ],
+          [
+            353,
+            686
+          ],
+          [
+            358,
+            686
+          ],
+          [
+            365,
+            686
+          ],
+          [
+            371,
+            686
+          ],
+          [
+            376,
+            686
+          ],
+          [
+            381,
+            686
+          ],
+          [
+            387,
+            686
+          ],
+          [
+            392,
+            686
+          ],
+          [
+            398,
+            686
+          ],
+          [
+            404,
+            686
+          ],
+          [
+            408,
+            686
+          ],
+          [
+            414,
+            686
+          ],
+          [
+            420,
+            686
+          ]
+        ],
+        "resized": true
+      },
+      "session-switcher": {
+        "pane": "18446744073709551615",
+        "target_sizes": [
+          [
+            320,
+            686
+          ],
+          [
+            326,
+            686
+          ],
+          [
+            332,
+            686
+          ],
+          [
+            336,
+            686
+          ],
+          [
+            342,
+            686
+          ],
+          [
+            348,
+            686
+          ],
+          [
+            353,
+            686
+          ],
+          [
+            359,
+            686
+          ],
+          [
+            364,
+            686
+          ],
+          [
+            369,
+            686
+          ],
+          [
+            375,
+            686
+          ],
+          [
+            382,
+            686
+          ],
+          [
+            387,
+            686
+          ],
+          [
+            393,
+            686
+          ],
+          [
+            398,
+            686
+          ],
+          [
+            404,
+            686
+          ],
+          [
+            408,
+            686
+          ],
+          [
+            414,
+            686
+          ],
+          [
+            418,
+            686
+          ],
+          [
+            420,
+            686
+          ]
+        ],
+        "resized": true
+      },
+      "status-bar": {
+        "pane": "18446744073709551611",
+        "target_sizes": [
+          [
+            1280,
+            34
+          ]
+        ],
+        "resized": false
+      },
+      "terminal-ui": {
+        "pane": "18446744073709551610",
+        "target_sizes": [
+          [
+            270,
+            343
+          ]
+        ],
+        "resized": false
+      },
+      "diff-viewer-sb1-s1": {
+        "pane": "18446744073709551608",
+        "target_sizes": [
+          [
+            270,
+            343
+          ]
+        ],
+        "resized": false
+      },
+      "neovim-ui-b1-s1": {
+        "pane": "18446744073709551607",
+        "target_sizes": [
+          [
+            270,
+            343
+          ]
+        ],
+        "resized": false
+      },
+      "coding-agent-ui-b1-s1-2": {
+        "pane": "18446744073709551606",
+        "target_sizes": [
+          [
+            270,
+            343
+          ]
+        ],
+        "resized": false
+      }
+    },
+    "synchronized_submissions": 168,
+    "facet_starts": 181,
+    "capture_cancellations": [],
+    "layout_rejections": [],
+    "before": "/tmp/brood-drag-fix-native1/plugins/drag-frames/inbox-narrow-before.png",
+    "after": "/tmp/brood-drag-fix-native1/plugins/drag-frames/inbox-narrow-after.png",
+    "errors": [],
+    "synchronized_completions": 84,
+    "synchronized_supersessions": 0,
+    "log_start_character": 8491206,
+    "log_end_character": 9252602,
+    "sample_count": 21,
+    "lane": "plugins"
+  },
+  {
+    "case": "inbox-wide",
+    "expected_actors": [
+      "inbox",
+      "session-switcher"
+    ],
+    "fixed_actors": [],
+    "boundary": "inbox",
+    "start": 860,
+    "target": 960,
+    "final": 960,
+    "duration_seconds": 1.6820990180058288,
+    "post_gesture_convergence_seconds": 0.021458205999806523,
+    "visible_positions": [
+      860,
+      861,
+      865,
+      871,
+      876,
+      882,
+      887,
+      893,
+      898,
+      904,
+      910,
+      915,
+      921,
+      926,
+      932,
+      937,
+      944,
+      947,
+      953,
+      960
+    ],
+    "actors": {
+      "inbox": {
+        "pane": "18446744073709551612",
+        "target_sizes": [
+          [
+            320,
+            686
+          ],
+          [
+            327,
+            686
+          ],
+          [
+            333,
+            686
+          ],
+          [
+            336,
+            686
+          ],
+          [
+            343,
+            686
+          ],
+          [
+            347,
+            686
+          ],
+          [
+            354,
+            686
+          ],
+          [
+            359,
+            686
+          ],
+          [
+            365,
+            686
+          ],
+          [
+            370,
+            686
+          ],
+          [
+            376,
+            686
+          ],
+          [
+            382,
+            686
+          ],
+          [
+            387,
+            686
+          ],
+          [
+            393,
+            686
+          ],
+          [
+            398,
+            686
+          ],
+          [
+            403,
+            686
+          ],
+          [
+            409,
+            686
+          ],
+          [
+            415,
+            686
+          ],
+          [
+            419,
+            686
+          ],
+          [
+            420,
+            686
+          ]
+        ],
+        "resized": true
+      },
+      "session-switcher": {
+        "pane": "18446744073709551615",
+        "target_sizes": [
+          [
+            320,
+            686
+          ],
+          [
+            321,
+            686
+          ],
+          [
+            325,
+            686
+          ],
+          [
+            331,
+            686
+          ],
+          [
+            337,
+            686
+          ],
+          [
+            342,
+            686
+          ],
+          [
+            347,
+            686
+          ],
+          [
+            353,
+            686
+          ],
+          [
+            358,
+            686
+          ],
+          [
+            364,
+            686
+          ],
+          [
+            370,
+            686
+          ],
+          [
+            375,
+            686
+          ],
+          [
+            381,
+            686
+          ],
+          [
+            386,
+            686
+          ],
+          [
+            393,
+            686
+          ],
+          [
+            397,
+            686
+          ],
+          [
+            404,
+            686
+          ],
+          [
+            407,
+            686
+          ],
+          [
+            413,
+            686
+          ],
+          [
+            420,
+            686
+          ]
+        ],
+        "resized": true
+      },
+      "status-bar": {
+        "pane": "18446744073709551611",
+        "target_sizes": [
+          [
+            1280,
+            34
+          ]
+        ],
+        "resized": false
+      },
+      "terminal-ui": {
+        "pane": "18446744073709551610",
+        "target_sizes": [
+          [
+            270,
+            343
+          ]
+        ],
+        "resized": false
+      },
+      "diff-viewer-sb1-s1": {
+        "pane": "18446744073709551608",
+        "target_sizes": [
+          [
+            270,
+            343
+          ]
+        ],
+        "resized": false
+      },
+      "neovim-ui-b1-s1": {
+        "pane": "18446744073709551607",
+        "target_sizes": [
+          [
+            270,
+            343
+          ]
+        ],
+        "resized": false
+      },
+      "coding-agent-ui-b1-s1-2": {
+        "pane": "18446744073709551606",
+        "target_sizes": [
+          [
+            270,
+            343
+          ]
+        ],
+        "resized": false
+      }
+    },
+    "synchronized_submissions": 154,
+    "facet_starts": 167,
+    "capture_cancellations": [],
+    "layout_rejections": [],
+    "before": "/tmp/brood-drag-fix-native1/plugins/drag-frames/inbox-wide-before.png",
+    "after": "/tmp/brood-drag-fix-native1/plugins/drag-frames/inbox-wide-after.png",
+    "errors": [],
+    "synchronized_completions": 77,
+    "synchronized_supersessions": 0,
+    "log_start_character": 9252602,
+    "log_end_character": 9964995,
+    "sample_count": 21,
+    "lane": "plugins"
+  },
+  {
+    "case": "status-window-narrow",
+    "expected_actors": [
+      "status-bar"
+    ],
+    "fixed_actors": [],
+    "boundary": "window",
+    "start": 1280,
+    "target": 580,
+    "final": 580,
+    "duration_seconds": 1.6371945430000778,
+    "post_gesture_convergence_seconds": 0.010546347999479622,
+    "visible_positions": [
+      595,
+      634,
+      673,
+      712,
+      751,
+      782,
+      821,
+      860,
+      898,
+      937,
+      976,
+      1015,
+      1054,
+      1093,
+      1132,
+      1163,
+      1202,
+      1241,
+      1272
+    ],
+    "actors": {
+      "inbox": {
+        "pane": "18446744073709551612",
+        "target_sizes": [
+          [
+            149,
+            462
+          ],
+          [
+            157,
+            473
+          ],
+          [
+            168,
+            488
+          ],
+          [
+            178,
+            500
+          ],
+          [
+            188,
+            446
+          ],
+          [
+            188,
+            513
+          ],
+          [
+            196,
+            523
+          ],
+          [
+            205,
+            535
+          ],
+          [
+            213,
+            546
+          ],
+          [
+            223,
+            558
+          ],
+          [
+            234,
+            574
+          ],
+          [
+            242,
+            584
+          ],
+          [
+            252,
+            596
+          ],
+          [
+            264,
+            612
+          ],
+          [
+            271,
+            622
+          ],
+          [
+            281,
+            635
+          ],
+          [
+            291,
+            648
+          ],
+          [
+            299,
+            657
+          ],
+          [
+            310,
+            673
+          ],
+          [
+            318,
+            683
+          ],
+          [
+            320,
+            686
+          ]
+        ],
+        "resized": true
+      },
+      "session-switcher": {
+        "pane": "18446744073709551615",
+        "target_sizes": [
+          [
+            195,
+            462
+          ],
+          [
+            199,
+            446
+          ],
+          [
+            205,
+            473
+          ],
+          [
+            221,
+            488
+          ],
+          [
+            234,
+            500
+          ],
+          [
+            246,
+            513
+          ],
+          [
+            257,
+            523
+          ],
+          [
+            269,
+            535
+          ],
+          [
+            280,
+            546
+          ],
+          [
+            292,
+            558
+          ],
+          [
+            307,
+            574
+          ],
+          [
+            318,
+            584
+          ],
+          [
+            330,
+            596
+          ],
+          [
+            346,
+            612
+          ],
+          [
+            356,
+            622
+          ],
+          [
+            369,
+            635
+          ],
+          [
+            382,
+            648
+          ],
+          [
+            392,
+            657
+          ],
+          [
+            407,
+            673
+          ],
+          [
+            417,
+            683
+          ],
+          [
+            420,
+            686
+          ]
+        ],
+        "resized": true
+      },
+      "status-bar": {
+        "pane": "18446744073709551611",
+        "target_sizes": [
+          [
+            580,
+            34
+          ],
+          [
+            595,
+            23
+          ],
+          [
+            626,
+            23
+          ],
+          [
+            673,
+            24
+          ],
+          [
+            712,
+            25
+          ],
+          [
+            751,
+            25
+          ],
+          [
+            782,
+            26
+          ],
+          [
+            821,
+            27
+          ],
+          [
+            852,
+            27
+          ],
+          [
+            891,
+            28
+          ],
+          [
+            937,
+            28
+          ],
+          [
+            968,
+            29
+          ],
+          [
+            1007,
+            30
+          ],
+          [
+            1054,
+            30
+          ],
+          [
+            1085,
+            31
+          ],
+          [
+            1124,
+            31
+          ],
+          [
+            1163,
+            32
+          ],
+          [
+            1194,
+            33
+          ],
+          [
+            1241,
+            33
+          ],
+          [
+            1272,
+            34
+          ],
+          [
+            1280,
+            34
+          ]
+        ],
+        "resized": true
+      },
+      "terminal-ui": {
+        "pane": "18446744073709551610",
+        "target_sizes": [
+          [
+            97,
+            223
+          ],
+          [
+            125,
+            231
+          ],
+          [
+            132,
+            236
+          ],
+          [
+            142,
+            244
+          ],
+          [
+            150,
+            250
+          ],
+          [
+            158,
+            256
+          ],
+          [
+            165,
+            262
+          ],
+          [
+            173,
+            268
+          ],
+          [
+            180,
+            273
+          ],
+          [
+            188,
+            279
+          ],
+          [
+            197,
+            287
+          ],
+          [
+            204,
+            292
+          ],
+          [
+            212,
+            298
+          ],
+          [
+            222,
+            306
+          ],
+          [
+            229,
+            311
+          ],
+          [
+            237,
+            317
+          ],
+          [
+            245,
+            324
+          ],
+          [
+            252,
+            329
+          ],
+          [
+            262,
+            336
+          ],
+          [
+            268,
+            342
+          ],
+          [
+            270,
+            343
+          ]
+        ],
+        "resized": true
+      },
+      "diff-viewer-sb1-s1": {
+        "pane": "18446744073709551608",
+        "target_sizes": [
+          [
+            97,
+            223
+          ],
+          [
+            126,
+            231
+          ],
+          [
+            132,
+            236
+          ],
+          [
+            142,
+            244
+          ],
+          [
+            150,
+            250
+          ],
+          [
+            158,
+            256
+          ],
+          [
+            165,
+            262
+          ],
+          [
+            173,
+            268
+          ],
+          [
+            180,
+            273
+          ],
+          [
+            188,
+            279
+          ],
+          [
+            198,
+            287
+          ],
+          [
+            204,
+            292
+          ],
+          [
+            212,
+            298
+          ],
+          [
+            222,
+            306
+          ],
+          [
+            229,
+            311
+          ],
+          [
+            237,
+            317
+          ],
+          [
+            245,
+            324
+          ],
+          [
+            252,
+            329
+          ],
+          [
+            262,
+            336
+          ],
+          [
+            268,
+            342
+          ],
+          [
+            270,
+            343
+          ]
+        ],
+        "resized": true
+      },
+      "neovim-ui-b1-s1": {
+        "pane": "18446744073709551607",
+        "target_sizes": [
+          [
+            97,
+            223
+          ],
+          [
+            125,
+            231
+          ],
+          [
+            132,
+            236
+          ],
+          [
+            142,
+            244
+          ],
+          [
+            150,
+            250
+          ],
+          [
+            158,
+            256
+          ],
+          [
+            165,
+            262
+          ],
+          [
+            173,
+            268
+          ],
+          [
+            180,
+            273
+          ],
+          [
+            188,
+            279
+          ],
+          [
+            197,
+            287
+          ],
+          [
+            204,
+            292
+          ],
+          [
+            212,
+            298
+          ],
+          [
+            222,
+            306
+          ],
+          [
+            229,
+            311
+          ],
+          [
+            237,
+            317
+          ],
+          [
+            245,
+            324
+          ],
+          [
+            252,
+            329
+          ],
+          [
+            262,
+            336
+          ],
+          [
+            268,
+            342
+          ],
+          [
+            270,
+            343
+          ]
+        ],
+        "resized": true
+      },
+      "coding-agent-ui-b1-s1-2": {
+        "pane": "18446744073709551606",
+        "target_sizes": [
+          [
+            97,
+            223
+          ],
+          [
+            126,
+            231
+          ],
+          [
+            132,
+            236
+          ],
+          [
+            142,
+            244
+          ],
+          [
+            150,
+            250
+          ],
+          [
+            158,
+            256
+          ],
+          [
+            165,
+            262
+          ],
+          [
+            173,
+            268
+          ],
+          [
+            180,
+            273
+          ],
+          [
+            188,
+            279
+          ],
+          [
+            198,
+            287
+          ],
+          [
+            204,
+            292
+          ],
+          [
+            212,
+            298
+          ],
+          [
+            222,
+            306
+          ],
+          [
+            229,
+            311
+          ],
+          [
+            237,
+            317
+          ],
+          [
+            245,
+            324
+          ],
+          [
+            252,
+            329
+          ],
+          [
+            262,
+            336
+          ],
+          [
+            268,
+            342
+          ],
+          [
+            270,
+            343
+          ]
+        ],
+        "resized": true
+      }
+    },
+    "synchronized_submissions": 1,
+    "facet_starts": 16,
+    "capture_cancellations": [],
+    "layout_rejections": [],
+    "before": "/tmp/brood-drag-fix-native1/plugins/drag-frames/status-window-narrow-before.png",
+    "after": "/tmp/brood-drag-fix-native1/plugins/drag-frames/status-window-narrow-after.png",
+    "errors": [],
+    "synchronized_completions": 1,
+    "synchronized_supersessions": 0,
+    "log_start_character": 9965955,
+    "log_end_character": 10183699,
+    "sample_count": 19,
+    "lane": "plugins"
+  },
+  {
+    "case": "status-window-wide",
+    "expected_actors": [
+      "status-bar"
+    ],
+    "fixed_actors": [],
+    "boundary": "window",
+    "start": 580,
+    "target": 1280,
+    "final": 1280,
+    "duration_seconds": 1.7155630810011644,
+    "post_gesture_convergence_seconds": 0.012459767000109423,
+    "visible_positions": [
+      587,
+      618,
+      650,
+      688,
+      727,
+      758,
+      797,
+      836,
+      875,
+      914,
+      953,
+      992,
+      1031,
+      1062,
+      1101,
+      1140,
+      1178,
+      1217,
+      1256,
+      1280
+    ],
+    "actors": {
+      "inbox": {
+        "pane": "18446744073709551612",
+        "target_sizes": [
+          [
+            188,
+            446
+          ],
+          [
+            192,
+            451
+          ],
+          [
+            200,
+            458
+          ],
+          [
+            210,
+            468
+          ],
+          [
+            225,
+            483
+          ],
+          [
+            235,
+            492
+          ],
+          [
+            245,
+            503
+          ],
+          [
+            260,
+            518
+          ],
+          [
+            273,
+            530
+          ],
+          [
+            286,
+            543
+          ],
+          [
+            296,
+            552
+          ],
+          [
+            308,
+            565
+          ],
+          [
+            320,
+            686
+          ],
+          [
+            323,
+            580
+          ],
+          [
+            333,
+            589
+          ],
+          [
+            343,
+            599
+          ],
+          [
+            356,
+            611
+          ],
+          [
+            371,
+            626
+          ],
+          [
+            381,
+            636
+          ],
+          [
+            396,
+            651
+          ],
+          [
+            409,
+            663
+          ],
+          [
+            414,
+            669
+          ]
+        ],
+        "resized": true
+      },
+      "session-switcher": {
+        "pane": "18446744073709551615",
+        "target_sizes": [
+          [
+            199,
+            446
+          ],
+          [
+            204,
+            451
+          ],
+          [
+            212,
+            458
+          ],
+          [
+            223,
+            468
+          ],
+          [
+            239,
+            483
+          ],
+          [
+            250,
+            492
+          ],
+          [
+            260,
+            503
+          ],
+          [
+            276,
+            518
+          ],
+          [
+            290,
+            530
+          ],
+          [
+            303,
+            543
+          ],
+          [
+            314,
+            552
+          ],
+          [
+            327,
+            565
+          ],
+          [
+            343,
+            580
+          ],
+          [
+            354,
+            589
+          ],
+          [
+            365,
+            599
+          ],
+          [
+            378,
+            611
+          ],
+          [
+            394,
+            626
+          ],
+          [
+            404,
+            636
+          ],
+          [
+            420,
+            651
+          ],
+          [
+            420,
+            686
+          ],
+          [
+            434,
+            663
+          ],
+          [
+            439,
+            669
+          ]
+        ],
+        "resized": true
+      },
+      "status-bar": {
+        "pane": "18446744073709551611",
+        "target_sizes": [
+          [
+            580,
+            34
+          ],
+          [
+            595,
+            34
+          ],
+          [
+            618,
+            35
+          ],
+          [
+            650,
+            36
+          ],
+          [
+            696,
+            37
+          ],
+          [
+            727,
+            38
+          ],
+          [
+            758,
+            38
+          ],
+          [
+            805,
+            39
+          ],
+          [
+            844,
+            40
+          ],
+          [
+            883,
+            41
+          ],
+          [
+            914,
+            42
+          ],
+          [
+            953,
+            43
+          ],
+          [
+            1000,
+            44
+          ],
+          [
+            1031,
+            45
+          ],
+          [
+            1062,
+            46
+          ],
+          [
+            1101,
+            47
+          ],
+          [
+            1147,
+            48
+          ],
+          [
+            1178,
+            49
+          ],
+          [
+            1225,
+            50
+          ],
+          [
+            1264,
+            51
+          ],
+          [
+            1280,
+            34
+          ],
+          [
+            1280,
+            51
+          ]
+        ],
+        "resized": true
+      },
+      "terminal-ui": {
+        "pane": "18446744073709551610",
+        "target_sizes": [
+          [
+            97,
+            223
+          ],
+          [
+            99,
+            225
+          ],
+          [
+            103,
+            229
+          ],
+          [
+            108,
+            234
+          ],
+          [
+            116,
+            242
+          ],
+          [
+            121,
+            246
+          ],
+          [
+            126,
+            251
+          ],
+          [
+            134,
+            259
+          ],
+          [
+            141,
+            265
+          ],
+          [
+            147,
+            271
+          ],
+          [
+            152,
+            276
+          ],
+          [
+            159,
+            282
+          ],
+          [
+            167,
+            290
+          ],
+          [
+            172,
+            295
+          ],
+          [
+            177,
+            300
+          ],
+          [
+            183,
+            306
+          ],
+          [
+            191,
+            313
+          ],
+          [
+            196,
+            318
+          ],
+          [
+            204,
+            326
+          ],
+          [
+            210,
+            332
+          ],
+          [
+            213,
+            335
+          ],
+          [
+            270,
+            343
+          ]
+        ],
+        "resized": true
+      },
+      "diff-viewer-sb1-s1": {
+        "pane": "18446744073709551608",
+        "target_sizes": [
+          [
+            97,
+            223
+          ],
+          [
+            99,
+            225
+          ],
+          [
+            103,
+            229
+          ],
+          [
+            108,
+            234
+          ],
+          [
+            116,
+            242
+          ],
+          [
+            121,
+            246
+          ],
+          [
+            126,
+            251
+          ],
+          [
+            134,
+            259
+          ],
+          [
+            141,
+            265
+          ],
+          [
+            147,
+            271
+          ],
+          [
+            152,
+            276
+          ],
+          [
+            159,
+            282
+          ],
+          [
+            167,
+            290
+          ],
+          [
+            172,
+            295
+          ],
+          [
+            177,
+            300
+          ],
+          [
+            184,
+            306
+          ],
+          [
+            191,
+            313
+          ],
+          [
+            196,
+            318
+          ],
+          [
+            204,
+            326
+          ],
+          [
+            211,
+            332
+          ],
+          [
+            213,
+            335
+          ],
+          [
+            270,
+            343
+          ]
+        ],
+        "resized": true
+      },
+      "neovim-ui-b1-s1": {
+        "pane": "18446744073709551607",
+        "target_sizes": [
+          [
+            97,
+            223
+          ],
+          [
+            99,
+            225
+          ],
+          [
+            103,
+            229
+          ],
+          [
+            108,
+            234
+          ],
+          [
+            116,
+            242
+          ],
+          [
+            121,
+            246
+          ],
+          [
+            126,
+            251
+          ],
+          [
+            134,
+            259
+          ],
+          [
+            141,
+            265
+          ],
+          [
+            147,
+            271
+          ],
+          [
+            152,
+            276
+          ],
+          [
+            159,
+            282
+          ],
+          [
+            167,
+            290
+          ],
+          [
+            172,
+            295
+          ],
+          [
+            177,
+            300
+          ],
+          [
+            183,
+            306
+          ],
+          [
+            191,
+            313
+          ],
+          [
+            196,
+            318
+          ],
+          [
+            204,
+            326
+          ],
+          [
+            210,
+            332
+          ],
+          [
+            213,
+            335
+          ],
+          [
+            270,
+            343
+          ]
+        ],
+        "resized": true
+      },
+      "coding-agent-ui-b1-s1-2": {
+        "pane": "18446744073709551606",
+        "target_sizes": [
+          [
+            97,
+            223
+          ],
+          [
+            99,
+            225
+          ],
+          [
+            103,
+            229
+          ],
+          [
+            108,
+            234
+          ],
+          [
+            116,
+            242
+          ],
+          [
+            121,
+            246
+          ],
+          [
+            126,
+            251
+          ],
+          [
+            134,
+            259
+          ],
+          [
+            141,
+            265
+          ],
+          [
+            147,
+            271
+          ],
+          [
+            152,
+            276
+          ],
+          [
+            159,
+            282
+          ],
+          [
+            167,
+            290
+          ],
+          [
+            172,
+            295
+          ],
+          [
+            177,
+            300
+          ],
+          [
+            184,
+            306
+          ],
+          [
+            191,
+            313
+          ],
+          [
+            196,
+            318
+          ],
+          [
+            204,
+            326
+          ],
+          [
+            211,
+            332
+          ],
+          [
+            213,
+            335
+          ],
+          [
+            270,
+            343
+          ]
+        ],
+        "resized": true
+      }
+    },
+    "synchronized_submissions": 1,
+    "facet_starts": 15,
+    "capture_cancellations": [],
+    "layout_rejections": [],
+    "before": "/tmp/brood-drag-fix-native1/plugins/drag-frames/status-window-wide-before.png",
+    "after": "/tmp/brood-drag-fix-native1/plugins/drag-frames/status-window-wide-after.png",
+    "errors": [],
+    "synchronized_completions": 1,
+    "synchronized_supersessions": 0,
+    "log_start_character": 10185895,
+    "log_end_character": 10413375,
+    "sample_count": 20,
+    "lane": "plugins"
+  },
+  {
+    "case": "picker-window-narrow",
+    "expected_actors": [
+      "picker"
+    ],
+    "fixed_actors": [],
+    "boundary": "window",
+    "start": 1280,
+    "target": 580,
+    "final": 580,
+    "duration_seconds": 1.6384015479998197,
+    "post_gesture_convergence_seconds": 0.01054300199757563,
+    "visible_positions": [
+      603,
+      642,
+      673,
+      712,
+      751,
+      790,
+      828,
+      867,
+      906,
+      945,
+      984,
+      1015,
+      1054,
+      1093,
+      1132,
+      1171,
+      1202,
+      1233,
+      1272
+    ],
+    "actors": {
+      "inbox": {
+        "pane": "18446744073709551612",
+        "target_sizes": [
+          [
+            149,
+            462
+          ],
+          [
+            159,
+            474
+          ],
+          [
+            168,
+            488
+          ],
+          [
+            178,
+            500
+          ],
+          [
+            188,
+            446
+          ],
+          [
+            188,
+            513
+          ],
+          [
+            198,
+            526
+          ],
+          [
+            205,
+            535
+          ],
+          [
+            215,
+            549
+          ],
+          [
+            225,
+            561
+          ],
+          [
+            234,
+            574
+          ],
+          [
+            246,
+            589
+          ],
+          [
+            254,
+            599
+          ],
+          [
+            264,
+            612
+          ],
+          [
+            273,
+            625
+          ],
+          [
+            281,
+            635
+          ],
+          [
+            293,
+            650
+          ],
+          [
+            301,
+            660
+          ],
+          [
+            308,
+            671
+          ],
+          [
+            316,
+            680
+          ],
+          [
+            320,
+            686
+          ]
+        ],
+        "resized": true
+      },
+      "picker": {
+        "pane": "18446744073709551614",
+        "target_sizes": [
+          [
+            335,
+            323
+          ],
+          [
+            357,
+            332
+          ],
+          [
+            379,
+            341
+          ],
+          [
+            401,
+            350
+          ],
+          [
+            422,
+            359
+          ],
+          [
+            444,
+            368
+          ],
+          [
+            462,
+            375
+          ],
+          [
+            484,
+            384
+          ],
+          [
+            505,
+            393
+          ],
+          [
+            510,
+            394
+          ],
+          [
+            527,
+            401
+          ],
+          [
+            554,
+            412
+          ],
+          [
+            571,
+            419
+          ],
+          [
+            593,
+            428
+          ],
+          [
+            615,
+            437
+          ],
+          [
+            632,
+            444
+          ],
+          [
+            659,
+            455
+          ],
+          [
+            676,
+            462
+          ],
+          [
+            694,
+            469
+          ],
+          [
+            711,
+            476
+          ],
+          [
+            720,
+            480
+          ]
+        ],
+        "resized": true
+      },
+      "session-switcher": {
+        "pane": "18446744073709551615",
+        "target_sizes": [
+          [
+            195,
+            462
+          ],
+          [
+            199,
+            446
+          ],
+          [
+            208,
+            474
+          ],
+          [
+            221,
+            488
+          ],
+          [
+            234,
+            500
+          ],
+          [
+            246,
+            513
+          ],
+          [
+            259,
+            526
+          ],
+          [
+            269,
+            535
+          ],
+          [
+            282,
+            549
+          ],
+          [
+            295,
+            561
+          ],
+          [
+            307,
+            574
+          ],
+          [
+            323,
+            589
+          ],
+          [
+            333,
+            599
+          ],
+          [
+            346,
+            612
+          ],
+          [
+            359,
+            625
+          ],
+          [
+            369,
+            635
+          ],
+          [
+            384,
+            650
+          ],
+          [
+            394,
+            660
+          ],
+          [
+            405,
+            671
+          ],
+          [
+            415,
+            680
+          ],
+          [
+            420,
+            686
+          ]
+        ],
+        "resized": true
+      },
+      "status-bar": {
+        "pane": "18446744073709551611",
+        "target_sizes": [
+          [
+            580,
+            34
+          ],
+          [
+            595,
+            23
+          ],
+          [
+            634,
+            24
+          ],
+          [
+            673,
+            24
+          ],
+          [
+            712,
+            25
+          ],
+          [
+            751,
+            25
+          ],
+          [
+            790,
+            26
+          ],
+          [
+            821,
+            27
+          ],
+          [
+            860,
+            27
+          ],
+          [
+            898,
+            28
+          ],
+          [
+            937,
+            28
+          ],
+          [
+            984,
+            29
+          ],
+          [
+            1015,
+            30
+          ],
+          [
+            1054,
+            30
+          ],
+          [
+            1093,
+            31
+          ],
+          [
+            1124,
+            31
+          ],
+          [
+            1171,
+            32
+          ],
+          [
+            1202,
+            33
+          ],
+          [
+            1233,
+            33
+          ],
+          [
+            1264,
+            34
+          ],
+          [
+            1280,
+            34
+          ]
+        ],
+        "resized": true
+      },
+      "terminal-ui": {
+        "pane": "18446744073709551610",
+        "target_sizes": [
+          [
+            97,
+            223
+          ],
+          [
+            125,
+            231
+          ],
+          [
+            134,
+            237
+          ],
+          [
+            142,
+            244
+          ],
+          [
+            150,
+            250
+          ],
+          [
+            158,
+            256
+          ],
+          [
+            166,
+            263
+          ],
+          [
+            173,
+            268
+          ],
+          [
+            181,
+            274
+          ],
+          [
+            189,
+            281
+          ],
+          [
+            197,
+            287
+          ],
+          [
+            207,
+            294
+          ],
+          [
+            214,
+            300
+          ],
+          [
+            222,
+            306
+          ],
+          [
+            230,
+            313
+          ],
+          [
+            237,
+            317
+          ],
+          [
+            247,
+            325
+          ],
+          [
+            253,
+            330
+          ],
+          [
+            260,
+            335
+          ],
+          [
+            266,
+            340
+          ],
+          [
+            270,
+            343
+          ]
+        ],
+        "resized": true
+      },
+      "diff-viewer-sb1-s1": {
+        "pane": "18446744073709551608",
+        "target_sizes": [
+          [
+            97,
+            223
+          ],
+          [
+            126,
+            231
+          ],
+          [
+            134,
+            237
+          ],
+          [
+            142,
+            244
+          ],
+          [
+            150,
+            250
+          ],
+          [
+            158,
+            256
+          ],
+          [
+            167,
+            263
+          ],
+          [
+            173,
+            268
+          ],
+          [
+            181,
+            274
+          ],
+          [
+            189,
+            281
+          ],
+          [
+            198,
+            287
+          ],
+          [
+            208,
+            294
+          ],
+          [
+            214,
+            300
+          ],
+          [
+            222,
+            306
+          ],
+          [
+            231,
+            313
+          ],
+          [
+            237,
+            317
+          ],
+          [
+            247,
+            325
+          ],
+          [
+            254,
+            330
+          ],
+          [
+            260,
+            335
+          ],
+          [
+            267,
+            340
+          ],
+          [
+            270,
+            343
+          ]
+        ],
+        "resized": true
+      },
+      "neovim-ui-b1-s1": {
+        "pane": "18446744073709551607",
+        "target_sizes": [
+          [
+            97,
+            223
+          ],
+          [
+            125,
+            231
+          ],
+          [
+            134,
+            237
+          ],
+          [
+            142,
+            244
+          ],
+          [
+            150,
+            250
+          ],
+          [
+            158,
+            256
+          ],
+          [
+            166,
+            263
+          ],
+          [
+            173,
+            268
+          ],
+          [
+            181,
+            274
+          ],
+          [
+            189,
+            281
+          ],
+          [
+            197,
+            287
+          ],
+          [
+            207,
+            294
+          ],
+          [
+            214,
+            300
+          ],
+          [
+            222,
+            306
+          ],
+          [
+            230,
+            313
+          ],
+          [
+            237,
+            317
+          ],
+          [
+            247,
+            325
+          ],
+          [
+            253,
+            330
+          ],
+          [
+            260,
+            335
+          ],
+          [
+            266,
+            340
+          ],
+          [
+            270,
+            343
+          ]
+        ],
+        "resized": true
+      },
+      "coding-agent-ui-b1-s1-2": {
+        "pane": "18446744073709551606",
+        "target_sizes": [
+          [
+            97,
+            223
+          ],
+          [
+            126,
+            231
+          ],
+          [
+            134,
+            237
+          ],
+          [
+            142,
+            244
+          ],
+          [
+            150,
+            250
+          ],
+          [
+            158,
+            256
+          ],
+          [
+            167,
+            263
+          ],
+          [
+            173,
+            268
+          ],
+          [
+            181,
+            274
+          ],
+          [
+            189,
+            281
+          ],
+          [
+            198,
+            287
+          ],
+          [
+            208,
+            294
+          ],
+          [
+            214,
+            300
+          ],
+          [
+            222,
+            306
+          ],
+          [
+            231,
+            313
+          ],
+          [
+            237,
+            317
+          ],
+          [
+            247,
+            325
+          ],
+          [
+            254,
+            330
+          ],
+          [
+            260,
+            335
+          ],
+          [
+            267,
+            340
+          ],
+          [
+            270,
+            343
+          ]
+        ],
+        "resized": true
+      }
+    },
+    "synchronized_submissions": 1,
+    "facet_starts": 18,
+    "capture_cancellations": [],
+    "layout_rejections": [],
+    "before": "/tmp/brood-drag-fix-native1/plugins/drag-frames/picker-window-narrow-before.png",
+    "after": "/tmp/brood-drag-fix-native1/plugins/drag-frames/picker-window-narrow-after.png",
+    "errors": [],
+    "synchronized_completions": 1,
+    "synchronized_supersessions": 0,
+    "log_start_character": 10453781,
+    "log_end_character": 10700386,
+    "sample_count": 19,
+    "lane": "plugins"
+  },
+  {
+    "case": "picker-window-wide",
+    "expected_actors": [
+      "picker"
+    ],
+    "fixed_actors": [],
+    "boundary": "window",
+    "start": 580,
+    "target": 1280,
+    "final": 1280,
+    "duration_seconds": 1.6351515849964926,
+    "post_gesture_convergence_seconds": 0.019060478000028525,
+    "visible_positions": [
+      587,
+      626,
+      657,
+      696,
+      735,
+      774,
+      813,
+      852,
+      891,
+      930,
+      968,
+      1007,
+      1046,
+      1085,
+      1124,
+      1163,
+      1202,
+      1241,
+      1280
+    ],
+    "actors": {
+      "inbox": {
+        "pane": "18446744073709551612",
+        "target_sizes": [
+          [
+            188,
+            446
+          ],
+          [
+            190,
+            448
+          ],
+          [
+            202,
+            461
+          ],
+          [
+            215,
+            473
+          ],
+          [
+            228,
+            485
+          ],
+          [
+            240,
+            498
+          ],
+          [
+            253,
+            510
+          ],
+          [
+            266,
+            522
+          ],
+          [
+            278,
+            535
+          ],
+          [
+            288,
+            544
+          ],
+          [
+            303,
+            559
+          ],
+          [
+            313,
+            570
+          ],
+          [
+            320,
+            686
+          ],
+          [
+            328,
+            584
+          ],
+          [
+            338,
+            595
+          ],
+          [
+            351,
+            607
+          ],
+          [
+            364,
+            619
+          ],
+          [
+            379,
+            634
+          ],
+          [
+            389,
+            644
+          ],
+          [
+            404,
+            659
+          ],
+          [
+            414,
+            669
+          ]
+        ],
+        "resized": true
+      },
+      "picker": {
+        "pane": "18446744073709551614",
+        "target_sizes": [
+          [
+            510,
+            394
+          ],
+          [
+            517,
+            395
+          ],
+          [
+            551,
+            407
+          ],
+          [
+            585,
+            417
+          ],
+          [
+            620,
+            428
+          ],
+          [
+            654,
+            440
+          ],
+          [
+            688,
+            450
+          ],
+          [
+            720,
+            480
+          ],
+          [
+            722,
+            461
+          ],
+          [
+            757,
+            472
+          ],
+          [
+            784,
+            481
+          ],
+          [
+            825,
+            494
+          ],
+          [
+            852,
+            503
+          ],
+          [
+            893,
+            516
+          ],
+          [
+            920,
+            525
+          ],
+          [
+            955,
+            535
+          ],
+          [
+            989,
+            546
+          ],
+          [
+            1030,
+            559
+          ],
+          [
+            1058,
+            568
+          ],
+          [
+            1098,
+            581
+          ],
+          [
+            1126,
+            590
+          ]
+        ],
+        "resized": true
+      },
+      "session-switcher": {
+        "pane": "18446744073709551615",
+        "target_sizes": [
+          [
+            199,
+            446
+          ],
+          [
+            201,
+            448
+          ],
+          [
+            215,
+            461
+          ],
+          [
+            228,
+            473
+          ],
+          [
+            242,
+            485
+          ],
+          [
+            255,
+            498
+          ],
+          [
+            268,
+            510
+          ],
+          [
+            282,
+            522
+          ],
+          [
+            295,
+            535
+          ],
+          [
+            306,
+            544
+          ],
+          [
+            322,
+            559
+          ],
+          [
+            332,
+            570
+          ],
+          [
+            348,
+            584
+          ],
+          [
+            359,
+            595
+          ],
+          [
+            372,
+            607
+          ],
+          [
+            386,
+            619
+          ],
+          [
+            402,
+            634
+          ],
+          [
+            413,
+            644
+          ],
+          [
+            420,
+            686
+          ],
+          [
+            428,
+            659
+          ],
+          [
+            439,
+            669
+          ]
+        ],
+        "resized": true
+      },
+      "status-bar": {
+        "pane": "18446744073709551611",
+        "target_sizes": [
+          [
+            580,
+            34
+          ],
+          [
+            587,
+            34
+          ],
+          [
+            626,
+            35
+          ],
+          [
+            665,
+            36
+          ],
+          [
+            704,
+            37
+          ],
+          [
+            743,
+            38
+          ],
+          [
+            782,
+            39
+          ],
+          [
+            821,
+            40
+          ],
+          [
+            860,
+            41
+          ],
+          [
+            891,
+            42
+          ],
+          [
+            937,
+            43
+          ],
+          [
+            968,
+            43
+          ],
+          [
+            1015,
+            45
+          ],
+          [
+            1046,
+            45
+          ],
+          [
+            1085,
+            46
+          ],
+          [
+            1124,
+            47
+          ],
+          [
+            1171,
+            48
+          ],
+          [
+            1202,
+            49
+          ],
+          [
+            1248,
+            50
+          ],
+          [
+            1280,
+            34
+          ],
+          [
+            1280,
+            51
+          ]
+        ],
+        "resized": true
+      },
+      "terminal-ui": {
+        "pane": "18446744073709551610",
+        "target_sizes": [
+          [
+            97,
+            223
+          ],
+          [
+            98,
+            224
+          ],
+          [
+            104,
+            230
+          ],
+          [
+            111,
+            236
+          ],
+          [
+            117,
+            243
+          ],
+          [
+            124,
+            249
+          ],
+          [
+            130,
+            255
+          ],
+          [
+            137,
+            261
+          ],
+          [
+            143,
+            268
+          ],
+          [
+            148,
+            272
+          ],
+          [
+            156,
+            280
+          ],
+          [
+            161,
+            285
+          ],
+          [
+            169,
+            292
+          ],
+          [
+            174,
+            297
+          ],
+          [
+            181,
+            303
+          ],
+          [
+            187,
+            309
+          ],
+          [
+            195,
+            317
+          ],
+          [
+            200,
+            322
+          ],
+          [
+            208,
+            329
+          ],
+          [
+            213,
+            335
+          ],
+          [
+            270,
+            343
+          ]
+        ],
+        "resized": true
+      },
+      "diff-viewer-sb1-s1": {
+        "pane": "18446744073709551608",
+        "target_sizes": [
+          [
+            97,
+            223
+          ],
+          [
+            98,
+            224
+          ],
+          [
+            104,
+            230
+          ],
+          [
+            111,
+            236
+          ],
+          [
+            117,
+            243
+          ],
+          [
+            124,
+            249
+          ],
+          [
+            130,
+            255
+          ],
+          [
+            137,
+            261
+          ],
+          [
+            143,
+            268
+          ],
+          [
+            149,
+            272
+          ],
+          [
+            156,
+            280
+          ],
+          [
+            161,
+            285
+          ],
+          [
+            169,
+            292
+          ],
+          [
+            174,
+            297
+          ],
+          [
+            181,
+            303
+          ],
+          [
+            187,
+            309
+          ],
+          [
+            195,
+            317
+          ],
+          [
+            200,
+            322
+          ],
+          [
+            208,
+            329
+          ],
+          [
+            213,
+            335
+          ],
+          [
+            270,
+            343
+          ]
+        ],
+        "resized": true
+      },
+      "neovim-ui-b1-s1": {
+        "pane": "18446744073709551607",
+        "target_sizes": [
+          [
+            97,
+            223
+          ],
+          [
+            98,
+            224
+          ],
+          [
+            104,
+            230
+          ],
+          [
+            111,
+            236
+          ],
+          [
+            117,
+            243
+          ],
+          [
+            124,
+            249
+          ],
+          [
+            130,
+            255
+          ],
+          [
+            137,
+            261
+          ],
+          [
+            143,
+            268
+          ],
+          [
+            148,
+            272
+          ],
+          [
+            156,
+            280
+          ],
+          [
+            161,
+            285
+          ],
+          [
+            169,
+            292
+          ],
+          [
+            174,
+            297
+          ],
+          [
+            181,
+            303
+          ],
+          [
+            187,
+            309
+          ],
+          [
+            195,
+            317
+          ],
+          [
+            200,
+            322
+          ],
+          [
+            208,
+            329
+          ],
+          [
+            213,
+            335
+          ],
+          [
+            270,
+            343
+          ]
+        ],
+        "resized": true
+      },
+      "coding-agent-ui-b1-s1-2": {
+        "pane": "18446744073709551606",
+        "target_sizes": [
+          [
+            97,
+            223
+          ],
+          [
+            98,
+            224
+          ],
+          [
+            104,
+            230
+          ],
+          [
+            111,
+            236
+          ],
+          [
+            117,
+            243
+          ],
+          [
+            124,
+            249
+          ],
+          [
+            130,
+            255
+          ],
+          [
+            137,
+            261
+          ],
+          [
+            143,
+            268
+          ],
+          [
+            149,
+            272
+          ],
+          [
+            156,
+            280
+          ],
+          [
+            161,
+            285
+          ],
+          [
+            169,
+            292
+          ],
+          [
+            174,
+            297
+          ],
+          [
+            181,
+            303
+          ],
+          [
+            187,
+            309
+          ],
+          [
+            195,
+            317
+          ],
+          [
+            200,
+            322
+          ],
+          [
+            208,
+            329
+          ],
+          [
+            213,
+            335
+          ],
+          [
+            270,
+            343
+          ]
+        ],
+        "resized": true
+      }
+    },
+    "synchronized_submissions": 1,
+    "facet_starts": 18,
+    "capture_cancellations": [],
+    "layout_rejections": [],
+    "before": "/tmp/brood-drag-fix-native1/plugins/drag-frames/picker-window-wide-before.png",
+    "after": "/tmp/brood-drag-fix-native1/plugins/drag-frames/picker-window-wide-after.png",
+    "errors": [],
+    "synchronized_completions": 1,
+    "synchronized_supersessions": 0,
+    "log_start_character": 10702652,
+    "log_end_character": 10951744,
+    "sample_count": 19,
+    "lane": "plugins"
+  },
+  {
+    "case": "keybindings-window-narrow",
+    "expected_actors": [
+      "keybindings"
+    ],
+    "fixed_actors": [],
+    "boundary": "window",
+    "start": 1280,
+    "target": 580,
+    "final": 580,
+    "duration_seconds": 1.7201573880010983,
+    "post_gesture_convergence_seconds": 0.014244735997635871,
+    "visible_positions": [
+      580,
+      603,
+      642,
+      681,
+      720,
+      758,
+      790,
+      828,
+      867,
+      906,
+      945,
+      984,
+      1023,
+      1054,
+      1093,
+      1132,
+      1171,
+      1210,
+      1241,
+      1272
+    ],
+    "actors": {
+      "inbox": {
+        "pane": "18446744073709551612",
+        "target_sizes": [
+          [
+            145,
+            457
+          ],
+          [
+            151,
+            465
+          ],
+          [
+            159,
+            474
+          ],
+          [
+            168,
+            488
+          ],
+          [
+            178,
+            500
+          ],
+          [
+            188,
+            446
+          ],
+          [
+            188,
+            513
+          ],
+          [
+            198,
+            526
+          ],
+          [
+            207,
+            538
+          ],
+          [
+            215,
+            549
+          ],
+          [
+            225,
+            561
+          ],
+          [
+            234,
+            574
+          ],
+          [
+            244,
+            587
+          ],
+          [
+            254,
+            599
+          ],
+          [
+            264,
+            612
+          ],
+          [
+            273,
+            625
+          ],
+          [
+            283,
+            637
+          ],
+          [
+            291,
+            648
+          ],
+          [
+            301,
+            660
+          ],
+          [
+            308,
+            671
+          ],
+          [
+            316,
+            680
+          ],
+          [
+            320,
+            686
+          ]
+        ],
+        "resized": true
+      },
+      "keybindings": {
+        "pane": "18446744073709551613",
+        "target_sizes": [
+          [
+            580,
+            480
+          ],
+          [
+            603,
+            488
+          ],
+          [
+            634,
+            498
+          ],
+          [
+            673,
+            512
+          ],
+          [
+            712,
+            525
+          ],
+          [
+            751,
+            538
+          ],
+          [
+            790,
+            552
+          ],
+          [
+            828,
+            565
+          ],
+          [
+            860,
+            576
+          ],
+          [
+            898,
+            589
+          ],
+          [
+            937,
+            602
+          ],
+          [
+            976,
+            616
+          ],
+          [
+            1015,
+            629
+          ],
+          [
+            1054,
+            642
+          ],
+          [
+            1093,
+            656
+          ],
+          [
+            1132,
+            669
+          ],
+          [
+            1163,
+            680
+          ],
+          [
+            1202,
+            693
+          ],
+          [
+            1233,
+            704
+          ],
+          [
+            1264,
+            714
+          ],
+          [
+            1280,
+            720
+          ]
+        ],
+        "resized": true
+      },
+      "session-switcher": {
+        "pane": "18446744073709551615",
+        "target_sizes": [
+          [
+            190,
+            457
+          ],
+          [
+            198,
+            465
+          ],
+          [
+            199,
+            446
+          ],
+          [
+            208,
+            474
+          ],
+          [
+            221,
+            488
+          ],
+          [
+            234,
+            500
+          ],
+          [
+            246,
+            513
+          ],
+          [
+            259,
+            526
+          ],
+          [
+            272,
+            538
+          ],
+          [
+            282,
+            549
+          ],
+          [
+            295,
+            561
+          ],
+          [
+            307,
+            574
+          ],
+          [
+            320,
+            587
+          ],
+          [
+            333,
+            599
+          ],
+          [
+            346,
+            612
+          ],
+          [
+            359,
+            625
+          ],
+          [
+            371,
+            637
+          ],
+          [
+            382,
+            648
+          ],
+          [
+            394,
+            660
+          ],
+          [
+            405,
+            671
+          ],
+          [
+            415,
+            680
+          ],
+          [
+            420,
+            686
+          ]
+        ],
+        "resized": true
+      },
+      "status-bar": {
+        "pane": "18446744073709551611",
+        "target_sizes": [
+          [
+            580,
+            23
+          ],
+          [
+            580,
+            34
+          ],
+          [
+            603,
+            23
+          ],
+          [
+            634,
+            24
+          ],
+          [
+            673,
+            24
+          ],
+          [
+            712,
+            25
+          ],
+          [
+            751,
+            25
+          ],
+          [
+            790,
+            26
+          ],
+          [
+            828,
+            27
+          ],
+          [
+            860,
+            27
+          ],
+          [
+            898,
+            28
+          ],
+          [
+            937,
+            28
+          ],
+          [
+            976,
+            29
+          ],
+          [
+            1015,
+            30
+          ],
+          [
+            1054,
+            30
+          ],
+          [
+            1093,
+            31
+          ],
+          [
+            1132,
+            32
+          ],
+          [
+            1163,
+            32
+          ],
+          [
+            1202,
+            33
+          ],
+          [
+            1233,
+            33
+          ],
+          [
+            1264,
+            34
+          ],
+          [
+            1280,
+            34
+          ]
+        ],
+        "resized": true
+      },
+      "terminal-ui": {
+        "pane": "18446744073709551610",
+        "target_sizes": [
+          [
+            97,
+            223
+          ],
+          [
+            122,
+            229
+          ],
+          [
+            127,
+            232
+          ],
+          [
+            134,
+            237
+          ],
+          [
+            142,
+            244
+          ],
+          [
+            150,
+            250
+          ],
+          [
+            158,
+            256
+          ],
+          [
+            166,
+            263
+          ],
+          [
+            174,
+            269
+          ],
+          [
+            181,
+            274
+          ],
+          [
+            189,
+            281
+          ],
+          [
+            197,
+            287
+          ],
+          [
+            206,
+            293
+          ],
+          [
+            214,
+            300
+          ],
+          [
+            222,
+            306
+          ],
+          [
+            230,
+            313
+          ],
+          [
+            239,
+            319
+          ],
+          [
+            245,
+            324
+          ],
+          [
+            253,
+            330
+          ],
+          [
+            260,
+            335
+          ],
+          [
+            266,
+            340
+          ],
+          [
+            270,
+            343
+          ]
+        ],
+        "resized": true
+      },
+      "diff-viewer-sb1-s1": {
+        "pane": "18446744073709551608",
+        "target_sizes": [
+          [
+            97,
+            223
+          ],
+          [
+            122,
+            229
+          ],
+          [
+            127,
+            232
+          ],
+          [
+            134,
+            237
+          ],
+          [
+            142,
+            244
+          ],
+          [
+            150,
+            250
+          ],
+          [
+            158,
+            256
+          ],
+          [
+            167,
+            263
+          ],
+          [
+            175,
+            269
+          ],
+          [
+            181,
+            274
+          ],
+          [
+            189,
+            281
+          ],
+          [
+            198,
+            287
+          ],
+          [
+            206,
+            293
+          ],
+          [
+            214,
+            300
+          ],
+          [
+            222,
+            306
+          ],
+          [
+            231,
+            313
+          ],
+          [
+            239,
+            319
+          ],
+          [
+            245,
+            324
+          ],
+          [
+            254,
+            330
+          ],
+          [
+            260,
+            335
+          ],
+          [
+            267,
+            340
+          ],
+          [
+            270,
+            343
+          ]
+        ],
+        "resized": true
+      },
+      "neovim-ui-b1-s1": {
+        "pane": "18446744073709551607",
+        "target_sizes": [
+          [
+            97,
+            223
+          ],
+          [
+            122,
+            229
+          ],
+          [
+            127,
+            232
+          ],
+          [
+            134,
+            237
+          ],
+          [
+            142,
+            244
+          ],
+          [
+            150,
+            250
+          ],
+          [
+            158,
+            256
+          ],
+          [
+            166,
+            263
+          ],
+          [
+            174,
+            269
+          ],
+          [
+            181,
+            274
+          ],
+          [
+            189,
+            281
+          ],
+          [
+            197,
+            287
+          ],
+          [
+            206,
+            293
+          ],
+          [
+            214,
+            300
+          ],
+          [
+            222,
+            306
+          ],
+          [
+            230,
+            313
+          ],
+          [
+            239,
+            319
+          ],
+          [
+            245,
+            324
+          ],
+          [
+            253,
+            330
+          ],
+          [
+            260,
+            335
+          ],
+          [
+            266,
+            340
+          ],
+          [
+            270,
+            343
+          ]
+        ],
+        "resized": true
+      },
+      "coding-agent-ui-b1-s1-2": {
+        "pane": "18446744073709551606",
+        "target_sizes": [
+          [
+            97,
+            223
+          ],
+          [
+            122,
+            229
+          ],
+          [
+            127,
+            232
+          ],
+          [
+            134,
+            237
+          ],
+          [
+            142,
+            244
+          ],
+          [
+            150,
+            250
+          ],
+          [
+            158,
+            256
+          ],
+          [
+            167,
+            263
+          ],
+          [
+            175,
+            269
+          ],
+          [
+            181,
+            274
+          ],
+          [
+            189,
+            281
+          ],
+          [
+            198,
+            287
+          ],
+          [
+            206,
+            293
+          ],
+          [
+            214,
+            300
+          ],
+          [
+            222,
+            306
+          ],
+          [
+            231,
+            313
+          ],
+          [
+            239,
+            319
+          ],
+          [
+            245,
+            324
+          ],
+          [
+            254,
+            330
+          ],
+          [
+            260,
+            335
+          ],
+          [
+            267,
+            340
+          ],
+          [
+            270,
+            343
+          ]
+        ],
+        "resized": true
+      }
+    },
+    "synchronized_submissions": 1,
+    "facet_starts": 19,
+    "capture_cancellations": [],
+    "layout_rejections": [],
+    "before": "/tmp/brood-drag-fix-native1/plugins/drag-frames/keybindings-window-narrow-before.png",
+    "after": "/tmp/brood-drag-fix-native1/plugins/drag-frames/keybindings-window-narrow-after.png",
+    "errors": [],
+    "synchronized_completions": 1,
+    "synchronized_supersessions": 0,
+    "log_start_character": 11156401,
+    "log_end_character": 11407340,
+    "sample_count": 20,
+    "lane": "plugins"
+  },
+  {
+    "case": "keybindings-window-wide",
+    "expected_actors": [
+      "keybindings"
+    ],
+    "fixed_actors": [],
+    "boundary": "window",
+    "start": 580,
+    "target": 1280,
+    "final": 1280,
+    "duration_seconds": 1.6361602510005469,
+    "post_gesture_convergence_seconds": 0.012045736002619378,
+    "visible_positions": [
+      587,
+      618,
+      657,
+      696,
+      735,
+      774,
+      813,
+      852,
+      891,
+      930,
+      968,
+      1007,
+      1046,
+      1085,
+      1116,
+      1155,
+      1194,
+      1233,
+      1272
+    ],
+    "actors": {
+      "inbox": {
+        "pane": "18446744073709551612",
+        "target_sizes": [
+          [
+            188,
+            446
+          ],
+          [
+            192,
+            451
+          ],
+          [
+            202,
+            461
+          ],
+          [
+            212,
+            470
+          ],
+          [
+            228,
+            485
+          ],
+          [
+            238,
+            495
+          ],
+          [
+            253,
+            510
+          ],
+          [
+            263,
+            520
+          ],
+          [
+            276,
+            532
+          ],
+          [
+            290,
+            547
+          ],
+          [
+            303,
+            559
+          ],
+          [
+            316,
+            572
+          ],
+          [
+            320,
+            686
+          ],
+          [
+            326,
+            582
+          ],
+          [
+            341,
+            597
+          ],
+          [
+            351,
+            607
+          ],
+          [
+            364,
+            619
+          ],
+          [
+            376,
+            632
+          ],
+          [
+            386,
+            641
+          ],
+          [
+            401,
+            656
+          ],
+          [
+            411,
+            666
+          ]
+        ],
+        "resized": true
+      },
+      "keybindings": {
+        "pane": "18446744073709551613",
+        "target_sizes": [
+          [
+            580,
+            480
+          ],
+          [
+            595,
+            485
+          ],
+          [
+            626,
+            496
+          ],
+          [
+            657,
+            506
+          ],
+          [
+            704,
+            522
+          ],
+          [
+            735,
+            533
+          ],
+          [
+            782,
+            549
+          ],
+          [
+            813,
+            560
+          ],
+          [
+            852,
+            573
+          ],
+          [
+            898,
+            589
+          ],
+          [
+            937,
+            602
+          ],
+          [
+            976,
+            616
+          ],
+          [
+            1007,
+            626
+          ],
+          [
+            1054,
+            642
+          ],
+          [
+            1085,
+            653
+          ],
+          [
+            1124,
+            666
+          ],
+          [
+            1163,
+            680
+          ],
+          [
+            1194,
+            690
+          ],
+          [
+            1241,
+            706
+          ],
+          [
+            1272,
+            717
+          ],
+          [
+            1280,
+            720
+          ]
+        ],
+        "resized": true
+      },
+      "session-switcher": {
+        "pane": "18446744073709551615",
+        "target_sizes": [
+          [
+            199,
+            446
+          ],
+          [
+            204,
+            451
+          ],
+          [
+            215,
+            461
+          ],
+          [
+            226,
+            470
+          ],
+          [
+            242,
+            485
+          ],
+          [
+            252,
+            495
+          ],
+          [
+            268,
+            510
+          ],
+          [
+            279,
+            520
+          ],
+          [
+            292,
+            532
+          ],
+          [
+            308,
+            547
+          ],
+          [
+            322,
+            559
+          ],
+          [
+            335,
+            572
+          ],
+          [
+            346,
+            582
+          ],
+          [
+            362,
+            597
+          ],
+          [
+            372,
+            607
+          ],
+          [
+            386,
+            619
+          ],
+          [
+            399,
+            632
+          ],
+          [
+            410,
+            641
+          ],
+          [
+            420,
+            686
+          ],
+          [
+            426,
+            656
+          ],
+          [
+            437,
+            666
+          ]
+        ],
+        "resized": true
+      },
+      "status-bar": {
+        "pane": "18446744073709551611",
+        "target_sizes": [
+          [
+            580,
+            34
+          ],
+          [
+            595,
+            34
+          ],
+          [
+            626,
+            35
+          ],
+          [
+            657,
+            36
+          ],
+          [
+            704,
+            37
+          ],
+          [
+            735,
+            38
+          ],
+          [
+            782,
+            39
+          ],
+          [
+            813,
+            40
+          ],
+          [
+            852,
+            41
+          ],
+          [
+            898,
+            42
+          ],
+          [
+            937,
+            43
+          ],
+          [
+            976,
+            44
+          ],
+          [
+            1007,
+            44
+          ],
+          [
+            1054,
+            45
+          ],
+          [
+            1085,
+            46
+          ],
+          [
+            1124,
+            47
+          ],
+          [
+            1163,
+            48
+          ],
+          [
+            1194,
+            49
+          ],
+          [
+            1241,
+            50
+          ],
+          [
+            1272,
+            51
+          ],
+          [
+            1280,
+            34
+          ]
+        ],
+        "resized": true
+      },
+      "terminal-ui": {
+        "pane": "18446744073709551610",
+        "target_sizes": [
+          [
+            97,
+            223
+          ],
+          [
+            99,
+            225
+          ],
+          [
+            104,
+            230
+          ],
+          [
+            109,
+            235
+          ],
+          [
+            117,
+            243
+          ],
+          [
+            122,
+            248
+          ],
+          [
+            130,
+            255
+          ],
+          [
+            135,
+            260
+          ],
+          [
+            142,
+            266
+          ],
+          [
+            150,
+            274
+          ],
+          [
+            156,
+            280
+          ],
+          [
+            163,
+            286
+          ],
+          [
+            168,
+            291
+          ],
+          [
+            175,
+            298
+          ],
+          [
+            181,
+            303
+          ],
+          [
+            187,
+            309
+          ],
+          [
+            194,
+            316
+          ],
+          [
+            199,
+            321
+          ],
+          [
+            207,
+            328
+          ],
+          [
+            212,
+            333
+          ],
+          [
+            270,
+            343
+          ]
+        ],
+        "resized": true
+      },
+      "diff-viewer-sb1-s1": {
+        "pane": "18446744073709551608",
+        "target_sizes": [
+          [
+            97,
+            223
+          ],
+          [
+            99,
+            225
+          ],
+          [
+            104,
+            230
+          ],
+          [
+            110,
+            235
+          ],
+          [
+            117,
+            243
+          ],
+          [
+            123,
+            248
+          ],
+          [
+            130,
+            255
+          ],
+          [
+            136,
+            260
+          ],
+          [
+            142,
+            266
+          ],
+          [
+            150,
+            274
+          ],
+          [
+            156,
+            280
+          ],
+          [
+            163,
+            286
+          ],
+          [
+            168,
+            291
+          ],
+          [
+            176,
+            298
+          ],
+          [
+            181,
+            303
+          ],
+          [
+            187,
+            309
+          ],
+          [
+            194,
+            316
+          ],
+          [
+            199,
+            321
+          ],
+          [
+            207,
+            328
+          ],
+          [
+            212,
+            333
+          ],
+          [
+            270,
+            343
+          ]
+        ],
+        "resized": true
+      },
+      "neovim-ui-b1-s1": {
+        "pane": "18446744073709551607",
+        "target_sizes": [
+          [
+            97,
+            223
+          ],
+          [
+            99,
+            225
+          ],
+          [
+            104,
+            230
+          ],
+          [
+            109,
+            235
+          ],
+          [
+            117,
+            243
+          ],
+          [
+            122,
+            248
+          ],
+          [
+            130,
+            255
+          ],
+          [
+            135,
+            260
+          ],
+          [
+            142,
+            266
+          ],
+          [
+            150,
+            274
+          ],
+          [
+            156,
+            280
+          ],
+          [
+            163,
+            286
+          ],
+          [
+            168,
+            291
+          ],
+          [
+            175,
+            298
+          ],
+          [
+            181,
+            303
+          ],
+          [
+            187,
+            309
+          ],
+          [
+            194,
+            316
+          ],
+          [
+            199,
+            321
+          ],
+          [
+            207,
+            328
+          ],
+          [
+            212,
+            333
+          ],
+          [
+            270,
+            343
+          ]
+        ],
+        "resized": true
+      },
+      "coding-agent-ui-b1-s1-2": {
+        "pane": "18446744073709551606",
+        "target_sizes": [
+          [
+            97,
+            223
+          ],
+          [
+            99,
+            225
+          ],
+          [
+            104,
+            230
+          ],
+          [
+            110,
+            235
+          ],
+          [
+            117,
+            243
+          ],
+          [
+            123,
+            248
+          ],
+          [
+            130,
+            255
+          ],
+          [
+            136,
+            260
+          ],
+          [
+            142,
+            266
+          ],
+          [
+            150,
+            274
+          ],
+          [
+            156,
+            280
+          ],
+          [
+            163,
+            286
+          ],
+          [
+            168,
+            291
+          ],
+          [
+            176,
+            298
+          ],
+          [
+            181,
+            303
+          ],
+          [
+            187,
+            309
+          ],
+          [
+            194,
+            316
+          ],
+          [
+            199,
+            321
+          ],
+          [
+            207,
+            328
+          ],
+          [
+            212,
+            333
+          ],
+          [
+            270,
+            343
+          ]
+        ],
+        "resized": true
+      }
+    },
+    "synchronized_submissions": 1,
+    "facet_starts": 18,
+    "capture_cancellations": [],
+    "layout_rejections": [],
+    "before": "/tmp/brood-drag-fix-native1/plugins/drag-frames/keybindings-window-wide-before.png",
+    "after": "/tmp/brood-drag-fix-native1/plugins/drag-frames/keybindings-window-wide-after.png",
+    "errors": [],
+    "synchronized_completions": 1,
+    "synchronized_supersessions": 0,
+    "log_start_character": 11409625,
+    "log_end_character": 11659678,
+    "sample_count": 19,
+    "lane": "plugins"
+  },
+  {
+    "case": "resize-proof-narrow",
+    "expected_actors": [
+      "resize-proof-fast"
+    ],
+    "fixed_actors": [],
+    "boundary": "tile",
+    "start": 480,
+    "target": 300,
+    "final": 300,
+    "duration_seconds": 1.6817658539948752,
+    "post_gesture_convergence_seconds": 0.0014749000038136728,
+    "visible_positions": [
+      300,
+      310,
+      318,
+      328,
+      338,
+      348,
+      358,
+      368,
+      378,
+      388,
+      398,
+      408,
+      418,
+      428,
+      438,
+      448,
+      458,
+      468,
+      478,
+      480
+    ],
+    "actors": {
+      "resize-proof-fast": {
+        "pane": "18446744073709551609",
+        "target_sizes": [
+          [
+            300,
+            686
+          ],
+          [
+            310,
+            686
+          ],
+          [
+            318,
+            686
+          ],
+          [
+            328,
+            686
+          ],
+          [
+            338,
+            686
+          ],
+          [
+            348,
+            686
+          ],
+          [
+            358,
+            686
+          ],
+          [
+            368,
+            686
+          ],
+          [
+            378,
+            686
+          ],
+          [
+            388,
+            686
+          ],
+          [
+            398,
+            686
+          ],
+          [
+            408,
+            686
+          ],
+          [
+            418,
+            686
+          ],
+          [
+            428,
+            686
+          ],
+          [
+            438,
+            686
+          ],
+          [
+            448,
+            686
+          ],
+          [
+            458,
+            686
+          ],
+          [
+            468,
+            686
+          ],
+          [
+            478,
+            686
+          ],
+          [
+            480,
+            686
+          ]
+        ],
+        "resized": true
+      },
+      "session-switcher": {
+        "pane": "18446744073709551615",
+        "target_sizes": [
+          [
+            320,
+            686
+          ]
+        ],
+        "resized": false
+      },
+      "terminal-ui": {
+        "pane": "18446744073709551610",
+        "target_sizes": [
+          [
+            480,
+            686
+          ],
+          [
+            482,
+            686
+          ],
+          [
+            492,
+            686
+          ],
+          [
+            502,
+            686
+          ],
+          [
+            512,
+            686
+          ],
+          [
+            522,
+            686
+          ],
+          [
+            532,
+            686
+          ],
+          [
+            542,
+            686
+          ],
+          [
+            552,
+            686
+          ],
+          [
+            562,
+            686
+          ],
+          [
+            572,
+            686
+          ],
+          [
+            582,
+            686
+          ],
+          [
+            592,
+            686
+          ],
+          [
+            602,
+            686
+          ],
+          [
+            612,
+            686
+          ],
+          [
+            622,
+            686
+          ],
+          [
+            632,
+            686
+          ],
+          [
+            642,
+            686
+          ],
+          [
+            650,
+            686
+          ],
+          [
+            660,
+            686
+          ]
+        ],
+        "resized": true
+      },
+      "status-bar": {
+        "pane": "18446744073709551611",
+        "target_sizes": [
+          [
+            1280,
+            34
+          ]
+        ],
+        "resized": false
+      }
+    },
+    "synchronized_submissions": 182,
+    "facet_starts": 185,
+    "capture_cancellations": [],
+    "layout_rejections": [],
+    "before": "/tmp/brood-drag-fix-native1/resize-proof/drag-frames/resize-proof-narrow-before.png",
+    "after": "/tmp/brood-drag-fix-native1/resize-proof/drag-frames/resize-proof-narrow-after.png",
+    "errors": [],
+    "synchronized_completions": 91,
+    "synchronized_supersessions": 0,
+    "log_start_character": 80857,
+    "log_end_character": 813544,
+    "sample_count": 21,
+    "lane": "resize-proof"
+  },
+  {
+    "case": "resize-proof-wide",
+    "expected_actors": [
+      "resize-proof-fast"
+    ],
+    "fixed_actors": [],
+    "boundary": "tile",
+    "start": 300,
+    "target": 480,
+    "final": 480,
+    "duration_seconds": 1.6819402350010932,
+    "post_gesture_convergence_seconds": 0.0019953209994127974,
+    "visible_positions": [
+      300,
+      302,
+      312,
+      322,
+      332,
+      342,
+      352,
+      362,
+      372,
+      382,
+      392,
+      402,
+      412,
+      422,
+      432,
+      442,
+      452,
+      462,
+      472,
+      480
+    ],
+    "actors": {
+      "resize-proof-fast": {
+        "pane": "18446744073709551609",
+        "target_sizes": [
+          [
+            300,
+            686
+          ],
+          [
+            302,
+            686
+          ],
+          [
+            312,
+            686
+          ],
+          [
+            322,
+            686
+          ],
+          [
+            332,
+            686
+          ],
+          [
+            342,
+            686
+          ],
+          [
+            352,
+            686
+          ],
+          [
+            362,
+            686
+          ],
+          [
+            372,
+            686
+          ],
+          [
+            382,
+            686
+          ],
+          [
+            392,
+            686
+          ],
+          [
+            402,
+            686
+          ],
+          [
+            412,
+            686
+          ],
+          [
+            422,
+            686
+          ],
+          [
+            432,
+            686
+          ],
+          [
+            442,
+            686
+          ],
+          [
+            452,
+            686
+          ],
+          [
+            462,
+            686
+          ],
+          [
+            472,
+            686
+          ],
+          [
+            480,
+            686
+          ]
+        ],
+        "resized": true
+      },
+      "session-switcher": {
+        "pane": "18446744073709551615",
+        "target_sizes": [
+          [
+            320,
+            686
+          ]
+        ],
+        "resized": false
+      },
+      "terminal-ui": {
+        "pane": "18446744073709551610",
+        "target_sizes": [
+          [
+            480,
+            686
+          ],
+          [
+            488,
+            686
+          ],
+          [
+            498,
+            686
+          ],
+          [
+            508,
+            686
+          ],
+          [
+            518,
+            686
+          ],
+          [
+            528,
+            686
+          ],
+          [
+            538,
+            686
+          ],
+          [
+            548,
+            686
+          ],
+          [
+            558,
+            686
+          ],
+          [
+            568,
+            686
+          ],
+          [
+            578,
+            686
+          ],
+          [
+            588,
+            686
+          ],
+          [
+            598,
+            686
+          ],
+          [
+            608,
+            686
+          ],
+          [
+            618,
+            686
+          ],
+          [
+            628,
+            686
+          ],
+          [
+            638,
+            686
+          ],
+          [
+            648,
+            686
+          ],
+          [
+            658,
+            686
+          ],
+          [
+            660,
+            686
+          ]
+        ],
+        "resized": true
+      },
+      "status-bar": {
+        "pane": "18446744073709551611",
+        "target_sizes": [
+          [
+            1280,
+            34
+          ]
+        ],
+        "resized": false
+      }
+    },
+    "synchronized_submissions": 182,
+    "facet_starts": 185,
+    "capture_cancellations": [],
+    "layout_rejections": [],
+    "before": "/tmp/brood-drag-fix-native1/resize-proof/drag-frames/resize-proof-wide-before.png",
+    "after": "/tmp/brood-drag-fix-native1/resize-proof/drag-frames/resize-proof-wide-after.png",
+    "errors": [],
+    "synchronized_completions": 91,
+    "synchronized_supersessions": 0,
+    "log_start_character": 813544,
+    "log_end_character": 1518426,
+    "sample_count": 21,
+    "lane": "resize-proof"
+  }
+]

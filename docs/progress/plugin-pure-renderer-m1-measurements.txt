@@ -1,0 +1,100 @@
+M1 release observations, 2026-09-05
+Reference and limitations: plugin-pure-renderer.md (Measurements And Scope).
+
+Snapshot storage, 500 revisions per shape/strategy:
+shape=session-list strategy=copied revisions=500 allocated_payload_bytes=2048000 peak_payload_bytes=16384
+shape=session-list strategy=copied stage=construction p50_ns=71 p95_ns=110 p99_ns=141 max_ns=771
+shape=session-list strategy=copied stage=assembly p50_ns=70 p95_ns=81 p99_ns=81 max_ns=601
+shape=session-list strategy=copied stage=exchange p50_ns=30 p95_ns=31 p99_ns=40 max_ns=40
+shape=session-list strategy=copied stage=acquisition p50_ns=40 p95_ns=40 p99_ns=41 max_ns=190
+shape=session-list strategy=copied stage=transfer_buffer p50_ns=50 p95_ns=70 p99_ns=101 max_ns=722
+shape=session-list strategy=copied stage=reclamation p50_ns=110 p95_ns=120 p99_ns=141 max_ns=842
+shape=session-list strategy=immutable-chunks revisions=500 allocated_payload_bytes=67968 peak_payload_bytes=4480
+shape=session-list strategy=immutable-chunks stage=construction p50_ns=220 p95_ns=240 p99_ns=291 max_ns=1213
+shape=session-list strategy=immutable-chunks stage=assembly p50_ns=130 p95_ns=161 p99_ns=211 max_ns=2244
+shape=session-list strategy=immutable-chunks stage=exchange p50_ns=30 p95_ns=40 p99_ns=41 max_ns=190
+shape=session-list strategy=immutable-chunks stage=acquisition p50_ns=40 p95_ns=41 p99_ns=41 max_ns=41
+shape=session-list strategy=immutable-chunks stage=transfer_buffer p50_ns=80 p95_ns=91 p99_ns=541 max_ns=53770
+shape=session-list strategy=immutable-chunks stage=reclamation p50_ns=260 p95_ns=271 p99_ns=281 max_ns=1072
+shape=session-list final_reclamation_ns=310
+shape=session-list final_reclamation_ns=1543
+shape=terminal-rows strategy=copied revisions=500 allocated_payload_bytes=32768000 peak_payload_bytes=262144
+shape=terminal-rows strategy=copied stage=construction p50_ns=792 p95_ns=932 p99_ns=1002 max_ns=1203
+shape=terminal-rows strategy=copied stage=assembly p50_ns=70 p95_ns=81 p99_ns=90 max_ns=201
+shape=terminal-rows strategy=copied stage=exchange p50_ns=30 p95_ns=31 p99_ns=40 max_ns=41
+shape=terminal-rows strategy=copied stage=acquisition p50_ns=40 p95_ns=40 p99_ns=41 max_ns=41
+shape=terminal-rows strategy=copied stage=transfer_buffer p50_ns=481 p95_ns=602 p99_ns=631 max_ns=6853
+shape=terminal-rows strategy=copied stage=reclamation p50_ns=110 p95_ns=120 p99_ns=131 max_ns=210
+shape=terminal-rows strategy=immutable-chunks revisions=500 allocated_payload_bytes=193280 peak_payload_bytes=66304
+shape=terminal-rows strategy=immutable-chunks stage=construction p50_ns=1312 p95_ns=1323 p99_ns=1363 max_ns=10379
+shape=terminal-rows strategy=immutable-chunks stage=assembly p50_ns=431 p95_ns=441 p99_ns=471 max_ns=9438
+shape=terminal-rows strategy=immutable-chunks stage=exchange p50_ns=30 p95_ns=40 p99_ns=40 max_ns=41
+shape=terminal-rows strategy=immutable-chunks stage=acquisition p50_ns=40 p95_ns=41 p99_ns=41 max_ns=41
+shape=terminal-rows strategy=immutable-chunks stage=transfer_buffer p50_ns=922 p95_ns=1072 p99_ns=1123 max_ns=11902
+shape=terminal-rows strategy=immutable-chunks stage=reclamation p50_ns=1322 p95_ns=1343 p99_ns=1353 max_ns=7804
+shape=terminal-rows final_reclamation_ns=321
+shape=terminal-rows final_reclamation_ns=10289
+shape=large-terminal strategy=copied revisions=500 allocated_payload_bytes=512000000 peak_payload_bytes=4096000
+shape=large-terminal strategy=copied stage=construction p50_ns=16711 p95_ns=91992 p99_ns=106349 max_ns=182992
+shape=large-terminal strategy=copied stage=assembly p50_ns=100 p95_ns=170 p99_ns=251 max_ns=370
+shape=large-terminal strategy=copied stage=exchange p50_ns=30 p95_ns=40 p99_ns=40 max_ns=50
+shape=large-terminal strategy=copied stage=acquisition p50_ns=40 p95_ns=41 p99_ns=60 max_ns=60
+shape=large-terminal strategy=copied stage=transfer_buffer p50_ns=15509 p95_ns=99736 p99_ns=108793 max_ns=181790
+shape=large-terminal strategy=copied stage=reclamation p50_ns=140 p95_ns=260 p99_ns=711 max_ns=47919
+shape=large-terminal strategy=immutable-chunks revisions=500 allocated_payload_bytes=1534976 peak_payload_bytes=1027072
+shape=large-terminal strategy=immutable-chunks stage=construction p50_ns=5120 p95_ns=5541 p99_ns=7854 max_ns=178794
+shape=large-terminal strategy=immutable-chunks stage=assembly p50_ns=1523 p95_ns=1683 p99_ns=2264 max_ns=42830
+shape=large-terminal strategy=immutable-chunks stage=exchange p50_ns=30 p95_ns=41 p99_ns=90 max_ns=171
+shape=large-terminal strategy=immutable-chunks stage=acquisition p50_ns=40 p95_ns=41 p99_ns=50 max_ns=61
+shape=large-terminal strategy=immutable-chunks stage=transfer_buffer p50_ns=17142 p95_ns=19807 p99_ns=133660 max_ns=174887
+shape=large-terminal strategy=immutable-chunks stage=reclamation p50_ns=4939 p95_ns=5160 p99_ns=5921 max_ns=11241
+shape=large-terminal final_reclamation_ns=35085
+shape=large-terminal final_reclamation_ns=84588
+
+Dedicated worker canonical transfer, 100 samples per shape:
+trusted_fixture_capacity_bytes=1148928 samples_per_shape=100
+session-list-128 input=7231B output=16B canonical_call p50=Some(2.695µs) p95=Some(2.735µs) p99=Some(8.736µs) max=Some(30.367µs)
+terminal-rows-24 input=1586B output=16B canonical_call p50=Some(1.102µs) p95=Some(1.142µs) p99=Some(1.172µs) max=Some(1.182µs)
+terminal-rows-80 input=5226B output=16B canonical_call p50=Some(2.104µs) p95=Some(2.144µs) p99=Some(2.164µs) max=Some(2.174µs)
+terminal-rows-240 input=15626B output=16B canonical_call p50=Some(4.969µs) p95=Some(5.01µs) p99=Some(5.049µs) max=Some(6.472µs)
+terminal-rows-1000 input=65026B output=16B canonical_call p50=Some(16.12µs) p95=Some(24.676µs) p99=Some(28.383µs) max=Some(50.364µs)
+transfer-1mib input=1048576B output=16B canonical_call p50=Some(256.019µs) p95=Some(285.764µs) p99=Some(327.944µs) max=Some(420.095µs)
+session-list-128 core_input=7231B core_copy_in=3.817µs core_call=9.117µs core_copy_out=441ns
+terminal-rows-24 core_input=1586B core_copy_in=181ns core_call=1.663µs core_copy_out=20ns
+terminal-rows-80 core_input=5226B core_copy_in=400ns core_call=5.36µs core_copy_out=30ns
+terminal-rows-240 core_input=15626B core_copy_in=1.773µs core_call=15.95µs core_copy_out=30ns
+terminal-rows-1000 core_input=65026B core_copy_in=12.132µs core_call=66.284µs core_copy_out=40ns
+transfer-1mib core_input=1048576B core_copy_in=181.76µs core_call=1.072756ms core_copy_out=250ns
+oversized component output trapped before host acceptance
+
+Final current-source canonical transfer rerun, 100 samples per shape:
+trusted_fixture_capacity_bytes=1148928 samples_per_shape=100
+session-list-128 input=7231B output=16B canonical_call p50=2.564µs p95=2.655µs p99=3.076µs max=32.291µs
+terminal-rows-24 input=1586B output=16B canonical_call p50=1.051µs p95=1.082µs p99=1.103µs max=1.122µs
+terminal-rows-80 input=5226B output=16B canonical_call p50=2.004µs p95=2.034µs p99=2.044µs max=2.054µs
+terminal-rows-240 input=15626B output=16B canonical_call p50=5.019µs p95=5.29µs p99=6.051µs max=7.795µs
+terminal-rows-1000 input=65026B output=16B canonical_call p50=18.535µs p95=18.775µs p99=20.729µs max=25.568µs
+transfer-1mib input=1048576B output=16B canonical_call p50=271.07µs p95=298.401µs p99=516.171µs max=527.171µs
+session-list-128 core_input=7231B core_copy_in=15.67µs core_call=8.846µs core_copy_out=671ns
+terminal-rows-24 core_input=1586B core_copy_in=210ns core_call=1.613µs core_copy_out=30ns
+terminal-rows-80 core_input=5226B core_copy_in=370ns core_call=5.27µs core_copy_out=20ns
+terminal-rows-240 core_input=15626B core_copy_in=2.164µs core_call=15.649µs core_copy_out=40ns
+terminal-rows-1000 core_input=65026B core_copy_in=13.635µs core_call=65.083µs core_copy_out=40ns
+transfer-1mib core_input=1048576B core_copy_in=171.883µs core_call=1.094278ms core_copy_out=70ns
+oversized component output trapped before host acceptance
+
+Same artifact in separate actor/facet instances after trust clarification:
+trusted_fixture_capacity_bytes=1148928 samples_per_shape=100
+session-list-128 input=7231B output=16B canonical_call p50=2.986µs p95=3.086µs p99=3.737µs max=31.819µs
+terminal-rows-24 input=1586B output=16B canonical_call p50=1.573µs p95=1.603µs p99=1.623µs max=1.663µs
+terminal-rows-80 input=5226B output=16B canonical_call p50=2.425µs p95=2.495µs p99=2.514µs max=2.535µs
+terminal-rows-240 input=15626B output=16B canonical_call p50=4.869µs p95=4.939µs p99=11.883µs max=19.888µs
+terminal-rows-1000 input=65026B output=16B canonical_call p50=16.14µs p95=16.22µs p99=21.601µs max=26.781µs
+transfer-1mib input=1048576B output=16B canonical_call p50=252.122µs p95=256.51µs p99=372.889µs max=711.713µs
+session-list-128 core_input=7231B core_copy_in=3.627µs core_call=9.548µs core_copy_out=311ns
+terminal-rows-24 core_input=1586B core_copy_in=180ns core_call=1.723µs core_copy_out=41ns
+terminal-rows-80 core_input=5226B core_copy_in=511ns core_call=5.57µs core_copy_out=30ns
+terminal-rows-240 core_input=15626B core_copy_in=1.993µs core_call=16.612µs core_copy_out=30ns
+terminal-rows-1000 core_input=65026B core_copy_in=13.996µs core_call=72.606µs core_copy_out=40ns
+transfer-1mib core_input=1048576B core_copy_in=165.74µs core_call=1.124016ms core_copy_out=270ns
+oversized component output trapped before host acceptance

@@ -7,6 +7,10 @@ publish = false
 [lib]
 crate-type = ["cdylib"]
 
+[features]
+default = ["pure-renderer"]
+pure-renderer = ["brood-plugin-sdk/facets"]
+
 [dependencies]
 brood-graphics = { path = "../../crates/brood-graphics" }
 brood-keybindings = { path = "../../crates/brood-keybindings" }

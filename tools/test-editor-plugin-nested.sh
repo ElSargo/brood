@@ -123,7 +123,7 @@ trap cleanup EXIT
 if [[ -n "${BROOD_EDITOR_PACKAGE:-}" ]]; then
   PACKAGE="$(readlink -f "$BROOD_EDITOR_PACKAGE")"
 else
-  nix build .#brood -o "$PACKAGE_LINK"
+  nix build path:.#brood -o "$PACKAGE_LINK"
   PACKAGE="$(readlink -f "$PACKAGE_LINK")"
 fi
 [[ -x "$PACKAGE/bin/brood" ]]
@@ -176,6 +176,7 @@ ctl() {
     -u brood_session \
     -u BROOD_SURFACE_SESSION_ID \
     -u BROOD_PANE_ID \
+    RUST_LOG=warn \
     "$PACKAGE/bin/brood" ctl \
     --dbus-destination "$DBUS_DESTINATION" \
     --dbus-address "$DBUS_SESSION_BUS_ADDRESS" \
@@ -261,7 +262,7 @@ CLIENT_PID=$!
 
 for _ in {1..400}; do
   if rg -q 'started presentation WASM actor id=terminal-ui' "$CLIENT_LOG" \
-    && rg -q 'accepted plugin draw packet' "$CLIENT_LOG"; then
+    && rg -q 'accepted plugin draw packet|facet native pair committed .*actor=terminal-ui' "$CLIENT_LOG"; then
     break
   fi
   kill -0 "$CLIENT_PID" 2> /dev/null || {
@@ -271,9 +272,9 @@ for _ in {1..400}; do
   sleep 0.05
 done
 rg -q 'started presentation WASM actor id=terminal-ui' "$CLIENT_LOG"
-rg -q 'accepted plugin draw packet' "$CLIENT_LOG"
+rg -q 'accepted plugin draw packet|facet native pair committed .*actor=terminal-ui' "$CLIENT_LOG"
 
-# A draw packet can be accepted before Sway has mapped and focused the
+# Native content can be committed before Sway has mapped and focused the
 # presentation surface. Virtual-keyboard input sent in that interval is valid
 # at the protocol level but has no focused surface to receive it. Wait for the
 # real Brood window to own compositor keyboard focus before exercising the
@@ -386,14 +387,9 @@ actor_pane() {
 draw_sequence() {
   local pane=$1
   local file=$2
-  local sequence
-  sequence="$(
-    sed -n \
-      "s/.*accepted plugin draw packet pane=$pane sequence=\\([0-9][0-9]*\\) .*/\\1/p" \
-      "$file" \
-      | tail -1
-  )"
-  printf '%s\n' "${sequence:-0}"
+  # Pure facets commit through a paired native receipt. Count either native
+  # acceptance path, rather than assuming every frame used the legacy queue.
+  rg -a -c "accepted plugin draw packet pane=$pane |facet native pair committed .*panes=\\{([^}]*, )?$pane([,}])" "$file" || true
 }
 
 terminal_snapshot_rendered() {
@@ -403,9 +399,10 @@ terminal_snapshot_rendered() {
   awk \
     -v start="recipient=$actor terminal_snapshot_bytes=" \
     -v draw="accepted plugin draw packet pane=$pane " \
+    -v facet="facet native pair committed route=ordinary actor=$actor " \
     '
       index($0, start) { snapshot = 1 }
-      snapshot && index($0, draw) { found = 1; exit }
+      snapshot && (index($0, draw) || index($0, facet)) { found = 1; exit }
       END { exit !found }
     ' \
     "$file"
@@ -415,7 +412,6 @@ actor_list() {
   ctl actors list 2> /dev/null
 }
 
-DRAW_PACKETS_BEFORE="$(rg -c 'accepted plugin draw packet' "$CLIENT_LOG" || true)"
 press_editor_shortcut
 
 EDITOR_UI=""
@@ -441,12 +437,11 @@ for _ in {1..1200}; do
       <<< "$ACTORS" \
       | head -1
   )"
-  DRAW_PACKETS_AFTER="$(rg -c 'accepted plugin draw packet' "$CLIENT_LOG" || true)"
   if [[ "$EDITOR_UI" == neovim-ui-* \
     && "$EDITOR_PANE" =~ ^[0-9]+$ \
     && "$EDITOR_FILES_ACTOR" == *.neovim-files \
     && "$SESSION_INIT_ACTOR" == brood.session-init.* ]] \
-    && ((DRAW_PACKETS_AFTER > DRAW_PACKETS_BEFORE)) \
+    && (("$(draw_sequence "$EDITOR_PANE" "$CLIENT_LOG")" > 0)) \
     && route_has_kind neovim-files "$EDITOR_UI" editor-client-authorized "$CLIENT_LOG" \
     && route_has_kind "$EDITOR_UI" init editor-files-ready "$CLIENT_LOG"; then
     break
@@ -461,6 +456,7 @@ done
 [[ "$EDITOR_PANE" =~ ^[0-9]+$ ]]
 [[ "$EDITOR_FILES_ACTOR" == *.neovim-files ]]
 [[ "$SESSION_INIT_ACTOR" == brood.session-init.* ]]
+(("$(draw_sequence "$EDITOR_PANE" "$CLIENT_LOG")" > 0))
 route_has_kind neovim-files "$EDITOR_UI" editor-client-authorized "$CLIENT_LOG"
 route_has_kind "$EDITOR_UI" init editor-files-ready "$CLIENT_LOG"
 actor_list > "$OUT/actors-editor-created.txt"
@@ -749,6 +745,8 @@ focus_editor
 nvim_command BroodDiff
 DIFF_ACTOR="diff-viewer-sb1-s1"
 DIFF_PANE=""
+# Coalescing may make the first visible frame already populated. The worker
+# completion plus nontrivial packet below proves content, not a loading flash.
 INITIAL_DIFF_SEQUENCE=""
 POPULATED_DIFF_SEQUENCE=""
 for _ in {1..800}; do
@@ -771,8 +769,31 @@ for _ in {1..800}; do
         | tail -1
     )"
   fi
+  # Pure rendering publishes paired native receipts instead of legacy draw
+  # packets. Require a committed frame after the real diff worker completes;
+  # the captured diff is also reviewed for populated content.
+  if [[ -z "$POPULATED_DIFF_SEQUENCE" ]] && awk -v actor="$DIFF_ACTOR" '
+    index($0, "presentation actor worker finished actor=" actor) { finished = 1 }
+    finished && index($0, "facet native pair committed route=ordinary actor=" actor " ") { found = 1 }
+    END { exit !found }
+  ' "$CLIENT_LOG"; then
+    INITIAL_DIFF_SEQUENCE="$(awk -v actor="$DIFF_ACTOR" '
+      index($0, "facet native pair committed route=ordinary actor=" actor " ") {
+        for (i = 1; i <= NF; i++) if ($i ~ /^native_revision=/) {
+          sub(/^native_revision=/, "", $i); print $i; exit
+        }
+      }' "$CLIENT_LOG")"
+    POPULATED_DIFF_SEQUENCE="$(awk -v actor="$DIFF_ACTOR" '
+      index($0, "presentation actor worker finished actor=" actor) { finished = 1 }
+      finished && index($0, "facet native pair committed route=ordinary actor=" actor " ") {
+        for (i = 1; i <= NF; i++) if ($i ~ /^native_revision=/) {
+          sub(/^native_revision=/, "", $i); latest = $i
+        }
+      }
+      END { if (latest != "") print latest }' "$CLIENT_LOG")"
+  fi
   if [[ -n "$POPULATED_DIFF_SEQUENCE" ]] \
-    && ((POPULATED_DIFF_SEQUENCE > INITIAL_DIFF_SEQUENCE)); then
+    && ((POPULATED_DIFF_SEQUENCE >= INITIAL_DIFF_SEQUENCE)); then
     break
   fi
   sleep 0.05
@@ -781,7 +802,7 @@ rg -a -q "started presentation WASM actor id=$DIFF_ACTOR" "$CLIENT_LOG"
 [[ "$DIFF_PANE" =~ ^[0-9]+$ ]]
 rg -a -q "presentation actor worker finished actor=$DIFF_ACTOR" "$CLIENT_LOG"
 [[ -n "$INITIAL_DIFF_SEQUENCE" && -n "$POPULATED_DIFF_SEQUENCE" ]]
-((POPULATED_DIFF_SEQUENCE > INITIAL_DIFF_SEQUENCE))
+((POPULATED_DIFF_SEQUENCE >= INITIAL_DIFF_SEQUENCE))
 sleep 0.8
 capture "$OUT/editor-diff-action.png"
 
@@ -912,6 +933,10 @@ OPEN_REPLIES="$(count_route_kind neovim-files "$EDITOR_UI" open "$CLIENT_LOG")"
 SAVE_BEGINS="$(count_route_kind "$EDITOR_UI" neovim-files save-begin "$CLIENT_LOG")"
 SAVE_COMPLETES="$(count_route_kind neovim-files "$EDITOR_UI" save-complete "$CLIENT_LOG")"
 DRAW_PACKETS="$(rg -c 'accepted plugin draw packet' "$CLIENT_LOG" || true)"
+FACET_COMMITS="$(rg -c '^facet native pair committed ' "$CLIENT_LOG" || true)"
+if [[ "${BROOD_EDITOR_PURE_RENDERER:-1}" == 1 ]]; then
+  rg -a -q "^facet native pair committed .*actor=$EDITOR_UI " "$CLIENT_LOG"
+fi
 LARGE_BYTES="$(wc -c < "$LARGE_FILE")"
 SCREENSHOT_METRICS="$(< "$OUT/screenshot-metrics.json")"
 jq -n \
@@ -927,7 +952,8 @@ jq -n \
   --argjson save_begins "$SAVE_BEGINS" \
   --argjson save_completes "$SAVE_COMPLETES" \
   --argjson large_bytes "$LARGE_BYTES" \
-  --argjson draw_packets "$DRAW_PACKETS" \
+  --argjson draw_packets "${DRAW_PACKETS:-0}" \
+  --argjson facet_commits "${FACET_COMMITS:-0}" \
   '{
     placement: {
       client_actor: $editor_ui,
@@ -965,6 +991,7 @@ jq -n \
     },
     render: {
       draw_packets: $draw_packets,
+      facet_native_commits: $facet_commits,
       screenshots: $screenshots
     },
     status: $status

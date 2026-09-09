@@ -44,6 +44,43 @@ OUTPUT_MODE="${BROOD_KEYBINDINGS_TEST_OUTPUT_MODE:-1280x720}"
 EMPTY_STARTUP_ONLY="${BROOD_EMPTY_STARTUP_ONLY:-0}"
 WORKTREE_CREATION_ONLY="${BROOD_WORKTREE_CREATION_ONLY:-0}"
 WORKTREE_FAILURE_ONLY="${BROOD_WORKTREE_FAILURE_ONLY:-0}"
+HOST_PROFILE="${BROOD_TEST_HOST_PROFILE:-debug}"
+case "$HOST_PROFILE" in
+  debug) HOST_BUILD_ARGS=() ;;
+  release) HOST_BUILD_ARGS=(--release) ;;
+  *) echo "ERR BROOD_TEST_HOST_PROFILE must be debug or release" >&2; exit 2 ;;
+esac
+HOST_BIN_DIR="$ROOT/target/$HOST_PROFILE"
+PREBUILT_PACKAGE="${BROOD_SESSION_SWITCHER_PACKAGE:-}"
+WORKSPACE_POLICY="$ROOT/plugins/default-workspace/target/wasm32-unknown-unknown/release/brood_default_workspace_plugin.wasm"
+if [[ -n "$PREBUILT_PACKAGE" ]]; then
+  PREBUILT_PACKAGE="$(readlink -f "$PREBUILT_PACKAGE")"
+  HOST_BIN_DIR="$PREBUILT_PACKAGE/bin"
+  WORKSPACE_POLICY="$PREBUILT_PACKAGE/plugins/default-workspace/target/wasm32-unknown-unknown/release/brood_default_workspace_plugin.wasm"
+  for binary in brood brood-sessiond brood-client; do
+    [[ -x "$HOST_BIN_DIR/$binary" ]] || { echo "ERR missing packaged host: $binary" >&2; exit 2; }
+  done
+  [[ -s "$WORKSPACE_POLICY" ]] || { echo "ERR missing packaged workspace policy" >&2; exit 2; }
+fi
+PURE_RENDERER="${BROOD_SESSION_SWITCHER_PURE_RENDERER:-1}"
+PURE_SHELL="${BROOD_SHELL_PURE_RENDERER:-1}"
+SHELL_FEATURE_ARGS=()
+SWITCHER_FEATURE_ARGS=()
+if [[ "$PURE_SHELL" == 1 ]]; then
+  PURE_RENDERER=1
+  SHELL_FEATURE_ARGS=(--features pure-renderer)
+  DIFF_RENDER_UNIT="paired native commits"
+  DIFF_TEXT_UNIT="new text layouts shaped"
+else
+  SHELL_FEATURE_ARGS=(--no-default-features)
+  DIFF_RENDER_UNIT="draw packets"
+  DIFF_TEXT_UNIT="text layouts"
+fi
+if [[ "$PURE_RENDERER" == 1 ]]; then
+  SWITCHER_FEATURE_ARGS=(--features pure-renderer)
+else
+  SWITCHER_FEATURE_ARGS=(--no-default-features)
+fi
 if [[ ! "$OUTPUT_MODE" =~ ^[1-9][0-9]*x[1-9][0-9]*$ ]]; then
   echo "ERR BROOD_KEYBINDINGS_TEST_OUTPUT_MODE must be WIDTHxHEIGHT" >&2
   exit 2
@@ -89,12 +126,23 @@ cleanup() {
 trap 'echo "ERR command=$BASH_COMMAND line=$LINENO" >&2' ERR
 trap cleanup EXIT
 
-cargo build -p broodd -p brood-client --bins --locked
-cargo build \
-  --manifest-path plugins/session-switcher/Cargo.toml \
-  --target wasm32-unknown-unknown \
-  --release \
+# Cargo unlocks a core artifact before componentization. Serialize this build
+# and copy phase with other nested gates so feature variants cannot race.
+mkdir -p "$ROOT/target"
+exec 9>"$ROOT/target/brood-plugin-artifacts.lock"
+flock 9
+if [[ -z "$PREBUILT_PACKAGE" ]]; then
+cargo build -p broodd -p brood-client --bins --locked "${HOST_BUILD_ARGS[@]}"
+SWITCHER_BUILD_ARGS=(
+  build
+  --manifest-path plugins/session-switcher/Cargo.toml
+  --target wasm32-unknown-unknown
+  --release
   --locked
+)
+SWITCHER_BUILD_ARGS+=("${SWITCHER_FEATURE_ARGS[@]}")
+cargo "${SWITCHER_BUILD_ARGS[@]}"
+fi
 read -r -a WAYLAND_BUILD_FLAGS <<< "$(pkg-config --cflags --libs wayland-client xkbcommon)"
 cc \
   -std=c11 \
@@ -135,6 +183,21 @@ cc \
   "$OUT/wlr-virtual-pointer-unstable-v1-protocol.c" \
   -o "$OUT/virtual-pointer-click" \
   "${WAYLAND_BUILD_FLAGS[@]}"
+if [[ -n "$PREBUILT_PACKAGE" ]]; then
+  cp -L "$PREBUILT_PACKAGE/packages/org.brood.default-client/"*.component.wasm "$PACKAGE/"
+  # The fixture's backend/session roots need their own colocated sidecars;
+  # these are intentionally outside the installed client package.
+  for plugin in worktree-manager terminal-session neovim-files; do
+    stem="brood_${plugin//-/_}_plugin.component.wasm"
+    cp -L "$PREBUILT_PACKAGE/plugins/$plugin/target/wasm32-unknown-unknown/release/$stem" "$PACKAGE/$stem"
+  done
+  cp -L \
+    "$PREBUILT_PACKAGE/examples/wasm-init-actor/target/wasm32-unknown-unknown/release/brood_wasm_init_actor_example.component.wasm" \
+    "$PACKAGE/brood_wasm_init_actor_example.component.wasm"
+  if [[ -d "$PREBUILT_PACKAGE/packages/org.brood.default-client/share" ]]; then
+    ln -s "$PREBUILT_PACKAGE/packages/org.brood.default-client/share" "$PACKAGE/share"
+  fi
+else
 cargo run --quiet -p brood-wasm --example componentize -- \
   plugins/session-switcher/target/wasm32-unknown-unknown/release/brood_session_switcher_plugin.wasm \
   "$PACKAGE/brood_session_switcher_plugin.component.wasm"
@@ -142,7 +205,8 @@ cargo build \
   --manifest-path plugins/status-bar/Cargo.toml \
   --target wasm32-unknown-unknown \
   --release \
-  --locked
+  --locked \
+  "${SHELL_FEATURE_ARGS[@]}"
 cargo run --quiet -p brood-wasm --example componentize -- \
   plugins/status-bar/target/wasm32-unknown-unknown/release/brood_status_bar_plugin.wasm \
   "$PACKAGE/brood_status_bar_plugin.component.wasm"
@@ -150,7 +214,8 @@ cargo build \
   --manifest-path plugins/inbox/Cargo.toml \
   --target wasm32-unknown-unknown \
   --release \
-  --locked
+  --locked \
+  "${SHELL_FEATURE_ARGS[@]}"
 cargo run --quiet -p brood-wasm --example componentize -- \
   plugins/inbox/target/wasm32-unknown-unknown/release/brood_inbox_plugin.wasm \
   "$PACKAGE/brood_inbox_plugin.component.wasm"
@@ -158,7 +223,8 @@ cargo build \
   --manifest-path plugins/picker/Cargo.toml \
   --target wasm32-unknown-unknown \
   --release \
-  --locked
+  --locked \
+  "${SHELL_FEATURE_ARGS[@]}"
 cargo run --quiet -p brood-wasm --example componentize -- \
   plugins/picker/target/wasm32-unknown-unknown/release/brood_picker_plugin.wasm \
   "$PACKAGE/brood_picker_plugin.component.wasm"
@@ -166,7 +232,8 @@ cargo build \
   --manifest-path plugins/keybindings/Cargo.toml \
   --target wasm32-unknown-unknown \
   --release \
-  --locked
+  --locked \
+  "${SHELL_FEATURE_ARGS[@]}"
 cargo run --quiet -p brood-wasm --example componentize -- \
   plugins/keybindings/target/wasm32-unknown-unknown/release/brood_keybindings_plugin.wasm \
   "$PACKAGE/brood_keybindings_plugin.component.wasm"
@@ -180,6 +247,7 @@ cargo run --quiet -p brood-wasm --example componentize -- \
   "$PACKAGE/brood_worktree_manager_plugin.component.wasm"
 cargo build \
   --manifest-path plugins/coding-agent/Cargo.toml \
+  "${SHELL_FEATURE_ARGS[@]}" \
   --target wasm32-unknown-unknown \
   --release \
   --locked
@@ -188,6 +256,7 @@ cargo run --quiet -p brood-wasm --example componentize -- \
   "$PACKAGE/brood_coding_agent_plugin.component.wasm"
 cargo build \
   --manifest-path plugins/terminal-ui/Cargo.toml \
+  "${SHELL_FEATURE_ARGS[@]}" \
   --target wasm32-unknown-unknown \
   --release \
   --locked
@@ -196,6 +265,7 @@ cargo run --quiet -p brood-wasm --example componentize -- \
   "$PACKAGE/brood_terminal_ui_plugin.component.wasm"
 cargo build \
   --manifest-path plugins/diff-viewer/Cargo.toml \
+  "${SHELL_FEATURE_ARGS[@]}" \
   --target wasm32-unknown-unknown \
   --release \
   --locked
@@ -203,16 +273,46 @@ cargo run --quiet -p brood-wasm --example componentize -- \
   plugins/diff-viewer/target/wasm32-unknown-unknown/release/brood_diff_viewer_plugin.wasm \
   "$PACKAGE/brood_diff_viewer_plugin.component.wasm"
 cargo build \
+  --manifest-path plugins/terminal-session/Cargo.toml \
+  --target wasm32-unknown-unknown \
+  --release \
+  --locked
+cargo run --quiet -p brood-wasm --example componentize -- \
+  plugins/terminal-session/target/wasm32-unknown-unknown/release/brood_terminal_session_plugin.wasm \
+  "$PACKAGE/brood_terminal_session_plugin.component.wasm"
+cargo build \
+  --manifest-path plugins/neovim-files/Cargo.toml \
+  --target wasm32-unknown-unknown \
+  --release \
+  --locked
+cargo run --quiet -p brood-wasm --example componentize -- \
+  plugins/neovim-files/target/wasm32-unknown-unknown/release/brood_neovim_files_plugin.wasm \
+  "$PACKAGE/brood_neovim_files_plugin.component.wasm"
+cargo build \
+  --manifest-path examples/wasm-init-actor/Cargo.toml \
+  --target wasm32-unknown-unknown \
+  --release \
+  --locked
+cargo run --quiet -p brood-wasm --example componentize -- \
+  examples/wasm-init-actor/target/wasm32-unknown-unknown/release/brood_wasm_init_actor_example.wasm \
+  "$PACKAGE/brood_wasm_init_actor_example.component.wasm"
+cargo build \
   --manifest-path plugins/default-workspace/Cargo.toml \
   --target wasm32-unknown-unknown \
   --release \
   --locked
 
-printf '[init]\nbackend = "%s"\nclient = "%s"\n\n[client.key-policy]\nprovider = "workspace"\npath = "%s"\n' \
+fi
+
+printf '[init]\nbackend = "%s"\nsession = "%s"\nclient = "%s"\n\n[client.key-policy]\nprovider = "workspace"\npath = "%s"\n' \
   "$PACKAGE/brood_worktree_manager_plugin.component.wasm" \
+  "$PACKAGE/brood_wasm_init_actor_example.component.wasm" \
   "$PACKAGE/brood_session_switcher_plugin.component.wasm" \
-  "$ROOT/plugins/default-workspace/target/wasm32-unknown-unknown/release/brood_default_workspace_plugin.wasm" \
+  "$WORKSPACE_POLICY" \
   > "$CONFIG"
+
+flock -u 9
+exec 9>&-
 
 RUST_LOG="${RUST_LOG:-broodd=info,brood_client=info,smithay=warn,wgpu_core=warn,wgpu_hal=warn}"
 SERVER_EXTRA_ARGS=()
@@ -224,7 +324,7 @@ fi
   env -u brood_session -u BROOD_SURFACE_SESSION_ID -u BROOD_PANE_ID \
     XDG_DATA_HOME="$DATA_HOME" \
     RUST_LOG="$RUST_LOG" \
-    "$ROOT/target/debug/brood-sessiond" \
+    "$HOST_BIN_DIR/brood-sessiond" \
     --headless \
     --no-default-modules \
     --config "$CONFIG" \
@@ -236,7 +336,8 @@ SERVER_PID=$!
 
 ctl() {
   env -u brood_session -u BROOD_SURFACE_SESSION_ID -u BROOD_PANE_ID \
-    target/debug/brood ctl \
+    RUST_LOG=warn \
+    "$HOST_BIN_DIR/brood" ctl \
     --dbus-destination "$DBUS_DESTINATION" \
     --dbus-address "$DBUS_SESSION_BUS_ADDRESS" \
     "$@"
@@ -255,7 +356,7 @@ ctl status > /dev/null 2>&1 || {
   exit 1
 }
 
-if [[ "$EMPTY_STARTUP_ONLY" != 1 ]]; then
+if [[ "$EMPTY_STARTUP_ONLY" != 1 && "${BROOD_PLUGIN_DRAG_TEST:-0}" != 1 ]]; then
   ctl surface-session new Beta > /dev/null
   ctl close-session 1 > /dev/null
   ctl spawn weston-simple-egl > /dev/null
@@ -264,7 +365,7 @@ if [[ "$EMPTY_STARTUP_ONLY" != 1 ]]; then
     sleep 0.05
   done
   ctl surface-session new Gamma > /dev/null
-  ctl spawn weston-simple-shm > /dev/null
+  ctl spawn env WAYLAND_DEBUG="${BROOD_TEST_WAYLAND_DEBUG:-0}" weston-simple-shm > /dev/null
   for _ in $(seq 1 100); do
     rg -q "total_windows=2" <<< "$(ctl status)" && break
     sleep 0.05
@@ -307,6 +408,12 @@ done
   exit 1
 }
 
+DRAG_ACTOR_ARGS=()
+if [[ "${BROOD_PLUGIN_DRAG_PROOF_ONLY:-0}" == 1 ]]; then
+  : "${PREBUILT_PACKAGE:?proof drag requires BROOD_SESSION_SWITCHER_PACKAGE}"
+  DRAG_ACTOR_ARGS+=(--wasm-actor "resize-proof-fast=$PREBUILT_PACKAGE/plugins/resize-proof/target/wasm32-unknown-unknown/release/brood_resize_proof_plugin.component.wasm")
+fi
+
 env -u brood_session -u BROOD_SURFACE_SESSION_ID -u BROOD_PANE_ID \
   XDG_DATA_HOME="$DATA_HOME" \
   BROOD_KEYBINDINGS_PATH="$OUT/keybindings.json" \
@@ -319,7 +426,7 @@ env -u brood_session -u BROOD_SURFACE_SESSION_ID -u BROOD_PANE_ID \
   BROOD_TRACE_PLUGIN_TEXT=1 \
   BROOD_TRACE_PLUGIN_WORKERS=1 \
   RUST_LOG="$RUST_LOG" \
-  target/debug/brood-client \
+  "$HOST_BIN_DIR/brood-client" "${DRAG_ACTOR_ARGS[@]}" \
   --config "$CONFIG" \
   --dbus-destination "$DBUS_DESTINATION" \
   --dbus-address "$DBUS_SESSION_BUS_ADDRESS" \
@@ -327,7 +434,7 @@ env -u brood_session -u BROOD_SURFACE_SESSION_ID -u BROOD_PANE_ID \
 CLIENT_PID=$!
 
 for _ in $(seq 1 200); do
-  if rg -q "compiled plugin GPU scene" "$CLIENT_LOG" \
+  if rg -q "compiled plugin GPU scene|facet native pair committed" "$CLIENT_LOG" \
     && rg -q "granted claimed root layout lease actor=session-switcher" "$CLIENT_LOG" \
     && rg -q "loaded presentation key policy provider=workspace" "$CLIENT_LOG"; then
     break
@@ -338,7 +445,7 @@ for _ in $(seq 1 200); do
   }
   sleep 0.1
 done
-rg -q "compiled plugin GPU scene" "$CLIENT_LOG"
+rg -q "compiled plugin GPU scene|facet native pair committed" "$CLIENT_LOG"
 rg -q "granted claimed root layout lease actor=session-switcher" "$CLIENT_LOG"
 rg -q "loaded presentation key policy provider=workspace" "$CLIENT_LOG"
 
@@ -349,6 +456,18 @@ capture() {
     grim "$target"
   [[ -s "$target" ]]
 }
+
+# The drag matrix reuses the production shell setup and offscreen compositor,
+# but supplies continuous pointer gestures instead of the sequential smoke flow.
+if [[ "${BROOD_PLUGIN_DRAG_TEST:-0}" == 1 ]]; then
+  ctl status-json > "$OUT/drag-server-before.json"
+  drag_result=0
+  env XDG_RUNTIME_DIR="$RUNTIME_DIR" WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+    python3 "$ROOT/tools/test-plugin-divider-drags.py" \
+      --out "$OUT" --client-pid "$CLIENT_PID" || drag_result=$?
+  ctl status-json > "$OUT/drag-server-after.json"
+  exit "$drag_result"
+fi
 
 send_keybindings() {
   env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
@@ -361,7 +480,8 @@ if [[ "$EMPTY_STARTUP_ONLY" == 1 ]]; then
     if rg -q 'started presentation WASM actor id=session-switcher ' "$CLIENT_LOG" \
       && rg -q 'started presentation WASM actor id=status-bar ' "$CLIENT_LOG" \
       && rg -q 'started presentation WASM actor id=inbox ' "$CLIENT_LOG" \
-      && rg -q 'accepted leased actor layout items=2 panes=2 ' "$CLIENT_LOG"; then
+      && { rg -q 'accepted leased actor layout items=2 panes=2 ' "$CLIENT_LOG" \
+        || rg -q 'completed synchronized layout actor=session-switcher .* pane_ready=2/2 .* missing=\[\]' "$CLIENT_LOG"; }; then
       break
     fi
     sleep 0.05
@@ -395,12 +515,20 @@ PY
     sed -n 's/.*started presentation WASM actor id=inbox .* pane=\([0-9][0-9]*\) .*/\1/p' \
       "$CLIENT_LOG" | tail -1
   )"
-  [[ -n "$SWITCHER_PANE" && -n "$STATUS_PANE" && -n "$INBOX_PANE" ]]
-  rg -q "accepted leased actor layout .* pane_rects=.*${STATUS_PANE}:0:686:1280:34" "$CLIENT_LOG"
+  PICKER_PANE="$(
+    sed -n 's/.*started presentation WASM actor id=picker .* pane=\([0-9][0-9]*\) .*/\1/p' \
+      "$CLIENT_LOG" | tail -1
+  )"
+  [[ -n "$SWITCHER_PANE" && -n "$STATUS_PANE" && -n "$INBOX_PANE" && -n "$PICKER_PANE" ]]
   rg -q "render scheduling actor-frame promoted actor=status-bar .* panes=\[$STATUS_PANE\]" "$CLIENT_LOG"
-  rg -q "accepted leased actor layout .* pane_rects=.*${SWITCHER_PANE}:960:0:320:686" "$CLIENT_LOG"
-  rg -q 'accepted leased actor layout items=2 panes=2 ' "$CLIENT_LOG"
-  if rg -q "accepted leased actor layout .* pane_rects=.*${INBOX_PANE}:[0-9]+:0:(320|480|640):686" "$CLIENT_LOG"; then
+  if rg -q "accepted leased actor layout .* pane_rects=.*${STATUS_PANE}:0:686:1280:34.*${SWITCHER_PANE}:960:0:320:686" "$CLIENT_LOG"; then
+    rg -q 'accepted leased actor layout items=2 panes=2 ' "$CLIENT_LOG"
+  else
+    rg -q "accepted synchronized layout .* target_rects=.*${STATUS_PANE}:0:686:1280:34.*${SWITCHER_PANE}:960:0:320:686" "$CLIENT_LOG"
+    rg -q 'synchronized layout ready actor=session-switcher .* pane_ready=2/2 .* missing=\[\] degraded=false ' "$CLIENT_LOG"
+    rg -q 'completed synchronized layout actor=session-switcher .* pane_ready=2/2 .* missing=\[\] ' "$CLIENT_LOG"
+  fi
+  if rg -q "(accepted leased actor layout .* pane_rects|accepted synchronized layout .* target_rects)=?.*${INBOX_PANE}:[0-9]+:0:(320|480|640):686" "$CLIENT_LOG"; then
     echo "ERR hidden inbox pane received a visible-width resize" >&2
     exit 1
   fi
@@ -413,16 +541,16 @@ PY
   ((STATUS_COLOURS >= 8))
 
   EMPTY_BACKEND_PICKER_LAYOUT_BEFORE="$(
-    rg -c 'accepted leased actor layout' "$CLIENT_LOG" || true
+    rg -c 'accepted (leased actor|synchronized) layout' "$CLIENT_LOG" || true
   )"
   env XDG_RUNTIME_DIR="$RUNTIME_DIR" WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
     "$OUT/virtual-pointer-click" 1244 26 1280 720
   for _ in $(seq 1 200); do
     EMPTY_BACKEND_PICKER_LAYOUT_OPEN="$(
-      rg -c 'accepted leased actor layout' "$CLIENT_LOG" || true
+      rg -c 'accepted (leased actor|synchronized) layout' "$CLIENT_LOG" || true
     )"
     if ((EMPTY_BACKEND_PICKER_LAYOUT_OPEN > EMPTY_BACKEND_PICKER_LAYOUT_BEFORE)) \
-      && rg -q 'sender=session-switcher recipient=picker body=.*"request":"backend-discovery".*"loading":true' "$CLIENT_LOG" \
+      && rg -q 'sender=session-switcher recipient=picker body=.*"request":"backend-discovery(-[0-9]+)?".*"loading":true' "$CLIENT_LOG" \
       && rg -q 'sender=session-switcher recipient=picker body=.*"type":"picker-update".*"loading":false' "$CLIENT_LOG"; then
       break
     fi
@@ -451,14 +579,32 @@ PY
   rg -q 'presentation actor message realm=Daemon sender=session-switcher recipient=init body=.*"kind":"list-directories"' "$CLIENT_LOG"
   rg -q 'backend actor message backend=1 realm=Daemon sender=init recipient=session-switcher body=.*"success":true.*"type":"directory-list"' "$CLIENT_LOG"
   capture "$OUT/empty-startup-directory-picker.png"
+  EMPTY_DIRECTORY_CLOSE_LAYOUT_BEFORE="$(
+    rg -c 'accepted (leased actor|synchronized) layout' "$CLIENT_LOG" || true
+  )"
   env XDG_RUNTIME_DIR="$RUNTIME_DIR" WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
     "$OUT/virtual-keyboard-key" --plain 1
+  for _ in $(seq 1 200); do
+    EMPTY_DIRECTORY_CLOSE_LAYOUT_AFTER="$(
+      rg -c 'accepted (leased actor|synchronized) layout' "$CLIENT_LOG" || true
+    )"
+    if ((EMPTY_DIRECTORY_CLOSE_LAYOUT_AFTER > EMPTY_DIRECTORY_CLOSE_LAYOUT_BEFORE)); then
+      break
+    fi
+    sleep 0.05
+  done
+  ((EMPTY_DIRECTORY_CLOSE_LAYOUT_AFTER > EMPTY_DIRECTORY_CLOSE_LAYOUT_BEFORE))
 
+  EMPTY_KEYBINDINGS_LAYOUT_BEFORE="$EMPTY_DIRECTORY_CLOSE_LAYOUT_AFTER"
   send_keybindings
   for _ in $(seq 1 200); do
+    EMPTY_KEYBINDINGS_LAYOUT_OPEN="$(
+      rg -c 'accepted (leased actor|synchronized) layout' "$CLIENT_LOG" || true
+    )"
     if rg -q 'started presentation WASM actor id=keybindings ' "$CLIENT_LOG" \
       && rg -q 'sent key-policy actor message actor=keybindings' "$CLIENT_LOG" \
-      && rg -q 'sender=keybindings recipient=picker body=.*"type":"picker-create"' "$CLIENT_LOG"; then
+      && rg -q 'sender=keybindings recipient=picker body=.*"type":"picker-create"' "$CLIENT_LOG" \
+      && ((EMPTY_KEYBINDINGS_LAYOUT_OPEN > EMPTY_KEYBINDINGS_LAYOUT_BEFORE)); then
       break
     fi
     sleep 0.05
@@ -466,6 +612,28 @@ PY
   rg -q 'started presentation WASM actor id=keybindings ' "$CLIENT_LOG"
   rg -q 'sent key-policy actor message actor=keybindings' "$CLIENT_LOG"
   rg -q 'sender=keybindings recipient=picker body=.*"type":"picker-create"' "$CLIENT_LOG"
+  ((EMPTY_KEYBINDINGS_LAYOUT_OPEN > EMPTY_KEYBINDINGS_LAYOUT_BEFORE))
+  for _ in $(seq 1 200); do
+    EMPTY_KEYBINDINGS_LAYOUT_LINE="$(
+      rg -n "accepted synchronized layout .* target_rects=.*${PICKER_PANE}:" "$CLIENT_LOG" \
+        | tail -1 | cut -d: -f1 || true
+    )"
+    if [[ -n "$EMPTY_KEYBINDINGS_LAYOUT_LINE" ]]; then
+      EMPTY_KEYBINDINGS_LAYOUT_RECORD="$(sed -n "${EMPTY_KEYBINDINGS_LAYOUT_LINE}p" "$CLIENT_LOG")"
+      EMPTY_KEYBINDINGS_REQUEST="$(sed -n 's/.* request=\([0-9][0-9]*\) .*/\1/p' <<<"$EMPTY_KEYBINDINGS_LAYOUT_RECORD")"
+      EMPTY_KEYBINDINGS_EPOCH="$(sed -n 's/.* epoch=\([0-9][0-9]*\) .*/\1/p' <<<"$EMPTY_KEYBINDINGS_LAYOUT_RECORD")"
+      EMPTY_KEYBINDINGS_TARGET_REVISION="$(sed -n 's/.* target_revision=\([0-9][0-9]*\) .*/\1/p' <<<"$EMPTY_KEYBINDINGS_LAYOUT_RECORD")"
+      if rg -q "synchronized layout ready actor=session-switcher request=${EMPTY_KEYBINDINGS_REQUEST} .* epoch=${EMPTY_KEYBINDINGS_EPOCH} target_revision=${EMPTY_KEYBINDINGS_TARGET_REVISION} .* pane_ready=3/3 .* missing=\[\] degraded=false" "$CLIENT_LOG" \
+        && rg -q "completed synchronized layout actor=session-switcher request=${EMPTY_KEYBINDINGS_REQUEST} .* epoch=${EMPTY_KEYBINDINGS_EPOCH} target_revision=${EMPTY_KEYBINDINGS_TARGET_REVISION} .* pane_ready=3/3 .* missing=\[\]" "$CLIENT_LOG" \
+        && rg -q "setup layout quiescent presented_layout_revision=${EMPTY_KEYBINDINGS_TARGET_REVISION} .* synchronized_layout_active=false staged_layouts=0" "$CLIENT_LOG"; then
+        break
+      fi
+    fi
+    sleep 0.05
+  done
+  rg -q "synchronized layout ready actor=session-switcher request=${EMPTY_KEYBINDINGS_REQUEST} .* epoch=${EMPTY_KEYBINDINGS_EPOCH} target_revision=${EMPTY_KEYBINDINGS_TARGET_REVISION} .* pane_ready=3/3 .* missing=\[\] degraded=false" "$CLIENT_LOG"
+  rg -q "completed synchronized layout actor=session-switcher request=${EMPTY_KEYBINDINGS_REQUEST} .* epoch=${EMPTY_KEYBINDINGS_EPOCH} target_revision=${EMPTY_KEYBINDINGS_TARGET_REVISION} .* pane_ready=3/3 .* missing=\[\]" "$CLIENT_LOG"
+  rg -q "setup layout quiescent presented_layout_revision=${EMPTY_KEYBINDINGS_TARGET_REVISION} .* synchronized_layout_active=false staged_layouts=0" "$CLIENT_LOG"
   capture "$OUT/empty-startup-keybindings.png"
   python3 - \
     "$OUT/empty-startup.png" \
@@ -506,13 +674,13 @@ fi
 
 if [[ "$WORKTREE_CREATION_ONLY" == 1 || "$WORKTREE_FAILURE_ONLY" == 1 ]]; then
   for _ in $(seq 1 200); do
-    if rg -q "accepted leased actor layout .* panes=[1-9][0-9]*" "$CLIENT_LOG" \
+    if rg -q "(accepted leased actor layout .* panes=[1-9][0-9]*|(completed|degraded) synchronized layout .* pane_ready=[0-9]+/[1-9][0-9]*)" "$CLIENT_LOG" \
       && rg -q "backend session catalogue backend=1 sessions=2 active=3" "$CLIENT_LOG"; then
       break
     fi
     sleep 0.05
   done
-  rg -q "accepted leased actor layout .* panes=[1-9][0-9]*" "$CLIENT_LOG"
+  rg -q "(accepted leased actor layout .* panes=[1-9][0-9]*|(completed|degraded) synchronized layout .* pane_ready=[0-9]+/[1-9][0-9]*)" "$CLIENT_LOG"
   rg -q "backend session catalogue backend=1 sessions=2 active=3" "$CLIENT_LOG"
   env XDG_RUNTIME_DIR="$RUNTIME_DIR" WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
     grim "$OUT/worktree-first-open.png"
@@ -601,7 +769,7 @@ fi
 
 for _ in $(seq 1 200); do
   if rg -q "granted rest layout lease .* actor=workspace panes=[1-9][0-9]*" "$CLIENT_LOG" \
-    && rg -q "accepted leased actor layout .* panes=[1-9][0-9]*" "$CLIENT_LOG" \
+    && rg -q "(accepted leased actor layout .* panes=[1-9][0-9]*|(completed|degraded) synchronized layout .* pane_ready=[0-9]+/[1-9][0-9]*)" "$CLIENT_LOG" \
     && rg -q "presentation shared catalog .*active=3 .*sessions=2 windows=2" "$CLIENT_LOG" \
     && rg -q "imported window DMA-BUF window_id=1 " "$CLIENT_LOG" \
     && rg -q "imported window DMA-BUF window_id=2 " "$CLIENT_LOG" \
@@ -611,7 +779,7 @@ for _ in $(seq 1 200); do
   sleep 0.1
 done
 rg -q "granted rest layout lease .* actor=workspace panes=[1-9][0-9]*" "$CLIENT_LOG"
-rg -q "accepted leased actor layout .* panes=[1-9][0-9]*" "$CLIENT_LOG"
+rg -q "(accepted leased actor layout .* panes=[1-9][0-9]*|(completed|degraded) synchronized layout .* pane_ready=[0-9]+/[1-9][0-9]*)" "$CLIENT_LOG"
 rg -q "presentation shared catalog .*active=3 .*sessions=2 windows=2" "$CLIENT_LOG"
 rg -q "imported window DMA-BUF window_id=1 " "$CLIENT_LOG"
 rg -q "imported window DMA-BUF window_id=2 " "$CLIENT_LOG"
@@ -633,24 +801,27 @@ SWITCHER_PANE="$(
 OUTPUT_WIDTH="${OUTPUT_MODE%x*}"
 [[ -n "$STATUS_PANE" && -n "$SWITCHER_PANE" ]]
 for _ in $(seq 1 100); do
-  if rg -q "accepted synchronized layout actor=session-switcher .* target_rects=.*${STATUS_PANE}:[0-9]+:${SIDEBAR_HEIGHT}:${OUTPUT_WIDTH}:34" "$CLIENT_LOG" \
+  if rg -q "(accepted synchronized layout .* target_rects|accepted leased actor layout .* pane_rects)=?.*${STATUS_PANE}:[0-9]+:${SIDEBAR_HEIGHT}:${OUTPUT_WIDTH}:34" "$CLIENT_LOG" \
     && rg -q "render scheduling actor-frame promoted actor=status-bar .* panes=\[$STATUS_PANE\]" "$CLIENT_LOG"; then
     break
   fi
   sleep 0.05
 done
-rg -q "accepted synchronized layout actor=session-switcher .* target_rects=.*${STATUS_PANE}:[0-9]+:${SIDEBAR_HEIGHT}:${OUTPUT_WIDTH}:34" "$CLIENT_LOG"
+rg -q "(accepted synchronized layout .* target_rects|accepted leased actor layout .* pane_rects)=?.*${STATUS_PANE}:[0-9]+:${SIDEBAR_HEIGHT}:${OUTPUT_WIDTH}:34" "$CLIENT_LOG"
 rg -q "render scheduling actor-frame promoted actor=status-bar .* panes=\[$STATUS_PANE\]" "$CLIENT_LOG"
+if rg -q "accepted synchronized layout .* target_rects=.*${STATUS_PANE}:[0-9]+:${SIDEBAR_HEIGHT}:${OUTPUT_WIDTH}:34" "$CLIENT_LOG"; then
+  rg -q 'synchronized layout ready .* missing=\[\] degraded=false ' "$CLIENT_LOG"
+fi
 
 if [[ "$OUTPUT_MODE" == "1280x720" ]]; then
   for _ in $(seq 1 100); do
-    if rg -q "accepted synchronized layout actor=session-switcher .* target_rects=.*${SWITCHER_PANE}:[0-9]+:0:320:${SIDEBAR_HEIGHT}" "$CLIENT_LOG" \
+    if rg -q "(accepted synchronized layout .* target_rects|accepted leased actor layout .* pane_rects)=?.*${SWITCHER_PANE}:[0-9]+:0:320:${SIDEBAR_HEIGHT}" "$CLIENT_LOG" \
       && rg -q "render scheduling actor-frame promoted actor=session-switcher .* panes=\[$SWITCHER_PANE\]" "$CLIENT_LOG"; then
       break
     fi
     sleep 0.05
   done
-  rg -q "accepted synchronized layout actor=session-switcher .* target_rects=.*${SWITCHER_PANE}:[0-9]+:0:320:${SIDEBAR_HEIGHT}" "$CLIENT_LOG"
+  rg -q "(accepted synchronized layout .* target_rects|accepted leased actor layout .* pane_rects)=?.*${SWITCHER_PANE}:[0-9]+:0:320:${SIDEBAR_HEIGHT}" "$CLIENT_LOG"
   rg -q "render scheduling actor-frame promoted actor=session-switcher .* panes=\[$SWITCHER_PANE\]" "$CLIENT_LOG"
 fi
 
@@ -662,8 +833,93 @@ capture() {
   [[ -s "$target" ]]
 }
 
+picker_snapshot() {
+  local snapshot
+  snapshot="$(sed -n 's/.*facet native pair committed .*actor=picker .*snapshot=\([0-9]*\) .*/\1/p' "$CLIENT_LOG" | tail -1)"
+  printf '%s\n' "${snapshot:-0}"
+}
+
+layout_is_settled() {
+  awk '
+    /^accepted synchronized layout / { pending = 1 }
+    /^(completed|aborted) synchronized layout / { pending = 0 }
+    END { exit pending }
+  ' "$CLIENT_LOG"
+}
+
+wait_layout_settled() {
+  for _ in $(seq 1 200); do
+    layout_is_settled && return 0
+    kill -0 "$CLIENT_PID" 2>/dev/null || break
+    sleep 0.05
+  done
+  echo "ERR layout did not settle before the next picker interaction" >&2
+  return 1
+}
+
+wait_picker_frame() {
+  local prior=$1
+  [[ "$PURE_SHELL" == 1 ]] || return 0
+  for _ in $(seq 1 200); do
+    if (( $(picker_snapshot) > prior )) \
+      && [[ "$(rg -a '^focused (local plugin pane=|away from plugin pane=|backend-managed window=)' "$CLIENT_LOG" | tail -1)" == "focused local plugin pane=$PICKER_PANE" ]] \
+      && layout_is_settled; then
+      return 0
+    fi
+    sleep 0.05
+  done
+  echo "ERR picker did not commit a focused replacement frame after snapshot=$prior" >&2
+  return 1
+}
+
 accepted_layout_count() {
   rg -c "accepted (leased actor layout|synchronized layout actor=)" "$CLIENT_LOG" || true
+}
+
+actor_native_render_count() {
+  local actor=$1
+  local pane=$2
+  if ! kill -0 "$CLIENT_PID" 2> /dev/null; then
+    echo "ERR presentation client exited while waiting for actor=$actor pane=$pane" >&2
+    tail -40 "$CLIENT_LOG" >&2
+    return 1
+  fi
+  if [[ "$PURE_SHELL" == 1 ]]; then
+    rg -a -c "facet native pair committed .*actor=${actor} .*pane_count=1 panes=\\{${pane}\\}" "$CLIENT_LOG" || true
+  else
+    rg -a -c "compiled plugin GPU scene pane=${pane} " "$CLIENT_LOG" || true
+  fi
+}
+
+actor_native_revision_after() {
+  local actor=$1
+  local pane=$2
+  local marker=$3
+  if [[ "$PURE_SHELL" == 1 ]]; then
+    sed -n "/${marker}/,\$p" "$CLIENT_LOG" \
+      | sed -n 's/.*facet native pair committed .*actor='"$actor"' .*native_revision=\([0-9][0-9]*\).*pane_count=1 panes={'"$pane"'}.*/\1/p' \
+      | tail -1
+  else
+    sed -n "/${marker}/,\$p" "$CLIENT_LOG" \
+      | sed -n 's/.*compiled plugin GPU scene pane='"$pane"' sequence=\([0-9][0-9]*\).*/\1/p' \
+      | tail -1
+  fi
+}
+
+actor_started_pane() {
+  local actor=$1
+  sed -n \
+    's/.*started presentation WASM actor id='"$actor"' kind=[^ ]* generation=[^ ]* pane=\([0-9][0-9]*\) .*/\1/p' \
+    "$CLIENT_LOG" \
+    | tail -1
+}
+
+actor_received_focus() {
+  local actor=$1
+  local pane=$2
+  [[ -n "$pane" ]] \
+    && sed -n "/started presentation WASM actor id=${actor}/,\$p" "$CLIENT_LOG" \
+      | rg -a -q "focused local plugin pane=${pane}([[:space:]]|$)"
 }
 
 send_toggle() {
@@ -679,9 +935,13 @@ send_open_terminal() {
 }
 
 send_picker() {
+  wait_layout_settled
+  local prior
+  prior="$(picker_snapshot)"
   env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
     WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
     "$OUT/virtual-keyboard-key" 25
+  wait_picker_frame "$prior"
 }
 
 send_keybindings() {
@@ -759,7 +1019,7 @@ KEYBINDINGS_PANE="$(
 [[ -n "$PICKER_PANE" && -n "$KEYBINDINGS_PANE" ]]
 for _ in $(seq 1 100); do
   KEYBINDINGS_LAYOUT_LINE="$(
-    rg -n "accepted synchronized layout actor=session-switcher .* target_rects=.*${PICKER_PANE}:" "$CLIENT_LOG" \
+    rg -n "accepted synchronized layout .* target_rects=.*${PICKER_PANE}:" "$CLIENT_LOG" \
       | tail -1 \
       | cut -d: -f1 \
       || true
@@ -779,11 +1039,27 @@ done
 ((KEYBINDINGS_PICKER_FRAME_LINE > KEYBINDINGS_LAYOUT_LINE))
 capture "$OUT/keybindings-visible.png"
 
+PICKER_FILTER_REVISION="$(sed -n 's/.*facet render started actor=picker .*snapshot=\([0-9]*\) .*/\1/p' "$CLIENT_LOG" | tail -1)"
 env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
   WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
-  wtype "toggle session switcher" -s 100
+  "$OUT/virtual-keyboard-key" --text "toggle session switcher"
+if [[ "$PURE_SHELL" == 1 ]]; then
+  # Enter intentionally targets displayed identities. Wait until all 23 text
+  # reductions have published and that view has committed, not merely arrived.
+  for _ in $(seq 1 200); do
+    FILTER_CANDIDATE="$(awk -v revision="$((PICKER_FILTER_REVISION + 23))" '/facet render started actor=picker / { candidate=0; snapshot=0; for(i=1;i<=NF;i++){if($i~/^candidate=/){split($i,a,"=");candidate=a[2]} if($i~/^snapshot=/){split($i,a,"=");snapshot=a[2]}} if(snapshot>=revision) latest=candidate } END{print latest}' "$CLIENT_LOG")"
+    if [[ -n "$FILTER_CANDIDATE" ]] && rg -a -q "facet native pair committed .*actor=picker .*candidate=$FILTER_CANDIDATE " "$CLIENT_LOG"; then
+      break
+    fi
+    sleep 0.05
+  done
+  [[ -n "$FILTER_CANDIDATE" ]]
+  rg -a -q "facet native pair committed .*actor=picker .*candidate=$FILTER_CANDIDATE " "$CLIENT_LOG"
+fi
 capture "$OUT/keybindings-filtered.png"
 KEYBINDINGS_CAPTURE_LAYOUT_BEFORE="$(accepted_layout_count)"
+KEYBINDINGS_CAPTURE_SNAPSHOT_BEFORE="$(sed -n 's/.*facet native pair committed .*actor=keybindings .*snapshot=\([0-9]*\) .*/\1/p' "$CLIENT_LOG" | tail -1)"
+KEYBINDINGS_CAPTURE_SNAPSHOT_BEFORE="${KEYBINDINGS_CAPTURE_SNAPSHOT_BEFORE:-1}"
 env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
   WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
   "$OUT/virtual-keyboard-key" --none 28
@@ -806,6 +1082,14 @@ for _ in $(seq 1 100); do
   sleep 0.05
 done
 rg -q "focused local plugin pane=$KEYBINDINGS_PANE" "$CLIENT_LOG"
+if [[ "$PURE_SHELL" == 1 ]]; then
+  for _ in $(seq 1 200); do
+    CAPTURE_SNAPSHOT="$(sed -n 's/.*facet native pair committed .*actor=keybindings .*snapshot=\([0-9]*\) .*/\1/p' "$CLIENT_LOG" | tail -1)"
+    (( ${CAPTURE_SNAPSHOT:-0} > KEYBINDINGS_CAPTURE_SNAPSHOT_BEFORE )) && break
+    sleep 0.05
+  done
+  (( ${CAPTURE_SNAPSHOT:-0} > KEYBINDINGS_CAPTURE_SNAPSHOT_BEFORE ))
+fi
 env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
   WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
   "$OUT/virtual-keyboard-key" 23
@@ -832,16 +1116,27 @@ assert bindings["sessions.toggle"] == (31, 3), bindings
 assert bindings["inbox.show"] == (58, 3), bindings
 PY
 
+# Saving a chord returns to the shared action picker. Wait for that specific
+# transition before dismissing it; a persisted file is earlier than its frame.
+for _ in $(seq 1 100); do
+  if [[ "$(rg -a -c 'sender=picker recipient=session-switcher body=.*"visible":true' "$CLIENT_LOG" || true)" -ge 2 ]]; then
+    break
+  fi
+  sleep 0.05
+done
+# The new picker must own focus and have committed its replacement view.
+for _ in $(seq 1 100); do
+  if [[ "$(rg -a -o 'focused local plugin pane=[0-9]+' "$CLIENT_LOG" | tail -1)" == "focused local plugin pane=$PICKER_PANE" ]]; then
+    break
+  fi
+  sleep 0.05
+done
+sleep 0.2
 KEYBINDINGS_LAYOUT_VISIBLE="$(accepted_layout_count)"
-if [[ "$OUTPUT_MODE" == "1280x720" ]]; then
-  KEYBINDINGS_CLOSE_PROOF="Clicking the dimmed backdrop closed the window."
-  click_at 32 360
-else
-  KEYBINDINGS_CLOSE_PROOF="Escape closed the window in the narrow presentation."
-  env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
-    WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
-    "$OUT/virtual-keyboard-key" --none 1
-fi
+KEYBINDINGS_CLOSE_PROOF="Escape dismissed the action picker after saving the chord."
+env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+  WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+  "$OUT/virtual-keyboard-key" --none 1
 for _ in $(seq 1 100); do
   KEYBINDINGS_LAYOUT_CLOSED="$(accepted_layout_count)"
   ((KEYBINDINGS_LAYOUT_CLOSED > KEYBINDINGS_LAYOUT_VISIBLE)) && break
@@ -954,19 +1249,21 @@ EOF
 fi
 
 BACKEND_PICKER_LAYOUT_BEFORE="$(accepted_layout_count)"
+BACKEND_PICKER_SNAPSHOT_BEFORE="$(picker_snapshot)"
 click_at 1244 26
 for _ in $(seq 1 100); do
   BACKEND_PICKER_LAYOUT_OPEN="$(accepted_layout_count)"
   if ((BACKEND_PICKER_LAYOUT_OPEN > BACKEND_PICKER_LAYOUT_BEFORE)) \
-    && rg -q 'sender=session-switcher recipient=picker body=.*"request":"backend-discovery".*"loading":true' "$CLIENT_LOG" \
+    && rg -q 'sender=session-switcher recipient=picker body=.*"request":"backend-discovery(-[0-9]+)?".*"loading":true' "$CLIENT_LOG" \
     && rg -q 'sender=session-switcher recipient=picker body=.*"type":"picker-update".*"loading":false' "$CLIENT_LOG"; then
     break
   fi
   sleep 0.05
 done
 ((BACKEND_PICKER_LAYOUT_OPEN > BACKEND_PICKER_LAYOUT_BEFORE))
-rg -q 'sender=session-switcher recipient=picker body=.*"request":"backend-discovery".*"loading":true' "$CLIENT_LOG"
+rg -q 'sender=session-switcher recipient=picker body=.*"request":"backend-discovery(-[0-9]+)?".*"loading":true' "$CLIENT_LOG"
 rg -q 'sender=session-switcher recipient=picker body=.*"type":"picker-update".*"loading":false' "$CLIENT_LOG"
+wait_picker_frame "$BACKEND_PICKER_SNAPSHOT_BEFORE"
 capture "$OUT/backend-picker-visible.png"
 env XDG_RUNTIME_DIR="$RUNTIME_DIR" WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
   "$OUT/virtual-keyboard-key" --plain 1
@@ -983,14 +1280,14 @@ for _ in $(seq 1 100); do
   accepted_picker="$(accepted_layout_count)"
   if rg -q "started presentation WASM actor id=picker" "$CLIENT_LOG" \
     && ((accepted_picker > accepted_before)) \
-    && rg -q "accepted synchronized layout actor=session-switcher .* target_rects=.*:720:[0-9]+" "$CLIENT_LOG"; then
+    && rg -q "accepted synchronized layout .* target_rects=.*:720:[0-9]+" "$CLIENT_LOG"; then
     break
   fi
   sleep 0.05
 done
 rg -q "started presentation WASM actor id=picker" "$CLIENT_LOG"
 ((accepted_picker > accepted_before))
-rg -q "accepted synchronized layout actor=session-switcher .* target_rects=.*:720:[0-9]+" "$CLIENT_LOG"
+rg -q "accepted synchronized layout .* target_rects=.*:720:[0-9]+" "$CLIENT_LOG"
 capture "$OUT/picker-visible.png"
 PICKER_BOTTOM_LEFT="$(
   magick "$OUT/picker-visible.png" -format '%[pixel:p{280,599}]' info:
@@ -1026,7 +1323,8 @@ rg -q "presentation shared catalog .*active=2 .*sessions=2 windows=2" "$CLIENT_L
 capture "$OUT/session-beta.png"
 
 gamma_snapshots_before="$(rg -c "presentation shared catalog .*active=3 .*sessions=2 windows=2" "$CLIENT_LOG")"
-ctl surface-session switch Gamma > /dev/null
+ctl surface-session switch Gamma > "$OUT/switch-gamma.json"
+ctl surface-session list-json > "$OUT/sessions-after-gamma.json"
 for _ in $(seq 1 100); do
   gamma_snapshots_after="$(rg -c "presentation shared catalog .*active=3 .*sessions=2 windows=2" "$CLIENT_LOG")"
   ((gamma_snapshots_after > gamma_snapshots_before)) && break
@@ -1115,15 +1413,25 @@ rg -q "total_windows=2" <<< "$(ctl status)"
 ((CATALOG_TWO_AFTER > CATALOG_TWO_BEFORE))
 ((LAYOUT_TWO_AFTER > LAYOUT_TWO_BEFORE))
 
-DIFF_PACKETS_BEFORE="$(rg -c "compiled plugin GPU scene" "$CLIENT_LOG")"
 DIFF_ACTOR="diff-viewer-sb1-s3"
+DIFF_PANE=""
+if [[ "$PURE_SHELL" == 1 ]]; then
+  DIFF_PACKETS_BEFORE="$(rg -a -c "facet native pair committed .*actor=${DIFF_ACTOR} " "$CLIENT_LOG" || true)"
+else
+  DIFF_PACKETS_BEFORE="$(rg -c "compiled plugin GPU scene" "$CLIENT_LOG" || true)"
+fi
 send_diff_toggle
 for _ in $(seq 1 200); do
-  DIFF_PACKETS_AFTER="$(rg -c "compiled plugin GPU scene" "$CLIENT_LOG")"
+  DIFF_PANE="$(actor_started_pane "$DIFF_ACTOR")"
+  if [[ "$PURE_SHELL" == 1 ]]; then
+    DIFF_PACKETS_AFTER="$(rg -a -c "facet native pair committed .*actor=${DIFF_ACTOR} " "$CLIENT_LOG" || true)"
+  else
+    DIFF_PACKETS_AFTER="$(rg -c "compiled plugin GPU scene" "$CLIENT_LOG" || true)"
+  fi
   if rg -q "started presentation WASM actor id=$DIFF_ACTOR" "$CLIENT_LOG" \
     && rg -q "sent key-policy actor message actor=brood.client-init" "$CLIENT_LOG" \
     && ((DIFF_PACKETS_AFTER > DIFF_PACKETS_BEFORE)) \
-    && rg -q "focused local plugin pane=" "$CLIENT_LOG"; then
+    && actor_received_focus "$DIFF_ACTOR" "$DIFF_PANE"; then
     break
   fi
   sleep 0.05
@@ -1131,31 +1439,38 @@ done
 rg -q "started presentation WASM actor id=$DIFF_ACTOR" "$CLIENT_LOG"
 rg -q "sent key-policy actor message actor=brood.client-init" "$CLIENT_LOG"
 ((DIFF_PACKETS_AFTER > DIFF_PACKETS_BEFORE))
-DIFF_PANE="$(
-  sed -n "/started presentation WASM actor id=$DIFF_ACTOR/,\$p" "$CLIENT_LOG" \
-    | sed -n 's/.*focused local plugin pane=\([0-9][0-9]*\).*/\1/p' \
-    | head -1
-)"
 [[ -n "$DIFF_PANE" ]]
+actor_received_focus "$DIFF_ACTOR" "$DIFF_PANE"
 INITIAL_DIFF_SEQUENCE="$(
-  sed -n "/started presentation WASM actor id=$DIFF_ACTOR/,\$p" "$CLIENT_LOG" \
-    | sed -n 's/.*compiled plugin GPU scene pane='"$DIFF_PANE"' sequence=\([0-9][0-9]*\).*/\1/p' \
-    | head -1
+  if [[ "$PURE_SHELL" == 1 ]]; then
+    sed -n "/started presentation WASM actor id=$DIFF_ACTOR/,\$p" "$CLIENT_LOG" \
+      | sed -n 's/.*facet native pair committed .*actor='"$DIFF_ACTOR"' .*native_revision=\([0-9][0-9]*\).*pane_count=1 panes={'"$DIFF_PANE"'}.*/\1/p' \
+      | head -1
+  else
+    sed -n "/started presentation WASM actor id=$DIFF_ACTOR/,\$p" "$CLIENT_LOG" \
+      | sed -n 's/.*compiled plugin GPU scene pane='"$DIFF_PANE"' sequence=\([0-9][0-9]*\).*/\1/p' \
+      | head -1
+  fi
 )"
 [[ -n "$INITIAL_DIFF_SEQUENCE" ]]
 for _ in $(seq 1 400); do
   POPULATED_DIFF_SEQUENCE="$(
-    sed -n "/presentation actor worker finished actor=$DIFF_ACTOR/,\$p" "$CLIENT_LOG" \
-      | sed -n 's/.*compiled plugin GPU scene pane='"$DIFF_PANE"' sequence=\([0-9][0-9]*\) commands=\([2-9][0-9]\|[1-9][0-9][0-9][0-9]*\).*/\1/p' \
-      | tail -1
+    if [[ "$PURE_SHELL" == 1 ]]; then
+      actor_native_revision_after "$DIFF_ACTOR" "$DIFF_PANE" \
+        "presentation actor worker finished actor=$DIFF_ACTOR"
+    else
+      sed -n "/presentation actor worker finished actor=$DIFF_ACTOR/,\$p" "$CLIENT_LOG" \
+        | sed -n 's/.*compiled plugin GPU scene pane='"$DIFF_PANE"' sequence=\([0-9][0-9]*\) commands=\([2-9][0-9]\|[1-9][0-9][0-9][0-9]*\).*/\1/p' \
+        | tail -1
+    fi
   )"
   if [[ -n "$POPULATED_DIFF_SEQUENCE" ]] \
-    && ((POPULATED_DIFF_SEQUENCE > INITIAL_DIFF_SEQUENCE)); then
+    && ((POPULATED_DIFF_SEQUENCE >= INITIAL_DIFF_SEQUENCE)); then
     break
   fi
   sleep 0.05
 done
-((POPULATED_DIFF_SEQUENCE > INITIAL_DIFF_SEQUENCE))
+((POPULATED_DIFF_SEQUENCE >= INITIAL_DIFF_SEQUENCE))
 capture "$OUT/diff-open.png"
 
 read -r DIFF_WIDTH DIFF_HEIGHT < <(
@@ -1169,7 +1484,7 @@ read -r DIFF_WIDTH DIFF_HEIGHT < <(
 
 DRAG_LOG_LINE="$(wc -l < "$CLIENT_LOG")"
 DRAG_PACKETS_BEFORE="$(
-  rg -c "compiled plugin GPU scene pane=${DIFF_PANE} " "$CLIENT_LOG"
+  actor_native_render_count "$DIFF_ACTOR" "$DIFF_PANE"
 )"
 DRAG_X=$((DIFF_WIDTH - 8))
 DRAG_START_Y=70
@@ -1177,7 +1492,7 @@ DRAG_END_Y=$((DIFF_HEIGHT * 2 / 3))
 send_pointer drag "$DRAG_X" "$DRAG_START_Y" "$DRAG_X" "$DRAG_END_Y" 12 1280 720
 for _ in $(seq 1 100); do
   DRAG_PACKETS_AFTER="$(
-    rg -c "compiled plugin GPU scene pane=${DIFF_PANE} " "$CLIENT_LOG"
+    actor_native_render_count "$DIFF_ACTOR" "$DIFF_PANE"
   )"
   ((DRAG_PACKETS_AFTER >= DRAG_PACKETS_BEFORE + 3)) && break
   sleep 0.05
@@ -1193,7 +1508,7 @@ capture "$OUT/diff-dragged.png"
 
 TRACKPAD_LOG_LINE="$(wc -l < "$CLIENT_LOG")"
 TRACKPAD_PACKETS_BEFORE="$(
-  rg -c "compiled plugin GPU scene pane=${DIFF_PANE} " "$CLIENT_LOG"
+  actor_native_render_count "$DIFF_ACTOR" "$DIFF_PANE"
 )"
 TRACKPAD_STARTED_MS="$(date +%s%3N)"
 send_pointer scroll 220 220 0.5 40 1280 720
@@ -1201,7 +1516,7 @@ stable_samples=0
 previous_packets="$TRACKPAD_PACKETS_BEFORE"
 for _ in $(seq 1 200); do
   TRACKPAD_PACKETS_AFTER="$(
-    rg -c "compiled plugin GPU scene pane=${DIFF_PANE} " "$CLIENT_LOG"
+    actor_native_render_count "$DIFF_ACTOR" "$DIFF_PANE"
   )"
   if ((TRACKPAD_PACKETS_AFTER > TRACKPAD_PACKETS_BEFORE)) \
     && ((TRACKPAD_PACKETS_AFTER == previous_packets)); then
@@ -1226,17 +1541,31 @@ TRACKPAD_TEXT_LAYOUTS="${TRACKPAD_TEXT_LAYOUTS:-0}"
 ((TRACKPAD_SETTLED_MS < 2000))
 
 CLOSED_LAYOUTS_BEFORE="$(accepted_layout_count)"
+CLOSE_LOG_LINE="$(wc -l < "$CLIENT_LOG")"
+diff_withdrawal_presented() {
+  [[ "$PURE_SHELL" != 1 ]] && return 0
+  awk -v first="$CLOSE_LOG_LINE" -v pane="$DIFF_PANE" '
+    NR > first && /completed synchronized layout/ { completed = 1 }
+    NR > first && /render-content-projection / {
+      withdrawn = index($0, pane ":") == 0
+    }
+    END { exit !(completed && withdrawn) }
+  ' "$CLIENT_LOG"
+}
 send_close_pane
 for _ in $(seq 1 100); do
   CLOSED_LAYOUTS_AFTER="$(accepted_layout_count)"
   if rg -q "stopped presentation init child actor id=$DIFF_ACTOR" "$CLIENT_LOG" \
-    && ((CLOSED_LAYOUTS_AFTER > CLOSED_LAYOUTS_BEFORE)); then
+    && ((CLOSED_LAYOUTS_AFTER > CLOSED_LAYOUTS_BEFORE)) \
+    && diff_withdrawal_presented; then
     break
   fi
   sleep 0.05
 done
 rg -q "stopped presentation init child actor id=$DIFF_ACTOR" "$CLIENT_LOG"
 ((CLOSED_LAYOUTS_AFTER > CLOSED_LAYOUTS_BEFORE))
+diff_withdrawal_presented
+sleep 0.05
 capture "$OUT/diff-closed.png"
 
 capture "$OUT/project-expanded.png"
@@ -1253,6 +1582,11 @@ WORKTREE_DAEMON_REQUESTS_BEFORE="$(
 click_at 1260 68
 submit_text picker-worktree
 for _ in $(seq 1 200); do
+  if ! kill -0 "$CLIENT_PID" 2> /dev/null; then
+    echo "ERR presentation client exited while waiting for worktree creation" >&2
+    tail -40 "$CLIENT_LOG" >&2
+    exit 1
+  fi
   WORKTREE_DAEMON_REQUESTS_AFTER="$(
     rg -c "delivered presentation-to-daemon actor message" "$SERVER_LOG" || true
   )"
@@ -1333,36 +1667,51 @@ rg -q "attached managed worktree session" "$SERVER_LOG"
 capture "$OUT/worktree-created.png"
 
 WORKTREE_DIFF_ACTOR="diff-viewer-sb1-s${WORKTREE_SESSION_ID}"
+WORKTREE_DIFF_PANE=""
 WORKTREE_DIFF_STARTS_BEFORE="$(
   rg -c "started presentation WASM actor id=$WORKTREE_DIFF_ACTOR" "$CLIENT_LOG" || true
 )"
-WORKTREE_DIFF_PACKETS_BEFORE="$(rg -c "compiled plugin GPU scene" "$CLIENT_LOG")"
+if [[ "$PURE_SHELL" == 1 ]]; then
+  WORKTREE_DIFF_PACKETS_BEFORE="$(rg -a -c "facet native pair committed .*actor=${WORKTREE_DIFF_ACTOR} " "$CLIENT_LOG" || true)"
+else
+  WORKTREE_DIFF_PACKETS_BEFORE="$(rg -c "compiled plugin GPU scene" "$CLIENT_LOG" || true)"
+fi
 send_diff_toggle
 for _ in $(seq 1 200); do
+  WORKTREE_DIFF_PANE="$(actor_started_pane "$WORKTREE_DIFF_ACTOR")"
   WORKTREE_DIFF_STARTS_AFTER="$(
     rg -c "started presentation WASM actor id=$WORKTREE_DIFF_ACTOR" "$CLIENT_LOG" || true
   )"
-  WORKTREE_DIFF_PACKETS_AFTER="$(rg -c "compiled plugin GPU scene" "$CLIENT_LOG")"
+  if [[ "$PURE_SHELL" == 1 ]]; then
+    WORKTREE_DIFF_PACKETS_AFTER="$(rg -a -c "facet native pair committed .*actor=${WORKTREE_DIFF_ACTOR} " "$CLIENT_LOG" || true)"
+  else
+    WORKTREE_DIFF_PACKETS_AFTER="$(rg -c "compiled plugin GPU scene" "$CLIENT_LOG" || true)"
+  fi
   if ((WORKTREE_DIFF_STARTS_AFTER > WORKTREE_DIFF_STARTS_BEFORE)) \
-    && ((WORKTREE_DIFF_PACKETS_AFTER > WORKTREE_DIFF_PACKETS_BEFORE)); then
+    && ((WORKTREE_DIFF_PACKETS_AFTER > WORKTREE_DIFF_PACKETS_BEFORE)) \
+    && actor_received_focus "$WORKTREE_DIFF_ACTOR" "$WORKTREE_DIFF_PANE"; then
     break
   fi
   sleep 0.05
 done
 ((WORKTREE_DIFF_STARTS_AFTER > WORKTREE_DIFF_STARTS_BEFORE))
 ((WORKTREE_DIFF_PACKETS_AFTER > WORKTREE_DIFF_PACKETS_BEFORE))
-WORKTREE_DIFF_PANE="$(
-  sed -n "/started presentation WASM actor id=$WORKTREE_DIFF_ACTOR/,\$p" "$CLIENT_LOG" \
-    | sed -n 's/.*focused local plugin pane=\([0-9][0-9]*\).*/\1/p' \
-    | head -1
-)"
 [[ -n "$WORKTREE_DIFF_PANE" ]]
+actor_received_focus "$WORKTREE_DIFF_ACTOR" "$WORKTREE_DIFF_PANE"
+for _ in $(seq 1 400); do
+  WORKTREE_POPULATED_REVISION="$(
+    actor_native_revision_after "$WORKTREE_DIFF_ACTOR" "$WORKTREE_DIFF_PANE" \
+      "presentation actor worker finished actor=$WORKTREE_DIFF_ACTOR"
+  )"
+  [[ -n "$WORKTREE_POPULATED_REVISION" ]] && break
+  sleep 0.05
+done
+rg -a -q "presentation actor worker finished actor=$WORKTREE_DIFF_ACTOR" "$CLIENT_LOG"
+[[ -n "$WORKTREE_POPULATED_REVISION" ]]
 capture "$OUT/worktree-plugin-before-switch.png"
 
 send_picker
-env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
-  WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
-  wtype "Bt" -s 100 -k Return
+submit_text Bt
 for _ in $(seq 1 100); do
   SESSION_JSON="$(ctl surface-session list-json)"
   if python3 - "$SESSION_JSON" "$WORKTREE_SESSION_ID" <<'PY'
@@ -1398,14 +1747,18 @@ fi
 WORKTREE_DIFF_LAYOUTS_BEFORE_RETURN="$(
   accepted_layout_count
 )"
+WORKTREE_DIFF_RENDERS_BEFORE_RETURN="$(
+  actor_native_render_count "$WORKTREE_DIFF_ACTOR" "$WORKTREE_DIFF_PANE"
+)"
 send_picker
-env XDG_RUNTIME_DIR="$RUNTIME_DIR" \
-  WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
-  wtype "picker-worktree" -s 100 -k Return
+submit_text picker-worktree
 for _ in $(seq 1 200); do
   SESSION_JSON="$(ctl surface-session list-json)"
   WORKTREE_DIFF_LAYOUTS_AFTER_RETURN="$(
     accepted_layout_count
+  )"
+  WORKTREE_DIFF_RENDERS_AFTER_RETURN="$(
+    actor_native_render_count "$WORKTREE_DIFF_ACTOR" "$WORKTREE_DIFF_PANE"
   )"
   if python3 - "$SESSION_JSON" "$WORKTREE_SESSION_ID" <<'PY'
 import json
@@ -1416,7 +1769,10 @@ worktree = next(session for session in catalog["sessions"] if session["id"] == i
 raise SystemExit(0 if worktree["active"] and worktree["windows"] == 0 else 1)
 PY
   then
-    ((WORKTREE_DIFF_LAYOUTS_AFTER_RETURN > WORKTREE_DIFF_LAYOUTS_BEFORE_RETURN)) && break
+    if ((WORKTREE_DIFF_LAYOUTS_AFTER_RETURN > WORKTREE_DIFF_LAYOUTS_BEFORE_RETURN)) \
+      && ((WORKTREE_DIFF_RENDERS_AFTER_RETURN > WORKTREE_DIFF_RENDERS_BEFORE_RETURN)); then
+      break
+    fi
   fi
   sleep 0.05
 done
@@ -1429,26 +1785,43 @@ worktree = next(session for session in catalog["sessions"] if session["id"] == i
 assert worktree["active"] is True
 assert worktree["windows"] == 0
 PY
+((WORKTREE_DIFF_RENDERS_AFTER_RETURN > WORKTREE_DIFF_RENDERS_BEFORE_RETURN))
 [[ "$(
   rg -c "started presentation WASM actor id=$WORKTREE_DIFF_ACTOR" "$CLIENT_LOG"
 )" == "$WORKTREE_DIFF_STARTS_AFTER" ]]
 ((WORKTREE_DIFF_LAYOUTS_AFTER_RETURN > WORKTREE_DIFF_LAYOUTS_BEFORE_RETURN))
 capture "$OUT/worktree-plugin-after-switch.png"
 
-WORKTREE_DIFF_FOCUSES_BEFORE="$(
-  rg -c "focused local plugin pane=$WORKTREE_DIFF_PANE" "$CLIENT_LOG"
-)"
-click_at 480 360
+wait_layout_settled
+read -r WORKTREE_DIFF_CLICK_X WORKTREE_DIFF_CLICK_Y < <(
+  python3 - "$CLIENT_LOG" "$WORKTREE_DIFF_PANE" <<'PY'
+import pathlib
+import re
+import sys
+
+pattern = re.compile(r"(?:\[|,)" + re.escape(sys.argv[2]) + r":(-?\d+):(-?\d+):(\d+):(\d+)")
+rect = None
+for line in pathlib.Path(sys.argv[1]).read_text(errors="replace").splitlines():
+    if "target_rects=" in line or "pane_rects=" in line:
+        match = pattern.search(line)
+        if match:
+            rect = tuple(map(int, match.groups()))
+if rect is None or rect[2] <= 0 or rect[3] <= 0:
+    raise SystemExit("worktree diff has no positive native layout rectangle")
+print(rect[0] + rect[2] // 2, rect[1] + rect[3] // 2)
+PY
+)
+click_at "$WORKTREE_DIFF_CLICK_X" "$WORKTREE_DIFF_CLICK_Y"
 for _ in $(seq 1 100); do
-  WORKTREE_DIFF_FOCUSES_AFTER="$(
-    rg -c "focused local plugin pane=$WORKTREE_DIFF_PANE" "$CLIENT_LOG"
+  WORKTREE_DIFF_FOCUS="$(
+    rg -a '^focused (local plugin pane=|away from plugin pane=|backend-managed window=)' "$CLIENT_LOG" | tail -1
   )"
-  if ((WORKTREE_DIFF_FOCUSES_AFTER > WORKTREE_DIFF_FOCUSES_BEFORE)); then
+  if [[ "$WORKTREE_DIFF_FOCUS" == "focused local plugin pane=$WORKTREE_DIFF_PANE" ]]; then
     break
   fi
   sleep 0.05
 done
-((WORKTREE_DIFF_FOCUSES_AFTER > WORKTREE_DIFF_FOCUSES_BEFORE))
+[[ "$WORKTREE_DIFF_FOCUS" == "focused local plugin pane=$WORKTREE_DIFF_PANE" ]]
 send_close_pane
 for _ in $(seq 1 100); do
   if rg -q "stopped presentation init child actor id=$WORKTREE_DIFF_ACTOR" "$CLIENT_LOG"; then
@@ -1471,6 +1844,7 @@ PY
 WORKTREE_COMPLETIONS_BEFORE="$(
   rg -c "delivered presentation-to-daemon actor message" "$SERVER_LOG" || true
 )"
+wait_layout_settled
 click_at 1260 68
 submit_text picker-worktree
 for _ in $(seq 1 100); do
@@ -1491,7 +1865,7 @@ done
 ((WORKTREE_COMPLETIONS_AFTER > WORKTREE_COMPLETIONS_BEFORE))
 [[ "$MATCHING_WORKTREE_SESSIONS" == "1" ]]
 
-ctl spawn weston-simple-shm > /dev/null
+ctl spawn env WAYLAND_DEBUG="${BROOD_TEST_WAYLAND_DEBUG:-0}" weston-simple-shm > /dev/null
 for _ in $(seq 1 100); do
   rg -q "total_windows=3" <<< "$(ctl status)" && break
   sleep 0.05
@@ -1503,7 +1877,7 @@ git -C "$OTHER_PROJECT" init --quiet
 git -C "$OTHER_PROJECT" -c user.name=Brood -c user.email=brood@example.invalid \
   commit --quiet --allow-empty -m initial
 ctl surface-session dir-new "$OTHER_PROJECT" default Other > /dev/null
-ctl spawn weston-simple-shm > /dev/null
+ctl spawn env WAYLAND_DEBUG="${BROOD_TEST_WAYLAND_DEBUG:-0}" weston-simple-shm > /dev/null
 for _ in $(seq 1 100); do
   SESSION_JSON="$(ctl surface-session list-json)"
   if rg -q "total_windows=4" <<< "$(ctl status)" \
@@ -1658,7 +2032,7 @@ PY
 
 STATUS="$(ctl status)"
 rg -q "presentation=Attached" <<< "$STATUS"
-rg -q "accepted leased actor layout .* panes=[1-9][0-9]*" "$CLIENT_LOG"
+rg -q "(accepted leased actor layout .* panes=[1-9][0-9]*|(completed|degraded) synchronized layout .* pane_ready=[0-9]+/[1-9][0-9]*)" "$CLIENT_LOG"
 rg -q "sent key-policy actor message actor=session-switcher" "$CLIENT_LOG"
 if rg -q "rejected actor-submitted layout; using native fallback" "$CLIENT_LOG"; then
   echo "ERR client abandoned actor layout after rejecting a recursive update" >&2
@@ -1722,8 +2096,8 @@ cat > "$OUT/proof.md" <<EOF
 - Ctrl+O latency: ${CTRL_O_LAYOUT_MS}ms from input helper start through the accepted three-pane layout
 - managed close: Ctrl+Alt+Q closed the focused foot pane in ${CLOSE_LAYOUT_MS}ms through shared catalog withdrawal and the accepted two-pane layout
 - diff viewer: Ctrl+Alt+D created and focused the session-scoped split-diff pane; a real pointer press, motion burst, and release dragged its scrollbar; Ctrl+Alt+Q stopped the focused actor and closed its pane
-- diff drag rendering: ${DRAG_PACKET_COUNT} draw packets covered the pointer grab from the first thumb press through release
-- diff touchpad rendering: 40 fractional-pixel finger-axis events settled in ${TRACKPAD_SETTLED_MS}ms; ${TRACKPAD_PACKET_COUNT} draw packets created ${TRACKPAD_TEXT_LAYOUTS} text layouts
+- diff drag rendering: ${DRAG_PACKET_COUNT} ${DIFF_RENDER_UNIT} covered the pointer grab from the first thumb press through release
+- diff touchpad rendering: 40 fractional-pixel finger-axis events settled in ${TRACKPAD_SETTLED_MS}ms; ${TRACKPAD_PACKET_COUNT} ${DIFF_RENDER_UNIT} caused ${TRACKPAD_TEXT_LAYOUTS} ${DIFF_TEXT_UNIT}
 - interaction feedback: the New control visibly changed between idle, hover, and held-press captures; releasing away from the control cancelled activation
 - captures: sidebar-visible.png, sidebar-new-hover.png, sidebar-new-pressed.png, backend-picker-visible.png, picker-visible.png, session-beta.png, sidebar-hidden.png, sidebar-restored.png, ctrl-o-terminal.png, diff-open.png, diff-dragged.png, diff-closed.png, project-expanded.png, project-collapsed.png, worktree-created.png, worktree-plugin-before-switch.png, worktree-plugin-after-switch.png, projects.png
 - status: $STATUS

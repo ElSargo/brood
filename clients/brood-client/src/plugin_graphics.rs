@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
+    ops::Deref,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -18,6 +19,8 @@ use brood_wasm::presentation::{
 use brood_wasm::{
     FontIntent, FontStyle, FontWeight, PresentationError, PresentationHost, TextLayoutOptions,
     TextLayoutResult,
+    facet_resources::FacetResourceBackend,
+    snapshot_budget::{BudgetedValue, ByteBudget},
 };
 use cosmic_text::{
     Attrs, Buffer, CacheKey, Family, FeatureTag, FontFeatures, FontSystem, Metrics, Shaping,
@@ -28,10 +31,11 @@ use winit::event_loop::EventLoopProxy;
 
 use crate::{
     ClientEvent,
+    plugin_facets::PreparedFacetRender,
     render_scheduler::{
         ActorSchedulerProgress, ActorScope, COLD_HOST_COST_NS, DIAGNOSTIC_WARMUP_OPPORTUNITIES,
-        FramePredictor, MAX_RELEVANT_PANES, MAX_RENDER_ACTORS, RenderScheduler, RenderToken,
-        SchedulerMetrics,
+        FramePredictor, LateFinishDiagnostic, MAX_RELEVANT_PANES, MAX_RENDER_ACTORS,
+        RenderScheduler, RenderToken, SchedulerMetrics,
     },
 };
 
@@ -42,9 +46,78 @@ const MAX_TEXT_LAYOUT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_RESOURCES_PER_PANE: usize = 1_024;
 const MAX_RESOURCE_BYTES_PER_PANE: usize = 64 * 1024 * 1024;
 const GLYPH_RASTER_QUEUE_CAPACITY: usize = 128;
+const MAX_GLYPH_CACHE_ENTRIES: usize = 4_096;
+const MAX_GLYPH_CACHE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_TEXT_BACKING_REUSE_SCAN: usize = 64;
 const COLD_WINIT_REDRAW_HOP_NS: u64 = 1_000_000;
 const MAX_WINIT_REDRAW_HOP_NS: u64 = 50_000_000;
 const DEFAULT_RASTER_SCALE: f32 = 1.0;
+const SHARED_PACKET_METADATA_BYTES: usize = std::mem::size_of::<Packet>()
+    + std::mem::size_of::<BudgetedValue<()>>()
+    + 4 * std::mem::size_of::<usize>();
+
+/// Immutable packet storage shared by CPU snapshots and prepared native scenes.
+///
+/// Facet packets retain their generation budget reservation for every clone.
+/// The inner `Arc` is deliberately not exposed, so packet ownership cannot be
+/// detached from that reservation.
+#[derive(Clone, Debug)]
+pub struct SharedPacket {
+    packet: Arc<Packet>,
+    _reservation: Option<Arc<BudgetedValue<()>>>,
+}
+
+impl SharedPacket {
+    pub(crate) fn decode_facet(
+        bytes: &[u8],
+        budget: &ByteBudget,
+        actor_generation: u64,
+    ) -> Result<Self, PresentationError> {
+        if budget.generation() != actor_generation {
+            return Err(PresentationError::ActorStopped);
+        }
+        let retained_bytes = Packet::decode_allocation_bound(bytes)
+            .map_err(packet_error_to_presentation)?
+            .checked_add(SHARED_PACKET_METADATA_BYTES)
+            .ok_or(PresentationError::LimitReached)?;
+        let reservation = BudgetedValue::capture(budget, retained_bytes, || {
+            Ok::<(), std::convert::Infallible>(())
+        })
+        .map_err(|_error| PresentationError::LimitReached)?;
+        let packet = Packet::decode(bytes).map_err(packet_error_to_presentation)?;
+        if budget.generation() != actor_generation || !budget.is_active() {
+            return Err(PresentationError::ActorStopped);
+        }
+        Ok(Self {
+            packet: Arc::new(packet),
+            _reservation: Some(Arc::new(reservation)),
+        })
+    }
+}
+
+impl From<Packet> for SharedPacket {
+    fn from(packet: Packet) -> Self {
+        Self {
+            packet: Arc::new(packet),
+            _reservation: None,
+        }
+    }
+}
+
+impl Deref for SharedPacket {
+    type Target = Packet;
+
+    fn deref(&self) -> &Self::Target {
+        &self.packet
+    }
+}
+
+const fn packet_error_to_presentation(error: PacketError) -> PresentationError {
+    match error {
+        PacketError::Limit(_) => PresentationError::LimitReached,
+        PacketError::Invalid(_) => PresentationError::InvalidPacket,
+    }
+}
 
 #[derive(Clone)]
 pub struct PluginGraphicsBridge {
@@ -71,19 +144,31 @@ pub struct ActorPresentationHost {
     actor: String,
     panes: BTreeSet<u64>,
     generation: AtomicU64,
+    retired_generation: AtomicU64,
     bridge: PluginGraphicsBridge,
+}
+
+/// Pure-facet resource adapter retaining the actor generation it was issued for.
+#[derive(Debug)]
+pub struct FacetPresentationBackend {
+    presentation: Arc<ActorPresentationHost>,
+    actor_generation: u64,
 }
 
 #[derive(Clone, Debug)]
 pub struct GraphicsSnapshot {
+    /// The complete texture extent validated by the paired facet contract.
+    /// Transparent and rounded canvases are complete without an opaque fill.
+    pub facet_extent: Option<(u32, u32)>,
     pub pane: u64,
     pub sequence: u64,
     /// Present only when this packet is staged for a synchronized resize.
     pub resize_epoch: Option<u64>,
-    pub packet: Packet,
+    pub packet: SharedPacket,
     pub images: BTreeMap<u64, ImageResource>,
     pub text_layouts: BTreeMap<u64, TextLayoutResource>,
     pub glyphs: BTreeMap<GlyphCacheKey, GlyphImageResource>,
+    pub(crate) facet_frame_lease: Option<Arc<brood_wasm::facet_frames::PaneFrame>>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -113,6 +198,9 @@ pub struct GraphicsDiagnostics {
     pub measured_opportunities: u64,
     pub measured_deadline_misses: u64,
     pub measured_target_misses: u64,
+    pub late_finish_diagnostics: Vec<LateFinishDiagnostic>,
+    pub late_finish_diagnostics_dropped: u64,
+    pub timing_observations: Vec<[u64; 7]>,
     pub actor_progress: Vec<ActorSchedulerProgress>,
     pub actor_frames_accepted: u64,
     pub actor_frames_ready: u64,
@@ -152,7 +240,8 @@ struct PaneScene {
     sequence: u64,
     resize_epoch: Option<u64>,
     terminal_input_sequence: Option<u64>,
-    packet: Packet,
+    packet: SharedPacket,
+    facet_frame: Option<Arc<brood_wasm::facet_frames::PaneFrame>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -180,12 +269,14 @@ pub enum ActorFramePreparationClaim {
 pub struct DeferredActorFrameResolutionPlan {
     pub retain: BTreeSet<u64>,
     pub commit: BTreeMap<u64, BTreeMap<u64, u64>>,
+    cancelled_tokens: Vec<u64>,
 }
 
 struct TextSystem {
     fonts: FontSystem,
     swash: SwashCache,
     glyphs: BTreeMap<GlyphCacheKey, Option<GlyphImageResource>>,
+    glyph_cache_bytes: usize,
 }
 
 #[derive(Debug)]
@@ -242,8 +333,11 @@ struct TextLayoutEntry {
     width: u32,
     height: u32,
     byte_len: usize,
+    includes_source_text: bool,
     text: Arc<str>,
     options: TextLayoutOptions,
+    metrics: TextLayoutResult,
+    font_context_revision: u64,
     raster_scale: f32,
     state: TextLayoutState,
 }
@@ -253,6 +347,51 @@ enum TextLayoutState {
     Pending,
     Ready(TextLayoutResource),
     Failed,
+}
+
+struct ReusableTextLayout {
+    retained_bytes: usize,
+    metrics: TextLayoutResult,
+    text: Arc<str>,
+    resource: TextLayoutResource,
+}
+
+fn reusable_text_layout(
+    state: &GraphicsState,
+    actor_generation: u64,
+    text: &str,
+    options: TextLayoutOptions,
+    raster_scale: f32,
+    includes_source_text: bool,
+) -> Option<ReusableTextLayout> {
+    // Handles increase monotonically, so reverse iteration considers the
+    // newest live entries first. Bound lookup independently of the registry's
+    // 16K resource ceiling; an older match safely falls back to shaping.
+    state
+        .text_layouts
+        .values()
+        .rev()
+        .take(MAX_TEXT_BACKING_REUSE_SCAN)
+        .find_map(|entry| {
+            if entry.generation != actor_generation
+                || entry.includes_source_text != includes_source_text
+                || entry.text.as_ref() != text
+                || entry.options != options
+                || entry.font_context_revision != state.font_context_revision
+                || entry.raster_scale.to_bits() != raster_scale.to_bits()
+            {
+                return None;
+            }
+            let TextLayoutState::Ready(resource) = &entry.state else {
+                return None;
+            };
+            Some(ReusableTextLayout {
+                retained_bytes: entry.byte_len,
+                metrics: entry.metrics,
+                text: Arc::clone(&entry.text),
+                resource: resource.clone(),
+            })
+        })
 }
 
 #[derive(Debug, Default)]
@@ -278,6 +417,7 @@ struct GraphicsState {
     deferred_actor_frames: BTreeMap<u64, PendingGraphicsActorFrame>,
     settled_actor_frame_correlations: BTreeMap<u64, Vec<(u64, u64, Option<u64>)>>,
     actor_panes: BTreeMap<ActorScope, BTreeSet<u64>>,
+    next_facet_targets: BTreeMap<ActorScope, u64>,
     actor_frames_accepted: u64,
     actor_frames_ready: u64,
     actor_frames_promoted: u64,
@@ -286,6 +426,38 @@ struct GraphicsState {
     visibility_changes: u64,
     max_visible_panes: usize,
     raster_scale: f32,
+    /// Revision of every font-selection/configuration input used by shaping.
+    /// Font configuration is currently immutable after bridge construction;
+    /// a future mutation must advance this before admitting more layouts.
+    font_context_revision: u64,
+}
+
+fn replace_facet_target(state: &mut GraphicsState, actor: &ActorScope, next_frame_ns: Option<u64>) {
+    if let Some(deadline) = next_frame_ns {
+        state.next_facet_targets.insert(actor.clone(), deadline);
+    } else {
+        state.next_facet_targets.remove(actor);
+    }
+}
+
+fn take_facet_targets(state: &mut GraphicsState) -> Vec<(ActorScope, u64)> {
+    let due = state
+        .next_facet_targets
+        .iter()
+        .map(|(actor, deadline)| {
+            let visible = state
+                .actor_panes
+                .get(actor)
+                .is_some_and(|owned| owned.iter().any(|pane| state.visible_panes.contains(pane)));
+            (actor.clone(), *deadline, visible)
+        })
+        .collect::<Vec<_>>();
+    for (actor, _deadline, _visible) in &due {
+        state.next_facet_targets.remove(actor);
+    }
+    due.into_iter()
+        .filter_map(|(actor, deadline, visible)| visible.then_some((actor, deadline)))
+        .collect()
 }
 
 #[derive(Debug)]
@@ -297,6 +469,8 @@ struct PendingGraphicsActorFrame {
     ready_notified: bool,
     required_panes: Option<BTreeSet<u64>>,
     blocker_epochs: BTreeSet<u64>,
+    facet_receipt: Option<PreparedFacetRender>,
+    facet_atomic: bool,
 }
 
 struct DeferredActorFrameStage {
@@ -394,7 +568,16 @@ fn ready_actor_frame_notifications(
             continue;
         }
         let visible = if let Some(required) = &frame.required_panes {
-            if !required.is_subset(&state.visible_panes) {
+            let drawable = if frame.facet_atomic {
+                // A facet response is one complete owned-pane batch, including
+                // hidden members. Prepare and commit that batch intact when
+                // any member is visible; requiring every member to be visible
+                // deadlocks a multi-pane actor after one pane is hidden.
+                !required.is_disjoint(&state.visible_panes)
+            } else {
+                required.is_subset(&state.visible_panes)
+            };
+            if !drawable {
                 continue;
             }
             required
@@ -425,6 +608,15 @@ fn ready_actor_frame_notifications(
                 terminal_input_sequence: scene.terminal_input_sequence,
             })
             .collect::<Vec<_>>();
+        if std::env::var_os("BROOD_TRACE_PLUGIN_GRAPHICS").is_some() {
+            eprintln!(
+                "facet bridge ready actor={} token={} revision={} panes={:?}",
+                frame.actor.name,
+                frame.token,
+                frame.revision,
+                frame.scenes.keys().collect::<Vec<_>>()
+            );
+        }
         notifications.push((frame.token, frame.revision, changes));
         if let Some(frame) = state.pending_actor_frames.get_mut(&revision) {
             frame.ready_notified = true;
@@ -474,6 +666,12 @@ fn actor_frame_snapshots_from_state(
                 .map_err(|_error| anyhow!("actor frame lost a referenced resource"))?;
             anyhow::ensure!(resources.ready, "actor frame pane resources are not ready");
             Ok(GraphicsSnapshot {
+                facet_extent: scene.facet_frame.as_ref().map(|frame| {
+                    (
+                        frame.geometry().physical_width,
+                        frame.geometry().physical_height,
+                    )
+                }),
                 pane,
                 sequence: scene.sequence,
                 resize_epoch: scene.resize_epoch,
@@ -481,6 +679,7 @@ fn actor_frame_snapshots_from_state(
                 images: resources.images,
                 text_layouts: resources.text_layouts,
                 glyphs: resources.glyphs,
+                facet_frame_lease: scene.facet_frame.clone(),
             })
         })
         .collect::<Result<Vec<_>>>()
@@ -491,21 +690,53 @@ fn promote_actor_frame_in_state(
     state: &mut GraphicsState,
     revision: u64,
     panes: &[u64],
-) -> Result<ActorFramePromotion> {
+) -> Result<(ActorFramePromotion, Option<u64>)> {
     let Some(mut frame) = state.pending_actor_frames.remove(&revision) else {
-        return Ok(ActorFramePromotion::Stale);
+        return Ok((ActorFramePromotion::Stale, None));
     };
     let promoted_panes = panes.iter().copied().collect::<BTreeSet<_>>();
     if promoted_panes.len() != panes.len()
         || promoted_panes
             .iter()
             .any(|pane| !frame.scenes.contains_key(pane))
+        || frame
+            .required_panes
+            .as_ref()
+            .is_some_and(|required| required != &promoted_panes)
     {
         state.actor_frame_partial_promotion_violations = state
             .actor_frame_partial_promotion_violations
             .saturating_add(1);
         state.pending_actor_frames.insert(revision, frame);
         anyhow::bail!("actor frame promotion pane set is invalid");
+    }
+    if let Some(receipt) = &frame.facet_receipt {
+        let candidate = receipt
+            .with_graphics(|graphics| {
+                (
+                    graphics.token().candidate,
+                    graphics.token().snapshot_revision,
+                )
+            })
+            .ok();
+        let Ok(next_frame_ns) = receipt.validate_current().and_then(|()| receipt.commit()) else {
+            // The scheduler accepted this frame before native promotion. A
+            // rejected interaction receipt consumes the bridge frame, so its
+            // accepted token must be settled before replacement demand can
+            // arm. A replayed notification for an already-consumed revision
+            // takes the missing-frame branch above and has no token to cancel.
+            return Ok((ActorFramePromotion::Stale, Some(frame.token)));
+        };
+        replace_facet_target(state, &frame.actor, next_frame_ns);
+        eprintln!(
+            "facet native pair committed route=ordinary actor={} generation={} native_revision={} candidate={} snapshot={} pane_count={} panes={promoted_panes:?}",
+            frame.actor.name,
+            frame.actor.generation,
+            revision,
+            candidate.map_or(0, |identity| identity.0),
+            candidate.map_or(0, |identity| identity.1),
+            promoted_panes.len(),
+        );
     }
     let actor = frame.actor.clone();
     let token = frame.token;
@@ -544,7 +775,7 @@ fn promote_actor_frame_in_state(
         revision,
         panes.len(),
     );
-    Ok(ActorFramePromotion::Claimed)
+    Ok((ActorFramePromotion::Claimed, None))
 }
 
 fn claim_actor_frame_for_preparation_in_state(
@@ -651,6 +882,12 @@ fn release_deferred_actor_frames_for_epoch(
             continue;
         };
         frame.blocker_epochs.remove(&resize_epoch);
+        // This fallback is used by resize cleanup without a complete prepared
+        // native texture set. A facet frame must remain paired with interaction
+        // authority, so cleanup discards it instead of exposing its CPU scene.
+        if frame.facet_atomic {
+            continue;
+        }
         if promote_tagged {
             for scene in frame.scenes.values_mut() {
                 if scene.resize_epoch == Some(resize_epoch) {
@@ -682,6 +919,16 @@ fn release_deferred_actor_frames_for_epoch(
         if frame.scenes.is_empty() {
             continue;
         }
+        if frame.facet_atomic
+            && frame.scenes.iter().any(|(pane, scene)| {
+                state
+                    .panes
+                    .get(pane)
+                    .is_some_and(|visible| scene.sequence <= visible.sequence)
+            })
+        {
+            continue;
+        }
         for (pane, scene) in frame.scenes {
             if state
                 .panes
@@ -700,6 +947,7 @@ fn deferred_actor_frame_resolution_plan_in_state(
     state: &mut GraphicsState,
     resize_epoch: u64,
     promote_tagged: bool,
+    promote_prepared_facets: bool,
 ) -> DeferredActorFrameResolutionPlan {
     let mut plan = DeferredActorFrameResolutionPlan::default();
     let revisions = state
@@ -716,13 +964,22 @@ fn deferred_actor_frame_resolution_plan_in_state(
             state.deferred_actor_frames.insert(revision, frame);
             continue;
         }
-        if promote_tagged {
+        // Degraded native promotion can still install a complete, validated
+        // facet batch. An unrelated managed-client timeout must not discard
+        // that exact output: a newly exposed pane may have only a blank fallback.
+        // Abort and cleanup never opt in because no native texture set commits.
+        if promote_tagged || (promote_prepared_facets && frame.facet_atomic) {
             for scene in frame.scenes.values_mut() {
                 if scene.resize_epoch == Some(resize_epoch) {
                     scene.resize_epoch = None;
                 }
             }
         } else {
+            if frame.facet_atomic {
+                plan.cancelled_tokens.push(frame.token);
+                plan.commit.insert(revision, BTreeMap::new());
+                continue;
+            }
             frame
                 .scenes
                 .retain(|_pane, scene| scene.resize_epoch != Some(resize_epoch));
@@ -742,6 +999,54 @@ fn deferred_actor_frame_resolution_plan_in_state(
             plan.retain.insert(revision);
             state.deferred_actor_frames.insert(revision, frame);
             continue;
+        }
+        let facet_member_is_stale = frame.facet_atomic
+            && frame.scenes.iter().any(|(pane, scene)| {
+                state
+                    .panes
+                    .get(pane)
+                    .map(|visible| visible.sequence)
+                    .into_iter()
+                    .chain(state.staged_panes.iter().filter_map(
+                        |((staged_pane, _epoch), staged)| {
+                            (*staged_pane == *pane).then_some(staged.sequence)
+                        },
+                    ))
+                    .max()
+                    .is_some_and(|latest| scene.sequence <= latest)
+            });
+        if facet_member_is_stale {
+            plan.cancelled_tokens.push(frame.token);
+            plan.commit.insert(revision, BTreeMap::new());
+            continue;
+        }
+        if let Some(receipt) = &frame.facet_receipt {
+            let candidate = receipt
+                .with_graphics(|graphics| {
+                    (
+                        graphics.token().candidate,
+                        graphics.token().snapshot_revision,
+                    )
+                })
+                .ok();
+            let Ok(next_frame_ns) = receipt.validate_current().and_then(|()| receipt.commit())
+            else {
+                plan.cancelled_tokens.push(frame.token);
+                plan.commit.insert(revision, BTreeMap::new());
+                continue;
+            };
+            replace_facet_target(state, &frame.actor, next_frame_ns);
+            let panes = frame.scenes.keys().copied().collect::<BTreeSet<_>>();
+            eprintln!(
+                "facet native pair committed route=synchronized actor={} generation={} native_revision={} candidate={} snapshot={} resize_epoch={} pane_count={} panes={panes:?}",
+                frame.actor.name,
+                frame.actor.generation,
+                revision,
+                candidate.map_or(0, |identity| identity.0),
+                candidate.map_or(0, |identity| identity.1),
+                resize_epoch,
+                panes.len(),
+            );
         }
         let mut members = BTreeMap::new();
         let mut correlations = Vec::new();
@@ -928,12 +1233,14 @@ impl PluginGraphicsBridge {
     pub fn new(proxy: EventLoopProxy<ClientEvent>) -> Self {
         let shared = Arc::new(Mutex::new(GraphicsState {
             raster_scale: DEFAULT_RASTER_SCALE,
+            font_context_revision: 1,
             ..GraphicsState::default()
         }));
         let text_system = Arc::new(Mutex::new(TextSystem {
             fonts: FontSystem::new(),
             swash: SwashCache::new(),
             glyphs: BTreeMap::new(),
+            glyph_cache_bytes: 0,
         }));
         let glyph_raster_tx =
             start_glyph_raster_worker(Arc::clone(&shared), Arc::clone(&text_system), proxy.clone());
@@ -983,6 +1290,7 @@ impl PluginGraphicsBridge {
             actor: actor.into(),
             panes: panes.into_iter().collect(),
             generation: AtomicU64::new(0),
+            retired_generation: AtomicU64::new(0),
             bridge: self.clone(),
         })
     }
@@ -998,10 +1306,20 @@ impl PluginGraphicsBridge {
         let now_ns = self.render_now_ns();
         let host_cost_ns = self.host_tail_ns.load(Ordering::Acquire);
         let redraw_hop_ns = self.winit_redraw_hop_ns.load(Ordering::Acquire);
+        let facet_targets = {
+            let mut state = self
+                .shared
+                .lock()
+                .map_err(|_poisoned| anyhow!("plugin graphics state is poisoned"))?;
+            take_facet_targets(&mut state)
+        };
         let mut scheduler = self
             .render_scheduler
             .lock()
             .map_err(|_poisoned| anyhow!("render scheduler is poisoned"))?;
+        for (actor, target_ns) in facet_targets {
+            scheduler.request_render_at(&actor, target_ns);
+        }
         for missed in scheduler.drain_deadline_results() {
             predictor.note_deadline_result(missed);
         }
@@ -1083,7 +1401,10 @@ impl PluginGraphicsBridge {
             .into_iter()
             .chain(scheduler.next_redraw_request_deadline_ns(host_cost_ns, redraw_hop_ns))
             .min()
-            .map(|deadline| self.render_clock_origin + std::time::Duration::from_nanos(deadline)))
+            .and_then(|deadline| {
+                self.render_clock_origin
+                    .checked_add(std::time::Duration::from_nanos(deadline))
+            }))
     }
 
     pub fn mark_graphics_ready(
@@ -1094,7 +1415,10 @@ impl PluginGraphicsBridge {
         let now = self.render_now_ns();
         if let Ok(mut scheduler) = self.render_scheduler.lock() {
             for pane in panes {
-                scheduler.mark_graphics_ready(RenderToken(token), pane, now);
+                let token = RenderToken(token);
+                if scheduler.token_expects_graphics_ready(token, pane) {
+                    scheduler.mark_graphics_ready(token, pane, now);
+                }
             }
             let redraw_hop_ns = self.winit_redraw_hop_ns.load(Ordering::Acquire);
             let tokens = scheduler
@@ -1214,6 +1538,18 @@ impl PluginGraphicsBridge {
             }
             Some(watermark)
         })
+    }
+
+    pub fn complete_facet_input(&self, actor: &ActorScope, event_watermark: u64) {
+        if let Ok(mut scheduler) = self.render_scheduler.lock() {
+            scheduler.mark_input_correlation_ready(actor, event_watermark);
+        }
+    }
+
+    pub fn complete_facet_publication(&self, actor: &ActorScope, event_watermark: u64) {
+        if let Ok(mut scheduler) = self.render_scheduler.lock() {
+            scheduler.mark_input_correlations_ready_through(actor, event_watermark);
+        }
     }
 
     pub fn complete_actor_turn(
@@ -1357,25 +1693,51 @@ impl PluginGraphicsBridge {
             .shared
             .lock()
             .map_err(|_poisoned| anyhow!("plugin graphics state is poisoned"))?;
-        promote_actor_frame_in_state(&mut state, revision, panes)
+        let (promotion, rejected_token) =
+            promote_actor_frame_in_state(&mut state, revision, panes)?;
+        drop(state);
+        if let Some(token) = rejected_token {
+            self.cancel_accepted_tokens([token]);
+        }
+        Ok(promotion)
     }
 
     /// Retire an actor frame whose complete atomic batch can no longer be
     /// presented. This is used when asynchronous preparation resumes after a
     /// resize epoch in the batch has already been promoted or superseded.
     pub fn discard_actor_frame(&self, revision: u64) -> Result<bool> {
-        let token = self
+        let mut state = self
             .shared
             .lock()
-            .map_err(|_poisoned| anyhow!("plugin graphics state is poisoned"))?
+            .map_err(|_poisoned| anyhow!("plugin graphics state is poisoned"))?;
+        let token = state
             .pending_actor_frames
             .remove(&revision)
+            .or_else(|| state.deferred_actor_frames.remove(&revision))
             .map(|frame| frame.token);
+        drop(state);
         if let Some(token) = token {
             self.cancel_accepted_tokens([token]);
+            // Cancellation can expose a newer relevant-pane or layout
+            // revision that arrived while this accepted frame was awaiting
+            // native preparation. Wake the event loop so that demand is
+            // armed without waiting for unrelated input or polling.
+            drop(self.proxy.send_event(ClientEvent::RenderSchedulingChanged));
             return Ok(true);
         }
         Ok(false)
+    }
+
+    pub fn facet_receipt(&self, revision: u64) -> Result<Option<PreparedFacetRender>> {
+        let state = self
+            .shared
+            .lock()
+            .map_err(|_poisoned| anyhow!("plugin graphics state is poisoned"))?;
+        Ok(state
+            .pending_actor_frames
+            .get(&revision)
+            .or_else(|| state.deferred_actor_frames.get(&revision))
+            .and_then(|frame| frame.facet_receipt.clone()))
     }
 
     pub fn expect_terminal_snapshot(&self, pane: u64, input_sequence: u64) -> Result<()> {
@@ -1448,6 +1810,12 @@ impl PluginGraphicsBridge {
             return Ok(None);
         }
         let snapshot = GraphicsSnapshot {
+            facet_extent: scene.facet_frame.as_ref().map(|frame| {
+                (
+                    frame.geometry().physical_width,
+                    frame.geometry().physical_height,
+                )
+            }),
             pane,
             sequence: scene.sequence,
             resize_epoch: None,
@@ -1455,6 +1823,7 @@ impl PluginGraphicsBridge {
             images: resources.images,
             text_layouts: resources.text_layouts,
             glyphs: resources.glyphs,
+            facet_frame_lease: scene.facet_frame.clone(),
         };
         drop(state);
         Ok(Some(snapshot))
@@ -1480,6 +1849,12 @@ impl PluginGraphicsBridge {
             return Ok(None);
         }
         let snapshot = GraphicsSnapshot {
+            facet_extent: scene.facet_frame.as_ref().map(|frame| {
+                (
+                    frame.geometry().physical_width,
+                    frame.geometry().physical_height,
+                )
+            }),
             pane,
             sequence: scene.sequence,
             resize_epoch: Some(resize_epoch),
@@ -1487,6 +1862,7 @@ impl PluginGraphicsBridge {
             images: resources.images,
             text_layouts: resources.text_layouts,
             glyphs: resources.glyphs,
+            facet_frame_lease: scene.facet_frame.clone(),
         };
         drop(state);
         Ok(Some(snapshot))
@@ -1529,16 +1905,21 @@ impl PluginGraphicsBridge {
         &self,
         resize_epoch: u64,
         promote_tagged: bool,
+        promote_prepared_facets: bool,
     ) -> Result<DeferredActorFrameResolutionPlan> {
         let mut state = self
             .shared
             .lock()
             .map_err(|_poisoned| anyhow!("plugin graphics state is poisoned"))?;
-        Ok(deferred_actor_frame_resolution_plan_in_state(
+        let plan = deferred_actor_frame_resolution_plan_in_state(
             &mut state,
             resize_epoch,
             promote_tagged,
-        ))
+            promote_prepared_facets,
+        );
+        drop(state);
+        self.cancel_accepted_tokens(plan.cancelled_tokens.iter().copied());
+        Ok(plan)
     }
 
     /// Abort one admitted epoch without making its tagged scenes visible.
@@ -1599,6 +1980,9 @@ impl PluginGraphicsBridge {
         let measured_opportunities;
         let measured_deadline_misses;
         let measured_target_misses;
+        let late_finish_diagnostics;
+        let late_finish_diagnostics_dropped;
+        let timing_observations;
         {
             let scheduler = self
                 .render_scheduler
@@ -1630,6 +2014,13 @@ impl PluginGraphicsBridge {
             measured_opportunities = scheduler.measured_opportunities();
             measured_deadline_misses = scheduler.measured_deadline_misses();
             measured_target_misses = scheduler.measured_target_misses();
+            late_finish_diagnostics = scheduler
+                .late_finish_diagnostics()
+                .iter()
+                .cloned()
+                .collect();
+            late_finish_diagnostics_dropped = scheduler.late_finish_diagnostics_dropped();
+            timing_observations = scheduler.timing_observations();
         }
         let mut key_samples = measured_key_to_present_ns.clone();
         let mut frame_intervals = measured_frame_intervals_ns.clone();
@@ -1682,6 +2073,9 @@ impl PluginGraphicsBridge {
             measured_opportunities,
             measured_deadline_misses,
             measured_target_misses,
+            late_finish_diagnostics,
+            late_finish_diagnostics_dropped,
+            timing_observations,
             actor_progress,
             actor_frames_accepted: state.actor_frames_accepted,
             actor_frames_ready: state.actor_frames_ready,
@@ -1890,7 +2284,13 @@ fn packet_references_text_layout(packet: &Packet, handle: u64) -> bool {
     )
 }
 
-fn release_actor_pane_state(state: &mut GraphicsState, actor: &str, panes: &BTreeSet<u64>) {
+fn release_actor_pane_state(
+    state: &mut GraphicsState,
+    actor: &str,
+    generation: u64,
+    panes: &BTreeSet<u64>,
+) {
+    let scope = ActorScope::new(actor, generation);
     state
         .images
         .retain(|_, resource| !panes.contains(&resource.pane));
@@ -1915,21 +2315,32 @@ fn release_actor_pane_state(state: &mut GraphicsState, actor: &str, panes: &BTre
     state.panes.retain(|pane, _| !panes.contains(pane));
     state
         .pending_actor_frames
-        .retain(|_revision, frame| frame.actor.name != actor);
+        .retain(|_revision, frame| frame.actor != scope);
     state
         .deferred_actor_frames
-        .retain(|_revision, frame| frame.actor.name != actor);
-    state
-        .actor_panes
-        .retain(|scope, _panes| scope.name != actor);
+        .retain(|_revision, frame| frame.actor != scope);
+    state.actor_panes.remove(&scope);
+    state.next_facet_targets.remove(&scope);
 }
 
 impl ActorPresentationHost {
+    #[must_use]
+    pub fn facet_resource_backend(
+        self: &Arc<Self>,
+        actor_generation: u64,
+    ) -> Arc<FacetPresentationBackend> {
+        Arc::new(FacetPresentationBackend {
+            presentation: Arc::clone(self),
+            actor_generation,
+        })
+    }
+
     pub fn bind_generation(&self, generation: u64) {
         let previous = self.generation.swap(generation, Ordering::AcqRel);
+        self.retired_generation.store(0, Ordering::Release);
         let scope = ActorScope::new(self.actor.clone(), generation);
         if let Ok(mut state) = self.bridge.shared.lock() {
-            release_actor_pane_state(&mut state, &self.actor, &self.panes);
+            release_actor_pane_state(&mut state, &self.actor, previous, &self.panes);
             state.actor_panes.insert(scope.clone(), self.panes.clone());
         }
         if let Ok(mut scheduler) = self.bridge.render_scheduler.lock() {
@@ -1940,6 +2351,32 @@ impl ActorPresentationHost {
                 scheduler.set_relevant_panes(&scope, std::iter::empty());
                 scheduler.request_render(&scope);
             }
+        }
+    }
+
+    /// Revoke scheduler authority as soon as the actor leaves the runtime map.
+    /// Native scene retirement remains tied to the atomic pane/layout path.
+    pub fn retire_generation(&self, generation: u64) {
+        if generation == 0
+            || self
+                .generation
+                .compare_exchange(generation, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return;
+        }
+        self.retired_generation.store(generation, Ordering::Release);
+        if let Ok(mut scheduler) = self.bridge.render_scheduler.lock() {
+            scheduler.cancel_generation(&ActorScope::new(self.actor.clone(), generation));
+        }
+    }
+
+    /// Detach the revoked generation after the renderer has retained any CPU
+    /// snapshots needed to replay its last accepted layout.
+    pub fn detach_retired_state(&self) {
+        let generation = self.retired_generation.load(Ordering::Acquire);
+        if let Ok(mut state) = self.bridge.shared.lock() {
+            release_actor_pane_state(&mut state, &self.actor, generation, &self.panes);
         }
     }
 
@@ -1958,19 +2395,433 @@ impl ActorPresentationHost {
         }
         Ok(())
     }
+
+    #[allow(
+        dead_code,
+        reason = "reached through the not-yet-enabled M2 facet backend"
+    )]
+    fn create_image_copy_bounded(
+        &self,
+        actor_generation: u64,
+        pane: u64,
+        width: u32,
+        height: u32,
+        pixels: &[u8],
+        max_retained_bytes: usize,
+    ) -> Result<(u64, usize), PresentationError> {
+        self.authorize(actor_generation, pane)?;
+        let retained_bytes = image_byte_len(width, height)?;
+        if retained_bytes > max_retained_bytes || retained_bytes > MAX_IMAGE_BYTES {
+            return Err(PresentationError::LimitReached);
+        }
+        if retained_bytes != pixels.len() {
+            return Err(PresentationError::InvalidArgument);
+        }
+        // Admission precedes the destination allocation. The caller's borrowed
+        // input remains outside this native resource's retained-byte charge.
+        let pixels = pixels.to_vec();
+        let handle = self.create_image_rgba8(actor_generation, pane, width, height, pixels)?;
+        Ok((handle, retained_bytes))
+    }
+
+    fn layout_text_bounded(
+        &self,
+        actor_generation: u64,
+        pane: u64,
+        text: &str,
+        options: TextLayoutOptions,
+        max_retained_bytes: usize,
+        include_source_text: bool,
+    ) -> Result<(TextLayoutResult, usize), PresentationError> {
+        self.authorize(actor_generation, pane)?;
+        validate_text_request(text, options)?;
+        let started = Instant::now();
+        // A facet must receive a fresh invocation-scoped handle, but its
+        // immutable shaped/raster backing may be shared with an equivalent
+        // live resource. Keeping reuse tied to a live entry bounds retention
+        // by the existing resource registry and its byte accounting.
+        {
+            let mut state = self
+                .bridge
+                .shared
+                .lock()
+                .map_err(|_poisoned| PresentationError::HostFailure)?;
+            if actor_generation != self.generation.load(Ordering::Acquire) {
+                return Err(PresentationError::InvalidPane);
+            }
+            let raster_scale = sanitize_raster_scale(state.raster_scale);
+            let reusable = reusable_text_layout(
+                &state,
+                actor_generation,
+                text,
+                options,
+                raster_scale,
+                include_source_text,
+            );
+            if let Some(reusable) = reusable {
+                let ReusableTextLayout {
+                    retained_bytes,
+                    metrics,
+                    text: retained_text,
+                    resource,
+                } = reusable;
+                if retained_bytes > max_retained_bytes {
+                    return Err(PresentationError::LimitReached);
+                }
+                let handle =
+                    allocate_resource_handle(&mut state, pane, actor_generation, retained_bytes)?;
+                let font_context_revision = state.font_context_revision;
+                state.text_layouts.insert(
+                    handle,
+                    TextLayoutEntry {
+                        pane,
+                        generation: actor_generation,
+                        width: resource.width,
+                        height: resource.height,
+                        byte_len: retained_bytes,
+                        includes_source_text: include_source_text,
+                        text: retained_text,
+                        options,
+                        metrics,
+                        font_context_revision,
+                        raster_scale,
+                        state: TextLayoutState::Ready(resource),
+                    },
+                );
+                state.text_layouts_created = state.text_layouts_created.saturating_add(1);
+                state.peak_text_layouts = state.peak_text_layouts.max(state.text_layouts.len());
+                return Ok((TextLayoutResult { handle, ..metrics }, retained_bytes));
+            }
+            drop(state);
+        }
+        // Shaping scratch is bounded by MAX_TEXT_BYTES, dimensions and
+        // MAX_TEXT_LAYOUT_BYTES. It is temporary and is not retained resource
+        // backing. The invocation ceiling is checked before retained text,
+        // registry state, or raster work is allocated.
+        let plan = {
+            let mut text_system = self
+                .bridge
+                .text_system
+                .lock()
+                .map_err(|_poisoned| PresentationError::HostFailure)?;
+            create_text_layout_plan(&mut text_system.fonts, text, options)?
+        };
+        let metrics = plan.metrics;
+        let retained_bytes = if include_source_text {
+            plan.byte_len
+                .checked_add(text.len())
+                .ok_or(PresentationError::LimitReached)?
+        } else {
+            plan.byte_len
+        };
+        if retained_bytes > max_retained_bytes {
+            return Err(PresentationError::LimitReached);
+        }
+        let text: Arc<str> = Arc::from(text);
+        let mut state = self
+            .bridge
+            .shared
+            .lock()
+            .map_err(|_poisoned| PresentationError::HostFailure)?;
+        if actor_generation != self.generation.load(Ordering::Acquire) {
+            return Err(PresentationError::InvalidPane);
+        }
+        let raster_scale = sanitize_raster_scale(state.raster_scale);
+        let handle = allocate_resource_handle(&mut state, pane, actor_generation, retained_bytes)?;
+        let font_context_revision = state.font_context_revision;
+        state.text_layouts.insert(
+            handle,
+            TextLayoutEntry {
+                pane,
+                generation: actor_generation,
+                width: plan.width,
+                height: plan.height,
+                byte_len: retained_bytes,
+                includes_source_text: include_source_text,
+                text,
+                options,
+                metrics,
+                font_context_revision,
+                raster_scale,
+                state: TextLayoutState::Pending,
+            },
+        );
+        state.text_layouts_created = state.text_layouts_created.saturating_add(1);
+        state.peak_text_layouts = state.peak_text_layouts.max(state.text_layouts.len());
+        drop(state);
+        let request = GlyphRasterRequest {
+            handle,
+            pane,
+            generation: actor_generation,
+            options,
+            plan,
+            raster_scale,
+        };
+        if self
+            .bridge
+            .glyph_raster_tx
+            .try_send(GlyphRasterWork::Layout(Box::new(request)))
+            .is_err()
+        {
+            if let Ok(mut state) = self.bridge.shared.lock() {
+                state.text_layouts.remove(&handle);
+                state.glyph_raster_backpressure = state.glyph_raster_backpressure.saturating_add(1);
+            }
+            return Err(PresentationError::LimitReached);
+        }
+        let elapsed = started.elapsed();
+        if std::env::var_os("BROOD_TRACE_PLUGIN_TEXT").is_some() || elapsed.as_millis() >= 8 {
+            eprintln!(
+                "plugin text layout pane={pane} handle={handle} bytes={} time_us={}",
+                retained_bytes,
+                elapsed.as_micros(),
+            );
+        }
+        Ok((TextLayoutResult { handle, ..metrics }, retained_bytes))
+    }
+}
+
+impl FacetResourceBackend for FacetPresentationBackend {
+    fn create_image(
+        &self,
+        pane: u64,
+        width: u32,
+        height: u32,
+        pixels: &[u8],
+        max_bytes: usize,
+    ) -> Result<(u64, usize), PresentationError> {
+        self.presentation.create_image_copy_bounded(
+            self.actor_generation,
+            pane,
+            width,
+            height,
+            pixels,
+            max_bytes,
+        )
+    }
+
+    fn create_text(
+        &self,
+        pane: u64,
+        text: &str,
+        options: TextLayoutOptions,
+        max_bytes: usize,
+    ) -> Result<(u64, TextLayoutResult, usize), PresentationError> {
+        let (result, retained_bytes) = self.presentation.layout_text_bounded(
+            self.actor_generation,
+            pane,
+            text,
+            options,
+            max_bytes,
+            true,
+        )?;
+        Ok((result.handle, result, retained_bytes))
+    }
+
+    fn release(&self, pane: u64, handle: u64) -> Result<(), PresentationError> {
+        self.presentation
+            .drop_resource(self.actor_generation, pane, handle)
+    }
 }
 
 impl Drop for ActorPresentationHost {
     fn drop(&mut self) {
-        if let Ok(mut state) = self.bridge.shared.lock() {
-            release_actor_pane_state(&mut state, &self.actor, &self.panes);
-        }
         let generation = self.generation.load(Ordering::Acquire);
+        let cleanup_generation = if generation == 0 {
+            self.retired_generation.load(Ordering::Acquire)
+        } else {
+            generation
+        };
+        if let Ok(mut state) = self.bridge.shared.lock() {
+            release_actor_pane_state(&mut state, &self.actor, cleanup_generation, &self.panes);
+        }
         if generation != 0
             && let Ok(mut scheduler) = self.bridge.render_scheduler.lock()
         {
             scheduler.cancel_generation(&ActorScope::new(self.actor.clone(), generation));
         }
+    }
+}
+
+impl ActorPresentationHost {
+    pub fn require_facet_input_reduction(&self, actor_generation: u64) -> bool {
+        self.bridge
+            .render_scheduler
+            .lock()
+            .is_ok_and(|mut scheduler| {
+                scheduler.require_input_correlation_reduction(&ActorScope::new(
+                    self.actor.clone(),
+                    actor_generation,
+                ))
+            })
+    }
+
+    pub fn submit_facet_frame(
+        &self,
+        actor_generation: u64,
+        scheduler_token: u64,
+        receipt: PreparedFacetRender,
+        resize_epochs: &BTreeMap<u64, Option<u64>>,
+        budget: &ByteBudget,
+    ) -> Result<u64, PresentationError> {
+        let guest_finished_ns = self.bridge.render_now_ns();
+        let validation_started = Instant::now();
+        let scope = self.authorize_actor(actor_generation)?;
+        receipt
+            .validate_current()
+            .map_err(|_error| PresentationError::InvalidToken)?;
+        let decoded = receipt
+            .with_graphics(|graphics| {
+                let facet_panes = graphics
+                    .panes()
+                    .map(|(pane, _frame)| *pane)
+                    .collect::<BTreeSet<_>>();
+                if facet_panes != self.panes
+                    || resize_epochs.keys().copied().collect::<BTreeSet<_>>() != self.panes
+                {
+                    return Err(PresentationError::InvalidPane);
+                }
+                graphics
+                    .panes()
+                    .map(|(pane, frame)| {
+                        self.authorize(actor_generation, *pane)?;
+                        let resize_epoch = resize_epochs
+                            .get(pane)
+                            .copied()
+                            .ok_or(PresentationError::InvalidPane)?;
+                        if resize_epoch == Some(0) {
+                            return Err(PresentationError::StaleResizeEpoch);
+                        }
+                        let packet = SharedPacket::decode_facet(
+                            frame
+                                .packet()
+                                .map_err(|_error| PresentationError::InvalidPacket)?,
+                            budget,
+                            actor_generation,
+                        )?;
+                        Ok((*pane, resize_epoch, Arc::clone(frame), packet))
+                    })
+                    .collect::<Result<Vec<_>, PresentationError>>()
+            })
+            .map_err(|_error| PresentationError::InvalidToken)??;
+        let panes = decoded
+            .iter()
+            .map(|(pane, ..)| *pane)
+            .collect::<BTreeSet<_>>();
+        let mut state = self
+            .bridge
+            .shared
+            .lock()
+            .map_err(|_poisoned| PresentationError::HostFailure)?;
+        if state.pending_actor_frames.len() >= MAX_RENDER_ACTORS
+            && !state
+                .pending_actor_frames
+                .values()
+                .any(|frame| frame.actor == scope)
+        {
+            return Err(PresentationError::LimitReached);
+        }
+        for (pane, resize_epoch, frame, packet) in &decoded {
+            if let Some(epoch) = resize_epoch
+                && !resize_epoch_is_active(&state, *pane, *epoch)
+            {
+                return Err(PresentationError::StaleResizeEpoch);
+            }
+            let resources = referenced_resources(&state, *pane, actor_generation, packet)?;
+            let candidate = GraphicsSnapshot {
+                facet_extent: Some((
+                    frame.geometry().physical_width,
+                    frame.geometry().physical_height,
+                )),
+                pane: *pane,
+                sequence: 0,
+                resize_epoch: *resize_epoch,
+                packet: packet.clone(),
+                images: resources.images,
+                text_layouts: resources.text_layouts,
+                glyphs: resources.glyphs,
+                facet_frame_lease: Some(Arc::clone(frame)),
+            };
+            crate::plugin_gpu::validate_snapshot_lowering(&candidate)?;
+        }
+        let next_sequence = state
+            .next_sequence
+            .checked_add(1)
+            .ok_or(PresentationError::LimitReached)?;
+        let accepted_ns = self.bridge.render_now_ns();
+        let mut scheduler = self
+            .bridge
+            .render_scheduler
+            .lock()
+            .map_err(|_poisoned| PresentationError::HostFailure)?;
+        let accepted = scheduler
+            .finish_for_actor_timed(
+                &scope,
+                RenderToken(scheduler_token),
+                guest_finished_ns,
+                accepted_ns,
+                &panes.iter().copied().collect::<Vec<_>>(),
+            )
+            .map_err(|_error| PresentationError::InvalidToken)?;
+        scheduler.note_actor_host_cost(
+            &scope,
+            u64::try_from(validation_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        );
+        drop(scheduler);
+        let Some(accepted) = accepted else {
+            return Ok(0);
+        };
+        state.next_sequence = next_sequence;
+        state
+            .pending_actor_frames
+            .retain(|_revision, frame| frame.actor != scope);
+        let scenes = decoded
+            .into_iter()
+            .map(|(pane, resize_epoch, frame, packet)| {
+                state.accepted_packets = state.accepted_packets.saturating_add(1);
+                state.max_packet_commands = state.max_packet_commands.max(packet.commands.len());
+                (
+                    pane,
+                    PaneScene {
+                        generation: actor_generation,
+                        sequence: next_sequence,
+                        resize_epoch,
+                        terminal_input_sequence: None,
+                        packet,
+                        facet_frame: Some(frame),
+                    },
+                )
+            })
+            .collect();
+        state.pending_actor_frames.insert(
+            accepted.actor_frame_revision,
+            PendingGraphicsActorFrame {
+                actor: scope,
+                token: scheduler_token,
+                revision: accepted.actor_frame_revision,
+                scenes,
+                ready_notified: false,
+                required_panes: Some(panes),
+                blocker_epochs: BTreeSet::new(),
+                facet_receipt: Some(receipt),
+                facet_atomic: true,
+            },
+        );
+        state.actor_frames_accepted = state.actor_frames_accepted.saturating_add(1);
+        if std::env::var_os("BROOD_TRACE_PLUGIN_GRAPHICS").is_some() {
+            eprintln!(
+                "facet bridge accepted token={scheduler_token} revision={} visible={:?}",
+                accepted.actor_frame_revision, state.visible_panes
+            );
+        }
+        let notifications = ready_actor_frame_notifications(&mut state);
+        drop(state);
+        publish_actor_frame_notifications(&self.bridge.proxy, notifications);
+        self.bridge
+            .proxy
+            .send_event(ClientEvent::RenderSchedulingChanged)
+            .map_err(|_closed| PresentationError::ActorStopped)?;
+        Ok(accepted.actor_frame_revision)
     }
 }
 
@@ -2061,12 +2912,12 @@ impl PresentationHost for ActorPresentationHost {
                 Ok(())
             },
             |draw| {
-                let packet = Packet::decode(&draw.packet).map_err(|error| match error {
-                    PacketError::Limit(_) => PresentationError::LimitReached,
-                    PacketError::Invalid(_) => PresentationError::InvalidPacket,
-                })?;
+                let packet = SharedPacket::from(
+                    Packet::decode(&draw.packet).map_err(packet_error_to_presentation)?,
+                );
                 let resources = referenced_resources(&state, draw.pane, actor_generation, &packet)?;
                 let candidate = GraphicsSnapshot {
+                    facet_extent: None,
                     pane: draw.pane,
                     sequence: 0,
                     resize_epoch: draw.resize_epoch,
@@ -2074,6 +2925,7 @@ impl PresentationHost for ActorPresentationHost {
                     images: resources.images,
                     text_layouts: resources.text_layouts,
                     glyphs: resources.glyphs,
+                    facet_frame_lease: None,
                 };
                 crate::plugin_gpu::validate_snapshot_lowering(&candidate)?;
                 Ok((
@@ -2159,6 +3011,7 @@ impl PresentationHost for ActorPresentationHost {
                     resize_epoch,
                     terminal_input_sequence: state_watermark,
                     packet,
+                    facet_frame: None,
                 },
             );
         }
@@ -2172,6 +3025,8 @@ impl PresentationHost for ActorPresentationHost {
                 ready_notified: false,
                 required_panes: None,
                 blocker_epochs: BTreeSet::new(),
+                facet_receipt: None,
+                facet_atomic: false,
             },
         );
         state.actor_frames_accepted = state.actor_frames_accepted.saturating_add(1);
@@ -2270,76 +3125,8 @@ impl PresentationHost for ActorPresentationHost {
         text: String,
         options: TextLayoutOptions,
     ) -> Result<TextLayoutResult, PresentationError> {
-        self.authorize(actor_generation, pane)?;
-        validate_text_request(&text, options)?;
-        let started = Instant::now();
-        let plan = {
-            let mut text_system = self
-                .bridge
-                .text_system
-                .lock()
-                .map_err(|_poisoned| PresentationError::HostFailure)?;
-            create_text_layout_plan(&mut text_system.fonts, &text, options)?
-        };
-        let metrics = plan.metrics;
-        let byte_len = plan.byte_len;
-        let text: Arc<str> = text.into();
-        let mut state = self
-            .bridge
-            .shared
-            .lock()
-            .map_err(|_poisoned| PresentationError::HostFailure)?;
-        if actor_generation != self.generation.load(Ordering::Acquire) {
-            return Err(PresentationError::InvalidPane);
-        }
-        let raster_scale = sanitize_raster_scale(state.raster_scale);
-        let handle = allocate_resource_handle(&mut state, pane, actor_generation, byte_len)?;
-        state.text_layouts.insert(
-            handle,
-            TextLayoutEntry {
-                pane,
-                generation: actor_generation,
-                width: plan.width,
-                height: plan.height,
-                byte_len,
-                text,
-                options,
-                raster_scale,
-                state: TextLayoutState::Pending,
-            },
-        );
-        state.text_layouts_created = state.text_layouts_created.saturating_add(1);
-        state.peak_text_layouts = state.peak_text_layouts.max(state.text_layouts.len());
-        drop(state);
-        let request = GlyphRasterRequest {
-            handle,
-            pane,
-            generation: actor_generation,
-            options,
-            plan,
-            raster_scale,
-        };
-        if self
-            .bridge
-            .glyph_raster_tx
-            .try_send(GlyphRasterWork::Layout(Box::new(request)))
-            .is_err()
-        {
-            if let Ok(mut state) = self.bridge.shared.lock() {
-                state.text_layouts.remove(&handle);
-                state.glyph_raster_backpressure = state.glyph_raster_backpressure.saturating_add(1);
-            }
-            return Err(PresentationError::LimitReached);
-        }
-        let elapsed = started.elapsed();
-        if std::env::var_os("BROOD_TRACE_PLUGIN_TEXT").is_some() || elapsed.as_millis() >= 8 {
-            eprintln!(
-                "plugin text layout pane={pane} handle={handle} bytes={} time_us={}",
-                byte_len,
-                elapsed.as_micros(),
-            );
-        }
-        Ok(TextLayoutResult { handle, ..metrics })
+        self.layout_text_bounded(actor_generation, pane, &text, options, usize::MAX, false)
+            .map(|(result, _retained_bytes)| result)
     }
 
     fn drop_resource(
@@ -2479,6 +3266,28 @@ fn allocate_resource_handle(
         .checked_add(1)
         .ok_or(PresentationError::LimitReached)?;
     Ok(state.next_resource)
+}
+
+#[allow(
+    dead_code,
+    reason = "reached through the not-yet-enabled M2 facet backend"
+)]
+fn image_byte_len(width: u32, height: u32) -> Result<usize, PresentationError> {
+    if width == 0 || height == 0 {
+        return Err(PresentationError::InvalidArgument);
+    }
+    if width > MAX_RESOURCE_DIMENSION || height > MAX_RESOURCE_DIMENSION {
+        return Err(PresentationError::LimitReached);
+    }
+    usize::try_from(width)
+        .ok()
+        .and_then(|width| {
+            usize::try_from(height)
+                .ok()
+                .and_then(|height| width.checked_mul(height))
+        })
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or(PresentationError::InvalidArgument)
 }
 
 fn validate_text_request(text: &str, options: TextLayoutOptions) -> Result<(), PresentationError> {
@@ -2633,15 +3442,20 @@ fn rasterize_text_layout(
             cache_key,
             color: requested_color,
         };
-        if !text_system.glyphs.contains_key(&key) {
+        let image = if let Some(cached) = text_system.glyphs.get(&key) {
+            cached.clone()
+        } else {
+            // SwashCache's built-in image map has no eviction policy. Render
+            // uncached and retain only in Brood's explicitly bounded cache.
             let rendered = text_system
                 .swash
-                .get_image(&mut text_system.fonts, cache_key)
+                .get_image_uncached(&mut text_system.fonts, cache_key)
                 .as_ref()
                 .and_then(|image| glyph_image_resource(image, requested_color));
-            text_system.glyphs.insert(key, rendered);
-        }
-        let Some(image) = text_system.glyphs.get(&key).cloned().flatten() else {
+            cache_glyph_image(text_system, key, rendered.clone());
+            rendered
+        };
+        let Some(image) = image else {
             continue;
         };
         sprites.push(GlyphSprite {
@@ -2658,6 +3472,36 @@ fn rasterize_text_layout(
         glyph_images,
         raster_scale,
     }
+}
+
+fn cache_glyph_image(
+    text_system: &mut TextSystem,
+    key: GlyphCacheKey,
+    image: Option<GlyphImageResource>,
+) {
+    let image_bytes = image
+        .as_ref()
+        .map_or(0, |image| image.linear_premultiplied_rgba8.len());
+    if image_bytes > MAX_GLYPH_CACHE_BYTES {
+        return;
+    }
+    while text_system.glyphs.len() >= MAX_GLYPH_CACHE_ENTRIES
+        || text_system
+            .glyph_cache_bytes
+            .checked_add(image_bytes)
+            .is_none_or(|bytes| bytes > MAX_GLYPH_CACHE_BYTES)
+    {
+        let Some(evicted_key) = text_system.glyphs.first_key_value().map(|(key, _)| *key) else {
+            break;
+        };
+        if let Some(Some(evicted)) = text_system.glyphs.remove(&evicted_key) {
+            text_system.glyph_cache_bytes = text_system
+                .glyph_cache_bytes
+                .saturating_sub(evicted.linear_premultiplied_rgba8.len());
+        }
+    }
+    text_system.glyph_cache_bytes = text_system.glyph_cache_bytes.saturating_add(image_bytes);
+    text_system.glyphs.insert(key, image);
 }
 
 fn glyph_image_resource(
@@ -2750,6 +3594,98 @@ fn linear_premultiplied_srgba8([red, green, blue, alpha]: [u8; 4]) -> [u8; 4] {
 mod tests {
     use super::*;
 
+    #[test]
+    fn facet_targets_admit_replace_cancel_and_prearm_once() {
+        let mut state = GraphicsState::default();
+        let actor = ActorScope::new("animated", 7);
+        state.actor_panes.insert(actor.clone(), BTreeSet::from([1]));
+        state.visible_panes.insert(1);
+
+        replace_facet_target(&mut state, &actor, Some(100));
+        assert_eq!(state.next_facet_targets.get(&actor), Some(&100));
+        replace_facet_target(&mut state, &actor, Some(250));
+        assert_eq!(take_facet_targets(&mut state), vec![(actor.clone(), 250)]);
+        assert_eq!(take_facet_targets(&mut state), Vec::new());
+
+        replace_facet_target(&mut state, &actor, Some(300));
+        replace_facet_target(&mut state, &actor, None);
+        assert!(state.next_facet_targets.is_empty());
+    }
+
+    #[test]
+    fn hidden_facet_deadline_is_retired_without_requesting_a_render() {
+        let mut state = GraphicsState::default();
+        let actor = ActorScope::new("hidden", 7);
+        state.actor_panes.insert(actor.clone(), BTreeSet::from([1]));
+        replace_facet_target(&mut state, &actor, Some(100));
+
+        assert_eq!(take_facet_targets(&mut state), Vec::new());
+        assert!(state.next_facet_targets.is_empty());
+    }
+
+    #[test]
+    fn facet_targets_are_generation_scoped_and_cleared_on_actor_replacement() {
+        let actor = "animated";
+        let old = ActorScope::new(actor, 7);
+        let replacement = ActorScope::new(actor, 8);
+        let unrelated = ActorScope::new("other", 7);
+        let mut state = GraphicsState::default();
+        replace_facet_target(&mut state, &old, Some(100));
+        replace_facet_target(&mut state, &replacement, Some(200));
+        replace_facet_target(&mut state, &unrelated, Some(300));
+
+        release_actor_pane_state(&mut state, actor, 7, &BTreeSet::new());
+
+        assert_eq!(state.next_facet_targets.len(), 2);
+        assert_eq!(state.next_facet_targets.get(&replacement), Some(&200));
+        assert_eq!(state.next_facet_targets.get(&unrelated), Some(&300));
+    }
+
+    #[test]
+    fn shared_facet_packet_keeps_its_budget_charge_until_the_last_clone() -> Result<()> {
+        let bytes = Packet::default().encode()?;
+        let retained = Packet::decode_allocation_bound(&bytes)? + SHARED_PACKET_METADATA_BYTES;
+        let budget = ByteBudget::new(
+            7,
+            brood_wasm::snapshot_budget::ByteBudgetLimits {
+                max_live_bytes: retained,
+                max_live_allocations: 1,
+                max_buffer_bytes: retained,
+            },
+        );
+        let packet = SharedPacket::decode_facet(&bytes, &budget, 7)
+            .map_err(|error| anyhow!(error.to_string()))?;
+        anyhow::ensure!(budget.retention().live_bytes == retained);
+        anyhow::ensure!(budget.retention().live_allocations == 1);
+
+        let retained_packet = packet.clone();
+        drop(packet);
+        anyhow::ensure!(budget.retention().live_bytes == retained);
+        drop(retained_packet);
+        anyhow::ensure!(budget.retention().live_bytes == 0);
+        anyhow::ensure!(budget.retention().live_allocations == 0);
+        Ok(())
+    }
+
+    #[test]
+    fn shared_facet_packet_rejects_a_foreign_generation_before_admission() -> Result<()> {
+        let bytes = Packet::default().encode()?;
+        let budget = ByteBudget::new(
+            8,
+            brood_wasm::snapshot_budget::ByteBudgetLimits {
+                max_live_bytes: 1_024,
+                max_live_allocations: 1,
+                max_buffer_bytes: 1_024,
+            },
+        );
+        anyhow::ensure!(matches!(
+            SharedPacket::decode_facet(&bytes, &budget, 7),
+            Err(PresentationError::ActorStopped)
+        ));
+        anyhow::ensure!(budget.retention().live_bytes == 0);
+        Ok(())
+    }
+
     fn test_text_options() -> TextLayoutOptions {
         TextLayoutOptions {
             font_intent: FontIntent::Ui,
@@ -2768,6 +3704,7 @@ mod tests {
             fonts: FontSystem::new(),
             swash: SwashCache::new(),
             glyphs: BTreeMap::new(),
+            glyph_cache_bytes: 0,
         };
         let options = test_text_options();
         let plan = create_text_layout_plan(&mut text_system.fonts, "Brood", options)?;
@@ -2786,6 +3723,40 @@ mod tests {
         anyhow::ensure!(fractional.raster_scale.to_bits() == 1.5_f32.to_bits());
         anyhow::ensure!(raster_area(&one_x) > 0);
         anyhow::ensure!(raster_area(&fractional) > raster_area(&one_x));
+        Ok(())
+    }
+
+    #[test]
+    fn native_glyph_cache_has_a_hard_entry_bound() -> Result<()> {
+        let mut text_system = TextSystem {
+            fonts: FontSystem::new(),
+            swash: SwashCache::new(),
+            glyphs: BTreeMap::new(),
+            glyph_cache_bytes: 0,
+        };
+        let cache_key = create_text_layout_plan(&mut text_system.fonts, "a", test_text_options())?
+            .buffer
+            .layout_runs()
+            .next()
+            .and_then(|run| {
+                run.glyphs
+                    .first()
+                    .map(|glyph| glyph.physical((0.0, run.line_y), 1.0).cache_key)
+            })
+            .context("test font produced no glyph")?;
+        for color in 0..=MAX_GLYPH_CACHE_ENTRIES {
+            let [low, high] = u16::try_from(color).unwrap_or(u16::MAX).to_le_bytes();
+            cache_glyph_image(
+                &mut text_system,
+                GlyphCacheKey {
+                    cache_key,
+                    color: [low, high, 0, 255],
+                },
+                None,
+            );
+        }
+        anyhow::ensure!(text_system.glyphs.len() == MAX_GLYPH_CACHE_ENTRIES);
+        anyhow::ensure!(text_system.glyph_cache_bytes == 0);
         Ok(())
     }
 
@@ -2808,11 +3779,230 @@ mod tests {
             width: 1,
             height: 1,
             byte_len: 4,
+            includes_source_text: false,
             text: Arc::from("x"),
             options: test_text_options(),
+            metrics: TextLayoutResult {
+                handle: 0,
+                width: 1.0,
+                height: 1.0,
+                first_baseline: 0.0,
+                line_count: 1,
+                cell_width: 0.0,
+                line_height: 1.0,
+            },
+            font_context_revision: 0,
             raster_scale: 1.0,
             state: TextLayoutState::Pending,
         }
+    }
+
+    fn reusable_ready_text_entry(
+        text: &str,
+        options: TextLayoutOptions,
+        raster_scale: f32,
+        byte_len: usize,
+    ) -> TextLayoutEntry {
+        let mut entry = pending_text_entry();
+        entry.text = Arc::from(text);
+        entry.options = options;
+        entry.raster_scale = raster_scale;
+        entry.byte_len = byte_len;
+        entry.includes_source_text = true;
+        entry.metrics.line_height = options.line_height;
+        entry.state = TextLayoutState::Ready(TextLayoutResource {
+            raster_scale,
+            ..ready_text_layout()
+        });
+        entry
+    }
+
+    #[test]
+    fn live_text_backing_reuse_requires_complete_shape_key() {
+        let options = test_text_options();
+        let mut state = GraphicsState::default();
+        state.text_layouts.insert(
+            1,
+            reusable_ready_text_entry("multilingual العربية 日本語", options, 1.5, 4096),
+        );
+
+        let hit = reusable_text_layout(
+            &state,
+            11,
+            "multilingual العربية 日本語",
+            options,
+            1.5,
+            true,
+        );
+        assert!(hit.is_some());
+
+        let mut different_width = options;
+        different_width.max_width += 1.0;
+        assert!(
+            reusable_text_layout(
+                &state,
+                11,
+                "multilingual العربية 日本語",
+                different_width,
+                1.5,
+                true,
+            )
+            .is_none()
+        );
+        assert!(
+            reusable_text_layout(
+                &state,
+                11,
+                "multilingual العربية 日本語",
+                options,
+                2.0,
+                true,
+            )
+            .is_none()
+        );
+        assert!(
+            reusable_text_layout(
+                &state,
+                12,
+                "multilingual العربية 日本語",
+                options,
+                1.5,
+                true,
+            )
+            .is_none()
+        );
+        assert!(
+            reusable_text_layout(
+                &state,
+                11,
+                "multilingual العربية 日本語",
+                options,
+                1.5,
+                false,
+            )
+            .is_none()
+        );
+        state.font_context_revision = 1;
+        assert!(
+            reusable_text_layout(
+                &state,
+                11,
+                "multilingual العربية 日本語",
+                options,
+                1.5,
+                true,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn reused_text_backing_still_allocates_and_charges_a_fresh_handle() -> Result<()> {
+        let options = test_text_options();
+        let mut state = GraphicsState {
+            next_resource: 40,
+            ..GraphicsState::default()
+        };
+        state
+            .text_layouts
+            .insert(40, reusable_ready_text_entry("same", options, 1.0, 4096));
+        let reused = reusable_text_layout(&state, 11, "same", options, 1.0, true)
+            .ok_or_else(|| anyhow!("live backing was not reusable"))?;
+        let handle = allocate_resource_handle(&mut state, 7, 11, reused.retained_bytes)?;
+        anyhow::ensure!(handle == 41 && handle != 40, "handle was reused");
+        let font_context_revision = state.font_context_revision;
+        state.text_layouts.insert(
+            handle,
+            TextLayoutEntry {
+                pane: 7,
+                generation: 11,
+                width: reused.resource.width,
+                height: reused.resource.height,
+                byte_len: reused.retained_bytes,
+                includes_source_text: true,
+                text: reused.text,
+                options,
+                metrics: reused.metrics,
+                font_context_revision,
+                raster_scale: 1.0,
+                state: TextLayoutState::Ready(reused.resource),
+            },
+        );
+        let charged = state
+            .text_layouts
+            .values()
+            .filter(|entry| entry.pane == 7 && entry.generation == 11)
+            .map(|entry| entry.byte_len)
+            .sum::<usize>();
+        anyhow::ensure!(
+            charged == 8192,
+            "fresh handle was not charged independently"
+        );
+        anyhow::ensure!(
+            allocate_resource_handle(
+                &mut state,
+                7,
+                11,
+                MAX_RESOURCE_BYTES_PER_PANE
+                    .saturating_sub(charged)
+                    .saturating_add(1),
+            ) == Err(PresentationError::LimitReached),
+            "reused backing bypassed the pane byte ceiling"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn text_backing_reuse_ends_with_the_last_live_resource() {
+        let options = test_text_options();
+        let mut state = GraphicsState::default();
+        state
+            .text_layouts
+            .insert(1, reusable_ready_text_entry("bounded", options, 1.0, 128));
+        assert!(reusable_text_layout(&state, 11, "bounded", options, 1.0, true).is_some());
+
+        state.text_layouts.remove(&1);
+        assert!(reusable_text_layout(&state, 11, "bounded", options, 1.0, true).is_none());
+    }
+
+    #[test]
+    fn text_backing_reuse_scan_is_bounded_and_old_match_is_a_clean_miss() -> Result<()> {
+        let options = test_text_options();
+        let mut state = GraphicsState::default();
+        state.text_layouts.insert(
+            1,
+            reusable_ready_text_entry("old matching layout", options, 1.0, 128),
+        );
+        for offset in 0..MAX_TEXT_BACKING_REUSE_SCAN {
+            let handle = u64::try_from(offset)?.saturating_add(2);
+            state.text_layouts.insert(
+                handle,
+                reusable_ready_text_entry(&format!("recent layout {handle}"), options, 1.0, 128),
+            );
+        }
+        state.next_resource = 100;
+        let entries_before = state.text_layouts.len();
+        let bytes_before = state
+            .text_layouts
+            .values()
+            .map(|entry| entry.byte_len)
+            .sum::<usize>();
+
+        anyhow::ensure!(
+            reusable_text_layout(&state, 11, "old matching layout", options, 1.0, true).is_none(),
+            "an entry outside the bounded scan window was reused"
+        );
+        anyhow::ensure!(state.text_layouts.len() == entries_before);
+        anyhow::ensure!(
+            state
+                .text_layouts
+                .values()
+                .map(|entry| entry.byte_len)
+                .sum::<usize>()
+                == bytes_before
+        );
+        anyhow::ensure!(state.next_resource == 100);
+        Ok(())
     }
 
     fn ready_text_layout() -> TextLayoutResource {
@@ -2827,11 +4017,12 @@ mod tests {
 
     fn resize_test_scene(sequence: u64, resize_epoch: Option<u64>) -> PaneScene {
         PaneScene {
+            facet_frame: None,
             generation: 2,
             sequence,
             resize_epoch,
             terminal_input_sequence: Some(sequence),
-            packet: Packet::default(),
+            packet: Packet::default().into(),
         }
     }
 
@@ -2851,6 +4042,8 @@ mod tests {
                 ready_notified: true,
                 required_panes: None,
                 blocker_epochs: BTreeSet::new(),
+                facet_receipt: None,
+                facet_atomic: false,
             },
         );
     }
@@ -2862,7 +4055,8 @@ mod tests {
             sequence: resource,
             resize_epoch: None,
             terminal_input_sequence: None,
-            packet: text_packet(&[resource]),
+            packet: text_packet(&[resource]).into(),
+            facet_frame: None,
         };
         let frame = |revision, resource| PendingGraphicsActorFrame {
             actor: ActorScope::new("resource-owner", 11),
@@ -2872,6 +4066,8 @@ mod tests {
             ready_notified: false,
             required_panes: None,
             blocker_epochs: BTreeSet::new(),
+            facet_receipt: None,
+            facet_atomic: false,
         };
         let mut state = GraphicsState::default();
         state.pending_actor_frames.insert(1, frame(1, 41));
@@ -3126,7 +4322,7 @@ mod tests {
         };
 
         let mut state = deferred_state();
-        let plan = deferred_actor_frame_resolution_plan_in_state(&mut state, 6, false);
+        let plan = deferred_actor_frame_resolution_plan_in_state(&mut state, 6, false, false);
         assert_eq!(plan.retain, BTreeSet::from([35]));
         assert!(plan.commit.is_empty());
         abort_resize_epoch_state(&mut state, 6);
@@ -3138,7 +4334,7 @@ mod tests {
                 .map(|frame| frame.blocker_epochs.clone()),
             Some(BTreeSet::from([7]))
         );
-        let plan = deferred_actor_frame_resolution_plan_in_state(&mut state, 7, true);
+        let plan = deferred_actor_frame_resolution_plan_in_state(&mut state, 7, true, false);
         assert_eq!(
             plan.commit.get(&35).cloned(),
             Some(BTreeMap::from([(7, 6), (8, 6)]))
@@ -3148,11 +4344,11 @@ mod tests {
         assert!(state.deferred_actor_frames.is_empty());
 
         let mut reverse = deferred_state();
-        let plan = deferred_actor_frame_resolution_plan_in_state(&mut reverse, 6, true);
+        let plan = deferred_actor_frame_resolution_plan_in_state(&mut reverse, 6, true, false);
         assert_eq!(plan.retain, BTreeSet::from([35]));
         complete_resize_epoch_state(&mut reverse, 6, true);
         assert_eq!(visible_resize_sequences(&reverse), [(7, 5), (8, 5), (9, 5)]);
-        let plan = deferred_actor_frame_resolution_plan_in_state(&mut reverse, 7, false);
+        let plan = deferred_actor_frame_resolution_plan_in_state(&mut reverse, 7, false, false);
         assert_eq!(
             plan.commit.get(&35).cloned(),
             Some(BTreeMap::from([(7, 6), (8, 6), (9, 6)]))
@@ -3160,6 +4356,112 @@ mod tests {
         abort_resize_epoch_state(&mut reverse, 7);
         assert_eq!(visible_resize_sequences(&reverse), [(7, 6), (8, 6), (9, 6)]);
         assert!(reverse.deferred_actor_frames.is_empty());
+    }
+
+    #[test]
+    fn partial_visibility_preserves_complete_facet_preparation_membership() {
+        let mut state = GraphicsState::default();
+        state.visible_panes.insert(7);
+        state.pending_actor_frames.insert(
+            41,
+            PendingGraphicsActorFrame {
+                actor: ActorScope::new("facet-visibility", 9),
+                token: 301,
+                revision: 41,
+                scenes: BTreeMap::from([
+                    (7, resize_test_scene(8, None)),
+                    (8, resize_test_scene(8, None)),
+                ]),
+                ready_notified: false,
+                required_panes: Some(BTreeSet::from([7, 8])),
+                blocker_epochs: BTreeSet::new(),
+                facet_receipt: None,
+                facet_atomic: true,
+            },
+        );
+        let notifications = ready_actor_frame_notifications(&mut state);
+        assert_eq!(notifications.len(), 1);
+        let panes = notifications
+            .iter()
+            .flat_map(|(_, _, changes)| changes.iter().map(|change| change.pane))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(panes, BTreeSet::from([7, 8]));
+        assert!(ready_actor_frame_notifications(&mut state).is_empty());
+        state.visible_panes.clear();
+        if let Some(frame) = state.pending_actor_frames.get_mut(&41) {
+            frame.ready_notified = false;
+        }
+        assert!(ready_actor_frame_notifications(&mut state).is_empty());
+    }
+
+    #[test]
+    fn cleanup_never_releases_an_uncommitted_facet_scene() {
+        let mut state = GraphicsState::default();
+        state.deferred_actor_frames.insert(
+            41,
+            PendingGraphicsActorFrame {
+                actor: ActorScope::new("facet-cleanup", 9),
+                token: 301,
+                revision: 41,
+                scenes: BTreeMap::from([(7, resize_test_scene(8, Some(6)))]),
+                ready_notified: true,
+                required_panes: Some(BTreeSet::from([7])),
+                blocker_epochs: BTreeSet::from([6]),
+                facet_receipt: None,
+                facet_atomic: true,
+            },
+        );
+
+        let released =
+            release_deferred_actor_frames_for_epoch(&mut state, 6, &BTreeSet::from([7]), true);
+        assert!(released.is_empty());
+        assert!(state.panes.is_empty());
+        assert!(state.deferred_actor_frames.is_empty());
+    }
+
+    #[test]
+    fn degraded_native_promotion_preserves_a_complete_prepared_facet_but_abort_discards_it() {
+        for promote_prepared in [false, true] {
+            let mut state = GraphicsState::default();
+            state.panes.insert(7, resize_test_scene(1, None));
+            state.panes.insert(8, resize_test_scene(1, None));
+            state.deferred_actor_frames.insert(
+                41,
+                PendingGraphicsActorFrame {
+                    actor: ActorScope::new("facet-recovery", 9),
+                    token: 301,
+                    revision: 41,
+                    scenes: BTreeMap::from([
+                        (7, resize_test_scene(8, Some(6))),
+                        (8, resize_test_scene(8, Some(6))),
+                    ]),
+                    ready_notified: true,
+                    required_panes: Some(BTreeSet::from([7, 8])),
+                    blocker_epochs: BTreeSet::from([6]),
+                    facet_receipt: None,
+                    facet_atomic: true,
+                },
+            );
+            let plan = deferred_actor_frame_resolution_plan_in_state(
+                &mut state,
+                6,
+                false,
+                promote_prepared,
+            );
+            if promote_prepared {
+                assert_eq!(
+                    plan.commit.get(&41),
+                    Some(&BTreeMap::from([(7, 8), (8, 8)]))
+                );
+                assert_eq!(visible_resize_sequences(&state), [(7, 8), (8, 8)]);
+                assert!(plan.cancelled_tokens.is_empty());
+            } else {
+                assert!(plan.commit.get(&41).is_some_and(BTreeMap::is_empty));
+                assert_eq!(visible_resize_sequences(&state), [(7, 1), (8, 1)]);
+                assert_eq!(plan.cancelled_tokens, vec![301]);
+            }
+            assert!(state.deferred_actor_frames.is_empty());
+        }
     }
 
     #[test]
@@ -3190,12 +4492,12 @@ mod tests {
         };
 
         let mut success = deferred_state();
-        let plan = deferred_actor_frame_resolution_plan_in_state(&mut success, 6, true);
+        let plan = deferred_actor_frame_resolution_plan_in_state(&mut success, 6, true, false);
         assert_eq!(plan.retain, BTreeSet::from([36]));
         assert!(plan.commit.is_empty());
         complete_resize_epoch_state(&mut success, 6, true);
         assert_eq!(visible_resize_sequences(&success), [(7, 5), (8, 5)]);
-        let plan = deferred_actor_frame_resolution_plan_in_state(&mut success, 7, true);
+        let plan = deferred_actor_frame_resolution_plan_in_state(&mut success, 7, true, false);
         assert_eq!(
             plan.commit.get(&36).cloned(),
             Some(BTreeMap::from([(7, 6), (8, 7)]))
@@ -3206,7 +4508,8 @@ mod tests {
 
         for degraded in [false, true] {
             let mut recovery = deferred_state();
-            let plan = deferred_actor_frame_resolution_plan_in_state(&mut recovery, 7, false);
+            let plan =
+                deferred_actor_frame_resolution_plan_in_state(&mut recovery, 7, false, false);
             assert_eq!(plan.retain, BTreeSet::from([36]));
             assert!(plan.commit.is_empty());
             if degraded {
@@ -3223,7 +4526,7 @@ mod tests {
                     .collect::<Vec<_>>()),
                 Some(vec![7])
             );
-            let plan = deferred_actor_frame_resolution_plan_in_state(&mut recovery, 6, true);
+            let plan = deferred_actor_frame_resolution_plan_in_state(&mut recovery, 6, true, false);
             assert_eq!(
                 plan.commit.get(&36).cloned(),
                 Some(BTreeMap::from([(7, 6)]))
@@ -3260,6 +4563,8 @@ mod tests {
                 ready_notified: true,
                 required_panes: None,
                 blocker_epochs: BTreeSet::new(),
+                facet_receipt: None,
+                facet_atomic: false,
             },
         );
         assert_eq!(
@@ -3289,7 +4594,8 @@ mod tests {
             sequence: pane,
             resize_epoch: None,
             terminal_input_sequence: Some(pane),
-            packet: Packet::default(),
+            packet: Packet::default().into(),
+            facet_frame: None,
         };
         let mut state = GraphicsState {
             accepted_packets: 9,
@@ -3325,6 +4631,8 @@ mod tests {
                 ready_notified: true,
                 required_panes: None,
                 blocker_epochs: BTreeSet::new(),
+                facet_receipt: None,
+                facet_atomic: false,
             },
         );
 
@@ -3336,7 +4644,7 @@ mod tests {
         assert_eq!(state.text_layouts_dropped, 2);
         assert_eq!(state.accepted_packets, 9);
 
-        release_actor_pane_state(&mut state, actor, &panes);
+        release_actor_pane_state(&mut state, actor, 11, &panes);
 
         assert!(state.text_layouts.is_empty());
         assert!(state.images.is_empty());
@@ -3380,12 +4688,15 @@ mod tests {
                         sequence: 1,
                         resize_epoch: None,
                         terminal_input_sequence: Some(719),
-                        packet: Packet::default(),
+                        packet: Packet::default().into(),
+                        facet_frame: None,
                     },
                 )]),
                 ready_notified: false,
                 required_panes: None,
                 blocker_epochs: BTreeSet::new(),
+                facet_receipt: None,
+                facet_atomic: false,
             },
         );
         let notifications = ready_actor_frame_notifications(&mut state);
@@ -3542,12 +4853,15 @@ mod tests {
                         sequence: 1,
                         resize_epoch: None,
                         terminal_input_sequence: None,
-                        packet: Packet::default(),
+                        packet: Packet::default().into(),
+                        facet_frame: None,
                     },
                 )]),
                 ready_notified: false,
                 required_panes: None,
                 blocker_epochs: BTreeSet::new(),
+                facet_receipt: None,
+                facet_atomic: false,
             },
         );
         scheduler.cancel_generation(&old);
@@ -3575,12 +4889,15 @@ mod tests {
                         sequence: 2,
                         resize_epoch: None,
                         terminal_input_sequence: None,
-                        packet: Packet::default(),
+                        packet: Packet::default().into(),
+                        facet_frame: None,
                     },
                 )]),
                 ready_notified: false,
                 required_panes: None,
                 blocker_epochs: BTreeSet::new(),
+                facet_receipt: None,
+                facet_atomic: false,
             },
         );
         assert_eq!(ready_actor_frame_notifications(&mut state).len(), 1);
@@ -3590,6 +4907,54 @@ mod tests {
             .unwrap()
             .ready_notified = false;
         assert_eq!(ready_actor_frame_notifications(&mut state).len(), 1);
+    }
+
+    #[test]
+    fn retiring_actor_generation_cancels_its_hint_and_keeps_peer_dispatchable() {
+        let retiring = ActorScope::new("retiring", 4);
+        let peer = ActorScope::new("peer", 9);
+        let mut scheduler = RenderScheduler::default();
+        let predictor = FramePredictor::new(16_666_667);
+        for actor in [&retiring, &peer] {
+            assert!(scheduler.register(actor.clone()));
+            assert!(scheduler.set_relevant_panes(actor, [actor.generation]));
+            assert!(scheduler.request_render(actor));
+            assert!(scheduler.arm(actor, 0, &predictor, 1_000_000));
+        }
+
+        scheduler.cancel_generation(&retiring);
+        let deadline = scheduler.next_deadline_ns().unwrap();
+        let dispatched = scheduler.dispatch_due(deadline);
+        assert_eq!(dispatched.len(), 1);
+        assert_eq!(dispatched.first().map(|(actor, _hint)| actor), Some(&peer));
+        assert!(scheduler.actor_progress().iter().all(|progress| {
+            (progress.actor.as_str(), progress.generation)
+                != (retiring.name.as_str(), retiring.generation)
+        }));
+    }
+
+    #[test]
+    fn rejected_native_promotion_token_does_not_block_replacement_demand() {
+        let actor = ActorScope::new("rejected-native", 4);
+        let predictor = FramePredictor::new(16_666_667);
+        let mut scheduler = RenderScheduler::default();
+        assert!(scheduler.register(actor.clone()));
+        assert!(scheduler.set_relevant_panes(&actor, [7]));
+        assert!(scheduler.request_render(&actor));
+        assert!(scheduler.arm(&actor, 0, &predictor, 1_000_000));
+        let deadline = scheduler.next_deadline_ns().unwrap();
+        let token = scheduler.dispatch_due(deadline).pop().unwrap().1.token;
+        scheduler.finish(token, deadline, &[7]).unwrap();
+
+        // This is the token returned beside Stale when receipt commit fails
+        // after the bridge has removed the pending frame.
+        assert!(scheduler.cancel_accepted(token));
+        assert!(scheduler.request_render(&actor));
+        scheduler.arm_all(deadline, &predictor, 1_000_000);
+        let replacement_deadline = scheduler.next_deadline_ns().unwrap();
+        let replacement = scheduler.dispatch_due(replacement_deadline);
+        assert_eq!(replacement.len(), 1);
+        assert_ne!(replacement.first().unwrap().1.token, token);
     }
 
     #[test]
@@ -3608,12 +4973,15 @@ mod tests {
                         sequence: 3,
                         resize_epoch: None,
                         terminal_input_sequence: None,
-                        packet: Packet::default(),
+                        packet: Packet::default().into(),
+                        facet_frame: None,
                     },
                 )]),
                 ready_notified: true,
                 required_panes: None,
                 blocker_epochs: BTreeSet::new(),
+                facet_receipt: None,
+                facet_atomic: false,
             },
         );
 
@@ -3636,7 +5004,8 @@ mod tests {
             sequence: pane + 10,
             resize_epoch: None,
             terminal_input_sequence: None,
-            packet: Packet::default(),
+            packet: Packet::default().into(),
+            facet_frame: None,
         };
         let mut state = GraphicsState::default();
         state.pending_actor_frames.insert(
@@ -3649,6 +5018,8 @@ mod tests {
                 ready_notified: true,
                 required_panes: None,
                 blocker_epochs: BTreeSet::new(),
+                facet_receipt: None,
+                facet_atomic: false,
             },
         );
 
@@ -3668,7 +5039,8 @@ mod tests {
         // A replayed ready event consumes the revision before the deferred
         // event resumes. The complete two-pane bridge frame promotes once.
         anyhow::ensure!(
-            promote_actor_frame_in_state(&mut state, 9, &[7, 8])? == ActorFramePromotion::Claimed,
+            promote_actor_frame_in_state(&mut state, 9, &[7, 8])?
+                == (ActorFramePromotion::Claimed, None),
             "replayed ready event did not claim the pending actor frame"
         );
         anyhow::ensure!(
@@ -3689,7 +5061,8 @@ mod tests {
         // Resuming with the prepared snapshots is expected staleness. It must
         // neither partially promote nor mutate the already-promoted frame.
         anyhow::ensure!(
-            promote_actor_frame_in_state(&mut state, 9, &[7, 8])? == ActorFramePromotion::Stale,
+            promote_actor_frame_in_state(&mut state, 9, &[7, 8])?
+                == (ActorFramePromotion::Stale, None),
             "resumed preparation did not report the disappeared revision as stale"
         );
         anyhow::ensure!(
@@ -3715,7 +5088,8 @@ mod tests {
                 sequence: pane + 10,
                 resize_epoch,
                 terminal_input_sequence: None,
-                packet: Packet::default(),
+                packet: Packet::default().into(),
+                facet_frame: None,
             };
             let mut state = GraphicsState::default();
             state.active_resize_epochs.insert(7, 41);
@@ -3729,6 +5103,8 @@ mod tests {
                     ready_notified: true,
                     required_panes: None,
                     blocker_epochs: BTreeSet::new(),
+                    facet_receipt: None,
+                    facet_atomic: false,
                 },
             );
             state
@@ -3777,7 +5153,8 @@ mod tests {
                 sequence: 1,
                 resize_epoch: None,
                 terminal_input_sequence: None,
-                packet: Packet::default(),
+                packet: Packet::default().into(),
+                facet_frame: None,
             },
         );
         assert!(pane_content_is_reusable(&state, 7, 2, 41));
@@ -3792,7 +5169,8 @@ mod tests {
             sequence,
             resize_epoch,
             terminal_input_sequence,
-            packet: Packet::default(),
+            packet: Packet::default().into(),
+            facet_frame: None,
         };
         let mut state = GraphicsState::default();
         state.panes.insert(7, scene(1, None, None));
@@ -3822,7 +5200,8 @@ mod tests {
             sequence,
             resize_epoch,
             terminal_input_sequence,
-            packet: Packet::default(),
+            packet: Packet::default().into(),
+            facet_frame: None,
         };
         let mut state = GraphicsState::default();
         state.panes.insert(7, scene(1, None, None));
@@ -3857,7 +5236,8 @@ mod tests {
             sequence,
             resize_epoch,
             terminal_input_sequence: None,
-            packet: Packet::default(),
+            packet: Packet::default().into(),
+            facet_frame: None,
         };
         let mut state = GraphicsState::default();
         state.panes.insert(7, scene(1, None));
@@ -3883,7 +5263,8 @@ mod tests {
                 sequence: 1,
                 resize_epoch: None,
                 terminal_input_sequence: None,
-                packet: Packet::default(),
+                packet: Packet::default().into(),
+                facet_frame: None,
             },
         );
         state.text_layouts.insert(1, pending_text_entry());
@@ -3894,7 +5275,8 @@ mod tests {
                 sequence: 3,
                 resize_epoch: None,
                 terminal_input_sequence: Some(20),
-                packet: text_packet(&[1]),
+                packet: text_packet(&[1]).into(),
+                facet_frame: None,
             },
         );
         state.active_resize_epochs.insert(7, 41);
@@ -3926,7 +5308,8 @@ mod tests {
                 sequence: 1,
                 resize_epoch: None,
                 terminal_input_sequence: None,
-                packet: Packet::default(),
+                packet: Packet::default().into(),
+                facet_frame: None,
             },
         );
         state.staged_panes.insert(
@@ -3936,7 +5319,8 @@ mod tests {
                 sequence: 2,
                 resize_epoch: Some(41),
                 terminal_input_sequence: None,
-                packet: Packet::default(),
+                packet: Packet::default().into(),
+                facet_frame: None,
             },
         );
         state.text_layouts.insert(1, pending_text_entry());
@@ -3947,7 +5331,8 @@ mod tests {
                 sequence: 3,
                 resize_epoch: None,
                 terminal_input_sequence: Some(20),
-                packet: text_packet(&[1]),
+                packet: text_packet(&[1]).into(),
+                facet_frame: None,
             },
         );
         state.active_resize_epochs.insert(7, 41);
@@ -3974,7 +5359,8 @@ mod tests {
             sequence,
             resize_epoch,
             terminal_input_sequence,
-            packet: Packet::default(),
+            packet: Packet::default().into(),
+            facet_frame: None,
         };
 
         let mut degraded = GraphicsState::default();

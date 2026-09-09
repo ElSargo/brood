@@ -21,12 +21,19 @@ use brood_wasm::{
     Registry, RuntimeIoCapabilities, RuntimeIoConfig, SessionCommandRequest, SessionEvent,
     SessionSnapshot, WasmActor, WasmActorDeclaration, WasmActorEventKind, WasmPluginArtifact,
 };
+use brood_wasm::{
+    component_actor::FacetPublicationConfig,
+    facet_executor::FacetExecutor,
+    snapshot_reclaimer::{BackgroundSnapshotReclaimer, SnapshotReclaimerConfig},
+    snapshot_store::SnapshotStoreLimits,
+};
 use tokio::sync::{Mutex, mpsc};
 use winit::event_loop::EventLoopProxy;
 
 use crate::{ClientEvent, plugin_graphics::PluginGraphicsBridge, render_scheduler::ActorScope};
 
 const CLIENT_INIT_ACTOR_ID: &str = "brood.client-init";
+const MAX_PENDING_FACET_INPUT_CORRELATIONS: usize = 1_024;
 const ACTOR_LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(2);
 const ACTOR_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_PENDING_START_MESSAGES: usize = 64;
@@ -35,6 +42,8 @@ pub const ACTOR_OUTPUT_BACKLOG: usize = 256;
 const ACTOR_INPUT_FLUSH_QUANTUM: usize = 64;
 const ACTOR_OUTPUT_PER_ACTOR_QUANTUM: usize = 32;
 const ACTOR_OUTPUT_TOTAL_QUANTUM: usize = 128;
+
+type FacetTargets = Vec<(brood_protocol::facets::PaneTarget, Option<u64>)>;
 
 type PendingStartMessage = (String, Vec<u8>);
 type PendingStartMailboxes = BTreeMap<String, VecDeque<PendingStartMessage>>;
@@ -49,6 +58,8 @@ struct PresentationActorSpec {
 pub struct PresentationWasmRuntime {
     executor: tokio::runtime::Runtime,
     io_executor: tokio::runtime::Runtime,
+    snapshot_reclaimer: Arc<BackgroundSnapshotReclaimer>,
+    facet_executor: FacetExecutor,
     actors: BTreeMap<String, PresentationActor>,
     legacy_actors: BTreeMap<String, LegacyPresentationActor>,
     legacy_registry: Arc<Mutex<Registry>>,
@@ -71,6 +82,7 @@ pub struct PresentationWasmRuntime {
     started_panes_awaiting_start_barrier: VecDeque<u64>,
     pending_pane_creations: VecDeque<u64>,
     pending_pane_removals: VecDeque<u64>,
+    retired_facet_hosts: BTreeMap<u64, Arc<crate::plugin_graphics::ActorPresentationHost>>,
     bound_backend_id: Option<BackendId>,
     bound_session_id: Option<u64>,
     connected_backends: BTreeSet<BackendId>,
@@ -159,6 +171,164 @@ struct PresentationActor {
     backend: Option<BackendId>,
     session: Option<u64>,
     actor: HostedWasmActor,
+    facets: Option<StdMutex<PresentationFacets>>,
+}
+
+struct PresentationFacets {
+    coordinator: crate::plugin_facets::PluginFacetCoordinator,
+    host: Arc<crate::plugin_graphics::ActorPresentationHost>,
+    publication: Arc<brood_wasm::facet_publication::FacetPublication>,
+    targets: BTreeMap<u64, brood_protocol::facets::PaneTarget>,
+    resize_epochs: BTreeMap<u64, Option<u64>>,
+    geometry_revision: u64,
+    dirty: bool,
+    failed: bool,
+    prepared: Option<crate::plugin_facets::PreparedFacetRender>,
+    render_candidate: Option<brood_wasm::presentation::RenderToken>,
+    admitted_input_watermarks: VecDeque<(u64, Option<u64>)>,
+    next_admitted_input_sequence: u64,
+    completed_input_sequence_changes: VecDeque<(u64, bool)>,
+    input_correlations: VecDeque<FacetInputCorrelation>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FacetInputCorrelation {
+    scheduler_watermark: u64,
+    input_sequence: u64,
+    sequence_changed: bool,
+}
+
+fn take_admitted_input_watermark(
+    admitted: &mut VecDeque<(u64, Option<u64>)>,
+    input_sequence: u64,
+) -> Option<u64> {
+    while admitted
+        .front()
+        .is_some_and(|(sequence, _)| *sequence < input_sequence)
+    {
+        admitted.pop_front();
+    }
+    if admitted
+        .front()
+        .is_some_and(|(sequence, _)| *sequence == input_sequence)
+    {
+        return admitted
+            .pop_front()
+            .and_then(|(_sequence, watermark)| watermark);
+    }
+    None
+}
+
+#[cfg(test)]
+fn facet_input_watermark_for_snapshot(
+    correlation: Option<FacetInputCorrelation>,
+    published_input_sequence: Option<u64>,
+) -> Option<u64> {
+    correlation
+        .filter(|input| {
+            input.sequence_changed || published_input_sequence == Some(input.input_sequence)
+        })
+        .map(|input| input.scheduler_watermark)
+}
+
+impl PresentationFacets {
+    fn retire_generation(&mut self, generation: u64) {
+        self.publication.invalidate();
+        self.coordinator.invalidate();
+        self.prepared = None;
+        self.render_candidate = None;
+        self.host.retire_generation(generation);
+    }
+
+    fn record_admitted_input(&mut self, watermark: Option<u64>) -> Result<()> {
+        let input_sequence = self.next_admitted_input_sequence;
+        self.next_admitted_input_sequence = input_sequence
+            .checked_add(1)
+            .context("facet admitted input sequences exhausted")?;
+        self.admitted_input_watermarks
+            .push_back((input_sequence, watermark));
+        Ok(())
+    }
+
+    fn take_admitted_input_watermark(&mut self, input_sequence: u64) -> Option<u64> {
+        take_admitted_input_watermark(&mut self.admitted_input_watermarks, input_sequence)
+    }
+
+    fn retire_render_opportunity(&mut self, generation: u64) {
+        use brood_wasm::PresentationHost;
+        if let Some(token) = self.render_candidate.take() {
+            let _retired = self.host.finish_actor_frame(generation, token, Vec::new());
+            eprintln!(
+                "facet render opportunity retired generation={generation} candidate={}",
+                token.0
+            );
+        }
+        self.dirty = true;
+    }
+
+    fn observe_geometry(&mut self, event: &PresentationEvent) -> Result<()> {
+        use brood_protocol::facets::{InputEvent, PaneTarget};
+        match event {
+            PresentationEvent::PaneCreated {
+                pane,
+                width,
+                height,
+                scale,
+            }
+            | PresentationEvent::PaneResized {
+                pane,
+                width,
+                height,
+                scale,
+                ..
+            } => {
+                let focused = self.targets.get(pane).is_some_and(|target| target.focused);
+                let target = PaneTarget {
+                    pane: *pane,
+                    logical_width: f64::from(*width),
+                    logical_height: f64::from(*height),
+                    physical_width: (*width * *scale).round() as u32,
+                    physical_height: (*height * *scale).round() as u32,
+                    scale: f64::from(*scale),
+                    clip: [0.0, 0.0, f64::from(*width), f64::from(*height)],
+                    visible: true,
+                    focused,
+                };
+                target.validate().map_err(anyhow::Error::msg)?;
+                self.targets.insert(*pane, target);
+                let epoch = match event {
+                    PresentationEvent::PaneResized { resize_epoch, .. } => *resize_epoch,
+                    _ => None,
+                };
+                self.resize_epochs.insert(*pane, epoch);
+            }
+            PresentationEvent::PaneFocused { pane, focused } => {
+                if let Some(target) = self.targets.get_mut(pane) {
+                    target.focused = *focused;
+                }
+                if !focused {
+                    // Startup focus metadata can precede the first visible
+                    // frame; there is no input sequence to cancel in that case.
+                    if let Err(error) = self.coordinator.admit_input(*pane, &InputEvent::FocusLost)
+                    {
+                        eprintln!("facet focus cancellation unavailable pane={pane}: {error:#}");
+                    } else {
+                        // Focus cancellation is semantic facet input, but it is
+                        // not a latency-traced host key admission.
+                        self.record_admitted_input(None)?;
+                    }
+                }
+            }
+            _ => return Ok(()),
+        }
+        self.geometry_revision = self
+            .geometry_revision
+            .checked_add(1)
+            .context("facet geometry revision exhausted")?;
+        self.coordinator.discard_pending_render()?;
+        self.dirty = true;
+        Ok(())
+    }
 }
 
 struct LegacyPresentationActor {
@@ -234,6 +404,13 @@ impl PresentationWasmRuntime {
         let mut runtime = Self {
             executor,
             io_executor,
+            snapshot_reclaimer: Arc::new(BackgroundSnapshotReclaimer::new(
+                SnapshotReclaimerConfig {
+                    max_generations: 64,
+                    poll_interval: Duration::from_millis(10),
+                },
+            )?),
+            facet_executor: FacetExecutor::new(32, 1)?,
             actors: BTreeMap::new(),
             legacy_actors: BTreeMap::new(),
             legacy_registry: Arc::new(Mutex::new(registry)),
@@ -256,6 +433,7 @@ impl PresentationWasmRuntime {
             started_panes_awaiting_start_barrier: VecDeque::new(),
             pending_pane_creations: VecDeque::new(),
             pending_pane_removals: VecDeque::new(),
+            retired_facet_hosts: BTreeMap::new(),
             bound_backend_id: bound_session.map(|(backend, _session)| backend),
             bound_session_id: bound_session.map(|(_backend, session)| session),
             connected_backends: bound_session
@@ -415,7 +593,7 @@ impl PresentationWasmRuntime {
             path: path.clone(),
             pane_count: 0,
         };
-        let actor = self.executor.block_on(load_hosted_actor(
+        let (actor, facets) = self.executor.block_on(load_hosted_actor(
             &spec,
             self.filesystem_watcher_service.clone(),
             None,
@@ -425,6 +603,8 @@ impl PresentationWasmRuntime {
             &self.workspace_root,
             self.event_proxy.clone(),
             Some(self.io_executor.handle().clone()),
+            Arc::clone(&self.snapshot_reclaimer),
+            self.facet_executor.clone(),
         ))?;
         self.executor.block_on(actor.lifecycle(
             PluginLifecycleEvent::Start(PluginStartContext {
@@ -449,6 +629,7 @@ impl PresentationWasmRuntime {
                 backend: None,
                 session: None,
                 actor,
+                facets: facets.map(StdMutex::new),
             },
         );
         self.init = Some(PresentationInitState {
@@ -593,20 +774,19 @@ impl PresentationWasmRuntime {
             .and_then(|realm| self.session_workspaces.get(&realm))
             .unwrap_or(&self.workspace_root)
             .clone();
-        let actor = self.executor.block_on(load_hosted_actor(
+        let (actor, facets) = self.executor.block_on(load_hosted_actor(
             &spec,
             watcher,
-            presentation.clone(),
+            presentation,
             artifact,
             false,
             capabilities,
             &workspace_root,
             self.event_proxy.clone(),
             Some(self.io_executor.handle().clone()),
+            Arc::clone(&self.snapshot_reclaimer),
+            self.facet_executor.clone(),
         ))?;
-        if let Some(presentation) = presentation {
-            presentation.bind_generation(actor.generation());
-        }
         eprintln!(
             "{}",
             started_hosted_actor_log(&spec.id, actor.kind(), actor.generation(), pane, &spec.path,)
@@ -619,6 +799,7 @@ impl PresentationWasmRuntime {
                 backend,
                 session,
                 actor,
+                facets: facets.map(StdMutex::new),
             },
         );
         Ok(())
@@ -670,6 +851,8 @@ impl PresentationWasmRuntime {
         let completion = self.lifecycle_completion_sender.clone();
         let diagnostics = Arc::clone(&self.diagnostics);
         let io_runtime = self.io_executor.handle().clone();
+        let snapshot_reclaimer = Arc::clone(&self.snapshot_reclaimer);
+        let facet_executor = self.facet_executor.clone();
         let capabilities = capabilities.to_vec();
         let id = spec.id.clone();
         let completion_panes = panes.clone();
@@ -686,14 +869,13 @@ impl PresentationWasmRuntime {
                 &workspace_root,
                 proxy.clone(),
                 Some(io_runtime),
+                snapshot_reclaimer,
+                facet_executor,
             )
             .await;
             let completion_event = match loaded {
-                Ok(actor) => {
+                Ok((actor, facets)) => {
                     let generation = actor.generation();
-                    if let Some(presentation) = presentation {
-                        presentation.bind_generation(generation);
-                    }
                     let lifecycle = PluginLifecycleEvent::Start(PluginStartContext {
                         instance_id: id.clone(),
                         generation,
@@ -723,6 +905,7 @@ impl PresentationWasmRuntime {
                             backend,
                             session,
                             actor,
+                            facets: facets.map(StdMutex::new),
                         }),
                         result,
                     }
@@ -1466,6 +1649,15 @@ impl PresentationWasmRuntime {
             });
             return;
         };
+        if let Some(facets) = &actor.facets
+            && let Ok(mut facets) = facets.lock()
+        {
+            facets.retire_generation(actor.actor.generation());
+            for pane in &actor.panes {
+                self.retired_facet_hosts
+                    .insert(*pane, Arc::clone(&facets.host));
+            }
+        }
         if let Some(init) = self.init.as_mut() {
             init.children.remove(&id);
         }
@@ -1477,6 +1669,15 @@ impl PresentationWasmRuntime {
         let Some(actor) = self.actors.remove(id) else {
             return;
         };
+        if let Some(facets) = &actor.facets
+            && let Ok(mut facets) = facets.lock()
+        {
+            facets.retire_generation(actor.actor.generation());
+            for pane in &actor.panes {
+                self.retired_facet_hosts
+                    .insert(*pane, Arc::clone(&facets.host));
+            }
+        }
         if let Some(init) = self.init.as_mut() {
             init.children.remove(id);
         }
@@ -1861,6 +2062,20 @@ impl PresentationWasmRuntime {
             .flat_map(|actor| actor.panes.iter().copied())
     }
 
+    /// Panes whose presentation is supplied by an immutable facet snapshot.
+    /// Layout admission uses this to enroll geometry-sensitive pure panes in
+    /// the same synchronized cohort as an interaction preview.
+    pub fn facet_pane_ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.actors.values().flat_map(|actor| {
+            actor
+                .facets
+                .is_some()
+                .then_some(actor.panes.iter().copied())
+                .into_iter()
+                .flatten()
+        })
+    }
+
     pub fn pane_realms(&self) -> impl Iterator<Item = (u64, Option<(BackendId, u64)>)> + '_ {
         self.actors.values().flat_map(|actor| {
             actor
@@ -1926,6 +2141,13 @@ impl PresentationWasmRuntime {
         self.pending_pane_removals.drain(..)
     }
 
+    pub fn take_retired_facet_host(
+        &mut self,
+        pane: u64,
+    ) -> Option<Arc<crate::plugin_graphics::ActorPresentationHost>> {
+        self.retired_facet_hosts.remove(&pane)
+    }
+
     pub fn send_presentation_event(&self, event: PresentationEvent) -> Result<()> {
         let key_input = matches!(&event, PresentationEvent::Key { pressed: true, .. });
         let pane = presentation_event_pane(&event)
@@ -1935,6 +2157,48 @@ impl PresentationWasmRuntime {
             .iter()
             .find(|(_name, actor)| actor.panes.contains(&pane))
             .with_context(|| format!("presentation pane {pane} has no actor"))?;
+        let event = if let Some(facets) = &hosted.facets {
+            let mut facets = facets
+                .lock()
+                .map_err(|poison| anyhow::anyhow!("facet coordinator poisoned: {poison}"))?;
+            if facets.failed {
+                return Ok(());
+            }
+            match crate::facet_events::into_facet_input(event) {
+                Ok((pane, input)) => {
+                    // This call runs at event-loop admission, before any actor
+                    // queue can replace the frame which supplied the target.
+                    if let Err(error) = facets.coordinator.admit_input(pane, &input) {
+                        eprintln!(
+                            "visual facet input failed actor={actor_name} generation={} pane={pane}: {error:#}",
+                            hosted.actor.generation()
+                        );
+                        facets.failed = true;
+                        facets.coordinator.invalidate();
+                        self.diagnostics
+                            .actor_failures
+                            .fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        let watermark = self.graphics.as_ref().and_then(|graphics| {
+                            graphics.admit_actor_event(
+                                &ActorScope::new(actor_name.clone(), hosted.actor.generation()),
+                                key_input,
+                            )
+                        });
+                        facets.record_admitted_input(watermark)?;
+                    }
+                    drop(facets);
+                    self.wake_facets();
+                    return Ok(());
+                }
+                Err(event) => {
+                    facets.observe_geometry(&event)?;
+                    event
+                }
+            }
+        } else {
+            event
+        };
         let watermark = self.graphics.as_ref().and_then(|graphics| {
             graphics.admit_actor_event(
                 &ActorScope::new(actor_name.clone(), hosted.actor.generation()),
@@ -1986,6 +2250,402 @@ impl PresentationWasmRuntime {
                 anyhow::bail!("Preview 1 compatibility actors cannot own presentation panes")
             }
         }
+    }
+
+    /// Service isolated completions on the event loop; guest execution and
+    /// compilation remain on dedicated workers. A failed facet affects only its
+    /// owning actor generation and leaves other actors schedulable.
+    pub fn service_facets(&self) -> Vec<(u64, Vec<brood_protocol::facets::HostRequest>)> {
+        use crate::plugin_facets::FacetPoll;
+        use brood_wasm::PresentationHost;
+        let mut host_requests = Vec::new();
+        for (name, actor) in &self.actors {
+            let (Some(facets), HostedWasmActor::Component(component)) =
+                (&actor.facets, &actor.actor)
+            else {
+                continue;
+            };
+            let Ok(mut facets) = facets.lock() else {
+                continue;
+            };
+            if facets.failed {
+                continue;
+            }
+            let serviced = (|| -> Result<()> {
+                // Publication interest is independently woken by the host
+                // import, even while the actor dispatch remains busy.
+                let publication_changed = facets.publication.take_interest();
+                facets.dirty |= publication_changed;
+                if publication_changed
+                    && let Some(snapshot) = facets.publication.acquire_latest()?
+                    && let Some(published_input) = facets
+                        .publication
+                        .input_sequence_for_revision(snapshot.revision())
+                    && let Some(position) = facets
+                        .input_correlations
+                        .iter()
+                        .position(|input| input.input_sequence == published_input)
+                    && let Some(graphics) = &self.graphics
+                {
+                    let watermark = facets
+                        .input_correlations
+                        .get(position)
+                        .map(|input| input.scheduler_watermark)
+                        .context("facet publication correlation disappeared")?;
+                    graphics.complete_facet_publication(
+                        &ActorScope::new(name.clone(), component.generation()),
+                        watermark,
+                    );
+                    facets.input_correlations.drain(..=position);
+                }
+                for _ in 0..2 {
+                    match facets.coordinator.poll_completion()? {
+                        FacetPoll::Idle | FacetPoll::InputAdmissionPending => break,
+                        FacetPoll::InputCommitted {
+                            input_sequence,
+                            sequence_changed,
+                        } => {
+                            // Application changes publish their own demand. Only
+                            // changed transient interaction state needs an extra frame.
+                            facets.dirty |= sequence_changed;
+                            facets
+                                .completed_input_sequence_changes
+                                .push_back((input_sequence, sequence_changed));
+                        }
+                        FacetPoll::NativeDiscarded => {
+                            if std::env::var_os("BROOD_TRACE_PLUGIN_GRAPHICS").is_some() {
+                                eprintln!(
+                                    "facet discarded completion actor={name} pending_native={} inflight={}",
+                                    facets.coordinator.awaits_native_commit(),
+                                    facets.coordinator.is_render_inflight()
+                                );
+                            }
+                            facets.dirty = true;
+                        }
+                        FacetPoll::DiscardedRender => {
+                            facets.retire_render_opportunity(component.generation());
+                        }
+                        FacetPoll::RenderReady(prepared) => facets.prepared = Some(prepared),
+                    }
+                }
+                // Keep admission ownership until the complete native batch
+                // accepts it; a temporary host allocation failure is retryable.
+                if let Some(prepared) = facets.prepared.as_ref() {
+                    if prepared.validate_current().is_err() {
+                        facets.prepared = None;
+                        facets.retire_render_opportunity(component.generation());
+                    } else {
+                        let token =
+                            prepared.with_graphics(|graphics| graphics.token().candidate)?;
+                        match facets.host.submit_facet_frame(
+                            component.generation(),
+                            token,
+                            prepared.clone(),
+                            &facets.resize_epochs,
+                            facets.coordinator.budget(),
+                        ) {
+                            Ok(revision) => {
+                                facets.prepared = None;
+                                facets.render_candidate = None;
+                                facets.dirty |= revision == 0;
+                            }
+                            Err(brood_wasm::PresentationError::LimitReached) => {}
+                            Err(
+                                brood_wasm::PresentationError::InvalidToken
+                                | brood_wasm::PresentationError::StaleResizeEpoch,
+                            ) => {
+                                facets.prepared = None;
+                                facets.retire_render_opportunity(component.generation());
+                            }
+                            Err(error) => return Err(error.into()),
+                        }
+                    }
+                }
+                for _ in 0..16 {
+                    let mut requests = None;
+                    let delivered = facets.coordinator.try_deliver(|batch| {
+                        component.try_send_facet_input(batch)?;
+                        eprintln!("facet input delivered actor={name} generation={} input={} frame={} snapshot={} events={}", component.generation(),
+                            batch.token.input_sequence, batch.token.frame, batch.token.snapshot_revision, batch.events.len());
+                        requests = Some((
+                            batch.token.pane,
+                            batch.token.input_sequence,
+                            batch.requests.clone(),
+                        ));
+                        Ok(())
+                    });
+                    match delivered {
+                        Ok(true) => {
+                            if let Some(requests) = requests {
+                                let admitted_watermark =
+                                    facets.take_admitted_input_watermark(requests.1);
+                                while facets
+                                    .completed_input_sequence_changes
+                                    .front()
+                                    .is_some_and(|(sequence, _)| *sequence < requests.1)
+                                {
+                                    facets.completed_input_sequence_changes.pop_front();
+                                }
+                                let sequence_changed =
+                                    facets.completed_input_sequence_changes.front().is_some_and(
+                                        |(sequence, changed)| *sequence == requests.1 && *changed,
+                                    );
+                                if facets
+                                    .completed_input_sequence_changes
+                                    .front()
+                                    .is_some_and(|(sequence, _)| *sequence == requests.1)
+                                {
+                                    facets.completed_input_sequence_changes.pop_front();
+                                }
+                                if let Some(scheduler_watermark) = admitted_watermark {
+                                    let correlation = FacetInputCorrelation {
+                                        scheduler_watermark,
+                                        input_sequence: requests.1,
+                                        sequence_changed,
+                                    };
+                                    if sequence_changed && let Some(graphics) = &self.graphics {
+                                        graphics.complete_facet_input(
+                                            &ActorScope::new(name.clone(), component.generation()),
+                                            scheduler_watermark,
+                                        );
+                                    } else {
+                                        if facets.input_correlations.len()
+                                            == MAX_PENDING_FACET_INPUT_CORRELATIONS
+                                        {
+                                            facets.input_correlations.pop_front();
+                                        }
+                                        facets.input_correlations.push_back(correlation);
+                                    }
+                                }
+                                facets.dirty |= requests.2.iter().any(|request| {
+                                    matches!(request, brood_protocol::facets::HostRequest::Render)
+                                });
+                                host_requests.push((requests.0, requests.2));
+                            }
+                        }
+                        Ok(false) | Err(_) => break,
+                    }
+                }
+                if !facets.coordinator.is_input_inflight() {
+                    let proxy = self.event_proxy.clone();
+                    facets.coordinator.try_start_input(Arc::new(move || {
+                        if let Some(proxy) = &proxy {
+                            drop(proxy.send_event(ClientEvent::RenderSchedulingChanged));
+                        }
+                    }))?;
+                }
+                if facets.dirty
+                    && !facets.coordinator.is_render_inflight()
+                    && !facets.coordinator.awaits_native_commit()
+                    && !facets.targets.is_empty()
+                    && facets.publication.acquire_latest()?.is_some()
+                {
+                    facets.host.request_render(component.generation())?;
+                    facets.dirty = false;
+                }
+                Ok(())
+            })();
+            if let Err(error) = serviced {
+                eprintln!(
+                    "visual facet failed actor={name} generation={}: {error:#}",
+                    component.generation()
+                );
+                facets.failed = true;
+                facets.coordinator.invalidate();
+                facets.prepared = None;
+                self.diagnostics
+                    .actor_failures
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        host_requests
+    }
+
+    fn wake_facets(&self) {
+        if let Some(proxy) = &self.event_proxy {
+            drop(proxy.send_event(ClientEvent::RenderSchedulingChanged));
+        }
+    }
+
+    pub fn facet_renderer_recreated(&self) -> Result<()> {
+        for actor in self.actors.values() {
+            let Some(facets) = &actor.facets else {
+                continue;
+            };
+            let mut facets = facets
+                .lock()
+                .map_err(|poison| anyhow::anyhow!("facet coordinator poisoned: {poison}"))?;
+            if facets.failed {
+                continue;
+            }
+            facets.coordinator.discard_pending_render()?;
+            facets.prepared = None;
+            facets.dirty = true;
+        }
+        self.wake_facets();
+        Ok(())
+    }
+
+    /// Resize tags belong to host transactions, not to application snapshots.
+    /// Retire them even when completion preserves the same logical dimensions
+    /// and therefore does not produce another `PaneResized` actor event.
+    pub fn reconcile_facet_resize_epochs(&self, active: &BTreeSet<u64>) -> Result<()> {
+        for actor in self.actors.values() {
+            let Some(facets) = &actor.facets else {
+                continue;
+            };
+            let mut facets = facets
+                .lock()
+                .map_err(|poison| anyhow::anyhow!("facet coordinator poisoned: {poison}"))?;
+            let mut changed = false;
+            for epoch in facets.resize_epochs.values_mut() {
+                if epoch.is_some_and(|epoch| !active.contains(&epoch)) {
+                    *epoch = None;
+                    changed = true;
+                }
+            }
+            if changed && !facets.failed {
+                facets.coordinator.discard_pending_render()?;
+                facets.geometry_revision = facets
+                    .geometry_revision
+                    .checked_add(1)
+                    .context("facet geometry revision exhausted")?;
+                facets.dirty = true;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn facet_targets(&self, identity: &ActorIdentity) -> Result<Option<FacetTargets>> {
+        let actor = self
+            .actors
+            .get(&identity.name)
+            .filter(|actor| actor.actor.generation() == identity.generation)
+            .context("facet actor generation unavailable")?;
+        actor
+            .facets
+            .as_ref()
+            .map(|facets| {
+                let facets = facets
+                    .lock()
+                    .map_err(|poison| anyhow::anyhow!("facet coordinator poisoned: {poison}"))?;
+                Ok(facets
+                    .targets
+                    .values()
+                    .map(|target| {
+                        (
+                            target.clone(),
+                            facets.resize_epochs.get(&target.pane).copied().flatten(),
+                        )
+                    })
+                    .collect())
+            })
+            .transpose()
+    }
+
+    pub fn send_facet_render_hint(
+        &self,
+        identity: &ActorIdentity,
+        hint: &brood_wasm::presentation::RenderHint,
+        targets: Vec<brood_protocol::facets::PaneTarget>,
+        renderer_generation: u64,
+    ) -> Result<()> {
+        let actor = self
+            .actors
+            .get(&identity.name)
+            .filter(|actor| actor.actor.generation() == identity.generation)
+            .context("facet actor generation unavailable")?;
+        let mut facets = actor
+            .facets
+            .as_ref()
+            .context("actor has no facets")?
+            .lock()
+            .map_err(|poison| anyhow::anyhow!("facet coordinator poisoned: {poison}"))?;
+        let snapshot = facets.publication.acquire_latest()?;
+        if facets.failed
+            || facets.coordinator.is_render_inflight()
+            || facets.coordinator.awaits_native_commit()
+            || snapshot.is_none()
+            || targets.is_empty()
+        {
+            use brood_wasm::PresentationHost;
+            if std::env::var_os("BROOD_TRACE_PLUGIN_GRAPHICS").is_some() {
+                eprintln!(
+                    "facet hint declined actor={} token={} failed={} inflight={} pending_native={} snapshot={} targets={}",
+                    identity.name,
+                    hint.token.0,
+                    facets.failed,
+                    facets.coordinator.is_render_inflight(),
+                    facets.coordinator.awaits_native_commit(),
+                    snapshot.is_some(),
+                    targets.len()
+                );
+            }
+            // Decline this host opportunity without entering the actor's
+            // legacy render handler. Publication/completion wakes future demand.
+            let _declined =
+                facets
+                    .host
+                    .finish_actor_frame(identity.generation, hint.token, Vec::new());
+            facets.dirty |= !facets.failed;
+            return Ok(());
+        }
+        let snapshot = snapshot.context("published facet view disappeared")?;
+        let geometry_revision = facets.geometry_revision;
+        let test_delay_completion = facets.resize_epochs.values().any(Option::is_some);
+        let parameters = crate::plugin_facets::RenderParameters {
+            targets,
+            candidate: hint.token.0,
+            target_time_ns: hint.target_presentation_time_ns,
+            cutoff_ns: hint.submission_deadline_ns,
+            configuration: Vec::new(),
+            pane_membership_revision: 1,
+            geometry_revision,
+            host_configuration_revision: 1,
+            renderer_generation,
+            interaction_revision: 1,
+            test_delay_completion,
+        };
+        let proxy = self.event_proxy.clone();
+        let revision = snapshot.revision();
+        match facets.coordinator.try_start_render(
+            snapshot,
+            parameters,
+            Arc::new(move || {
+                if let Some(proxy) = &proxy {
+                    drop(proxy.send_event(ClientEvent::RenderSchedulingChanged));
+                }
+            }),
+        ) {
+            Ok(()) => {
+                facets.render_candidate = Some(hint.token);
+                eprintln!(
+                    "facet render started actor={} generation={} candidate={} snapshot={revision} renderer={renderer_generation}",
+                    identity.name, identity.generation, hint.token.0
+                );
+            }
+            Err(error) if error.is::<crate::plugin_facets::RenderAdmissionDeferred>() => {
+                use brood_wasm::PresentationHost;
+                let _declined =
+                    facets
+                        .host
+                        .finish_actor_frame(identity.generation, hint.token, Vec::new());
+                facets.dirty = true;
+            }
+            Err(error) => {
+                eprintln!(
+                    "visual facet render failed actor={} generation={}: {error:#}",
+                    identity.name, identity.generation
+                );
+                facets.failed = true;
+                facets.coordinator.invalidate();
+                self.diagnostics
+                    .actor_failures
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        drop(facets);
+        Ok(())
     }
 
     pub fn send_render_hint(
@@ -2317,6 +2977,17 @@ impl PresentationWasmRuntime {
 
     pub fn shutdown(mut self) -> Result<()> {
         let mut first_error = None;
+        for actor in self.actors.values() {
+            if let Some(facets) = &actor.facets
+                && let Ok(mut facets) = facets.lock()
+            {
+                facets.retire_generation(actor.actor.generation());
+                facets.host.detach_retired_state();
+            }
+        }
+        for host in std::mem::take(&mut self.retired_facet_hosts).into_values() {
+            host.detach_retired_state();
+        }
         let tasks = self.lifecycle_tasks.drain(..).collect::<Vec<_>>();
         for task in &tasks {
             task.abort();
@@ -2508,7 +3179,9 @@ async fn load_hosted_actor(
     workspace_root: &Path,
     event_proxy: Option<EventLoopProxy<ClientEvent>>,
     io_runtime: Option<tokio::runtime::Handle>,
-) -> Result<HostedWasmActor> {
+    snapshot_reclaimer: Arc<BackgroundSnapshotReclaimer>,
+    facet_executor: FacetExecutor,
+) -> Result<(HostedWasmActor, Option<PresentationFacets>)> {
     let root = spec.path.parent().unwrap_or_else(|| Path::new("."));
     let (filesystem, runtime_io) = presentation_actor_grants(root, workspace_root, capabilities)?;
     let actor = match artifact {
@@ -2516,10 +3189,22 @@ async fn load_hosted_actor(
             let actor = ComponentActor::load(
                 &spec.path,
                 ComponentActorConfig {
+                    facet_publication: Some(FacetPublicationConfig {
+                        reclaimer: snapshot_reclaimer,
+                        limits: SnapshotStoreLimits {
+                            max_live_bytes: if spec.id == "picker" { 64 } else { 32 } * 1024 * 1024,
+                            max_snapshot_bytes: if spec.id == "picker" { 8 } else { 4 }
+                                * 1024
+                                * 1024,
+                            max_live_allocations: 256,
+                            max_live_roots: 64,
+                            max_chunks_per_snapshot: 64,
+                        },
+                    }),
                     filesystem: Some(filesystem.clone()),
                     filesystem_watcher_service: watcher,
                     runtime_io,
-                    presentation: presentation.map(|presentation| {
+                    presentation: presentation.clone().map(|presentation| {
                         presentation as std::sync::Arc<dyn brood_wasm::PresentationHost>
                     }),
                     actor_management,
@@ -2567,7 +3252,232 @@ async fn load_hosted_actor(
         }
     };
 
-    Ok(actor)
+    let facets = match &actor {
+        HostedWasmActor::Component(component)
+            if component.has_facets() && presentation.is_some() =>
+        {
+            let publication = component
+                .facet_publication()
+                .context("visual facets require render publication")?;
+            let host = presentation
+                .clone()
+                .context("visual facets require presentation ownership")?;
+            let coordinator = load_presentation_facets(
+                &facet_executor,
+                &spec.path,
+                component.generation(),
+                &spec.id,
+                spec.id.starts_with("coding-agent-ui"),
+                spec.id.starts_with("terminal-ui"),
+                &host,
+            )
+            .await?;
+            Some(PresentationFacets {
+                coordinator,
+                host,
+                publication,
+                targets: BTreeMap::new(),
+                resize_epochs: BTreeMap::new(),
+                geometry_revision: 1,
+                dirty: true,
+                failed: false,
+                prepared: None,
+                render_candidate: None,
+                admitted_input_watermarks: VecDeque::new(),
+                next_admitted_input_sequence: 1,
+                completed_input_sequence_changes: VecDeque::new(),
+                input_correlations: VecDeque::new(),
+            })
+        }
+        _ => None,
+    };
+    // Isolated compilation can take longer than a frame deadline. Register
+    // scheduling demand only after both stores are ready, immediately before
+    // lifecycle; otherwise the client can dispatch for an actor still loading.
+    if let Some(host) = &presentation {
+        host.bind_generation(actor.generation());
+        if facets.is_some() {
+            ensure!(
+                host.require_facet_input_reduction(actor.generation()),
+                "facet input scheduler generation is unavailable"
+            );
+        }
+    }
+    Ok((actor, facets))
+}
+
+async fn load_presentation_facets(
+    executor: &FacetExecutor,
+    path: &Path,
+    generation: u64,
+    actor_id: &str,
+    attachment_input: bool,
+    terminal_view: bool,
+    host: &Arc<crate::plugin_graphics::ActorPresentationHost>,
+) -> Result<crate::plugin_facets::PluginFacetCoordinator> {
+    use crate::plugin_facets::{PluginFacetConfig, PluginFacetCoordinator};
+    use brood_protocol::{
+        facet_codec::DecodeLimits,
+        facets::{InvocationLimits, Scope},
+    };
+    use brood_wasm::{
+        facet_input::FacetInputConfig,
+        facet_resources::{FacetResourceRegistry, FacetResourceRegistryConfig},
+        facet_runtime::FacetRuntimeConfig,
+        snapshot_budget::{ByteBudget, ByteBudgetLimits},
+    };
+    // Actor generations are process-unique; no restarted client can inherit a
+    // host receipt, resource handle, or event queue from this runtime.
+    let scope = Scope {
+        client_generation: generation,
+        actor_generation: generation,
+        facet_generation: 1,
+    };
+    // Attachment source bytes remain actor data, but must cross the isolated
+    // interpreter once. The coding-agent envelope carries raw bytes (not JSON
+    // arrays), so a bounded 16 MiB event includes an 8 MiB image plus thumbnail.
+    // Picker publications retain stable identities for the complete filtered
+    // order, including rows outside the viewport used by keyboard navigation.
+    let picker_view = actor_id == "picker";
+    let large_view = attachment_input || terminal_view || picker_view;
+    let wire_bytes = if attachment_input || picker_view {
+        16
+    } else {
+        8
+    } * 1024
+        * 1024;
+    let memory_bytes = if large_view { 64 } else { 16 } * 1024 * 1024;
+    let decode_bytes = if large_view { 32 } else { 4 } * 1024 * 1024;
+    let limits = InvocationLimits {
+        max_output_bytes: if attachment_input || picker_view {
+            16
+        } else if terminal_view {
+            8
+        } else {
+            2
+        } * 1024
+            * 1024,
+        max_packet_bytes: if terminal_view { 4 } else { 1 } * 1024 * 1024,
+        max_interaction_bytes: if picker_view {
+            8 * 1024 * 1024
+        } else if terminal_view {
+            4 * 1024 * 1024
+        } else {
+            256 * 1024
+        },
+        max_sequence_bytes: 64 * 1024,
+        max_events: 64,
+        max_event_bytes: if attachment_input {
+            16 * 1024 * 1024
+        } else if terminal_view {
+            1024 * 1024
+        } else {
+            // A 256 KiB admitted paste can expand sixfold in a plugin's JSON
+            // semantic envelope. Keep that valid input inside the output cap.
+            2 * 1024 * 1024
+        },
+        max_host_requests: 16,
+        max_resources: if terminal_view { 16_384 } else { 1024 },
+        max_resource_bytes: if terminal_view { 64 } else { 16 } * 1024 * 1024,
+    };
+    let budget_limits = ByteBudgetLimits {
+        max_live_bytes: if large_view { 256 } else { 64 } * 1024 * 1024,
+        max_live_allocations: 4096,
+        max_buffer_bytes: if large_view { 128 } else { 32 } * 1024 * 1024,
+    };
+    let budget = ByteBudget::new(generation, budget_limits);
+    let resource_budget = ByteBudget::new(generation, budget_limits);
+    let resources = Arc::new(FacetResourceRegistry::new(
+        host.facet_resource_backend(generation),
+        FacetResourceRegistryConfig {
+            max_invocations: 4,
+            retry_interval: Duration::from_millis(10),
+        },
+    )?);
+    let mut coordinator = PluginFacetCoordinator::load(
+        executor,
+        path.to_path_buf(),
+        PluginFacetConfig {
+            scope,
+            runtime: FacetRuntimeConfig {
+                max_memory_bytes: memory_bytes,
+                max_input_bytes: wire_bytes,
+                max_output_bytes: limits.max_output_bytes as usize,
+                ..FacetRuntimeConfig::default()
+            },
+            limits,
+            max_panes: 16,
+            wire_bytes,
+            decode: DecodeLimits {
+                max_wire_bytes: limits.max_output_bytes as usize,
+                max_allocated_bytes: decode_bytes,
+                max_allocations: 4096,
+            },
+            input: FacetInputConfig {
+                limits,
+                max_queued_inputs: 1024,
+                max_pending_delivery_batches: 16,
+                max_events_per_result: 64,
+                max_requests_per_result: 16,
+                max_text_bytes_per_input: 256 * 1024,
+            },
+        },
+        budget,
+        resource_budget,
+        resources,
+    )
+    .await?
+    .context("declared visual facets are unavailable")?;
+    let completion_delay = test_facet_render_completion_delay(actor_id)?;
+    if let Some(delay) = completion_delay {
+        eprintln!(
+            "test facet render completion delay actor={actor_id} delay_ms={}",
+            delay.as_millis()
+        );
+    }
+    coordinator.set_test_render_completion_delay(completion_delay);
+    Ok(coordinator)
+}
+
+/// Test-only completion hold used by offscreen cohort proofs. Execution and
+/// resource validation happen normally; only delivery to native preparation is
+/// delayed on the bounded facet task runtime. Dropping that runtime cancels the
+/// task and releases its bounded output/resource ownership.
+fn test_facet_render_completion_delay(actor_id: &str) -> Result<Option<Duration>> {
+    let Some(value) = std::env::var_os("BROOD_TEST_FACET_RENDER_COMPLETION_DELAY") else {
+        return Ok(None);
+    };
+    let value = value.into_string().map_err(|value| {
+        anyhow::anyhow!(
+            "BROOD_TEST_FACET_RENDER_COMPLETION_DELAY is not UTF-8: {}",
+            value.to_string_lossy()
+        )
+    })?;
+    parse_test_facet_render_completion_delay(actor_id, &value)
+}
+
+fn parse_test_facet_render_completion_delay(
+    actor_id: &str,
+    value: &str,
+) -> Result<Option<Duration>> {
+    const MAX_TEST_DELAY_MS: u64 = 5_000;
+    let (configured_actor, delay_ms) = value.split_once('=').context(
+        "BROOD_TEST_FACET_RENDER_COMPLETION_DELAY must have the form actor-id=milliseconds",
+    )?;
+    ensure!(
+        !configured_actor.is_empty()
+            && !configured_actor.chars().any(char::is_whitespace)
+            && !configured_actor.contains(','),
+        "BROOD_TEST_FACET_RENDER_COMPLETION_DELAY has an invalid actor ID"
+    );
+    let delay_ms = delay_ms.parse::<u64>().with_context(
+        || "BROOD_TEST_FACET_RENDER_COMPLETION_DELAY milliseconds must be an unsigned integer",
+    )?;
+    ensure!(
+        delay_ms <= MAX_TEST_DELAY_MS,
+        "BROOD_TEST_FACET_RENDER_COMPLETION_DELAY exceeds {MAX_TEST_DELAY_MS} ms"
+    );
+    Ok((configured_actor == actor_id && delay_ms != 0).then(|| Duration::from_millis(delay_ms)))
 }
 
 fn presentation_actor_grants(
@@ -2795,6 +3705,42 @@ mod tests {
     use std::time::Instant;
 
     #[test]
+    fn facet_input_correlation_requires_its_causal_snapshot_or_sequence_change() {
+        let published_input = FacetInputCorrelation {
+            scheduler_watermark: 41,
+            input_sequence: 7,
+            sequence_changed: false,
+        };
+        assert_eq!(
+            facet_input_watermark_for_snapshot(Some(published_input), None),
+            None
+        );
+        assert_eq!(
+            facet_input_watermark_for_snapshot(Some(published_input), Some(6)),
+            None
+        );
+        assert_eq!(
+            facet_input_watermark_for_snapshot(Some(published_input), Some(8)),
+            None
+        );
+        assert_eq!(
+            facet_input_watermark_for_snapshot(Some(published_input), Some(7)),
+            Some(41)
+        );
+
+        let transient_input = FacetInputCorrelation {
+            scheduler_watermark: 42,
+            input_sequence: 8,
+            sequence_changed: true,
+        };
+        assert_eq!(
+            facet_input_watermark_for_snapshot(Some(transient_input), None),
+            Some(42)
+        );
+        assert_eq!(facet_input_watermark_for_snapshot(None, Some(99)), None);
+    }
+
+    #[test]
     fn legacy_address_delivers_eight_motions_and_release_while_registry_is_locked() -> Result<()> {
         let mut registry = Registry::new();
         let (registration, mut mailbox) = registry.prepare_actor("workspace", 64)?;
@@ -2845,12 +3791,15 @@ mod tests {
             let registry = Arc::new(Mutex::new(registry));
             let start = Arc::new(std::sync::Barrier::new(2));
             let actor_start = Arc::clone(&start);
+            // Keep the registry alive until both producers and the consumer
+            // finish; dropping it retires the mailbox generation.
+            let outbox_registry = Arc::clone(&registry);
             let outbox = tokio::spawn(async move {
                 actor_start.wait();
                 for sequence in 0_u64..10 {
                     let mut payload = vec![1];
                     payload.extend_from_slice(&sequence.to_le_bytes());
-                    registry.lock().await.try_post_named_message_from(
+                    outbox_registry.lock().await.try_post_named_message_from(
                         actor_id,
                         "workspace",
                         payload,
@@ -2896,10 +3845,7 @@ mod tests {
                 }
             }
             ensure!(next_host == 10 && next_actor == 10);
-            match actor_mailbox.try_read_envelope() {
-                Ok(None) | Err(_) => {}
-                Ok(Some(_extra)) => anyhow::bail!("same-recipient mailbox duplicated a message"),
-            }
+            ensure!(actor_mailbox.try_read_envelope()?.is_none());
             Ok(())
         })
     }
@@ -3330,5 +4276,33 @@ mod tests {
             BackendId(1),
             BackendActorRealm::Daemon
         ));
+    }
+
+    #[test]
+    fn facet_completion_delay_is_exactly_scoped_and_bounded() -> Result<()> {
+        let matching =
+            parse_test_facet_render_completion_delay("resize-proof-slow", "resize-proof-slow=90")?;
+        ensure!(matching == Some(Duration::from_millis(90)));
+        let other =
+            parse_test_facet_render_completion_delay("resize-proof-fast", "resize-proof-slow=90")?;
+        ensure!(other.is_none());
+        ensure!(parse_test_facet_render_completion_delay("resize-proof-slow", "broken").is_err());
+        ensure!(
+            parse_test_facet_render_completion_delay("resize-proof-slow", "resize-proof-slow=5001")
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn facet_delivery_matches_admission_by_exact_input_sequence() {
+        let mut admitted = VecDeque::from([(1, Some(41)), (2, None), (4, Some(44))]);
+        assert_eq!(take_admitted_input_watermark(&mut admitted, 1), Some(41));
+        assert_eq!(take_admitted_input_watermark(&mut admitted, 2), None);
+        // An uncorrelated delivery must not consume the later admission.
+        assert_eq!(take_admitted_input_watermark(&mut admitted, 3), None);
+        assert_eq!(admitted.front(), Some(&(4, Some(44))));
+        assert_eq!(take_admitted_input_watermark(&mut admitted, 4), Some(44));
+        assert!(admitted.is_empty());
     }
 }

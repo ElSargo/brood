@@ -70,8 +70,10 @@ use winit::{
 mod actor_runtime;
 mod backend_registry;
 mod clipboard;
+mod facet_events;
 mod key_policy;
 mod layout;
+mod plugin_facets;
 mod plugin_gpu;
 mod plugin_graphics;
 mod pointer_policy;
@@ -314,7 +316,15 @@ fn push_bounded(samples: &mut VecDeque<u128>, sample: u128) {
 
 pub(crate) fn terminal_input_sequence(body: &[u8]) -> Option<u64> {
     let encoded = <[u8; 8]>::try_from(body.get(1..9)?).ok()?;
-    (body.first() == Some(&b'I')).then(|| u64::from_le_bytes(encoded))
+    let starts_input = match body.first() {
+        Some(b'I') => true,
+        // Reliable terminal records retain the logical sequence at the same
+        // offset. Only the first transport chunk claims the pending input;
+        // later chunks must not claim keys queued behind a large paste.
+        Some(b'J') => body.len() > 34 && matches!(body.get(33), Some(1 | 3)),
+        _ => false,
+    };
+    starts_input.then(|| u64::from_le_bytes(encoded))
 }
 
 fn terminal_snapshot_input_sequence(body: &[u8]) -> Option<u64> {
@@ -1082,6 +1092,11 @@ fn main() -> Result<()> {
         let report = serde_json::json!({
             "scenario": scenario,
             "graphics": metrics,
+            "active_measurement": application.render_scheduling_active_measurement,
+            "scheduler_wake_tail": {
+                "margin_ns": application.render_predictor.safety_margin_ns(),
+                "retained_samples_ns": application.render_predictor.wake_lateness_samples_ns(),
+            },
             "reliable_transition_drops": application.reliable_transition_drops
                 .saturating_add(actor_runtime_diagnostics.reliable_transition_drops),
             "actor_failures": actor_runtime_diagnostics.actor_failures
@@ -1383,6 +1398,27 @@ fn register_graphics_preparation_batch(
         latest.insert((key.pane, key.resize_epoch), *key);
     }
     true
+}
+
+// Retire only this rejected frame, including completions still on the worker.
+// Keeping a prepared snapshot pins its facet resource slot and can prevent the
+// replacement render from allocating the very resources needed to supersede it.
+fn retire_graphics_preparation<T>(
+    latest: &mut BTreeMap<(u64, Option<u64>), GraphicsPreparationKey>,
+    prepared: &mut BTreeMap<GraphicsPreparationKey, T>,
+    pending: &mut BTreeSet<Vec<GraphicsPreparationKey>>,
+    changes: &[ActorFrameGraphicsChange],
+) {
+    let rejected = |key: &GraphicsPreparationKey| {
+        changes.iter().any(|change| {
+            key.pane == change.pane
+                && key.sequence == change.sequence
+                && key.resize_epoch == change.resize_epoch
+        })
+    };
+    prepared.retain(|key, _| !rejected(key));
+    latest.retain(|_, key| !rejected(key));
+    pending.retain(|keys| !keys.iter().any(rejected));
 }
 
 /// Only retained whole-frame work can safely recompute its current snapshots
@@ -4193,6 +4229,8 @@ struct ActiveSynchronizedResize {
     event_sequence: u64,
     interaction_claim: Option<PointerInteractionClaimKey>,
     native_resize_revision: Option<u64>,
+    interaction_preview: bool,
+    host_owned: bool,
     superseded_epochs: u64,
     epoch: brood_wasm::ResizeEpoch,
     requester: ActorIdentity,
@@ -4265,6 +4303,57 @@ fn synchronized_resize_wait_deadline(
     matches!(presentation, SynchronizedResizePresentation::Waiting).then_some(deadline)
 }
 
+fn interaction_preview_pure_cohort(
+    affected_panes: &BTreeSet<u64>,
+    facet_panes: &BTreeSet<u64>,
+) -> BTreeSet<u64> {
+    affected_panes.intersection(facet_panes).copied().collect()
+}
+
+fn target_present_pane_cohort(panes: BTreeSet<u64>, target: &ResolvedLayout) -> BTreeSet<u64> {
+    panes
+        .into_iter()
+        .filter(|pane| target.pane_item(*pane).is_some())
+        .collect()
+}
+
+fn actor_layout_acknowledges_pending_focus(pending: Option<u64>, actor_focus: Option<u64>) -> bool {
+    pending.is_some() && pending == actor_focus
+}
+
+fn pending_focus_after_actor_layout(pending: Option<u64>, actor_focus: Option<u64>) -> Option<u64> {
+    if actor_layout_acknowledges_pending_focus(pending, actor_focus) {
+        None
+    } else {
+        pending
+    }
+}
+
+fn promoted_synchronized_focus(
+    host_owned: bool,
+    captured_focus: Option<u64>,
+    current_focus: Option<u64>,
+    pending_focus: Option<u64>,
+    newly_admitted_active: Option<u64>,
+) -> Option<u64> {
+    if let Some(pending) = pending_focus {
+        return Some(pending);
+    }
+    if !host_owned {
+        return captured_focus;
+    }
+    if current_focus != captured_focus {
+        return current_focus;
+    }
+    newly_admitted_active.or(captured_focus)
+}
+
+fn synchronized_resize_preview_timed_out(active: &ActiveSynchronizedResize, now: Instant) -> bool {
+    (active.interaction_preview || active.host_owned)
+        && matches!(active.presentation, SynchronizedResizePresentation::Waiting)
+        && now >= active.deadline
+}
+
 fn next_event_loop_deadline(
     deadlines: impl IntoIterator<Item = Option<Instant>>,
 ) -> Option<Instant> {
@@ -4274,14 +4363,17 @@ fn next_event_loop_deadline(
 #[derive(Default)]
 struct EventLoopDeadlineSchedule {
     armed: Option<(Instant, u64)>,
-    pending_wake: Option<u64>,
+    pending_wake: Option<(Instant, u64)>,
     next_generation: u64,
     stopped: bool,
 }
 
 impl EventLoopDeadlineSchedule {
     fn replace(&mut self, deadline: Option<Instant>) -> bool {
-        if self.armed.map(|(armed, _generation)| armed) == deadline && self.pending_wake.is_none() {
+        // A fired wake remains the current deadline until its queued event is
+        // accepted. Redraw can synchronize that same deadline in the meantime;
+        // preserve the queued generation instead of forcing another wakeup.
+        if self.armed.or(self.pending_wake).map(|(armed, _)| armed) == deadline {
             return false;
         }
         self.next_generation = self.next_generation.wrapping_add(1).max(1);
@@ -4296,12 +4388,12 @@ impl EventLoopDeadlineSchedule {
             return None;
         }
         self.armed = None;
-        self.pending_wake = Some(generation);
+        self.pending_wake = Some((deadline, generation));
         Some(generation)
     }
 
     fn accept_wake(&mut self, generation: u64) -> bool {
-        if self.pending_wake != Some(generation) {
+        if self.pending_wake.map(|(_, pending)| pending) != Some(generation) {
             return false;
         }
         self.pending_wake = None;
@@ -4428,6 +4520,13 @@ fn synchronized_resize_inventory_matches(
         .is_some_and(|target_panes| target_panes.is_subset(&current_inventory))
 }
 
+const fn layout_state_publication_is_deferred(
+    synchronized_resize_active: bool,
+    layout_state_dirty: bool,
+) -> bool {
+    synchronized_resize_active && layout_state_dirty
+}
+
 fn named_layout_panes(layout: &ResolvedLayout) -> BTreeSet<u64> {
     layout
         .items
@@ -4485,6 +4584,14 @@ fn prepare_synchronized_resize_presentation(
     active: &mut ActiveSynchronizedResize,
     degraded: bool,
 ) -> Option<(bool, Vec<u64>)> {
+    let exact_cohort = active.host_owned || active.interaction_preview;
+    if exact_cohort
+        && (degraded
+            || synchronized_resize_requires_degraded_completion(active)
+            || !synchronized_resize_wait_set_is_ready(active))
+    {
+        return None;
+    }
     if !matches!(active.presentation, SynchronizedResizePresentation::Waiting)
         || !resize_regions_are_final(active)
         || !changed_region_chain_is_final(active, active.target_extent)
@@ -5025,6 +5132,16 @@ struct RenderSchedulingIdleMeasurement {
     periodic_lifecycle_polls: u64,
 }
 
+#[derive(Clone, Debug, serde::Serialize)]
+struct RenderSchedulingActiveMeasurement {
+    frame_intervals_ns: Vec<u64>,
+    opportunities: u64,
+    deadline_misses: u64,
+    target_misses: u64,
+    late_finishes: Vec<render_scheduler::LateFinishDiagnostic>,
+    late_finishes_dropped: u64,
+}
+
 #[derive(Default)]
 struct WinitHotPathMetrics {
     samples_ns: VecDeque<u64>,
@@ -5039,9 +5156,58 @@ struct WinitHotPathMetrics {
 // next power-of-two bound above the observed 37,786-callback saturated lane,
 // while keeping the diagnostic allocation finite (a few MiB across both
 // deques on 64-bit hosts).
-const MAX_WINIT_HOT_PATH_SAMPLES: usize = 65_536;
+// Retain the complete extended input proof while keeping diagnostics bounded.
+const MAX_WINIT_HOT_PATH_SAMPLES: usize = 131_072;
+
+const fn client_event_callback_kind(event: &ClientEvent) -> &'static str {
+    match event {
+        ClientEvent::SceneFrame { .. } => "SceneFrame",
+        ClientEvent::ManagedResizeStatus { .. } => "ManagedResizeStatus",
+        ClientEvent::FocusPresentation => "FocusPresentation",
+        ClientEvent::ClosePresentation => "ClosePresentation",
+        ClientEvent::TransportError(..) => "TransportError",
+        ClientEvent::BackendDisconnected { .. } => "BackendDisconnected",
+        ClientEvent::RemoteArtifactInstalled { .. } => "RemoteArtifactInstalled",
+        ClientEvent::PluginGraphicsChanged { .. } => "PluginGraphicsChanged",
+        ClientEvent::PluginActorFrameChanged { .. } => "PluginActorFrameChanged",
+        ClientEvent::PluginRendererReplayRequested { .. } => "PluginRendererReplayRequested",
+        ClientEvent::PluginContentReused { .. } => "PluginContentReused",
+        ClientEvent::RenderSchedulingChanged => "RenderSchedulingChanged",
+        ClientEvent::EventLoopDeadlineReached { .. } => "EventLoopDeadlineReached",
+        ClientEvent::GraphicsPreparationCapacityAvailable => "GraphicsPreparationCapacityAvailable",
+        ClientEvent::GraphicsPreparationCompleted(..) => "GraphicsPreparationCompleted",
+        ClientEvent::GpuSubmissionCapacityAvailable { .. } => "GpuSubmissionCapacityAvailable",
+        ClientEvent::GpuSubmissionCompleted(..) => "GpuSubmissionCompleted",
+        ClientEvent::RendererFailed { .. } => "RendererFailed",
+        ClientEvent::BackendCommandCompleted { .. } => "BackendCommandCompleted",
+        ClientEvent::BackendSnapshot { .. } => "BackendSnapshot",
+        ClientEvent::SessionCommandCompleted { .. } => "SessionCommandCompleted",
+        ClientEvent::SshBackendReady(..) => "SshBackendReady",
+        ClientEvent::SshBackendFailed(..) => "SshBackendFailed",
+        ClientEvent::ContainerBackendReady(..) => "ContainerBackendReady",
+        ClientEvent::ContainerBackendFailed(..) => "ContainerBackendFailed",
+        ClientEvent::RemoteBackendReady(..) => "RemoteBackendReady",
+        ClientEvent::RemoteBackendFailed { .. } => "RemoteBackendFailed",
+        ClientEvent::RemoteTerminalInputSent { .. } => "RemoteTerminalInputSent",
+        ClientEvent::WaylandDroppedFile(..) => "WaylandDroppedFile",
+        ClientEvent::ActorHostMessagesReady => "ActorHostMessagesReady",
+        ClientEvent::ActorLifecycleReady => "ActorLifecycleReady",
+        ClientEvent::BackendActorMessage { .. } => "BackendActorMessage",
+    }
+}
+
+fn thread_cpu_time_ns() -> u64 {
+    let time = rustix::time::clock_gettime(rustix::time::ClockId::ThreadCPUTime);
+    u64::try_from(time.tv_sec)
+        .unwrap_or(0)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(u64::try_from(time.tv_nsec).unwrap_or(0))
+}
 
 struct WinitCallbackGuard {
+    started_cpu_ns: Option<u64>,
+    render_timings: Option<RenderTimings>,
+    detail: &'static str,
     started: Instant,
     driver_present_ns: u64,
     kind: &'static str,
@@ -5058,6 +5224,9 @@ impl WinitCallbackGuard {
     ) -> Self {
         Self {
             started: Instant::now(),
+            started_cpu_ns: measured.then(thread_cpu_time_ns),
+            render_timings: None,
+            detail: window_event_kind.unwrap_or(kind),
             driver_present_ns: 0,
             kind,
             window_event_kind,
@@ -5079,6 +5248,15 @@ impl Drop for WinitCallbackGuard {
             self.started.elapsed(),
             self.driver_present_ns,
         );
+        if sample >= 5_000_000 {
+            let cpu_ns = self
+                .started_cpu_ns
+                .map(|started| thread_cpu_time_ns().saturating_sub(started));
+            eprintln!(
+                "slow Winit callback kind={} detail={} wall_ns={} cpu_ns={cpu_ns:?} driver_present_ns={} render_timings={:?}",
+                self.kind, self.detail, sample, self.driver_present_ns, self.render_timings
+            );
+        }
         let mut metrics = metrics
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -5187,6 +5365,7 @@ struct Application {
     render_scheduling_redraws: u64,
     render_scheduling_idle_baseline: Option<RenderSchedulingIdleBaseline>,
     render_scheduling_idle_measurement: Option<RenderSchedulingIdleMeasurement>,
+    render_scheduling_active_measurement: Option<RenderSchedulingActiveMeasurement>,
     render_scheduling_backend_requests_enqueued: u64,
     render_scheduling_backend_actor_messages_enqueued: u64,
     reliable_transition_drops: u64,
@@ -5275,6 +5454,66 @@ fn send_computer_use_observer_subscriptions(
 
 impl Application {
     fn service_plugin_render_scheduler(&mut self) -> Result<()> {
+        if let (Some(runtime), Some(renderer)) = (&self.wasm_runtime, &self.renderer) {
+            runtime.reconcile_facet_resize_epochs(
+                &renderer.staged_layouts.keys().copied().collect(),
+            )?;
+        }
+        let actions = self
+            .wasm_runtime
+            .as_ref()
+            .map(PresentationWasmRuntime::service_facets)
+            .unwrap_or_default();
+        for (pane, requests) in actions {
+            for request in requests {
+                use brood_protocol::facets::HostRequest;
+                match request {
+                    HostRequest::Render => {} // Runtime records explicit render demand.
+                    HostRequest::ReleaseCapture => {
+                        if self
+                            .pointer_grab
+                            .as_ref()
+                            .is_some_and(|grab| grab.target.pane() == pane)
+                        {
+                            self.pointer_grab = None;
+                        }
+                    }
+                    HostRequest::Capture => {
+                        if let (Some(renderer), Some((x, y))) =
+                            (&self.renderer, self.cursor_position)
+                            && let Some(target) =
+                                renderer.pointer_target_for_pane_at_window_point(pane, x, y)
+                            && self
+                                .pointer_grab
+                                .as_ref()
+                                .is_none_or(|grab| grab.target.pane() == pane)
+                        {
+                            if let Some(grab) = &mut self.pointer_grab {
+                                grab.target = target;
+                            } else {
+                                self.pointer_grab = Some(PointerGrab {
+                                    target,
+                                    buttons: Vec::new(),
+                                });
+                            }
+                        }
+                    }
+                    HostRequest::Focus => {
+                        if let Some(renderer) = &mut self.renderer
+                            && let Some(target) = renderer.focus_target_for_visible_pane(pane)
+                            && let Some(change) = renderer.set_focus(target)
+                        {
+                            dispatch_focus_change(
+                                self.wasm_runtime.as_ref(),
+                                self.input_sender.as_mut(),
+                                change,
+                                self.window_focused,
+                            )?;
+                        }
+                    }
+                }
+            }
+        }
         let (Some(graphics), Some(runtime)) =
             (self.plugin_graphics.as_ref(), self.wasm_runtime.as_ref())
         else {
@@ -5311,9 +5550,38 @@ impl Application {
                 name: actor.name,
                 generation: actor.generation,
             };
-            runtime
-                .send_render_hint(&identity, hint)
-                .context("dispatch scheduled render hint")?;
+            if let Some(targets) = runtime.facet_targets(&identity)? {
+                let renderer = self
+                    .renderer
+                    .as_ref()
+                    .context("facet render requires native renderer")?;
+                let targets = targets
+                    .into_iter()
+                    .map(|(mut target, epoch)| {
+                        let extent = match epoch {
+                            Some(epoch) => {
+                                renderer.staged_plugin_scene_extent(target.pane, epoch)?
+                            }
+                            None => renderer.plugin_scene_extent(target.pane),
+                        };
+                        target.physical_width = extent.0;
+                        target.physical_height = extent.1;
+                        target.scale = f64::from(extent.2);
+                        target.logical_width = f64::from(extent.0) / target.scale;
+                        target.logical_height = f64::from(extent.1) / target.scale;
+                        target.clip = [0.0, 0.0, target.logical_width, target.logical_height];
+                        target.visible = hint.relevant_panes.contains(&target.pane);
+                        target.focused =
+                            renderer.focused_pane == Some(FocusedPane::Plugin(target.pane));
+                        Ok(target)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                runtime.send_facet_render_hint(&identity, &hint, targets, renderer.generation)?;
+            } else {
+                runtime
+                    .send_render_hint(&identity, hint)
+                    .context("dispatch scheduled render hint")?;
+            }
         }
         for token in service.composition_tokens {
             if !self.pending_render_token_resize_epochs.contains_key(&token) {
@@ -6904,27 +7172,17 @@ impl Application {
             // inventory and must precede the replacement layout publication.
             return Ok(());
         }
-        if self.active_synchronized_resize.is_some()
-            && self
-                .renderer
+        if layout_state_publication_is_deferred(
+            self.active_synchronized_resize.is_some(),
+            self.renderer
                 .as_ref()
-                .is_some_and(|renderer| renderer.layout_state_dirty)
-            && let Some(change) = self.finish_synchronized_resize(true)?
-        {
-            dispatch_focus_change(
-                self.wasm_runtime.as_ref(),
-                self.input_sender.as_mut(),
-                change,
-                self.window_focused,
-            )?;
-            return Ok(());
-        }
-        if self.active_synchronized_resize.is_some()
-            && self
-                .renderer
-                .as_ref()
-                .is_some_and(|renderer| renderer.layout_state_dirty)
-        {
+                .is_some_and(|renderer| renderer.layout_state_dirty),
+        ) {
+            // A compatible inventory or focus publication is not evidence
+            // that the active transaction may expose a partial wait set.
+            // Keep it queued until exact readiness or the bounded global
+            // deadline handled by settle_synchronized_resize. Incompatible
+            // inventory was explicitly aborted above.
             return Ok(());
         }
         let live_actors = self
@@ -7901,21 +8159,29 @@ impl Application {
         }
         self.mark_deferred_plugin_scenes_ready(&deferred);
         self.resize_presentation_trace = ResizePresentationTrace::default();
-        self.abort_synchronized_layout_for_claim(
-            &active.requester,
-            active.request_id,
-            active.epoch,
-            brood_wasm::SynchronizedLayoutRejectionReason::Busy,
-            reason,
-            Vec::new(),
-            active.interaction_claim,
-        )?;
+        if !active.host_owned {
+            self.abort_synchronized_layout_for_claim(
+                &active.requester,
+                active.request_id,
+                active.epoch,
+                brood_wasm::SynchronizedLayoutRejectionReason::Busy,
+                reason,
+                Vec::new(),
+                active.interaction_claim,
+            )?;
+        }
         eprintln!(
             "aborted synchronized layout for native window resize actor={} request={} epoch={} reason={reason}",
             active.requester.name, active.request_id, active.epoch.id,
         );
         self.cleanup_proof_managed_frame_for_epoch(active.epoch.id, "native resize abort")?;
         Ok(focus_change)
+    }
+
+    fn abort_synchronized_interaction_preview_timeout(&mut self) -> Result<Option<FocusChange>> {
+        self.abort_synchronized_resize_for_native_window_resize(
+            "interaction preview timed out before exact pure pane content was ready",
+        )
     }
 
     fn rollback_unannounced_synchronized_resize(
@@ -8112,6 +8378,15 @@ impl Application {
         sender: &ActorIdentity,
         request: brood_wasm::SubmitSynchronizedLayout,
     ) -> Result<Option<FocusChange>> {
+        self.submit_synchronized_layout_with_ownership(sender, request, false)
+    }
+
+    fn submit_synchronized_layout_with_ownership(
+        &mut self,
+        sender: &ActorIdentity,
+        request: brood_wasm::SubmitSynchronizedLayout,
+        host_owned: bool,
+    ) -> Result<Option<FocusChange>> {
         let request_id = request.request_id;
         let interaction_event = match (request.interaction, request.event_sequence) {
             (Some(interaction), Some(event_sequence)) if event_sequence > 0 => {
@@ -8178,7 +8453,7 @@ impl Application {
         };
         let interaction_claim_key = interaction_claim.map(|claim| claim.key);
         let interaction_preview = interaction_claim.is_some_and(|claim| !claim.terminal);
-        if !self.pending_synchronized_layout_notifications.is_empty() {
+        if !host_owned && !self.pending_synchronized_layout_notifications.is_empty() {
             self.reject_synchronized_layout_for_claim(
                 sender,
                 request_id,
@@ -8342,8 +8617,13 @@ impl Application {
             return Ok(None);
         }
         let base_tree = self.layout_leases.clone();
+        let wait_scope = if host_owned {
+            base_tree.root_token()
+        } else {
+            submitted_lease
+        };
         let waitable = base_tree
-            .waitable_panes(submitted_lease)
+            .waitable_panes(wait_scope)
             .unwrap_or_default()
             .into_iter()
             .collect::<BTreeSet<_>>();
@@ -8414,6 +8694,49 @@ impl Application {
                 &waitable_target_panes,
             ));
         }
+        let mut affected_panes = changed_layout_panes(
+            &renderer.presented_layout,
+            &composed.layout,
+            renderer.layout_extent(),
+        );
+        if native_resize_request {
+            affected_panes.extend(unique_wait.iter().copied());
+        }
+        if interaction_preview || host_owned {
+            // Pure panes cannot be projected from their previous immutable
+            // snapshot: even a one-pixel target change would stretch stale
+            // content. Enroll changed facet and managed panes in this
+            // preview's bounded cohort.
+            let facet_panes = self
+                .wasm_runtime
+                .as_ref()
+                .map_or_else(BTreeSet::new, |runtime| {
+                    runtime.facet_pane_ids().collect::<BTreeSet<_>>()
+                });
+            let mut geometry_sensitive_panes = facet_panes;
+            geometry_sensitive_panes
+                .extend(renderer.available_windows.iter().map(|window| window.pane));
+            unique_wait =
+                interaction_preview_pure_cohort(&affected_panes, &geometry_sensitive_panes);
+            // A pane removed by the candidate has no target geometry to
+            // render. Its old surface disappears atomically with promotion;
+            // only facets present in the target can join the ready cohort.
+            unique_wait = target_present_pane_cohort(unique_wait, &composed.layout);
+            affected_panes.clone_from(&unique_wait);
+        }
+        // Validate after host-driven enrollment so automatically selected
+        // pure panes meet the same bounds, inventory, geometry and transport
+        // requirements as panes named by the actor.
+        if let Some(pane) = unique_wait.iter().find(|pane| !waitable.contains(pane)) {
+            self.reject_synchronized_layout_for_claim(
+                sender,
+                request_id,
+                brood_wasm::SynchronizedLayoutRejectionReason::WaitPaneOutsideSubtree,
+                format!("pane {pane} is outside the requesting lease subtree"),
+                interaction_claim_key,
+            )?;
+            return Ok(None);
+        }
         if unique_wait.len() > MAX_SYNCHRONIZED_WAIT_PANES {
             self.reject_synchronized_layout_for_claim(
                 sender,
@@ -8455,22 +8778,6 @@ impl Application {
                 interaction_claim_key,
             )?;
             return Ok(None);
-        }
-        let mut affected_panes = changed_layout_panes(
-            &renderer.presented_layout,
-            &composed.layout,
-            renderer.layout_extent(),
-        );
-        if native_resize_request {
-            affected_panes.extend(unique_wait.iter().copied());
-        }
-        if interaction_preview {
-            // Pointer motion is a scaled visual projection. Keep pane and
-            // descendant resize work for the terminal interaction request so
-            // a raw input stream cannot repeatedly restart the durable
-            // synchronized barrier.
-            unique_wait.clear();
-            affected_panes.clear();
         }
         let Some(epoch_id) = allocate_resize_epoch(&mut self.next_resize_epoch) else {
             self.reject_synchronized_layout_for_claim(
@@ -8516,14 +8823,15 @@ impl Application {
         }
 
         let mut regions = BTreeMap::new();
-        if !interaction_preview
-            && let Some((child, source_viewport, target_viewport)) = changed_rest_child(
-                &base_tree,
-                &target_tree,
-                submitted_lease,
-                renderer.layout_extent(),
-            )
-        {
+        // Preview promotion requires the same exact child-region chain as
+        // release. Omitting its request leaves a ready pane cohort waiting
+        // for a region response that can never arrive.
+        if let Some((child, source_viewport, target_viewport)) = changed_rest_child(
+            &base_tree,
+            &target_tree,
+            submitted_lease,
+            renderer.layout_extent(),
+        ) {
             let Some(holder) = self.layout_holders.get(&child.id).cloned() else {
                 self.reject_synchronized_layout_for_claim(
                     sender,
@@ -8575,11 +8883,13 @@ impl Application {
                     superseding_resize_epoch: epoch,
                 },
             );
-            self.queue_synchronized_layout_terminal_notification_for_claim(
-                &previous.requester,
-                notification,
-                previous.interaction_claim,
-            )?;
+            if !previous.host_owned {
+                self.queue_synchronized_layout_terminal_notification_for_claim(
+                    &previous.requester,
+                    notification,
+                    previous.interaction_claim,
+                )?;
+            }
             if !self.pending_synchronized_layout_notifications.is_empty() {
                 let reason = "the superseded transaction terminal is waiting for mailbox delivery";
                 self.cancel_active_layout_capture(reason);
@@ -8633,6 +8943,8 @@ impl Application {
             event_sequence,
             interaction_claim: interaction_claim_key,
             native_resize_revision: request.native_resize_revision,
+            interaction_preview,
+            host_owned,
             superseded_epochs,
             epoch,
             requester: sender.clone(),
@@ -8687,7 +8999,9 @@ impl Application {
                 ..NativeResizePresentationTrace::default()
             };
         }
-        if let Err(error) = self.send_synchronized_layout_notification(sender, notification) {
+        if !host_owned
+            && let Err(error) = self.send_synchronized_layout_notification(sender, notification)
+        {
             let reason =
                 format!("host could not deliver synchronized layout acceptance: {error:#}");
             let focus_change = self.rollback_unannounced_synchronized_resize(&reason)?;
@@ -8902,6 +9216,7 @@ impl Application {
             return Ok(None);
         }
         if Instant::now() >= active.deadline {
+            let retain_previous_composition = active.host_owned || active.interaction_preview;
             let recovery_extent = active.target_extent;
             self.reject_layout_region_response(
                 sender,
@@ -8911,7 +9226,9 @@ impl Application {
                 "the region response arrived after the synchronized resize deadline",
             );
             self.recover_pending_layout_regions_at(recovery_extent)?;
-            return if self.renderer.is_some() {
+            return if retain_previous_composition {
+                self.abort_synchronized_interaction_preview_timeout()
+            } else if self.renderer.is_some() {
                 self.finish_synchronized_resize(true)
             } else {
                 Ok(None)
@@ -9569,11 +9886,13 @@ impl Application {
                 },
             )
         };
-        self.queue_synchronized_layout_terminal_notification_for_claim(
-            &active.requester,
-            notification,
-            active.interaction_claim,
-        )?;
+        if !active.host_owned {
+            self.queue_synchronized_layout_terminal_notification_for_claim(
+                &active.requester,
+                notification,
+                active.interaction_claim,
+            )?;
+        }
         eprintln!(
             "{} synchronized layout actor={} request={} interaction={} event_sequence={} native_resize_revision={} epoch={} target_revision={} region_final={}/{} pane_ready={}/{} recovered_regions=[{}] recovered_count={} recovered_managed={:?} recovered_managed_content={:?} missing={missing_panes:?} duration_us={}",
             if degraded { "degraded" } else { "completed" },
@@ -9622,12 +9941,23 @@ impl Application {
 
     fn settle_synchronized_resize(&mut self) -> Result<Option<FocusChange>> {
         self.reconcile_managed_resize_recovery()?;
+        let now = Instant::now();
+        let timed_out_preview = self
+            .active_synchronized_resize
+            .as_ref()
+            .is_some_and(|active| synchronized_resize_preview_timed_out(active, now));
+        if timed_out_preview {
+            // A degraded promotion would project the previous immutable facet
+            // into the new pane bounds. Abort the preview and retain the last
+            // complete composition instead.
+            return self.abort_synchronized_interaction_preview_timeout();
+        }
         if self
             .active_synchronized_resize
             .as_ref()
             .is_some_and(|active| {
                 matches!(active.presentation, SynchronizedResizePresentation::Waiting)
-                    && Instant::now() >= active.deadline
+                    && now >= active.deadline
             })
         {
             self.recover_pending_layout_regions_for_timeout()?;
@@ -9862,9 +10192,22 @@ impl Application {
                     continue;
                 }
             };
+            let host_owned_coalesce =
+                self.active_synchronized_resize
+                    .as_ref()
+                    .is_some_and(|active| {
+                        active.host_owned
+                            && actor_message.sender.as_ref() == Some(&active.requester)
+                            && matches!(
+                                &message,
+                                HostMessage::SetResolvedLayout { lease: Some(lease), .. }
+                                    if lease.id == active.epoch.lease
+                                        && lease.generation == active.epoch.lease_generation
+                            )
+                    });
             if ordinary_layout_message_conflicts_with_unsettled_resize(
                 &message,
-                self.active_synchronized_resize.is_some(),
+                self.active_synchronized_resize.is_some() && !host_owned_coalesce,
                 self.window_resize.is_some(),
                 self.pending_native_window_resize.is_some(),
             ) {
@@ -10043,7 +10386,8 @@ impl Application {
                         renderer.reject_actor_layout(&"layout result is missing its lease token");
                         continue;
                     };
-                    let submitted_lease = convert_actor_layout_lease(lease);
+                    let actor_lease = lease;
+                    let submitted_lease = convert_actor_layout_lease(actor_lease);
                     let Some(holder) = self.layout_holders.get(&submitted_lease.id) else {
                         eprintln!(
                             "ignored layout result because lease={} has no holder",
@@ -10087,62 +10431,112 @@ impl Application {
                         );
                         continue;
                     }
-                    let result = (|| {
-                        self.layout_leases.submit(
-                            submitted_lease,
-                            revision,
-                            convert_actor_layout_fragment(layout, rest),
-                            focus,
-                        )?;
-                        if self.layout_leases.is_complete() {
-                            self.layout_leases
-                                .compose()
-                                .map(Some)
-                                .map_err(anyhow::Error::from)
-                        } else {
-                            Ok(None)
-                        }
-                    })();
-                    let Some(renderer) = self.renderer.as_mut() else {
-                        continue;
-                    };
-                    let (focus_change, accepted, layout_changed) = match result {
-                        Ok(Some(composed)) => renderer.commit_actor_layout(composed),
-                        Ok(None) => {
-                            eprintln!(
-                                "accepted layout fragment lease={} revision={revision}; waiting for child",
-                                submitted_lease.id.0
+                    let actor_fragment = convert_actor_layout_fragment(layout.clone(), rest);
+                    let host_cohort_required = self
+                        .renderer
+                        .as_ref()
+                        .and_then(|renderer| {
+                            let mut target = self.layout_leases.clone();
+                            target
+                                .submit(submitted_lease, revision, actor_fragment.clone(), focus)
+                                .ok()?;
+                            let composed = target.compose().ok()?;
+                            let changed = changed_layout_panes(
+                                &renderer.presented_layout,
+                                &composed.layout,
+                                renderer.layout_extent(),
                             );
-                            (None, false, false)
+                            let facet_panes = self
+                                .wasm_runtime
+                                .as_ref()?
+                                .facet_pane_ids()
+                                .collect::<BTreeSet<_>>();
+                            let managed_panes = renderer
+                                .available_windows
+                                .iter()
+                                .map(|window| window.pane)
+                                .collect::<BTreeSet<_>>();
+                            changed
+                                .iter()
+                                .any(|pane| {
+                                    facet_panes.contains(pane) || managed_panes.contains(pane)
+                                })
+                                .then_some(())
+                        })
+                        .is_some();
+                    if host_cohort_required {
+                        let request = brood_wasm::SubmitSynchronizedLayout {
+                            request_id: 0,
+                            interaction: None,
+                            event_sequence: None,
+                            native_resize_revision: None,
+                            lease: actor_lease,
+                            inventory_revision: revision,
+                            base_layout_revision: self.current_target_layout_revision(),
+                            fragment: brood_wasm::SynchronizedLayoutFragment { layout, rest },
+                            focus,
+                            wait_for_panes: Vec::new(),
+                            presentation: brood_wasm::PresentationMode::ScaleThenAtomic,
+                        };
+                        self.submit_synchronized_layout_with_ownership(sender, request, true)?
+                    } else {
+                        let result = (|| {
+                            self.layout_leases.submit(
+                                submitted_lease,
+                                revision,
+                                convert_actor_layout_fragment(layout, rest),
+                                focus,
+                            )?;
+                            if self.layout_leases.is_complete() {
+                                self.layout_leases
+                                    .compose()
+                                    .map(Some)
+                                    .map_err(anyhow::Error::from)
+                            } else {
+                                Ok(None)
+                            }
+                        })();
+                        let Some(renderer) = self.renderer.as_mut() else {
+                            continue;
+                        };
+                        let (focus_change, accepted, layout_changed) = match result {
+                            Ok(Some(composed)) => renderer.commit_actor_layout(composed),
+                            Ok(None) => {
+                                eprintln!(
+                                    "accepted layout fragment lease={} revision={revision}; waiting for child",
+                                    submitted_lease.id.0
+                                );
+                                (None, false, false)
+                            }
+                            Err(error) => renderer.reject_actor_layout(&error),
+                        };
+                        if accepted && layout_changed {
+                            let accepted_items = renderer.accepted_layout.items.len();
+                            let accepted_panes = renderer.accepted_layout.pane_count();
+                            let accepted_pane_rects = trace_layout_pane_rects(
+                                &renderer.accepted_layout,
+                                renderer.layout_extent(),
+                            );
+                            let pending_revision = self.schedule_presented_layout_revision()?;
+                            eprintln!(
+                                "{}",
+                                trace_accepted_leased_actor_layout(
+                                    accepted_items,
+                                    accepted_panes,
+                                    self.layout_leases.inventory_revision(),
+                                    pending_revision,
+                                    &accepted_pane_rects,
+                                )
+                            );
+                        } else if accepted {
+                            self.pending_presented_layout_revision = None;
+                            eprintln!(
+                                "accepted unchanged leased actor layout revision={revision} presented_layout_revision={}",
+                                self.presented_layout_revision,
+                            );
                         }
-                        Err(error) => renderer.reject_actor_layout(&error),
-                    };
-                    if accepted && layout_changed {
-                        let accepted_items = renderer.accepted_layout.items.len();
-                        let accepted_panes = renderer.accepted_layout.pane_count();
-                        let accepted_pane_rects = trace_layout_pane_rects(
-                            &renderer.accepted_layout,
-                            renderer.layout_extent(),
-                        );
-                        let pending_revision = self.schedule_presented_layout_revision()?;
-                        eprintln!(
-                            "{}",
-                            trace_accepted_leased_actor_layout(
-                                accepted_items,
-                                accepted_panes,
-                                self.layout_leases.inventory_revision(),
-                                pending_revision,
-                                &accepted_pane_rects,
-                            )
-                        );
-                    } else if accepted {
-                        self.pending_presented_layout_revision = None;
-                        eprintln!(
-                            "accepted unchanged leased actor layout revision={revision} presented_layout_revision={}",
-                            self.presented_layout_revision,
-                        );
+                        focus_change
                     }
-                    focus_change
                 }
                 HostMessage::SubmitSynchronizedLayout(request) => {
                     let Some(sender) = actor_message.sender.as_ref() else {
@@ -10471,8 +10865,30 @@ impl Application {
             }
             let panes = runtime.drain_pending_pane_removals().collect::<Vec<_>>();
             if let Some(renderer) = self.renderer.as_mut() {
+                let mut retired = Vec::with_capacity(panes.len());
+                let mut hosts = Vec::new();
                 for pane in panes {
-                    let change = renderer.remove_plugin_pane(pane);
+                    let retired_host = runtime.take_retired_facet_host(pane);
+                    let facet = retired_host.is_some();
+                    if let Some(host) = retired_host {
+                        hosts.push(host);
+                    }
+                    retired.push((pane, facet));
+                }
+                let mut detached = BTreeSet::new();
+                for host in hosts {
+                    let identity = Arc::as_ptr(&host) as usize;
+                    if detached.insert(identity) {
+                        host.detach_retired_state();
+                    }
+                }
+                for (pane, facet) in retired {
+                    let replay = if facet {
+                        RetiredPluginReplay::Facet
+                    } else {
+                        RetiredPluginReplay::Legacy
+                    };
+                    let change = renderer.remove_plugin_pane(pane, replay)?;
                     if let Some(change) = change {
                         dispatch_focus_change(
                             Some(runtime),
@@ -10481,6 +10897,17 @@ impl Application {
                             self.window_focused,
                         )?;
                     }
+                }
+                if self.pointer_grab.as_ref().is_some_and(|grab| {
+                    renderer.focus_target_for_pane(grab.target.pane()).is_none()
+                }) {
+                    cancel_pointer_grab(
+                        Some(&*runtime),
+                        self.input_sender.as_mut(),
+                        &mut self.pointer_routing,
+                        &mut self.pointer_grab,
+                        modifier_bits(self.modifiers),
+                    );
                 }
             }
             let messages = runtime.drain_backend_messages();
@@ -10865,9 +11292,15 @@ impl Application {
                     missing_panes,
                 } = active.presentation.clone()
                 {
-                    active.presentation = SynchronizedResizePresentation::Ready {
-                        degraded,
-                        missing_panes,
+                    active.presentation = if (active.host_owned || active.interaction_preview)
+                        && !synchronized_resize_wait_set_is_ready(active)
+                    {
+                        SynchronizedResizePresentation::Waiting
+                    } else {
+                        SynchronizedResizePresentation::Ready {
+                            degraded,
+                            missing_panes,
+                        }
                     };
                 }
             }
@@ -10916,6 +11349,9 @@ impl Application {
         self.sync_render_predictor_refresh();
         if let Some(graphics) = self.plugin_graphics.as_ref() {
             graphics.renderer_recreated()?;
+        }
+        if let Some(runtime) = self.wasm_runtime.as_ref() {
+            runtime.facet_renderer_recreated()?;
         }
         self.pending_composition_redraw_request = None;
         if let Some(renderer) = self.renderer.as_ref() {
@@ -11119,12 +11555,13 @@ impl ApplicationHandler<ClientEvent> for Application {
         reason = "distinct wakeup events intentionally require no immediate action and are serviced in about_to_wait"
     )]
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: ClientEvent) {
-        let _callback_guard = WinitCallbackGuard::new(
+        let mut callback_guard = WinitCallbackGuard::new(
             Arc::clone(&self.winit_hot_path_metrics),
             self.render_scheduling_warmup_complete,
             "user_event",
             None,
         );
+        callback_guard.detail = client_event_callback_kind(&event);
         if !self.drain_wasm_events(event_loop) {
             return;
         }
@@ -12800,6 +13237,9 @@ impl ApplicationHandler<ClientEvent> for Application {
             }
             WindowEvent::ModifiersChanged(modifiers) => {
                 self.modifiers = modifiers.state();
+                if std::env::var_os("BROOD_TRACE_PLUGIN_INPUT").is_some() {
+                    eprintln!("plugin keyboard modifiers state={:?}", self.modifiers);
+                }
             }
             WindowEvent::Focused(focused) => {
                 self.window_focused = focused;
@@ -12880,9 +13320,11 @@ impl ApplicationHandler<ClientEvent> for Application {
                     std::env::var_os("BROOD_RENDER_SCHEDULING_PROOF").is_some();
                 if render_scheduling_proof
                     && matches!(logical_key.as_str(), "F9" | "F10" | "F11" | "F12")
-                    && event.state == ElementState::Pressed
-                    && !event.repeat
                 {
+                    // Proof-control release/repeat edges must not reach plugin input.
+                    if event.state != ElementState::Pressed || event.repeat {
+                        return;
+                    }
                     match logical_key.as_str() {
                         "F9" => {
                             if let Some(proxy) = &self.event_proxy {
@@ -12938,6 +13380,18 @@ impl ApplicationHandler<ClientEvent> for Application {
                             if let Some(graphics) = self.plugin_graphics.as_ref()
                                 && let Ok(diagnostics) = graphics.diagnostics()
                             {
+                                self.render_scheduling_active_measurement
+                                    .get_or_insert_with(|| RenderSchedulingActiveMeasurement {
+                                        frame_intervals_ns: diagnostics
+                                            .measured_frame_intervals_ns
+                                            .clone(),
+                                        opportunities: diagnostics.measured_opportunities,
+                                        deadline_misses: diagnostics.measured_deadline_misses,
+                                        target_misses: diagnostics.measured_target_misses,
+                                        late_finishes: diagnostics.late_finish_diagnostics.clone(),
+                                        late_finishes_dropped: diagnostics
+                                            .late_finish_diagnostics_dropped,
+                                    });
                                 self.render_scheduling_idle_measurement = None;
                                 self.render_scheduling_idle_baseline =
                                     Some(RenderSchedulingIdleBaseline {
@@ -13121,8 +13575,8 @@ impl ApplicationHandler<ClientEvent> for Application {
                 {
                     eprintln!(
                         "plugin keyboard input logical={logical_key:?} physical={:?} \
-                         state={:?} synthetic={is_synthetic}",
-                        event.physical_key, event.state
+                         state={:?} synthetic={is_synthetic} modifiers={:?}",
+                        event.physical_key, event.state, self.modifiers
                     );
                 }
                 let policy_evaluation =
@@ -13449,6 +13903,7 @@ impl ApplicationHandler<ClientEvent> for Application {
                         geometry_invariant,
                     } => {
                         callback_guard.set_driver_present_ns(timings.driver_present_ns);
+                        callback_guard.render_timings = Some(timings);
                         if sequence.is_some() {
                             let frame_sequences = self.gpu_scene_completions.claim_submission(
                                 renderer.generation,
@@ -14318,6 +14773,7 @@ struct Renderer {
     current_sequences: BTreeMap<BackendId, u64>,
     plugin_graphics: PluginGraphicsBridge,
     plugin_panes: BTreeMap<u64, PluginPaneTexture>,
+    retired_plugin_snapshots: BTreeMap<u64, crate::plugin_graphics::GraphicsSnapshot>,
     /// Visible scenes intentionally sampled into newer layout geometry after
     /// degraded presentation or an accepted `ReusePaneContent` response.
     projected_plugin_scenes: ProjectedPluginScenes,
@@ -14400,6 +14856,7 @@ struct RendererRecoveryState {
     current_sequence: Option<u64>,
     current_sequences: BTreeMap<BackendId, u64>,
     visible_plugin_panes: Vec<u64>,
+    retired_plugin_snapshots: BTreeMap<u64, crate::plugin_graphics::GraphicsSnapshot>,
     projected_plugin_scenes: ProjectedPluginScenes,
     staged_plugin_scenes: Vec<(u64, u64)>,
     plugin_pane_realms: BTreeMap<u64, Option<(BackendId, u64)>>,
@@ -14507,6 +14964,8 @@ struct SceneWindow {
     /// renderer recovery. Keeping this explicit prevents a later resize
     /// promotion from releasing the same producer resource twice.
     transport_resource_owned: bool,
+    /// Retained after omission from a newer backend snapshot, pending layout withdrawal.
+    retained_from_previous_snapshot: bool,
     resource_id: u64,
     source_rect: [i32; 4],
     rect: [i32; 4],
@@ -14626,6 +15085,11 @@ struct PluginPaneTexture {
     rect: [i32; 4],
 }
 
+enum RetiredPluginReplay {
+    Legacy,
+    Facet,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct RenderGeometryInvariant {
     panes: usize,
@@ -14648,7 +15112,10 @@ struct RenderContentProjection {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-#[allow(clippy::struct_field_names)]
+#[allow(
+    clippy::struct_field_names,
+    reason = "the diagnostic compares source, drawn, and expected rectangles explicitly"
+)]
 struct ResizeElementGeometry {
     source_rect: [f64; 4],
     drawn_rect: [f64; 4],
@@ -14755,7 +15222,7 @@ impl RenderContentProjection {
 }
 
 impl RenderGeometryInvariant {
-    fn is_exact(&self) -> bool {
+    const fn is_exact(&self) -> bool {
         self.verified == self.panes
             && self.missing_surfaces == 0
             && self.missing_painted_extents == 0
@@ -15202,6 +15669,7 @@ fn promote_ready_synchronized_resize(
     let change = renderer.promote_staged_layout(
         active.epoch.id,
         active.focus,
+        active.host_owned,
         degraded,
         &active.wait_panes,
     )?;
@@ -15679,6 +16147,7 @@ fn pointer_target_for_cursor(
     grab: Option<&PointerGrab>,
 ) -> Option<PanePointerTarget> {
     if let Some(grab) = grab {
+        renderer.focus_target_for_pane(grab.target.pane())?;
         return cursor_position
             .and_then(|(x, y)| {
                 renderer.pointer_target_for_pane_at_window_point(grab.target.pane(), x, y)
@@ -17289,6 +17758,7 @@ impl Renderer {
             current_sequences,
             plugin_graphics: _,
             plugin_panes,
+            retired_plugin_snapshots,
             projected_plugin_scenes,
             staged_plugin_panes,
             deferred_plugin_actor_frames: _,
@@ -17335,7 +17805,16 @@ impl Renderer {
             current_windows,
             current_sequence,
             current_sequences,
-            visible_plugin_panes: plugin_panes.into_keys().collect(),
+            visible_plugin_panes: plugin_panes.keys().copied().collect(),
+            retired_plugin_snapshots: retired_plugin_snapshots
+                .into_iter()
+                .chain(plugin_panes.values().filter_map(|pane| {
+                    pane.scene
+                        .replay_snapshot()
+                        .cloned()
+                        .map(|snapshot| (pane.scene.pane, snapshot))
+                }))
+                .collect(),
             projected_plugin_scenes,
             staged_plugin_scenes: staged_plugin_panes.into_keys().collect(),
             plugin_pane_realms,
@@ -17379,6 +17858,7 @@ impl Renderer {
             current_sequence,
             current_sequences,
             visible_plugin_panes: _,
+            retired_plugin_snapshots,
             projected_plugin_scenes,
             staged_plugin_scenes: _,
             plugin_pane_realms,
@@ -17417,6 +17897,7 @@ impl Renderer {
         self.current_windows = current_windows;
         self.current_sequence = current_sequence;
         self.current_sequences = current_sequences;
+        self.retired_plugin_snapshots = retired_plugin_snapshots;
         self.projected_plugin_scenes = projected_plugin_scenes;
         self.plugin_pane_realms = plugin_pane_realms;
         self.focused_pane = focused_pane;
@@ -17622,6 +18103,7 @@ impl Renderer {
             current_sequences: BTreeMap::new(),
             plugin_graphics,
             plugin_panes: BTreeMap::new(),
+            retired_plugin_snapshots: BTreeMap::new(),
             projected_plugin_scenes: ProjectedPluginScenes::default(),
             staged_plugin_panes: BTreeMap::new(),
             deferred_plugin_actor_frames: BTreeMap::new(),
@@ -18031,6 +18513,15 @@ impl Renderer {
                     .then_some(expectation.route.view_pane)
             })
             .collect::<BTreeSet<_>>();
+        // A catalog withdrawal can precede the actor's replacement layout.
+        // Keep the old composition drawable until that layout commits, or its
+        // missing surface blocks presentation of this transport sequence and
+        // therefore the exact resized frame needed by the replacement.
+        preserve_panes.extend(self.current_windows.iter().filter_map(|window| {
+            (window.backend == backend
+                && self.accepted_layout.pane_item(window.window_id).is_some())
+            .then_some(window.window_id)
+        }));
         let mut scene_windows = Vec::with_capacity(windows.len());
         let mut backend_focus = None;
         let mut has_authoritative_visible_member = false;
@@ -18136,6 +18627,7 @@ impl Renderer {
                 window_id: window.window_id,
                 transport_resource_id: window.resource_id,
                 transport_resource_owned: true,
+                retained_from_previous_snapshot: false,
                 resource_id: resource_key,
                 source_rect: window.rect,
                 rect: previous_rect,
@@ -18677,7 +19169,7 @@ impl Renderer {
         let item = self.presented_layout.pane_item(pane)?;
         let rect = item.pixel_rect(self.layout_extent());
         let mut rect = [rect.x, rect.y, rect.w, rect.h];
-        if self.plugin_panes.contains_key(&pane) {
+        if self.plugin_panes.contains_key(&pane) && self.plugin_pane_realms.contains_key(&pane) {
             let scale = self.window.scale_factor() as f32;
             let (x, y) = plugin_local_point(x, y, rect, scale);
             return Some(PanePointerTarget::Plugin { pane, x, y });
@@ -18780,13 +19272,11 @@ impl Renderer {
         {
             let extent = self.layout_extent();
             let focus = self.focused_pane_id();
-            let change = self.commit_layout(
+            return self.commit_layout(
                 native_flat_layout(&self.default_visible_pane_inventory(), extent),
                 pending_focus.or(focus),
                 LayoutSource::NativeFallback,
             );
-            self.clear_fulfilled_pending_focus(pending_focus);
-            return change;
         }
         if !valid {
             eprintln!(
@@ -18794,9 +19284,7 @@ impl Renderer {
                 panes.len()
             );
         }
-        let change = self.project_accepted_layout(pending_focus);
-        self.clear_fulfilled_pending_focus(pending_focus);
-        change
+        self.project_accepted_layout(pending_focus)
     }
 
     fn clear_fulfilled_pending_focus(&mut self, requested: Option<u64>) {
@@ -18818,6 +19306,8 @@ impl Renderer {
                 let pending_focus = self
                     .pending_focus_pane
                     .filter(|pane| layout.pane_item(*pane).is_some());
+                let pending_focus_acknowledged =
+                    actor_layout_acknowledges_pending_focus(pending_focus, composed.focus);
                 let focus = pending_focus.or(composed.focus);
                 let layout_changed = durable_composed_layout_differs(
                     &self.presented_layout,
@@ -18839,7 +19329,11 @@ impl Renderer {
                     },
                     LayoutSource::Actor,
                 );
-                self.clear_fulfilled_pending_focus(pending_focus);
+                if pending_focus_after_actor_layout(pending_focus, composed.focus).is_none() {
+                    self.clear_fulfilled_pending_focus(
+                        pending_focus.filter(|_| pending_focus_acknowledged),
+                    );
+                }
                 (change, true, layout_changed)
             }
             Err(error) => self.reject_actor_layout(&error),
@@ -18958,7 +19452,7 @@ impl Renderer {
         &mut self,
         resize_epoch: u64,
     ) -> Result<(Option<FocusChange>, Vec<DeferredPluginScene>)> {
-        self.retire_managed_resize_epoch(resize_epoch, false, false);
+        let _ = self.retire_managed_resize_epoch(resize_epoch, false, false);
         let was_pre_promotion = self.staged_layouts.remove(&resize_epoch).is_some();
         if was_pre_promotion {
             remember_retired_staged_layout_epoch(
@@ -18970,9 +19464,11 @@ impl Renderer {
         self.staged_plugin_panes
             .retain(|(_pane, epoch), _scene| *epoch != resize_epoch);
         let active_panes = self.plugin_graphics.active_resize_panes(resize_epoch)?;
-        let actor_plan = self
-            .plugin_graphics
-            .deferred_actor_frame_resolution_plan(resize_epoch, false)?;
+        let actor_plan = self.plugin_graphics.deferred_actor_frame_resolution_plan(
+            resize_epoch,
+            false,
+            false,
+        )?;
         let deferred = self.plugin_graphics.abort_resize_epoch(resize_epoch)?;
         let revisions = self
             .deferred_plugin_actor_frames
@@ -19059,6 +19555,7 @@ impl Renderer {
         &mut self,
         resize_epoch: u64,
         focus: Option<u64>,
+        host_owned: bool,
         degraded: bool,
         wait_panes: &BTreeSet<u64>,
     ) -> Result<Option<FocusChange>> {
@@ -19068,7 +19565,7 @@ impl Renderer {
             .context("promoted resize epoch has no staged layout")?;
         remember_retired_staged_layout_epoch(&mut self.retired_staged_layout_epochs, resize_epoch);
         self.retire_graphics_preparations_for_epoch(resize_epoch);
-        self.retire_managed_resize_epoch(resize_epoch, true, degraded);
+        let promoted_managed_focus = self.retire_managed_resize_epoch(resize_epoch, true, degraded);
         let layout = composed.layout;
         if degraded {
             let extent = self.layout_extent();
@@ -19088,9 +19585,55 @@ impl Renderer {
                 );
             }
         }
-        let actor_plan = self
-            .plugin_graphics
-            .deferred_actor_frame_resolution_plan(resize_epoch, !degraded)?;
+        // Validate the complete native batch before the bridge advances its
+        // paired interaction identity. This is the same event-loop turn which
+        // installs the compiled textures below; no input admission interleaves.
+        let mut invalid_facets = Vec::new();
+        let mut prepared_facets = BTreeSet::new();
+        for (&revision, frame) in &self.deferred_plugin_actor_frames {
+            let Some(receipt) = self.plugin_graphics.facet_receipt(revision)? else {
+                continue;
+            };
+            let valid = receipt.validate_current().is_ok()
+                && receipt
+                    .with_graphics(|graphics| {
+                        graphics.token().renderer_generation == self.generation
+                            && graphics.panes().count() == frame.scenes.len()
+                            && graphics.panes().all(|(pane, pair)| {
+                                frame.scenes.get(pane).is_some_and(|scene| {
+                                    let geometry = pair.geometry();
+                                    geometry.physical_width == scene.scene.width
+                                        && geometry.physical_height == scene.scene.height
+                                        && geometry.scale.to_bits()
+                                            == f64::from(scene.scene.scale).to_bits()
+                                        && self.plugin_panes.get(pane).is_none_or(|visible| {
+                                            visible.scene.sequence < scene.sequence
+                                        })
+                                        && self.staged_plugin_panes.iter().all(
+                                            |((staged_pane, _), staged)| {
+                                                staged_pane != pane
+                                                    || staged.sequence <= scene.sequence
+                                            },
+                                        )
+                                })
+                            })
+                    })
+                    .unwrap_or(false);
+            if valid {
+                prepared_facets.insert(revision);
+            } else {
+                invalid_facets.push(revision);
+            }
+        }
+        for revision in invalid_facets {
+            self.plugin_graphics.discard_actor_frame(revision)?;
+            self.deferred_plugin_actor_frames.remove(&revision);
+        }
+        let actor_plan = self.plugin_graphics.deferred_actor_frame_resolution_plan(
+            resize_epoch,
+            !degraded,
+            true,
+        )?;
         let deferred_revisions = self
             .deferred_plugin_actor_frames
             .keys()
@@ -19107,7 +19650,7 @@ impl Renderer {
                 frame.scenes.retain(|_pane, scene| {
                     resolve_deferred_plugin_actor_member(
                         resize_epoch,
-                        !degraded,
+                        !degraded || prepared_facets.contains(&revision),
                         blockers_remain,
                         &mut scene.resize_epoch,
                     )
@@ -19191,6 +19734,16 @@ impl Renderer {
         self.accepted_zones = composed.zones;
         self.accepted_dividers = composed.dividers;
         self.retire_all_staged_layouts();
+        let pending_focus = self
+            .pending_focus_pane
+            .filter(|pane| self.accepted_layout.pane_item(*pane).is_some());
+        let focus = promoted_synchronized_focus(
+            host_owned,
+            focus,
+            self.focused_pane_id(),
+            pending_focus,
+            promoted_managed_focus,
+        );
         let change = self.project_accepted_layout(focus);
         self.window.request_redraw();
         Ok(change)
@@ -19199,6 +19752,49 @@ impl Renderer {
     fn project_accepted_layout(&mut self, requested_focus: Option<u64>) -> Option<FocusChange> {
         let previous_focus = self.focused_pane;
         let extent = self.layout_extent();
+        let live_panes = self
+            .available_windows
+            .iter()
+            .map(|window| window.pane)
+            .collect();
+        let retired = retire_withdrawn_managed_scenes(
+            &mut self.current_windows,
+            &live_panes,
+            &self.accepted_layout,
+        );
+        for window in retired {
+            let still_referenced = self.current_windows.iter().any(|current| {
+                current.backend == window.backend && current.resource_id == window.resource_id
+            }) || self.managed_resizes.expectations.values().any(
+                |expectation| {
+                    matches!(&expectation.state, ManagedResizeExpectationState::Staged(staged)
+                    if staged.backend == window.backend && staged.resource_id == window.resource_id)
+                },
+            );
+            if still_referenced {
+                continue;
+            }
+            // Retained transport backing remains owned until its last visible
+            // use ends at this atomic layout boundary.
+            self.frame_keys
+                .remove(&(window.backend, window.transport_resource_id));
+            self.imported_frames.remove(&window.resource_id);
+            if window.transport_resource_owned {
+                self.pending_managed_resource_releases
+                    .insert((window.backend, window.transport_resource_id));
+            }
+        }
+        // Actor authority and input routing disappear immediately, while the
+        // last accepted texture remains drawable until the replacement layout
+        // reaches this atomic projection boundary.
+        self.plugin_panes.retain(|pane, _texture| {
+            self.plugin_pane_realms.contains_key(pane)
+                || self.accepted_layout.pane_item(*pane).is_some()
+        });
+        self.retired_plugin_snapshots.retain(|pane, _snapshot| {
+            self.plugin_pane_realms.contains_key(pane)
+                || self.accepted_layout.pane_item(*pane).is_some()
+        });
 
         for plugin in self.plugin_panes.values_mut() {
             plugin.rect = [0, 0, 0, 0];
@@ -19494,9 +20090,15 @@ impl Renderer {
         let layout_extent = self.layout_extent();
         let mut requested = Vec::with_capacity(panes.len());
         for pane in panes {
+            // Renderer recovery must reproduce the CPU snapshot paired with
+            // the accepted native texture. A newer bridge publication may be
+            // awaiting preparation and is not yet presentation-authoritative.
             let snapshot = self
-                .plugin_graphics
-                .snapshot(*pane)?
+                .retired_plugin_snapshots
+                .get(pane)
+                .cloned()
+                .or(self.plugin_graphics.snapshot(*pane)?);
+            let snapshot = snapshot
                 .with_context(|| format!("retained plugin replay pane {pane} has no CPU scene"))?;
             let extent = self
                 .accepted_layout
@@ -19538,9 +20140,19 @@ impl Renderer {
             );
             self.plugin_panes.insert(pane, texture);
             self.projected_plugin_scenes.accept_ordinary(pane, sequence);
+            self.retired_plugin_snapshots.remove(&pane);
         }
         let focus_change = self.reconcile_layout();
         Ok(GraphicsRefresh::Applied(focus_change))
+    }
+
+    fn retire_actor_frame_preparation(&mut self, changes: &[ActorFrameGraphicsChange]) {
+        retire_graphics_preparation(
+            &mut self.latest_graphics_preparations,
+            &mut self.prepared_plugin_scenes,
+            &mut self.pending_graphics_preparation_batches,
+            changes,
+        );
     }
 
     fn refresh_plugin_actor_frame(
@@ -19550,6 +20162,11 @@ impl Renderer {
         changes: &[ActorFrameGraphicsChange],
         ready_at: Instant,
     ) -> Result<GraphicsRefresh> {
+        if std::env::var_os("BROOD_TRACE_PLUGIN_GRAPHICS").is_some() {
+            eprintln!(
+                "facet native refresh token={token} revision={actor_frame_revision} changes={changes:?}"
+            );
+        }
         let tagged_epochs = changes
             .iter()
             .filter_map(|change| change.resize_epoch)
@@ -19562,11 +20179,49 @@ impl Renderer {
             eprintln!(
                 "discarded stale tagged plugin actor frame token={token} revision={actor_frame_revision} resize_epochs={tagged_epochs:?}"
             );
+            self.retire_actor_frame_preparation(changes);
             self.plugin_graphics
                 .discard_actor_frame(actor_frame_revision)?;
             return Ok(GraphicsRefresh::Stale);
         }
         let panes = changes.iter().map(|change| change.pane).collect::<Vec<_>>();
+        if let Some(receipt) = self.plugin_graphics.facet_receipt(actor_frame_revision)? {
+            let valid = receipt.validate_current().is_ok()
+                && receipt
+                    .with_graphics(|graphics| {
+                        graphics.token().renderer_generation == self.generation
+                            && graphics.panes().count() == changes.len()
+                            && graphics.panes().all(|(pane, pair)| {
+                                changes
+                                    .iter()
+                                    .find(|change| change.pane == *pane)
+                                    .is_some_and(|change| {
+                                        let extent = change.resize_epoch.map_or_else(
+                                            || Some(self.plugin_scene_extent(*pane)),
+                                            |epoch| {
+                                                self.staged_plugin_scene_extent(*pane, epoch).ok()
+                                            },
+                                        );
+                                        extent.is_some_and(|extent| {
+                                            pair.geometry().physical_width == extent.0
+                                                && pair.geometry().physical_height == extent.1
+                                                && pair.geometry().scale.to_bits()
+                                                    == f64::from(extent.2).to_bits()
+                                        })
+                                    })
+                            })
+                    })
+                    .unwrap_or(false);
+            if !valid {
+                eprintln!(
+                    "facet native stale geometry token={token} revision={actor_frame_revision}"
+                );
+                self.retire_actor_frame_preparation(changes);
+                self.plugin_graphics
+                    .discard_actor_frame(actor_frame_revision)?;
+                return Ok(GraphicsRefresh::Stale);
+            }
+        }
         let preparation_claim = match self
             .plugin_graphics
             .claim_actor_frame_for_preparation(actor_frame_revision, &panes)?
@@ -19574,6 +20229,7 @@ impl Renderer {
             claim @ (ActorFramePreparationClaim::Prepare
             | ActorFramePreparationClaim::PrepareDeferred) => claim,
             ActorFramePreparationClaim::Stale => {
+                self.retire_actor_frame_preparation(changes);
                 return Ok(GraphicsRefresh::Stale);
             }
         };
@@ -19584,6 +20240,7 @@ impl Renderer {
             // Renderer recovery may replay readiness while the original event is
             // already queued. Promotion consumes the revision, so that later
             // notification is stale and must not re-arm its token or panes.
+            self.retire_actor_frame_preparation(changes);
             return Ok(GraphicsRefresh::Stale);
         };
         let snapshots = snapshots
@@ -19958,21 +20615,49 @@ impl Renderer {
         Ok(())
     }
 
-    fn remove_plugin_pane(&mut self, pane: u64) -> Option<FocusChange> {
+    fn remove_plugin_pane(
+        &mut self,
+        pane: u64,
+        retired_replay: RetiredPluginReplay,
+    ) -> Result<Option<FocusChange>> {
         self.latest_graphics_preparations
             .retain(|(prepared_pane, _epoch), _key| *prepared_pane != pane);
         self.prepared_plugin_scenes
             .retain(|key, _scene| key.pane != pane);
         self.projected_plugin_scenes.remove(pane);
-        let removed_visible = self.plugin_panes.remove(&pane).is_some();
+        let had_visible = self.plugin_panes.contains_key(&pane);
+        let retain_visible = retain_withdrawn_plugin_scene(
+            had_visible,
+            self.accepted_layout.pane_item(pane).is_some(),
+        );
+        let replay_snapshot = match (retain_visible, retired_replay) {
+            (true, RetiredPluginReplay::Facet) => self
+                .plugin_panes
+                .get(&pane)
+                .and_then(|texture| texture.scene.replay_snapshot())
+                .cloned()
+                .with_context(|| {
+                    format!("retired plugin pane {pane} lost its accepted CPU replay scene")
+                })
+                .map(Some),
+            _ => Ok(None),
+        };
+        if retain_visible {
+            if let Some(snapshot) = replay_snapshot? {
+                self.retired_plugin_snapshots.insert(pane, snapshot);
+            }
+        } else {
+            self.plugin_panes.remove(&pane);
+            self.retired_plugin_snapshots.remove(&pane);
+        }
         let removed_realm = self.plugin_pane_realms.remove(&pane).is_some();
         let staged_before = self.staged_plugin_panes.len();
         self.staged_plugin_panes
             .retain(|(staged_pane, _epoch), _scene| *staged_pane != pane);
         let removed_staged = self.staged_plugin_panes.len() != staged_before;
         self.sent_plugin_sizes.remove(&pane);
-        if !removed_visible && !removed_realm && !removed_staged {
-            return None;
+        if !had_visible && !removed_realm && !removed_staged {
+            return Ok(None);
         }
         self.layout_state_dirty = true;
         let mut focus_change = self.reconcile_layout();
@@ -19982,7 +20667,7 @@ impl Renderer {
             change.plugin_blur = None;
         }
         self.window.request_redraw();
-        focus_change
+        Ok(focus_change)
     }
 
     fn plugin_scene_extent(&self, pane: u64) -> (u32, u32, f32) {
@@ -19991,6 +20676,15 @@ impl Renderer {
             && let Some(plugin) = self.plugin_panes.get(&pane)
         {
             return (plugin.scene.width, plugin.scene.height, plugin.scene.scale);
+        }
+        // A pane can receive its first frame after a layout already allocated
+        // it. Use that allocation even before a native scene exists; falling
+        // back to the window size would lay out text off the smaller canvas.
+        if let Some(item) = self.accepted_layout.pane_item(pane) {
+            let rect = item.pixel_rect(self.layout_extent());
+            if let Some((width, height)) = positive_rect_extent([rect.x, rect.y, rect.w, rect.h]) {
+                return (width, height, scale);
+            }
         }
         let extent = self.plugin_panes.get(&pane).map_or_else(
             || (self.config.width.max(1), self.config.height.max(1)),
@@ -20110,7 +20804,10 @@ impl Renderer {
                 label: Some("brood-client frame encoder"),
             });
 
+        let plugin_encode_started = Instant::now();
+        let mut slowest_plugin_encode_us = 0;
         for plugin in self.plugin_panes.values_mut() {
+            let pane_encode_started = Instant::now();
             if let Err(error) = self
                 .plugin_canvas
                 .encode_if_dirty(&mut encoder, &mut plugin.scene)
@@ -20118,7 +20815,10 @@ impl Renderer {
                 eprintln!("failed to encode plugin GPU scene: {error:#}");
                 return RenderOutcome::Failed("failed to encode plugin GPU scene");
             }
+            slowest_plugin_encode_us =
+                slowest_plugin_encode_us.max(pane_encode_started.elapsed().as_micros());
         }
+        let plugins_encoded = Instant::now();
 
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -20386,8 +21086,23 @@ impl Renderer {
             drop(render_pass);
         }
 
+        let composition_encoded = Instant::now();
         let commands = encoder.finish();
         let encoded = Instant::now();
+        if encoded.duration_since(acquired) >= Duration::from_millis(5) {
+            eprintln!(
+                "slow frame encoding setup_us={} plugins_us={} slowest_plugin_us={} composition_us={} finish_us={}",
+                plugin_encode_started.duration_since(acquired).as_micros(),
+                plugins_encoded
+                    .duration_since(plugin_encode_started)
+                    .as_micros(),
+                slowest_plugin_encode_us,
+                composition_encoded
+                    .duration_since(plugins_encoded)
+                    .as_micros(),
+                encoded.duration_since(composition_encoded).as_micros()
+            );
+        }
         on_composed(encoded);
         let submission = self.queue.submit([commands]);
         let submitted = Instant::now();
@@ -20644,7 +21359,12 @@ impl Renderer {
         }
     }
 
-    fn retire_managed_resize_epoch(&mut self, epoch: u64, promote: bool, degraded: bool) {
+    fn retire_managed_resize_epoch(
+        &mut self,
+        epoch: u64,
+        promote: bool,
+        degraded: bool,
+    ) -> Option<u64> {
         release_recovery_holds_for_epoch(&mut self.pending_ordinary_managed_recovery, epoch);
         let promotions = retire_managed_resize_expectations(
             &mut self.managed_resizes,
@@ -20655,6 +21375,7 @@ impl Renderer {
             promote,
             degraded,
         );
+        let mut newly_admitted_active = None;
         for (route, mut staged) in promotions {
             if let Some(current) = self
                 .current_windows
@@ -20670,6 +21391,9 @@ impl Renderer {
                 staged.rect = current.rect;
                 *current = staged;
             } else {
+                if staged.active {
+                    newly_admitted_active = Some(route.view_pane);
+                }
                 if let Some(item) = self.accepted_layout.pane_item(route.view_pane) {
                     let rect = item.pixel_rect(self.layout_extent());
                     staged.rect = [rect.x, rect.y, rect.w, rect.h];
@@ -20679,6 +21403,7 @@ impl Renderer {
                     .sort_by_key(|window| (window.backend, window.window_id));
             }
         }
+        newly_admitted_active
     }
 
     fn hold_superseded_managed_recovery(
@@ -21354,6 +22079,30 @@ fn managed_scene_changes_layout_state(
     previous_inventory != inventory || previous_focus != focus
 }
 
+fn retire_withdrawn_managed_scenes(
+    windows: &mut Vec<SceneWindow>,
+    live_panes: &BTreeSet<u64>,
+    layout: &ResolvedLayout,
+) -> Vec<SceneWindow> {
+    let mut retired = Vec::new();
+    windows.retain(|window| {
+        if !window.retained_from_previous_snapshot
+            || live_panes.contains(&window.window_id)
+            || layout.pane_item(window.window_id).is_some()
+        {
+            true
+        } else {
+            retired.push(window.clone());
+            false
+        }
+    });
+    retired
+}
+
+const fn retain_withdrawn_plugin_scene(has_texture: bool, accepted_layout_contains: bool) -> bool {
+    has_texture && accepted_layout_contains
+}
+
 fn preserved_managed_scene_windows(
     current_windows: &[SceneWindow],
     backend: BackendId,
@@ -21368,6 +22117,10 @@ fn preserved_managed_scene_windows(
                 && !accepted_scene_panes.contains(&current.window_id)
         })
         .cloned()
+        .map(|mut window| {
+            window.retained_from_previous_snapshot = true;
+            window
+        })
         .collect()
 }
 
@@ -21685,7 +22438,7 @@ fn border_rects(rect: [i32; 4], thickness: i32) -> [[i32; 4]; 4] {
     ]
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct RenderTimings {
     acquire_us: u128,
     encode_us: u128,
@@ -22030,6 +22783,7 @@ mod tests {
             window_id: view_pane,
             transport_resource_id: resource,
             transport_resource_owned: true,
+            retained_from_previous_snapshot: false,
             resource_id: resource + 1000,
             source_rect: [0, 0, 300, 150],
             rect: [10, 20, 300, 150],
@@ -22331,6 +23085,47 @@ mod tests {
             previous_focus,
             focus,
         ));
+    }
+
+    #[test]
+    fn withdrawn_managed_surface_survives_until_replacement_layout_commits() {
+        let mut current = vec![managed_scene(7, 70), managed_scene(8, 80)];
+        let old_layout = ResolvedLayout {
+            items: vec![test_pane_item(7, -1.0, 1.0), test_pane_item(8, 0.0, 1.0)],
+        };
+        let live = BTreeSet::from([7]);
+        let mut newly_arrived = vec![managed_scene(9, 90)];
+        assert!(
+            retire_withdrawn_managed_scenes(&mut newly_arrived, &live, &old_layout).is_empty(),
+            "a new snapshot arriving before catalog publication is not a withdrawal"
+        );
+        assert!(retire_withdrawn_managed_scenes(&mut current, &live, &old_layout).is_empty());
+        let preserved = preserved_managed_scene_windows(
+            &current,
+            BackendId(3),
+            &BTreeSet::from([7, 8]),
+            &BTreeSet::from([7]),
+        );
+        assert_eq!(preserved.len(), 1);
+        assert_eq!(preserved[0].transport_resource_id, 80);
+        current.retain(|window| window.window_id == 7);
+        current.extend(preserved);
+        assert!(retire_withdrawn_managed_scenes(&mut current, &live, &old_layout).is_empty());
+        let replacement = ResolvedLayout {
+            items: vec![test_pane_item(7, -1.0, 2.0)],
+        };
+        let retired = retire_withdrawn_managed_scenes(&mut current, &live, &replacement);
+        assert_eq!(retired.len(), 1);
+        assert_eq!(retired[0].transport_resource_id, 80);
+        assert_eq!(current.len(), 1);
+        assert!(retire_withdrawn_managed_scenes(&mut current, &live, &replacement).is_empty());
+    }
+
+    #[test]
+    fn withdrawn_plugin_texture_survives_only_while_the_accepted_layout_names_it() {
+        assert!(retain_withdrawn_plugin_scene(true, true));
+        assert!(!retain_withdrawn_plugin_scene(true, false));
+        assert!(!retain_withdrawn_plugin_scene(false, true));
     }
 
     #[test]
@@ -23496,6 +24291,8 @@ mod tests {
             event_sequence: 1,
             interaction_claim: None,
             native_resize_revision: None,
+            interaction_preview: false,
+            host_owned: false,
             superseded_epochs: 0,
             epoch: brood_wasm::ResizeEpoch {
                 id: 41,
@@ -23525,6 +24322,34 @@ mod tests {
             deadline: now + SYNCHRONIZED_RESIZE_TIMEOUT,
             presentation,
         })
+    }
+
+    #[test]
+    fn compatible_dirty_inventory_waits_for_exact_synchronized_completion() -> Result<()> {
+        assert!(layout_state_publication_is_deferred(true, true));
+        assert!(!layout_state_publication_is_deferred(false, true));
+
+        let mut timed_out = active_resize_with_inventory(SynchronizedResizePresentation::Waiting)?;
+        assert_eq!(
+            prepare_synchronized_resize_presentation(&mut timed_out, true),
+            Some((true, vec![7, 8])),
+            "the normal bounded deadline remains able to publish a degraded cohort"
+        );
+
+        let mut active = active_resize_with_inventory(SynchronizedResizePresentation::Waiting)?;
+        active.ready_panes.clone_from(&active.wait_panes);
+        assert_eq!(
+            prepare_synchronized_resize_presentation(&mut active, false),
+            Some((false, Vec::new()))
+        );
+        assert!(matches!(
+            active.presentation,
+            SynchronizedResizePresentation::Ready {
+                degraded: false,
+                ref missing_panes,
+            } if missing_panes.is_empty()
+        ));
+        Ok(())
     }
 
     fn active_resize_with_region_chain() -> Result<ActiveSynchronizedResize> {
@@ -23603,6 +24428,8 @@ mod tests {
             event_sequence: 1,
             interaction_claim: None,
             native_resize_revision: None,
+            interaction_preview: false,
+            host_owned: false,
             superseded_epochs: 0,
             epoch: brood_wasm::ResizeEpoch {
                 id: 41,
@@ -25176,6 +26003,121 @@ mod tests {
     }
 
     #[test]
+    fn interaction_preview_enrolls_only_changed_waitable_facet_panes() {
+        let affected = BTreeSet::from([1, 2, 3, 4]);
+        let facets = BTreeSet::from([2, 3, 5]);
+        let waitable = BTreeSet::from([1, 2, 4, 5]);
+        assert_eq!(
+            interaction_preview_pure_cohort(&affected, &facets),
+            BTreeSet::from([2, 3])
+        );
+        assert!(actor_layout_acknowledges_pending_focus(Some(7), Some(7)));
+        assert!(
+            !actor_layout_acknowledges_pending_focus(Some(7), Some(8)),
+            "a stale child focus must not retire a newer deferred host focus"
+        );
+        let pending = pending_focus_after_actor_layout(Some(7), Some(8));
+        let pending = pending_focus_after_actor_layout(pending, Some(8));
+        assert_eq!(
+            pending,
+            Some(7),
+            "stale root and child responses retain host focus"
+        );
+        assert_eq!(
+            pending_focus_after_actor_layout(pending, Some(7)),
+            None,
+            "an actor acknowledgement retires the deferred focus"
+        );
+        assert_eq!(
+            pending_focus_after_actor_layout(None, Some(8)),
+            None,
+            "a subsequent explicit focus action can clear and supersede it"
+        );
+        assert!(!interaction_preview_pure_cohort(&affected, &facets).is_subset(&waitable));
+        let target = ResolvedLayout {
+            items: vec![test_pane_item(2, -1.0, 2.0)],
+        };
+        assert_eq!(
+            target_present_pane_cohort(BTreeSet::from([2, 3]), &target),
+            BTreeSet::from([2]),
+            "removed pure panes must not block their own atomic disappearance"
+        );
+    }
+
+    #[test]
+    fn host_owned_promotion_focuses_a_newly_admitted_active_managed_pane() {
+        assert_eq!(
+            promoted_synchronized_focus(true, Some(91), Some(91), None, Some(3)),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn staged_active_focus_has_no_authority_outside_host_owned_promotion() {
+        assert_eq!(
+            promoted_synchronized_focus(false, Some(91), Some(91), None, Some(3)),
+            Some(91),
+            "actor-owned layout focus remains authoritative"
+        );
+    }
+
+    #[test]
+    fn explicit_newer_focus_overrides_newly_admitted_managed_focus() {
+        assert_eq!(
+            promoted_synchronized_focus(true, Some(91), Some(91), Some(7), Some(3)),
+            Some(7),
+            "a deferred explicit host request wins at the atomic boundary"
+        );
+        assert_eq!(
+            promoted_synchronized_focus(true, Some(91), Some(7), None, Some(3)),
+            Some(7),
+            "an already-applied focus change after cohort capture is retained"
+        );
+    }
+
+    #[test]
+    fn timed_out_interaction_preview_requires_abort_before_degraded_projection() -> Result<()> {
+        let mut active = active_resize_with_inventory(SynchronizedResizePresentation::Waiting)?;
+        active.interaction_preview = true;
+        active.deadline = Instant::now() - Duration::from_millis(1);
+        assert!(synchronized_resize_preview_timed_out(
+            &active,
+            Instant::now()
+        ));
+
+        active.interaction_preview = false;
+        active.host_owned = true;
+        assert!(synchronized_resize_preview_timed_out(
+            &active,
+            Instant::now()
+        ));
+
+        active.host_owned = false;
+        assert!(!synchronized_resize_preview_timed_out(
+            &active,
+            Instant::now()
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn exact_host_cohort_cannot_prepare_partial_degraded_presentation() -> Result<()> {
+        let mut active = active_resize_with_inventory(SynchronizedResizePresentation::Waiting)?;
+        active.host_owned = true;
+        assert!(active.ready_panes.is_empty());
+        assert_eq!(active.wait_panes.len(), 2);
+        assert_eq!(
+            prepare_synchronized_resize_presentation(&mut active, true),
+            None
+        );
+        assert!(matches!(
+            active.presentation,
+            SynchronizedResizePresentation::Waiting
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn managed_resize_epoch_allocator_exhausts_before_the_reserved_authority_bit() {
         let mut next = 0;
         assert_eq!(allocate_resize_epoch(&mut next), Some(1));
@@ -26029,6 +26971,19 @@ mod tests {
         input.push(b'a');
         assert_eq!(terminal_input_sequence(&input), Some(17));
 
+        let mut reliable = vec![0; 35];
+        reliable[0] = b'J';
+        reliable[1..9].copy_from_slice(&18_u64.to_le_bytes());
+        reliable[33] = 1;
+        assert_eq!(terminal_input_sequence(&reliable), Some(18));
+        reliable[33] = 0;
+        assert_eq!(terminal_input_sequence(&reliable), None);
+        reliable[33] = 2;
+        assert_eq!(terminal_input_sequence(&reliable), None);
+        assert_eq!(terminal_input_sequence(&reliable[..33]), None);
+        reliable[33] = 3;
+        assert_eq!(terminal_input_sequence(&reliable), Some(18));
+
         let mut snapshot = vec![0_u8; 41];
         snapshot[..4].copy_from_slice(b"BTRM");
         snapshot[4] = 4;
@@ -26841,6 +27796,66 @@ mod tests {
     }
 
     #[test]
+    fn rejected_preparation_releases_resources_and_rejects_late_completion() {
+        let old = GraphicsPreparationKey {
+            pane: 7,
+            sequence: 10,
+            resize_epoch: Some(3),
+            width: 640,
+            height: 720,
+            scale_bits: 1.0_f32.to_bits(),
+        };
+        let newer = GraphicsPreparationKey {
+            sequence: 11,
+            ..old
+        };
+        let peer = GraphicsPreparationKey { pane: 8, ..old };
+        let resource = Arc::new(());
+        let mut prepared = BTreeMap::from([
+            (old, Arc::clone(&resource)),
+            (newer, Arc::new(())),
+            (peer, Arc::new(())),
+        ]);
+        let mut latest = BTreeMap::from([
+            ((old.pane, old.resize_epoch), newer),
+            ((peer.pane, peer.resize_epoch), peer),
+        ]);
+        let mut pending = BTreeSet::from([vec![old], vec![newer], vec![peer]]);
+        retire_graphics_preparation(
+            &mut latest,
+            &mut prepared,
+            &mut pending,
+            &[ActorFrameGraphicsChange {
+                pane: old.pane,
+                sequence: old.sequence,
+                resize_epoch: old.resize_epoch,
+                terminal_input_sequence: None,
+            }],
+        );
+        assert_eq!(Arc::strong_count(&resource), 1);
+        assert!(!graphics_preparation_batch_is_current(&latest, &[old]));
+        assert!(graphics_preparation_batch_is_current(&latest, &[newer]));
+        assert!(prepared.contains_key(&newer));
+        assert!(prepared.contains_key(&peer));
+        assert_eq!(pending, BTreeSet::from([vec![newer], vec![peer]]));
+
+        // No newer replacement is required to invalidate an in-flight result.
+        latest.insert((old.pane, old.resize_epoch), old);
+        retire_graphics_preparation(
+            &mut latest,
+            &mut prepared,
+            &mut pending,
+            &[ActorFrameGraphicsChange {
+                pane: old.pane,
+                sequence: old.sequence,
+                resize_epoch: old.resize_epoch,
+                terminal_input_sequence: None,
+            }],
+        );
+        assert!(!graphics_preparation_batch_is_current(&latest, &[old]));
+    }
+
+    #[test]
     fn idle_event_loop_has_no_immediate_deadline() {
         assert_eq!(next_event_loop_deadline([None, None, None]), None);
     }
@@ -26935,6 +27950,28 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(schedule.armed, Some((second, second_generation)));
         assert_eq!(schedule.pending_wake, None);
+    }
+
+    #[test]
+    fn redraw_preserves_an_already_queued_unchanged_deadline() {
+        let now = Instant::now();
+        let mut schedule = EventLoopDeadlineSchedule::default();
+        assert!(schedule.replace(Some(now)));
+        let fired = schedule.take_due(now).unwrap();
+        for _ in 0..260 {
+            assert!(!schedule.replace(Some(now)));
+            assert_eq!(schedule.take_due(now), None);
+        }
+        assert_eq!(schedule.pending_wake, Some((now, fired)));
+        assert!(schedule.accept_wake(fired));
+        assert!(!schedule.accept_wake(fired));
+
+        // Removing demand must still cancel a queued wake.
+        assert!(schedule.replace(Some(now)));
+        let cancelled = schedule.take_due(now).unwrap();
+        assert!(schedule.replace(None));
+        assert!(!schedule.accept_wake(cancelled));
+        assert!(!schedule.replace(None));
     }
 
     #[test]

@@ -780,14 +780,43 @@ fn emit_presentation_toplevel_configure(
     size: Size<i32, Logical>,
     policy: PresentationConfigurePolicy,
 ) -> Option<Serial> {
-    toplevel.with_pending_state(|state| {
-        state.size = Some(size);
-        state.bounds = Some(size);
-    });
+    toplevel.with_pending_state(|state| apply_presentation_toplevel_state(state, size));
     match policy {
         PresentationConfigurePolicy::Deduplicate => toplevel.send_pending_configure(),
         PresentationConfigurePolicy::Force => Some(toplevel.send_configure()),
     }
+}
+
+fn apply_presentation_toplevel_state(
+    state: &mut smithay::wayland::shell::xdg::ToplevelState,
+    size: Size<i32, Logical>,
+) {
+    state.size = Some(size);
+    state.bounds = Some(size);
+    for tiled in [
+        xdg_toplevel::State::TiledLeft,
+        xdg_toplevel::State::TiledRight,
+        xdg_toplevel::State::TiledTop,
+        xdg_toplevel::State::TiledBottom,
+    ] {
+        state.states.set(tiled);
+    }
+}
+
+fn presentation_toplevel_state_matches(
+    state: &smithay::wayland::shell::xdg::ToplevelState,
+    size: Size<i32, Logical>,
+) -> bool {
+    state.size == Some(size)
+        && state.bounds == Some(size)
+        && [
+            xdg_toplevel::State::TiledLeft,
+            xdg_toplevel::State::TiledRight,
+            xdg_toplevel::State::TiledTop,
+            xdg_toplevel::State::TiledBottom,
+        ]
+        .into_iter()
+        .all(|tiled| state.states.contains(tiled))
 }
 
 pub struct Brood {
@@ -3861,13 +3890,14 @@ impl Brood {
         };
         crate::frame_export::cleanup_provisional_tagged_resources(fast_path);
         let size: Size<i32, Logical> = logical_size.into();
-        toplevel.with_pending_state(|state| {
-            state.size = Some(size);
-            state.bounds = Some(size);
-        });
         // A tagged request always sends a configure. This preserves a distinct
         // serial when the logical size is unchanged but the epoch is new.
-        let serial = toplevel.send_configure();
+        let serial = emit_presentation_toplevel_configure(
+            toplevel,
+            size,
+            PresentationConfigurePolicy::Force,
+        )
+        .expect("forced presentation configure always emits one serial");
         let sent_after_commit = fast_path.managed_resizes.current_surface_commit(pane);
         fast_path
             .managed_resizes
@@ -3984,7 +4014,7 @@ impl Brood {
                 .and_then(|data| data.lock().ok())
                 .is_some_and(|data| {
                     let current = data.current_server_state();
-                    current.size == Some(size) && current.bounds == Some(size)
+                    presentation_toplevel_state_matches(current, size)
                 })
         });
         if !PresentationConfigurePolicy::Deduplicate.should_emit(already_configured) {
@@ -9411,6 +9441,29 @@ mod managed_resize_tests {
         assert!(PresentationConfigurePolicy::Force.should_emit(false));
         assert!(!PresentationConfigurePolicy::Deduplicate.should_emit(true));
         assert!(PresentationConfigurePolicy::Deduplicate.should_emit(false));
+    }
+
+    #[test]
+    fn presentation_configure_state_is_tiled_and_preserves_other_states() {
+        let size: Size<i32, Logical> = (480, 686).into();
+        let mut ordinary = smithay::wayland::shell::xdg::ToplevelState::default();
+        ordinary.states.set(xdg_toplevel::State::Activated);
+        ordinary.states.set(xdg_toplevel::State::Maximized);
+        ordinary.states.set(xdg_toplevel::State::Fullscreen);
+        apply_presentation_toplevel_state(&mut ordinary, size);
+
+        let mut tagged = ordinary.clone();
+        apply_presentation_toplevel_state(&mut tagged, size);
+
+        assert_eq!(ordinary, tagged);
+        assert!(presentation_toplevel_state_matches(&ordinary, size));
+        assert!(ordinary.states.contains(xdg_toplevel::State::Activated));
+        assert!(ordinary.states.contains(xdg_toplevel::State::Maximized));
+        assert!(ordinary.states.contains(xdg_toplevel::State::Fullscreen));
+        assert!(ordinary.states.contains(xdg_toplevel::State::TiledLeft));
+        assert!(ordinary.states.contains(xdg_toplevel::State::TiledRight));
+        assert!(ordinary.states.contains(xdg_toplevel::State::TiledTop));
+        assert!(ordinary.states.contains(xdg_toplevel::State::TiledBottom));
     }
 
     #[test]

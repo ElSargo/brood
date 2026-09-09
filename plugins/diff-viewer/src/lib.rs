@@ -1,17 +1,23 @@
+#[cfg(not(feature = "pure-renderer"))]
+use brood_plugin_sdk::graphics::reuse_pane_content;
 use std::sync::Mutex;
 
 use brood_graphics::{Color, Command, Packet, Rect, theme::ashen};
+#[cfg(not(feature = "pure-renderer"))]
+use brood_plugin_sdk::bindings;
+#[cfg(feature = "pure-renderer")]
+mod pure_renderer;
 use brood_plugin_sdk::{
-    bindings,
     brood::plugin::host,
     exports::brood::plugin::actor::{
         Command as ActorCommand, Event, Guest, LifecycleEvent, PresentationEvent, WorkerEvent,
         WorkerRequest,
     },
-    graphics::{TextLayoutCache, reuse_pane_content},
+    graphics::TextLayoutCache,
     input::BUTTON_PRIMARY as LEFT_BUTTON,
     runtime::run_process,
 };
+use serde::{Deserialize, Serialize};
 
 const FIRST_WORKER: u64 = 1;
 const HEADER_HEIGHT: f32 = 52.0;
@@ -45,13 +51,13 @@ const ADDED_BG: Color = ashen::DIFF_ADDED_BG;
 const DELETED_BG: Color = ashen::DIFF_DELETED_BG;
 const EMPTY_BG: Color = ashen::DIFF_EMPTY_BG;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 enum ChangeKind {
     Context,
     Changed,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 enum DisplayRow {
     File {
         path: String,
@@ -80,7 +86,7 @@ impl DisplayRow {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct DiffDocument {
     rows: Vec<DisplayRow>,
     files: usize,
@@ -89,12 +95,29 @@ struct DiffDocument {
     truncated: bool,
 }
 
+/// Immutable visual input to the renderer. Runtime workers, handles, and the
+/// text layout cache deliberately remain in `ViewerState` and are not copied.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct RenderView {
+    width: f32,
+    height: f32,
+    scroll: f32,
+    document: DiffDocument,
+    document_revision: u64,
+    loading: bool,
+    error: Option<String>,
+    scrollbar_hovered: bool,
+    refresh_hovered: bool,
+    refresh_pressed: bool,
+}
+
 #[derive(Clone, Copy)]
+#[cfg_attr(feature = "pure-renderer", allow(dead_code))]
 struct ScrollbarDrag {
     pointer_offset: f32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 struct ScrollbarGeometry {
     track_top: f32,
     track_height: f32,
@@ -108,6 +131,7 @@ struct ViewerState {
     height: f32,
     scroll: f32,
     document: DiffDocument,
+    document_revision: u64,
     loading: bool,
     error: Option<String>,
     next_worker: u64,
@@ -116,6 +140,7 @@ struct ViewerState {
     scrollbar_hovered: bool,
     refresh_hovered: bool,
     refresh_pressed: bool,
+    #[cfg_attr(feature = "pure-renderer", allow(dead_code))]
     text_cache: Option<TextLayoutCache>,
 }
 
@@ -133,6 +158,7 @@ impl ViewerState {
                 deletions: 0,
                 truncated: false,
             },
+            document_revision: 0,
             loading: false,
             error: None,
             next_worker: FIRST_WORKER,
@@ -184,6 +210,21 @@ impl ViewerState {
             payload: Vec::new(),
         }))
     }
+
+    fn render_view(&self) -> RenderView {
+        RenderView {
+            width: self.width,
+            height: self.height,
+            scroll: self.scroll,
+            document: self.document.clone(),
+            document_revision: self.document_revision,
+            loading: self.loading,
+            error: self.error.clone(),
+            scrollbar_hovered: self.scrollbar_hovered,
+            refresh_hovered: self.refresh_hovered,
+            refresh_pressed: self.refresh_pressed,
+        }
+    }
 }
 
 static STATE: Mutex<ViewerState> = Mutex::new(ViewerState::new());
@@ -192,7 +233,9 @@ struct DiffViewer;
 
 impl Guest for DiffViewer {
     fn dispatch(event: Event) -> Vec<ActorCommand> {
-        match event {
+        let commands = match event {
+            #[cfg(feature = "pure-renderer")]
+            Event::FacetInput(batch) => pure_renderer::handle_input(batch.events),
             Event::Lifecycle(LifecycleEvent::Start(_)) => {
                 vec![ActorCommand::LifecycleComplete(Ok(()))]
             }
@@ -219,7 +262,10 @@ impl Guest for DiffViewer {
             }
             Event::Worker(event) => handle_worker(event),
             _ => Vec::new(),
-        }
+        };
+        #[cfg(feature = "pure-renderer")]
+        pure_renderer::publish();
+        commands
     }
 
     async fn worker_run(_worker: u64, _payload: Vec<u8>) -> Result<Vec<u8>, String> {
@@ -250,6 +296,7 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
             let width = resized.width.max(480.0);
             let height = resized.height.max(320.0);
             if (state.width - width).abs() < 0.5 && (state.height - height).abs() < 0.5 {
+                #[cfg(not(feature = "pure-renderer"))]
                 if let Some(resize_epoch) = resized.resize_epoch
                     && let Err(error) = reuse_pane_content(state.pane, resize_epoch)
                 {
@@ -267,6 +314,7 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
             redraw_for_resize_or_record_error(&mut state, resized.resize_epoch);
             Vec::new()
         }
+        #[cfg(not(feature = "pure-renderer"))]
         PresentationEvent::PointerMoved(moved) if moved.pane == state.pane => {
             let refresh_hovered =
                 !state.loading && rect_contains(refresh_button_rect(&state), moved.x, moved.y);
@@ -285,6 +333,7 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
             }
             Vec::new()
         }
+        #[cfg(not(feature = "pure-renderer"))]
         PresentationEvent::PointerLeft(left) if left.pane == state.pane => {
             let changed = state.refresh_hovered
                 || state.refresh_pressed
@@ -299,6 +348,7 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
             }
             Vec::new()
         }
+        #[cfg(not(feature = "pure-renderer"))]
         PresentationEvent::PointerButton(button)
             if button.pane == state.pane && button.button == LEFT_BUTTON =>
         {
@@ -344,6 +394,7 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
             redraw_or_record_error(&mut state);
             Vec::new()
         }
+        #[cfg(not(feature = "pure-renderer"))]
         PresentationEvent::PointerScroll(scroll) if scroll.pane == state.pane => {
             // The client already converts wheel lines to pixels while preserving
             // high-resolution touchpad deltas. Consume those pixels directly.
@@ -352,6 +403,7 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
             }
             Vec::new()
         }
+        #[cfg(not(feature = "pure-renderer"))]
         PresentationEvent::Key(key) if key.pane == state.pane && key.pressed && !key.repeat => {
             let command = match key.logical_key.as_str() {
                 "ArrowDown" | "j" => {
@@ -385,6 +437,7 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
             redraw_or_record_error(&mut state);
             command.into_iter().collect()
         }
+        #[cfg(not(feature = "pure-renderer"))]
         PresentationEvent::RenderHint(hint) => {
             if let Err(error) =
                 brood_plugin_sdk::graphics::render_with_hint(&hint, || redraw(&mut state, None))
@@ -393,6 +446,8 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
             }
             Vec::new()
         }
+        #[cfg(feature = "pure-renderer")]
+        PresentationEvent::RenderHint(_) => Vec::new(),
         _ => Vec::new(),
     }
 }
@@ -407,6 +462,10 @@ fn handle_worker(event: WorkerEvent) -> Vec<ActorCommand> {
             state.loading = false;
             let text = String::from_utf8_lossy(&finished.output);
             state.document = parse_diff(&text);
+            state.document_revision = state
+                .document_revision
+                .checked_add(1)
+                .expect("diff document revision exhausted");
             state.scroll = 0.0;
             state.error = None;
             redraw_or_record_error(&mut state);
@@ -432,6 +491,10 @@ fn redraw_or_record_error(state: &mut ViewerState) {
     redraw_for_resize_or_record_error(state, None);
 }
 
+#[cfg(feature = "pure-renderer")]
+fn redraw_for_resize_or_record_error(_state: &mut ViewerState, _epoch: Option<u64>) {}
+
+#[cfg(not(feature = "pure-renderer"))]
 fn redraw_for_resize_or_record_error(state: &mut ViewerState, resize_epoch: Option<u64>) {
     if state.pane == 0 {
         return;
@@ -446,13 +509,15 @@ fn redraw_for_resize_or_record_error(state: &mut ViewerState, resize_epoch: Opti
     }
 }
 
+#[cfg(not(feature = "pure-renderer"))]
 fn redraw(state: &mut ViewerState, resize_epoch: Option<u64>) -> Result<(), String> {
+    let view = state.render_view();
     let mut text_cache = state
         .text_cache
         .take()
         .unwrap_or_else(|| TextLayoutCache::new(state.pane));
     text_cache.set_pane(state.pane);
-    let result = redraw_with_cache(state, &mut text_cache, resize_epoch);
+    let result = redraw_with_cache(&view, &mut text_cache, resize_epoch);
     if result.is_err() {
         text_cache.abort_frame();
     }
@@ -460,11 +525,38 @@ fn redraw(state: &mut ViewerState, resize_epoch: Option<u64>) -> Result<(), Stri
     result
 }
 
+#[cfg(not(feature = "pure-renderer"))]
 fn redraw_with_cache(
-    state: &ViewerState,
+    view: &RenderView,
     text_cache: &mut TextLayoutCache,
     resize_epoch: Option<u64>,
 ) -> Result<(), String> {
+    let packet = build_packet(view, (view.width, view.height), text_cache)?;
+    text_cache.queue(resize_epoch, &packet)
+}
+
+fn build_packet(
+    view: &RenderView,
+    geometry: (f32, f32),
+    text_cache: &mut TextLayoutCache,
+) -> Result<Packet, String> {
+    let state = ViewerState {
+        pane: 0,
+        width: geometry.0,
+        height: geometry.1,
+        scroll: view.scroll,
+        document: view.document.clone(),
+        document_revision: view.document_revision,
+        loading: view.loading,
+        error: view.error.clone(),
+        next_worker: FIRST_WORKER,
+        active_worker: None,
+        scrollbar_drag: None,
+        scrollbar_hovered: view.scrollbar_hovered,
+        refresh_hovered: view.refresh_hovered,
+        refresh_pressed: view.refresh_pressed,
+        text_cache: None,
+    };
     let mut packet = Packet::new();
     text_cache.begin_frame();
     packet.push(Command::FillRect {
@@ -489,7 +581,7 @@ fn redraw_with_cache(
         14.0,
         180.0,
     )?;
-    let refresh_rect = refresh_button_rect(state);
+    let refresh_rect = refresh_button_rect(&state);
     let summary = if state.loading {
         "Refreshing…".to_string()
     } else {
@@ -560,7 +652,7 @@ fn redraw_with_cache(
     for row in &state.document.rows {
         let height = row.height();
         if y + height >= content_top && y <= content_bottom {
-            draw_row(state, &mut packet, text_cache, row, y, height, split_x)?;
+            draw_row(&state, &mut packet, text_cache, row, y, height, split_x)?;
         }
         y += height;
         if y > content_bottom {
@@ -627,7 +719,7 @@ fn redraw_with_cache(
         )?;
     }
 
-    draw_scrollbar(state, &mut packet);
+    draw_scrollbar(&state, &mut packet);
     packet.push(Command::FillRect {
         rect: Rect::new(
             0.0,
@@ -653,8 +745,7 @@ fn redraw_with_cache(
         state.width - 28.0,
     )?;
 
-    text_cache.queue(resize_epoch, &packet)?;
-    Ok(())
+    Ok(packet)
 }
 
 fn draw_row(
@@ -849,6 +940,7 @@ fn refresh_button_rect(state: &ViewerState) -> Rect {
     )
 }
 
+#[cfg(not(feature = "pure-renderer"))]
 fn scrollbar_hit(state: &ViewerState, x: f32, y: f32) -> bool {
     let Some(geometry) = scrollbar_geometry(state) else {
         return false;
@@ -859,6 +951,7 @@ fn scrollbar_hit(state: &ViewerState, x: f32, y: f32) -> bool {
         && y <= geometry.track_top + geometry.track_height
 }
 
+#[cfg(not(feature = "pure-renderer"))]
 fn rect_contains(rect: Rect, x: f32, y: f32) -> bool {
     x.is_finite()
         && y.is_finite()
@@ -889,6 +982,7 @@ fn scrollbar_geometry(state: &ViewerState) -> Option<ScrollbarGeometry> {
     })
 }
 
+#[cfg(any(test, not(feature = "pure-renderer")))]
 fn set_scroll_from_thumb_pointer(
     state: &mut ViewerState,
     pointer_y: f32,
@@ -909,6 +1003,7 @@ fn set_scroll_from_thumb_pointer(
     state.set_scroll((thumb_y - geometry.track_top) / travel * state.max_scroll())
 }
 
+#[cfg(any(test, not(feature = "pure-renderer")))]
 fn apply_pointer_scroll(state: &mut ViewerState, vertical: f32) -> bool {
     if !vertical.is_finite() || vertical == 0.0 {
         return false;
@@ -1451,6 +1546,9 @@ fn process_failure(operation: &str, output: &ProcessOutput) -> String {
     }
 }
 
+#[cfg(feature = "pure-renderer")]
+brood_plugin_sdk::export_visual_plugin!(DiffViewer);
+#[cfg(not(feature = "pure-renderer"))]
 bindings::export!(DiffViewer with_types_in bindings);
 
 #[cfg(test)]
@@ -1649,5 +1747,34 @@ rename to new.txt
         assert!(apply_pointer_scroll(&mut state, -0.25));
         assert!((state.scroll - 100.25).abs() < f32::EPSILON);
         assert!(!apply_pointer_scroll(&mut state, f32::NAN));
+    }
+
+    #[test]
+    fn render_view_contains_visual_state_but_no_runtime_or_cache_fields() {
+        let mut state = ViewerState::new();
+        state.active_worker = Some(42);
+        state.next_worker = 43;
+        state.text_cache = Some(TextLayoutCache::new(7));
+        state.document.rows.push(DisplayRow::Hunk("@@".to_string()));
+        let value = serde_json::to_value(state.render_view()).expect("serialize render view");
+        assert!(value.get("document").is_some());
+        assert!(value.get("width").is_some());
+        assert!(value.get("active_worker").is_none());
+        assert!(value.get("next_worker").is_none());
+        assert!(value.get("text_cache").is_none());
+    }
+
+    #[test]
+    fn render_view_round_trips_without_runtime_state() {
+        let mut state = ViewerState::new();
+        state.scroll = 18.0;
+        state.document.rows.push(DisplayRow::Gap);
+        let view = state.render_view();
+        let encoded = serde_json::to_vec(&view).expect("encode render view");
+        let decoded: RenderView = serde_json::from_slice(&encoded).expect("decode render view");
+        assert_eq!(decoded.width, view.width);
+        assert_eq!(decoded.height, view.height);
+        assert_eq!(decoded.scroll, view.scroll);
+        assert_eq!(decoded.document.rows, view.document.rows);
     }
 }

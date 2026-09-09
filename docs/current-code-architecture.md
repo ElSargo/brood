@@ -99,10 +99,13 @@ only with its session. Empty managed-window inventory does not close a session
 or its plugin actors. Agent UI panes subscribe to the complete registry for
 their owning session.
 
-Picker callers stream items to a stable request ID and receive the original
-selected JSON result and append-order index through ordinary local messages.
-The picker owns filtering and interaction while the caller owns selection
-effects. See [[systems/picker-actor]].
+Picker callers stream stable `{id, value}` item envelopes to a request ID and
+receive the original inner JSON result plus its `item_id` and informational
+append-order index through ordinary local messages. IDs are unique within each
+request and selection survives item reordering by ID; callers validate the
+returned identity against current domain state. The picker owns filtering and
+interaction while the caller owns selection effects. See
+[[systems/picker-actor]].
 
 ## Input
 

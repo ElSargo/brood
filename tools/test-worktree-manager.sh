@@ -70,7 +70,7 @@ printf '[init]\nbackend = "%s"\n' \
 SERVER_PID=$!
 
 ctl() {
-  env -u brood_session target/debug/brood ctl \
+  env -u brood_session RUST_LOG=warn target/debug/brood ctl \
     --dbus-destination "$DBUS_DESTINATION" \
     --dbus-address "$DBUS_SESSION_BUS_ADDRESS" \
     "$@"

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
@@ -19,7 +19,7 @@ done
 if [[ -n "${BROOD_TERMINAL_PACKAGE:-}" ]]; then
   PACKAGE="$BROOD_TERMINAL_PACKAGE"
 else
-  PACKAGE="$(nix build .#brood --no-link --print-out-paths)"
+  PACKAGE="$(nix build path:.#brood --no-link --print-out-paths)"
 fi
 PACKAGE="$(readlink -f "$PACKAGE")"
 
@@ -40,6 +40,7 @@ COMPOSITOR_LOG="$OUT/compositor.log"
 SWAY_CONFIG="$OUT/sway.conf"
 DBUS_DESTINATION="org.brood.TerminalTest.p$$"
 WESTON_DIRECT="${BROOD_TERMINAL_WESTON_DIRECT:-0}"
+PURE_RENDERER="${BROOD_TERMINAL_PURE_RENDERER:-1}"
 WESTON_RENDERER="${BROOD_TERMINAL_WESTON_RENDERER:-gl}"
 if [[ -n "${BROOD_TERMINAL_REFRESH_HZ:-}" ]]; then
   REFRESH_HZ="$BROOD_TERMINAL_REFRESH_HZ"
@@ -82,6 +83,7 @@ cleanup() {
   fi
   return "$result"
 }
+trap 'echo "ERR line=$LINENO command=$BASH_COMMAND callers=${BASH_LINENO[*]}" >&2' ERR
 trap cleanup EXIT
 
 read -r -a WAYLAND_BUILD_FLAGS <<< "$(pkg-config --cflags --libs wayland-client xkbcommon)"
@@ -118,7 +120,7 @@ fi
 SERVER_PID=$!
 
 ctl() {
-  env -u brood_session "$PACKAGE/bin/brood" ctl \
+  env -u brood_session RUST_LOG=warn "$PACKAGE/bin/brood" ctl \
     --dbus-destination "$DBUS_DESTINATION" \
     --dbus-address "$DBUS_SESSION_BUS_ADDRESS" \
     "$@"
@@ -257,7 +259,9 @@ wait_for_terminal_render() {
   local log="$1"
   for _ in $(seq 1 300); do
     if rg -q "started presentation WASM actor id=terminal-ui" "$log" \
-      && rg -q 'presentation plugin worker metrics actor=terminal-ui ' "$log"; then
+      && { { [[ "$PURE_RENDERER" == 1 ]] \
+          && rg -q 'facet native pair committed route=.* actor=terminal-ui ' "$log"; } \
+        || rg -q 'presentation plugin worker metrics actor=terminal-ui ' "$log"; }; then
       return
     fi
     kill -0 "$CLIENT_PID" 2> /dev/null || {
@@ -415,6 +419,101 @@ fi
 
 start_client "$CLIENT1_LOG"
 wait_for_terminal_render "$CLIENT1_LOG"
+if [[ "$PURE_RENDERER" == 1 ]]; then
+  TERMINAL_PANE="$(sed -n 's/.*started presentation WASM actor id=terminal-ui .* pane=\([0-9][0-9]*\) .*/\1/p' "$CLIENT1_LOG" | head -1)"
+  [[ -n "$TERMINAL_PANE" ]]
+  for _ in $(seq 1 300); do
+    rg -q 'setup layout quiescent .*native_resize_pending=false .*pending_terminal_notifications=0' "$CLIENT1_LOG" && break
+    sleep 0.05
+  done
+  rg -q 'setup layout quiescent .*native_resize_pending=false .*pending_terminal_notifications=0' "$CLIENT1_LOG"
+  wayland_env "$OUT/virtual-pointer-input" click 240 360 1280 720
+  for _ in $(seq 1 100); do
+    [[ "$(sed -n 's/.*focused local plugin pane=\([0-9][0-9]*\).*/\1/p' "$CLIENT1_LOG" | tail -1)" == "$TERMINAL_PANE" ]] && break
+    sleep 0.05
+  done
+  [[ "$(sed -n 's/.*focused local plugin pane=\([0-9][0-9]*\).*/\1/p' "$CLIENT1_LOG" | tail -1)" == "$TERMINAL_PANE" ]]
+  capture "$OUT/pure-initial.png"
+
+  COMMIT_BASELINE="$(rg -a -c 'facet native pair committed route=.* actor=terminal-ui ' "$CLIENT1_LOG" || true)"
+  STYLED_DONE="$OUT/pure-styled.done"
+  # Emit the Unicode marker from ASCII shell octal escapes. This exercises the
+  # terminal's UTF-8 decode and wide/combining-cell renderer without depending
+  # on compositor-specific synthetic Unicode key composition.
+  type_line "awk 'BEGIN{for(r=0;r<24;r++){for(c=0;c<80;c++)printf \"\\033[38;5;%dmX\",(r*80+c)%256; print \"\\033[0m\"}}'; printf ' \\316\\273\\344\\270\\255e\\314\\201 __PURE_STYLED__\\n'; touch '$STYLED_DONE'"
+  for _ in $(seq 1 300); do
+    COMMIT_COUNT="$(rg -a -c 'facet native pair committed route=.* actor=terminal-ui ' "$CLIENT1_LOG" || true)"
+    ((COMMIT_COUNT > COMMIT_BASELINE)) && [[ -f "$STYLED_DONE" ]] && break
+    sleep 0.05
+  done
+  ((COMMIT_COUNT > COMMIT_BASELINE)) && [[ -f "$STYLED_DONE" ]]
+  sleep 0.5
+  capture "$OUT/pure-styled-unicode.png"
+
+  PASTE_FILE="$OUT/pure-paste.bin"
+  PASTE_READY="$OUT/pure-paste-ready"
+  AFTER_PASTE_FILE="$OUT/pure-after-paste-key.bin"
+  type_line "printf '\\033[?2004l'; sleep 1; stty raw; touch '$PASTE_READY'; sleep 5; head -c 262144 > '$PASTE_FILE'; head -c 1 > '$AFTER_PASTE_FILE'; stty sane; printf '\\033[?2004h'"
+  for _ in $(seq 1 300); do
+    [[ -f "$PASTE_READY" ]] && break
+    sleep 0.05
+  done
+  [[ -f "$PASTE_READY" ]]
+  python3 - <<'PY' | wayland_env wl-copy
+import sys
+sys.stdout.write('"\\' * (256 * 1024 // 2))
+PY
+  for _ in $(seq 1 100); do
+    [[ "$(wayland_env wl-paste --no-newline | wc -c)" == 262144 ]] && break
+    sleep 0.05
+  done
+  [[ "$(wayland_env wl-paste --no-newline | wc -c)" == 262144 ]]
+  # The client clipboard bridge consumes the compositor offer on its own event
+  # loop after the external wl-copy source is readable.
+  sleep 1
+  PASTE_LOG_START=$(($(wc -l < "$CLIENT1_LOG") + 1))
+  wayland_env "$OUT/virtual-keyboard-key" --ctrl-shift-only 47
+  paste_chunk_sent() {
+    awk -v first="$PASTE_LOG_START" '
+      NR >= first && /presentation actor message .*sender=terminal-ui recipient=terminal-session body=J/ { found = 1 }
+      END { exit !found }
+    ' "$CLIENT1_LOG"
+  }
+  for _ in $(seq 1 100); do
+    paste_chunk_sent && break
+    sleep 0.01
+  done
+  paste_chunk_sent
+  [[ ! -e "$PASTE_FILE" ]]
+  # Queue a real key immediately behind the paste while the PTY reader is
+  # deliberately paused. It must follow all clipboard bytes without overtaking.
+  wayland_env "$OUT/virtual-keyboard-key" --none 44
+  # Clipboard delivery is asynchronous. The two reads verify both exact paste
+  # bytes and ordering before restoring the terminal mode.
+
+  for _ in $(seq 1 300); do
+    [[ -f "$PASTE_FILE" && -f "$AFTER_PASTE_FILE" ]] \
+      && [[ "$(wc -c < "$PASTE_FILE")" == 262144 ]] \
+      && [[ "$(wc -c < "$AFTER_PASTE_FILE")" == 1 ]] && break
+    sleep 0.05
+  done
+  [[ "$(wc -c < "$PASTE_FILE")" == 262144 ]]
+  python3 - "$PASTE_FILE" "$AFTER_PASTE_FILE" <<'PY'
+import pathlib
+import sys
+
+payload = pathlib.Path(sys.argv[1]).read_bytes()
+expected = b'"\\' * (256 * 1024 // 2)
+assert payload == expected, f"unexpected paste bytes: {len(payload)}"
+assert pathlib.Path(sys.argv[2]).read_bytes() == b'z', "key overtook or was lost behind paste"
+PY
+  capture "$OUT/pure-after-paste.png"
+  awk '/VmHWM|VmRSS/ {print}' "/proc/$CLIENT_PID/status" > "$OUT/client-memory.txt"
+  rg -a 'facet render started actor=terminal-ui|facet native pair committed route=.* actor=terminal-ui|visual facet.*terminal-ui' "$CLIENT1_LOG" > "$OUT/pure-facet-evidence.log"
+  ! rg -q 'visual facet.*failed actor=terminal-ui|visual facet failed actor=terminal-ui' "$CLIENT1_LOG"
+  echo "terminal_pure_renderer=verified out=$OUT"
+  exit 0
+fi
 if [[ "$WESTON_DIRECT" != 1 ]]; then
   focus_terminal "$CLIENT1_LOG"
 fi

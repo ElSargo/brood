@@ -93,6 +93,15 @@ static mut ACTIVE_BOUNDARY_AXIS: u8 = 0;
 static mut ACTIVE_BOUNDARY_NEGATIVE_MASK: u64 = 0;
 static mut ACTIVE_BOUNDARY_POSITIVE_MASK: u64 = 0;
 static mut POINTER_BOUNDARY_OFFSET: f32 = 0.0;
+static mut OUTSTANDING_POINTER_REQUEST_ID: u64 = 0;
+static mut OUTSTANDING_POINTER_INTERACTION: u64 = 0;
+static mut HAS_QUEUED_POINTER_RESIZE: bool = false;
+static mut QUEUED_POINTER_INTERACTION: u64 = 0;
+static mut QUEUED_POINTER_EVENT_SEQUENCE: u64 = 0;
+static mut QUEUED_POINTER_BOUNDARY_AXIS: u8 = 0;
+static mut QUEUED_POINTER_NEGATIVE_MASK: u64 = 0;
+static mut QUEUED_POINTER_POSITIVE_MASK: u64 = 0;
+static mut QUEUED_POINTER_COORDINATE: f32 = 0.0;
 static mut NEXT_LAYOUT_REQUEST_ID: u64 = 1;
 static mut CONSUMED_KEYS: [u64; 4] = [0; 4];
 
@@ -367,15 +376,12 @@ pub extern "C" fn brood_policy_provider_key_workspace(
     if focused_keybinding_editor(&state) {
         return OUTPUT_ABSTAIN;
     }
-    if input.modifiers & brood_keybindings::MOD_CTRL != 0
-        && input.modifiers & brood_keybindings::MOD_ALT == 0
-        && focused_raw_control_plugin(&state)
-    {
+    let normal_mode = workspace_input_mode() == INPUT_MODE_NORMAL;
+    let action = matching_action(&state, &input, normal_mode);
+    if raw_control_plugin_should_abstain(&state, &input, action) {
         return OUTPUT_ABSTAIN;
     }
-
-    let normal_mode = workspace_input_mode() == INPUT_MODE_NORMAL;
-    let Some(action) = matching_action(&state, &input, normal_mode) else {
+    let Some(action) = action else {
         return OUTPUT_ABSTAIN;
     };
     mark_consumed_key(input.key_code);
@@ -554,8 +560,13 @@ pub extern "C" fn brood_actor_workspace_epoch_run(
         };
     }
 
-    if handle_synchronized_layout_notification(&message) {
-        return 0;
+    if is_synchronized_layout_notification(&message) {
+        let len = handle_synchronized_layout_notification(output, &message);
+        return if len <= 0 {
+            len as i64
+        } else {
+            pack_actor_outbox(output.as_ptr() as i32, len)
+        };
     }
 
     if message.message_type != "layout-action" {
@@ -1137,6 +1148,21 @@ fn clear_resize_proposals() {
             ids.add(index).write(0);
         }
     }
+    clear_pointer_resize_pacing();
+}
+
+fn clear_pointer_resize_pacing() {
+    unsafe {
+        OUTSTANDING_POINTER_REQUEST_ID = 0;
+        OUTSTANDING_POINTER_INTERACTION = 0;
+        HAS_QUEUED_POINTER_RESIZE = false;
+        QUEUED_POINTER_INTERACTION = 0;
+        QUEUED_POINTER_EVENT_SEQUENCE = 0;
+        QUEUED_POINTER_BOUNDARY_AXIS = 0;
+        QUEUED_POINTER_NEGATIVE_MASK = 0;
+        QUEUED_POINTER_POSITIVE_MASK = 0;
+        QUEUED_POINTER_COORDINATE = 0.0;
+    }
 }
 
 fn reset_layout_geometry(panes: &[u64], pane_backends: &[u64], width: i32, height: i32) {
@@ -1575,9 +1601,16 @@ fn reject_resize_proposal(request_id: u64) {
     rebuild_requested_layout();
 }
 
-fn handle_synchronized_layout_notification(message: &WorkspaceMessage) -> bool {
+fn is_synchronized_layout_notification(message: &WorkspaceMessage) -> bool {
+    matches!(
+        message.message_type.as_str(),
+        "accepted" | "completed" | "degraded" | "rejected" | "aborted" | "superseded"
+    )
+}
+
+fn handle_synchronized_layout_notification(output: &mut [u8], message: &WorkspaceMessage) -> i32 {
     match message.message_type.as_str() {
-        "accepted" => true,
+        "accepted" => 0,
         "completed" | "degraded" => {
             if let Some(epoch) = message.resize_epoch {
                 unsafe {
@@ -1588,15 +1621,86 @@ fn handle_synchronized_layout_notification(message: &WorkspaceMessage) -> bool {
             if let Some(request_id) = message.request_id {
                 commit_resize_proposal(request_id);
             }
-            true
+            finish_pointer_resize_request(output, message.request_id)
         }
         "rejected" | "aborted" | "superseded" => {
             if let Some(request_id) = message.request_id {
                 reject_resize_proposal(request_id);
             }
-            true
+            unsafe {
+                if message.request_id == Some(OUTSTANDING_POINTER_REQUEST_ID) {
+                    let failed_interaction = OUTSTANDING_POINTER_INTERACTION;
+                    if !HAS_QUEUED_POINTER_RESIZE
+                        || QUEUED_POINTER_INTERACTION == failed_interaction
+                    {
+                        clear_pointer_resize_pacing();
+                        return 0;
+                    }
+                    return finish_pointer_resize_request(output, message.request_id);
+                }
+            }
+            0
         }
-        _ => false,
+        _ => 0,
+    }
+}
+
+fn finish_pointer_resize_request(output: &mut [u8], request_id: Option<u64>) -> i32 {
+    unsafe {
+        if request_id != Some(OUTSTANDING_POINTER_REQUEST_ID) {
+            return 0;
+        }
+        OUTSTANDING_POINTER_REQUEST_ID = 0;
+        OUTSTANDING_POINTER_INTERACTION = 0;
+        if !HAS_QUEUED_POINTER_RESIZE {
+            return 0;
+        }
+        let boundary = LayoutBoundary {
+            axis: QUEUED_POINTER_BOUNDARY_AXIS,
+            fixed: 0.0,
+            start: 0.0,
+            end: 0.0,
+            negative_mask: QUEUED_POINTER_NEGATIVE_MASK,
+            positive_mask: QUEUED_POINTER_POSITIVE_MASK,
+        };
+        let fixed = QUEUED_POINTER_COORDINATE;
+        let interaction = QUEUED_POINTER_INTERACTION;
+        let event_sequence = QUEUED_POINTER_EVENT_SEQUENCE;
+        HAS_QUEUED_POINTER_RESIZE = false;
+        apply_boundary(
+            ptr::addr_of_mut!(REQUESTED_LAYOUT).cast::<LayoutTransform>(),
+            LAYOUT_GEOMETRY_PANE_COUNT.min(MAX_PANES),
+            boundary.axis,
+            boundary.negative_mask,
+            boundary.positive_mask,
+            fixed,
+        );
+        let (panes, pane_backends, focus, fullscreen, lease, _) = layout_actor_state();
+        let Some(lease) = lease else { return 0 };
+        let next_request_id = next_layout_request_id();
+        let len = write_synchronized_layout_outbox(
+            output,
+            panes,
+            pane_backends,
+            SynchronizedRequestContext {
+                focus,
+                fullscreen,
+                lease,
+                interaction: Some(interaction),
+                event_sequence: Some(event_sequence),
+                request_id: next_request_id,
+                native_resize_revision: None,
+                use_requested_geometry: true,
+            },
+        );
+        if len > 0 {
+            remember_resize_proposal(next_request_id, boundary, fixed);
+            OUTSTANDING_POINTER_REQUEST_ID = next_request_id;
+            OUTSTANDING_POINTER_INTERACTION = interaction;
+        } else {
+            rebuild_requested_layout();
+        }
+        len
     }
 }
 
@@ -1640,7 +1744,11 @@ fn handle_layout_pointer(output: &mut [u8], message: &WorkspaceMessage) -> i32 {
 
     if phase == "button-press" && message.button == Some(PRIMARY_BUTTON) {
         let mut boundaries = [LayoutBoundary::EMPTY; MAX_LAYOUT_BOUNDARIES];
-        let boundary_count = collect_layout_boundaries(panes, pane_backends, true, &mut boundaries);
+        // A prior transaction may still own requested geometry that has not
+        // been presented. A new capture begins at the durable visible edge.
+        let use_requested = unsafe { OUTSTANDING_POINTER_REQUEST_ID == 0 };
+        let boundary_count =
+            collect_layout_boundaries(panes, pane_backends, use_requested, &mut boundaries);
         let Some(boundary_index) = zone
             .checked_sub(DIVIDER_ZONE_ID)
             .map(|index| index as usize)
@@ -1681,6 +1789,16 @@ fn handle_layout_pointer(output: &mut [u8], message: &WorkspaceMessage) -> i32 {
         return 0;
     }
     if phase == "cancel" {
+        let mut discarded_queued_resize = false;
+        unsafe {
+            if HAS_QUEUED_POINTER_RESIZE && QUEUED_POINTER_INTERACTION == interaction {
+                HAS_QUEUED_POINTER_RESIZE = false;
+                discarded_queued_resize = true;
+            }
+        }
+        if discarded_queued_resize {
+            rebuild_requested_layout();
+        }
         clear_pointer_interaction();
         return 0;
     }
@@ -1720,6 +1838,21 @@ fn handle_layout_pointer(output: &mut [u8], message: &WorkspaceMessage) -> i32 {
         );
         LAST_POINTER_EVENT_SEQUENCE = event_sequence;
     }
+    if unsafe { OUTSTANDING_POINTER_REQUEST_ID != 0 } {
+        unsafe {
+            HAS_QUEUED_POINTER_RESIZE = true;
+            QUEUED_POINTER_INTERACTION = interaction;
+            QUEUED_POINTER_EVENT_SEQUENCE = event_sequence;
+            QUEUED_POINTER_BOUNDARY_AXIS = boundary.axis;
+            QUEUED_POINTER_NEGATIVE_MASK = boundary.negative_mask;
+            QUEUED_POINTER_POSITIVE_MASK = boundary.positive_mask;
+            QUEUED_POINTER_COORDINATE = fixed;
+        }
+        if phase == "button-release" {
+            clear_pointer_interaction();
+        }
+        return 0;
+    }
     let request_id = next_layout_request_id();
     let len = write_synchronized_layout_outbox(
         output,
@@ -1738,6 +1871,10 @@ fn handle_layout_pointer(output: &mut [u8], message: &WorkspaceMessage) -> i32 {
     );
     if len > 0 {
         remember_resize_proposal(request_id, boundary, fixed);
+        unsafe {
+            OUTSTANDING_POINTER_REQUEST_ID = request_id;
+            OUTSTANDING_POINTER_INTERACTION = interaction;
+        }
     } else {
         rebuild_requested_layout();
     }
@@ -2516,6 +2653,17 @@ fn focused_raw_control_plugin(state: &PolicyState) -> bool {
     })
 }
 
+fn raw_control_plugin_should_abstain(
+    state: &PolicyState,
+    input: &KeyInput,
+    action: Option<&Action>,
+) -> bool {
+    input.modifiers & brood_keybindings::MOD_CTRL != 0
+        && input.modifiers & brood_keybindings::MOD_ALT == 0
+        && focused_raw_control_plugin(state)
+        && action.is_none_or(|action| action.category != "Brood")
+}
+
 fn focused_keybinding_editor(state: &PolicyState) -> bool {
     let Some(focused) = state.focused_pane else {
         return false;
@@ -2603,6 +2751,58 @@ mod tests {
         host_payloads(output, len).pop().unwrap()
     }
 
+    #[test]
+    fn raw_control_plugins_keep_plain_ctrl_but_allow_brood_global_shortcuts() {
+        for app_id in ["terminal-ui", "neovim-ui"] {
+            let state: PolicyState = decode_json(
+                format!(r#"{{"focused_pane":7,"app_panes":[{{"pane":7,"app_id":"{app_id}"}}]}}"#)
+                    .as_bytes(),
+            )
+            .unwrap();
+            let open = KeyInput {
+                key_code: brood_keybindings::KEY_SLASH,
+                key_state: KEY_PRESSED,
+                modifiers: brood_keybindings::MOD_CTRL | brood_keybindings::MOD_SHIFT,
+                repeat: false,
+            };
+            let open_action = matching_action(&state, &open, false);
+            assert_eq!(
+                open_action.map(|action| action.id),
+                Some("keybindings.open")
+            );
+            assert!(!raw_control_plugin_should_abstain(
+                &state,
+                &open,
+                open_action
+            ));
+
+            let plain_control = KeyInput {
+                key_code: brood_keybindings::KEY_L,
+                key_state: KEY_PRESSED,
+                modifiers: brood_keybindings::MOD_CTRL,
+                repeat: false,
+            };
+            let plain_action = matching_action(&state, &plain_control, true);
+            assert!(raw_control_plugin_should_abstain(
+                &state,
+                &plain_control,
+                plain_action
+            ));
+
+            let unbound = KeyInput {
+                key_code: 255,
+                key_state: KEY_PRESSED,
+                modifiers: brood_keybindings::MOD_CTRL | brood_keybindings::MOD_SHIFT,
+                repeat: false,
+            };
+            assert!(raw_control_plugin_should_abstain(
+                &state,
+                &unbound,
+                matching_action(&state, &unbound, true)
+            ));
+        }
+    }
+
     fn pointer_message(
         phase: &str,
         position: f64,
@@ -2620,9 +2820,21 @@ mod tests {
         sequence: u64,
         button: Option<u32>,
     ) -> WorkspaceMessage {
+        pointer_message_for_interaction(99, zone, phase, u, v, sequence, button)
+    }
+
+    fn pointer_message_for_interaction(
+        interaction: u64,
+        zone: u64,
+        phase: &str,
+        u: f64,
+        v: f64,
+        sequence: u64,
+        button: Option<u32>,
+    ) -> WorkspaceMessage {
         let button = button.map_or_else(|| "null".into(), |button| button.to_string());
         let json = format!(
-            "{{\"type\":\"layout-pointer\",\"interaction\":99,\"event_sequence\":{sequence},\"lease\":{{\"id\":5,\"generation\":2}},\"zone\":{zone},\"phase\":\"{phase}\",\"position\":{{\"u\":{u},\"v\":{v}}},\"button\":{button},\"modifiers\":0,\"inventory_revision\":7,\"base_layout_revision\":3}}"
+            "{{\"type\":\"layout-pointer\",\"interaction\":{interaction},\"event_sequence\":{sequence},\"lease\":{{\"id\":5,\"generation\":2}},\"zone\":{zone},\"phase\":\"{phase}\",\"position\":{{\"u\":{u},\"v\":{v}}},\"button\":{button},\"modifiers\":0,\"inventory_revision\":7,\"base_layout_revision\":3}}"
         );
         decode_json(json.as_bytes()).unwrap()
     }
@@ -2781,21 +2993,66 @@ mod tests {
             .unwrap();
         assert!((motion_primary_width - 1.4).abs() < 0.01);
 
+        let release_len =
+            handle_layout_pointer(&mut output, &pointer_message("motion", 0.45, 3, None));
+        assert_eq!(release_len, 0, "newer motion coalesces behind request 1");
         let release_len = handle_layout_pointer(
             &mut output,
-            &pointer_message("button-release", 0.5, 3, Some(PRIMARY_BUTTON)),
+            &pointer_message("button-release", 0.5, 4, Some(PRIMARY_BUTTON)),
         );
+        assert_eq!(
+            release_len, 0,
+            "release waits behind the outstanding motion"
+        );
+        assert_eq!(unsafe { OUTSTANDING_POINTER_REQUEST_ID }, 1);
+        assert!(unsafe { HAS_QUEUED_POINTER_RESIZE });
+        assert!(!unsafe { HAS_ACTIVE_POINTER_INTERACTION });
+
+        // A new capture is accepted while the old release waits, but its
+        // offset starts at the durable 0.0 edge rather than the invisible 0.5
+        // target. Cancelling it does not discard the prior interaction's release.
+        assert_eq!(
+            handle_layout_pointer(
+                &mut output,
+                &pointer_message_for_interaction(
+                    100,
+                    DIVIDER_ZONE_ID,
+                    "button-press",
+                    0.5,
+                    0.0,
+                    1,
+                    Some(PRIMARY_BUTTON),
+                ),
+            ),
+            0
+        );
+        assert!(unsafe { HAS_ACTIVE_POINTER_INTERACTION });
+        assert!((unsafe { POINTER_BOUNDARY_OFFSET } + 0.5).abs() < f32::EPSILON);
+        assert_eq!(
+            handle_layout_pointer(
+                &mut output,
+                &pointer_message_for_interaction(100, DIVIDER_ZONE_ID, "cancel", 0.5, 0.0, 2, None,),
+            ),
+            0
+        );
+        assert!(!unsafe { HAS_ACTIVE_POINTER_INTERACTION });
+        assert!(unsafe { HAS_QUEUED_POINTER_RESIZE });
+        assert_eq!(unsafe { QUEUED_POINTER_EVENT_SEQUENCE }, 4);
+
+        let release_len =
+            handle_synchronized_layout_notification(&mut output, &completed_notification(1, 8));
         let release = host_payload(&output, release_len);
         assert_eq!(release["request_id"], 2);
-        assert_eq!(release["event_sequence"], 3);
+        assert_eq!(release["event_sequence"], 4);
         assert_eq!(
             release["fragment"]["layout"]["items"][0]["transform"]["size"]["u"],
             1.5
         );
-        assert!(!unsafe { HAS_ACTIVE_POINTER_INTERACTION });
+        assert_eq!(release["base_layout_revision"], 8);
+        assert_eq!(unsafe { OUTSTANDING_POINTER_REQUEST_ID }, 2);
 
-        // Ordinary actor updates cannot publish the proposed geometry before
-        // the host confirms that the synchronized request was presented.
+        // Request 1 is durable because its completion triggered the queued
+        // release. The still-outstanding release geometry remains private.
         let len = write_layout_actor_update_outbox(
             &mut output,
             &panes,
@@ -2809,18 +3066,27 @@ mod tests {
             Some(7),
         );
         let before_completion = host_payload(&output, len);
-        assert_eq!(
-            before_completion["layout"]["items"][0]["transform"]["size"]["u"],
-            1.0
+        assert!(
+            (before_completion["layout"]["items"][0]["transform"]["size"]["u"]
+                .as_f64()
+                .unwrap()
+                - 1.4)
+                .abs()
+                < 0.01
         );
 
-        assert!(handle_synchronized_layout_notification(
-            &synchronized_notification("superseded", 1)
-        ));
-        assert!(handle_synchronized_layout_notification(
-            &completed_notification(2, 8)
-        ));
-        assert_eq!(unsafe { LAYOUT_BASE_PRESENTED_REVISION }, 8);
+        assert_eq!(
+            handle_synchronized_layout_notification(
+                &mut output,
+                &synchronized_notification("superseded", 1)
+            ),
+            0
+        );
+        assert_eq!(
+            handle_synchronized_layout_notification(&mut output, &completed_notification(2, 9)),
+            0
+        );
+        assert_eq!(unsafe { LAYOUT_BASE_PRESENTED_REVISION }, 9);
         let len = write_layout_actor_update_outbox(
             &mut output,
             &panes,
@@ -2869,9 +3135,13 @@ mod tests {
             0.8,
         );
         remember_resize_proposal(3, boundary, 0.8);
-        assert!(handle_synchronized_layout_notification(
-            &synchronized_notification("rejected", 3)
-        ));
+        assert_eq!(
+            handle_synchronized_layout_notification(
+                &mut output,
+                &synchronized_notification("rejected", 3)
+            ),
+            0
+        );
         assert!((layout_transform(0, &panes, &[1, 1], true).size_u - 1.5).abs() < f32::EPSILON);
         assert!((layout_transform(0, &panes, &[1, 1], false).size_u - 1.5).abs() < f32::EPSILON);
 
@@ -2896,15 +3166,20 @@ mod tests {
             0.4,
         );
         remember_resize_proposal(11, boundary, 0.4);
-        assert!(handle_synchronized_layout_notification(
-            &completed_notification(10, 9)
-        ));
+        assert_eq!(
+            handle_synchronized_layout_notification(&mut output, &completed_notification(10, 9)),
+            0
+        );
         assert_eq!(unsafe { LAYOUT_BASE_PRESENTED_REVISION }, 9);
         assert!((layout_transform(0, &panes, &[1, 1], false).size_u - 1.2).abs() < f32::EPSILON);
         assert!((layout_transform(0, &panes, &[1, 1], true).size_u - 1.4).abs() < f32::EPSILON);
-        assert!(handle_synchronized_layout_notification(
-            &synchronized_notification("rejected", 11)
-        ));
+        assert_eq!(
+            handle_synchronized_layout_notification(
+                &mut output,
+                &synchronized_notification("rejected", 11)
+            ),
+            0
+        );
         unsafe {
             assert!((REQUESTED_LAYOUT[0].size_u - 1.2).abs() < f32::EPSILON);
             apply_boundary(
@@ -2917,9 +3192,22 @@ mod tests {
             );
         }
         remember_resize_proposal(12, boundary, 0.6);
-        assert!(handle_synchronized_layout_notification(
-            &synchronized_notification("aborted", 12)
-        ));
+        unsafe {
+            OUTSTANDING_POINTER_REQUEST_ID = 12;
+            OUTSTANDING_POINTER_INTERACTION = 99;
+            HAS_QUEUED_POINTER_RESIZE = true;
+            QUEUED_POINTER_INTERACTION = 99;
+            QUEUED_POINTER_EVENT_SEQUENCE = 44;
+        }
+        assert_eq!(
+            handle_synchronized_layout_notification(
+                &mut output,
+                &synchronized_notification("aborted", 12)
+            ),
+            0
+        );
+        assert_eq!(unsafe { OUTSTANDING_POINTER_REQUEST_ID }, 0);
+        assert!(!unsafe { HAS_QUEUED_POINTER_RESIZE });
         assert!((layout_transform(0, &panes, &[1, 1], true).size_u - 1.2).abs() < f32::EPSILON);
         assert_native_window_resize_request();
     }
@@ -3004,10 +3292,14 @@ mod tests {
                 Some(PRIMARY_BUTTON),
             ),
         );
+        assert_eq!(release_len, 0);
+        let release_len =
+            handle_synchronized_layout_notification(&mut output, &completed_notification(100, 8));
         assert!(release_len > 0);
-        assert!(handle_synchronized_layout_notification(
-            &completed_notification(101, 8)
-        ));
+        assert_eq!(
+            handle_synchronized_layout_notification(&mut output, &completed_notification(101, 9)),
+            0
+        );
 
         assert_eq!(
             handle_layout_pointer(

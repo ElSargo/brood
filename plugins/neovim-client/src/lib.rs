@@ -4,17 +4,21 @@ use std::{
 };
 
 use brood_graphics::{Color, Command as DrawCommand, Packet, Rect, theme::ashen};
+#[cfg(not(feature = "pure-renderer"))]
+use brood_plugin_sdk::bindings;
+#[cfg(not(feature = "pure-renderer"))]
+use brood_plugin_sdk::graphics::queue_packet_for_resize;
 use brood_plugin_sdk::{
-    bindings,
     brood::plugin::host,
     exports::brood::plugin::actor::{
         Command, Event, Guest, LifecycleEvent, LocalActorMessage, NotificationEvent,
         PresentationEvent, SessionActorMessage, StartContext, WorkerEvent, WorkerRequest,
     },
-    graphics::queue_packet_for_resize,
     input::{MOD_ALT, MOD_CTRL, MOD_SHIFT, MOD_SUPER},
 };
 use serde_json::{Map, Value, json};
+#[cfg(feature = "pure-renderer")]
+mod pure_renderer;
 use sha2::{Digest, Sha256};
 use unicode_width::UnicodeWidthStr;
 
@@ -345,7 +349,7 @@ struct RunnerSave {
     content: Vec<u8>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct Screen {
     revision: u64,
     columns: u16,
@@ -371,7 +375,9 @@ struct LayoutKey {
 
 impl Guest for NeovimClient {
     fn dispatch(event: Event) -> Vec<Command> {
-        match event {
+        let commands = match event {
+            #[cfg(feature = "pure-renderer")]
+            Event::FacetInput(batch) => pure_renderer::handle_input(batch.events),
             Event::Lifecycle(LifecycleEvent::Start(context)) => start(context),
             Event::Lifecycle(LifecycleEvent::Stop(_)) => stop(),
             Event::Presentation(event) => handle_presentation(event),
@@ -388,7 +394,10 @@ impl Guest for NeovimClient {
             }
             Event::Worker(WorkerEvent::Cancelled(worker)) if worker == WORKER => Vec::new(),
             _ => Vec::new(),
-        }
+        };
+        #[cfg(feature = "pure-renderer")]
+        pure_renderer::publish();
+        commands
     }
 
     async fn worker_run(worker: u64, payload: Vec<u8>) -> Result<Vec<u8>, String> {
@@ -538,6 +547,7 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
             }
             redraw_or_record_error(state);
         }
+        #[cfg(not(feature = "pure-renderer"))]
         PresentationEvent::Key(key) if key.pane == state.pane && key.pressed => {
             if let Some(key) = nvim_key(&key.logical_key, key.modifiers)
                 && let Err(error) =
@@ -547,6 +557,7 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
                 redraw_or_record_error(state);
             }
         }
+        #[cfg(not(feature = "pure-renderer"))]
         PresentationEvent::Text(text) if text.pane == state.pane => {
             let filtered = text
                 .text
@@ -560,6 +571,7 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
                 redraw_or_record_error(state);
             }
         }
+        #[cfg(not(feature = "pure-renderer"))]
         PresentationEvent::Paste(paste) if paste.pane == state.pane => {
             if !paste.text.is_empty()
                 && let Err(error) = state.queue_paste(paste.text)
@@ -568,6 +580,7 @@ fn handle_presentation(event: PresentationEvent) -> Vec<Command> {
                 redraw_or_record_error(state);
             }
         }
+        #[cfg(not(feature = "pure-renderer"))]
         PresentationEvent::RenderHint(hint) => {
             if let Err(error) =
                 brood_plugin_sdk::graphics::render_with_hint(&hint, || redraw(state, None))
@@ -1461,6 +1474,12 @@ fn redraw_or_record_error(state: &mut ClientState) {
     redraw_for_resize_or_record_error(state, None);
 }
 
+#[cfg(feature = "pure-renderer")]
+fn redraw_for_resize_or_record_error(_state: &mut ClientState, _resize_epoch: Option<u64>) {
+    // The dispatch boundary publishes the final view after all state changes.
+}
+
+#[cfg(not(feature = "pure-renderer"))]
 fn redraw_for_resize_or_record_error(state: &mut ClientState, resize_epoch: Option<u64>) {
     if state.pane == 0 {
         return;
@@ -1480,6 +1499,7 @@ fn redraw_for_resize_or_record_error(state: &mut ClientState, resize_epoch: Opti
     }
 }
 
+#[cfg(not(feature = "pure-renderer"))]
 fn redraw(state: &mut ClientState, resize_epoch: Option<u64>) -> Result<(), String> {
     let mut layouts = std::mem::take(&mut state.layouts);
     let result = redraw_with_layouts(state, &mut layouts, resize_epoch);
@@ -1487,11 +1507,62 @@ fn redraw(state: &mut ClientState, resize_epoch: Option<u64>) -> Result<(), Stri
     result
 }
 
+struct RenderState<'a> {
+    pane: u64,
+    width: f32,
+    height: f32,
+    cell_width: f32,
+    line_height: f32,
+    focused: bool,
+    screen: Option<&'a Screen>,
+    error: Option<&'a str>,
+    status: &'a str,
+    runner_ready: bool,
+}
+
+#[cfg(not(feature = "pure-renderer"))]
 fn redraw_with_layouts(
     state: &ClientState,
     layouts: &mut BTreeMap<LayoutKey, u64>,
     resize_epoch: Option<u64>,
 ) -> Result<(), String> {
+    let render = RenderState {
+        pane: state.pane,
+        width: state.width,
+        height: state.height,
+        cell_width: state.cell_width,
+        line_height: state.line_height,
+        focused: state.focused,
+        screen: state.screen.as_ref(),
+        error: state.error.as_deref(),
+        status: &state.status,
+        runner_ready: state.runner_ready,
+    };
+    let (packet, used) = build_screen_packet(&render, layouts)?;
+    queue_packet_for_resize(state.pane, resize_epoch, &packet)
+        .map_err(|error| format!("submit Neovim screen: {error}"))?;
+    let stale = layouts
+        .iter()
+        .filter_map(|(key, handle)| (!used.contains(handle)).then_some(key.clone()))
+        .collect::<Vec<_>>();
+    for key in stale {
+        let Some(handle) = layouts.get(&key).copied() else {
+            continue;
+        };
+        if matches!(
+            host::graphics_drop_resource(state.pane, handle),
+            Ok(()) | Err(host::GraphicsError::InvalidResource)
+        ) {
+            layouts.remove(&key);
+        }
+    }
+    Ok(())
+}
+
+fn build_screen_packet(
+    state: &RenderState<'_>,
+    layouts: &mut BTreeMap<LayoutKey, u64>,
+) -> Result<(Packet, BTreeSet<u64>), String> {
     let mut packet = Packet::new();
     let mut used = BTreeSet::new();
     packet.push(DrawCommand::FillRect {
@@ -1564,7 +1635,7 @@ fn redraw_with_layouts(
             )?;
         }
     } else {
-        let heading = state.error.as_deref().unwrap_or(if state.runner_ready {
+        let heading = state.error.unwrap_or(if state.runner_ready {
             "Waiting for Neovim's first screen…"
         } else {
             "Starting local Neovim…"
@@ -1590,7 +1661,7 @@ fn redraw_with_layouts(
                 &mut packet,
                 layouts,
                 &mut used,
-                &state.status,
+                state.status,
                 0x0073_7373,
                 20.0,
                 50.0,
@@ -1619,25 +1690,7 @@ fn redraw_with_layouts(
             (state.width - PADDING * 2.0).max(40.0),
         )?;
     }
-    queue_packet_for_resize(state.pane, resize_epoch, &packet)
-        .map_err(|error| format!("submit Neovim screen: {error}"))?;
-
-    let stale = layouts
-        .iter()
-        .filter_map(|(key, handle)| (!used.contains(handle)).then_some(key.clone()))
-        .collect::<Vec<_>>();
-    for key in stale {
-        let Some(handle) = layouts.get(&key).copied() else {
-            continue;
-        };
-        if matches!(
-            host::graphics_drop_resource(state.pane, handle),
-            Ok(()) | Err(host::GraphicsError::InvalidResource)
-        ) {
-            layouts.remove(&key);
-        }
-    }
-    Ok(())
+    Ok((packet, used))
 }
 
 #[allow(
@@ -2751,7 +2804,10 @@ const fn hex_nibble(byte: u8) -> Option<u8> {
     }
 }
 
+#[cfg(not(feature = "pure-renderer"))]
 bindings::export!(NeovimClient with_types_in bindings);
+#[cfg(feature = "pure-renderer")]
+brood_plugin_sdk::export_visual_plugin!(NeovimClient);
 
 #[cfg(test)]
 mod tests {

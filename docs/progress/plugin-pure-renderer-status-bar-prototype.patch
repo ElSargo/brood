@@ -1,0 +1,217 @@
+diff --git a/plugins/status-bar/Cargo.toml b/plugins/status-bar/Cargo.toml
+index 069dd8c..7522ced 100644
+--- a/plugins/status-bar/Cargo.toml
++++ b/plugins/status-bar/Cargo.toml
+@@ -7,9 +7,14 @@ publish = false
+ [lib]
+ crate-type = ["cdylib"]
+ 
++[features]
++default = []
++pure-renderer = ["brood-plugin-sdk/facets"]
++
+ [dependencies]
+ brood-graphics = { path = "../../crates/brood-graphics" }
+ brood-plugin-sdk = { path = "../../crates/brood-plugin-sdk" }
++brood-protocol = { path = "../../crates/brood-protocol" }
+ serde = { version = "1.0", features = ["derive"] }
+ serde_json = "1.0"
+ 
+diff --git a/plugins/status-bar/src/lib.rs b/plugins/status-bar/src/lib.rs
+index cecce57..b822766 100644
+--- a/plugins/status-bar/src/lib.rs
++++ b/plugins/status-bar/src/lib.rs
+@@ -1,15 +1,18 @@
+ use std::{collections::BTreeMap, sync::Mutex};
+ 
+ use brood_graphics::{Color, Command, Packet, Rect, theme::ashen};
++#[cfg(not(feature = "pure-renderer"))]
++use brood_plugin_sdk::bindings;
++#[cfg(feature = "pure-renderer")]
++use brood_plugin_sdk::{Facets, export_visual_plugin, facet_codec, facets};
+ use brood_plugin_sdk::{
+-    bindings,
+     exports::brood::plugin::actor::{
+         Command as ActorCommand, Event, Guest, LifecycleEvent, LocalActorMessage,
+         PresentationEvent, SessionEvent,
+     },
+     graphics::UiFrame,
+ };
+-use serde::Deserialize;
++use serde::{Deserialize, Serialize};
+ 
+ const STATUS_BAR_ACTOR_ID: &str = "status-bar";
+ const SHELL_ACTOR_ID: &str = "session-switcher";
+@@ -18,7 +21,7 @@ const SURFACE: Color = ashen::SURFACE;
+ const BORDER: Color = ashen::BORDER;
+ const TEXT: Color = ashen::TEXT;
+ 
+-#[derive(Default)]
++#[derive(Clone, Default, Deserialize, Serialize)]
+ struct StatusBackend {
+     session_count: usize,
+     active_session: Option<String>,
+@@ -32,6 +35,7 @@ struct StatusBarState {
+     text_resources: Vec<u64>,
+     error: String,
+     notice: String,
++    render_revision: u64,
+ }
+ 
+ impl StatusBarState {
+@@ -44,16 +48,42 @@ impl StatusBarState {
+             text_resources: Vec::new(),
+             error: String::new(),
+             notice: String::new(),
++            render_revision: 0,
+         }
+     }
+ }
+ 
+ static STATE: Mutex<StatusBarState> = Mutex::new(StatusBarState::new());
++#[cfg(feature = "pure-renderer")]
++static PENDING_PUBLICATION: Mutex<Option<(u64, Vec<u8>)>> = Mutex::new(None);
++
++#[cfg(feature = "pure-renderer")]
++#[derive(Deserialize, Serialize)]
++struct StatusRenderView {
++    backends: BTreeMap<u64, StatusBackend>,
++    error: String,
++    notice: String,
++}
++
++#[cfg(feature = "pure-renderer")]
++struct PublicationTurn;
++
++#[cfg(feature = "pure-renderer")]
++impl Drop for PublicationTurn {
++    fn drop(&mut self) {
++        if let Some((revision, bytes)) = PENDING_PUBLICATION.lock().expect("status publication mutex poisoned").take() {
++            brood_plugin_sdk::publication::publish(revision, &bytes)
++                .unwrap_or_else(|error| panic!("publish status render view: {error:?}"));
++        }
++    }
++}
+ 
+ struct StatusBar;
+ 
+ impl Guest for StatusBar {
+     fn dispatch(event: Event) -> Vec<ActorCommand> {
++        #[cfg(feature = "pure-renderer")]
++        let _publication_turn = PublicationTurn;
+         match event {
+             Event::Lifecycle(LifecycleEvent::Start(context)) => {
+                 if context.instance_id != STATUS_BAR_ACTOR_ID
+@@ -94,6 +124,7 @@ impl Guest for StatusBar {
+                 }
+                 Vec::new()
+             }
++            #[cfg(not(feature = "pure-renderer"))]
+             Event::Presentation(PresentationEvent::RenderHint(hint)) => {
+                 let Ok(mut state) = STATE.lock() else {
+                     return Vec::new();
+@@ -152,6 +183,9 @@ fn redraw_or_record_error(state: &mut StatusBarState) {
+ }
+ 
+ fn redraw_for_resize_or_record_error(state: &mut StatusBarState, resize_epoch: Option<u64>) {
++    #[cfg(feature = "pure-renderer")]
++    let result = publish_view(state);
++    #[cfg(not(feature = "pure-renderer"))]
+     let result = if brood_plugin_sdk::graphics::render_is_active() {
+         redraw(state, resize_epoch)
+     } else {
+@@ -162,6 +196,18 @@ fn redraw_for_resize_or_record_error(state: &mut StatusBarState, resize_epoch: O
+     }
+ }
+ 
++#[cfg(feature = "pure-renderer")]
++fn publish_view(state: &mut StatusBarState) -> Result<(), String> {
++    state.render_revision = state.render_revision.saturating_add(1).max(1);
++    let bytes = serde_json::to_vec(&StatusRenderView {
++        backends: state.backends.clone(),
++        error: state.error.clone(),
++        notice: state.notice.clone(),
++    }).map_err(|error| format!("serialize status render view: {error}"))?;
++    *PENDING_PUBLICATION.lock().map_err(|_| "status publication mutex poisoned".to_string())? = Some((state.render_revision, bytes));
++    Ok(())
++}
++
+ fn redraw(state: &mut StatusBarState, resize_epoch: Option<u64>) -> Result<(), String> {
+     if state.pane == 0 {
+         return Ok(());
+@@ -199,16 +245,22 @@ fn redraw(state: &mut StatusBarState, resize_epoch: Option<u64>) -> Result<(), S
+ }
+ 
+ fn status_bar_text(state: &StatusBarState, width: f32) -> String {
+-    if !state.notice.is_empty() {
+-        return state.notice.clone();
++    status_bar_text_parts(&state.backends, &state.notice, width)
++}
++
++fn status_bar_text_parts(
++    backends: &BTreeMap<u64, StatusBackend>,
++    notice: &str,
++    width: f32,
++) -> String {
++    if !notice.is_empty() {
++        return notice.to_string();
+     }
+-    let session_count = state
+-        .backends
++    let session_count = backends
+         .values()
+         .map(|backend| backend.session_count)
+         .sum::<usize>();
+-    let active = state
+-        .backends
++    let active = backends
+         .values()
+         .find_map(|backend| backend.active_session.as_deref())
+         .unwrap_or("No session");
+@@ -232,6 +284,38 @@ fn status_bar_text(state: &StatusBarState, width: f32) -> String {
+     }
+ }
+ 
++#[cfg(feature = "pure-renderer")]
++impl Facets for StatusBar {
++    fn render(input: Vec<u8>) -> Vec<u8> {
++        let request = facet_codec::decode_render_request(&input, facet_codec::DecodeLimits {
++            max_wire_bytes: input.len(), max_allocated_bytes: input.len().saturating_mul(4).max(4096), max_allocations: 1024,
++        }).expect("valid status render request");
++        let view: StatusRenderView = serde_json::from_slice(&request.application_view).expect("valid status render view");
++        let panes = request.panes.iter().map(|pane| {
++            let width = pane.logical_width as f32;
++            let height = pane.logical_height as f32;
++            let mut packet = Packet::new();
++            packet.push(Command::FillRect { rect: Rect::new(0.0, 0.0, width, height), color: SURFACE });
++            packet.push(Command::FillRect { rect: Rect::new(0.0, 0.0, width, 1.0), color: BORDER });
++            let mut text = brood_plugin_sdk::graphics::TextLayoutCache::new(pane.pane);
++            text.begin_frame();
++            text.draw_text_clipped(&mut packet, &status_bar_text_parts(&view.backends, &view.notice, width), 12.0, width - 24.0, 16.0, TEXT, 12.0, ((height - 16.0) * 0.5).max(3.0)).expect("bounded status text");
++            facets::PaneOutput { pane: pane.pane, content: facets::PaneContent::Draw { packet: packet.encode().expect("status packet"), interaction: Vec::new() } }
++        }).collect();
++        let response = facets::RenderResponse { token: request.token, panes, next_frame_ns: None };
++        let mut output = vec![0; request.limits.max_output_bytes as usize];
++        let len = facet_codec::encode_render_response(&response, &mut output).expect("bounded status response");
++        output.truncate(len); output
++    }
++
++    fn interpret(input: Vec<u8>) -> Vec<u8> {
++        let request = facet_codec::decode_input_request(&input, facet_codec::DecodeLimits { max_wire_bytes: input.len(), max_allocated_bytes: input.len().saturating_mul(2).max(1024), max_allocations: 128 }).expect("valid status input");
++        let response = facets::InputResponse { token: request.token, next_sequence_state: request.sequence_state, events: Vec::new(), requests: Vec::new() };
++        let mut output = vec![0; request.limits.max_output_bytes as usize];
++        let len = facet_codec::encode_input_response(&response, &mut output).expect("bounded status input response"); output.truncate(len); output
++    }
++}
++
+ #[derive(Deserialize)]
+ struct StatusBarNotice {
+     kind: String,
+@@ -270,4 +354,7 @@ mod tests {
+     }
+ }
+ 
++#[cfg(feature = "pure-renderer")]
++export_visual_plugin!(StatusBar);
++#[cfg(not(feature = "pure-renderer"))]
+ bindings::export!(StatusBar with_types_in bindings);

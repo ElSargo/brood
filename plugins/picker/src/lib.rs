@@ -1,18 +1,23 @@
-use std::{collections::VecDeque, sync::Mutex};
+use std::{
+    collections::{HashSet, VecDeque},
+    sync::Mutex,
+};
 
 use brood_graphics::{Color, Command, Packet, Rect, theme::ashen};
+#[cfg(feature = "pure-renderer")]
+use brood_plugin_sdk::{Facets, export_visual_plugin, facet_codec, facets};
 use brood_plugin_sdk::{
     actor::send_local,
-    bindings,
     exports::brood::plugin::actor::{
         Command as ActorCommand, Event, Guest, LifecycleEvent, PresentationEvent, WorkerEvent,
-        WorkerRequest,
     },
     graphics::UiFrame,
     input::BUTTON_PRIMARY as LEFT_BUTTON,
     runtime::sleep,
     text::{truncate, truncate_to_width},
 };
+#[cfg(not(feature = "pure-renderer"))]
+use brood_plugin_sdk::{bindings, exports::brood::plugin::actor::WorkerRequest};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -26,6 +31,9 @@ const QUERY_X: f32 = 150.0;
 const SPINNER_INTERVAL_MS: u64 = 90;
 const MAX_QUEUED_REQUESTS: usize = 64;
 const SCROLL_PIXELS_PER_ROW: f32 = 5.0;
+const MAX_ITEM_ID_BYTES: usize = 8_192;
+#[cfg(feature = "pure-renderer")]
+const MAX_PUBLICATION_BYTES: usize = 8 * 1024 * 1024;
 
 const BG: Color = ashen::BACKGROUND;
 const PANEL: Color = ashen::SURFACE;
@@ -79,8 +87,9 @@ enum PickerMessage {
     Close,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct PickerEntry {
+    id: String,
     index: usize,
     label: String,
     detail: Option<String>,
@@ -89,6 +98,19 @@ struct PickerEntry {
 
 impl PickerEntry {
     fn from_value(index: usize, result: Value) -> Result<Self, String> {
+        let envelope = result.as_object().ok_or_else(|| {
+            "picker items require an object envelope with `id` and `value` fields".to_string()
+        })?;
+        let id = envelope
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty() && id.len() <= MAX_ITEM_ID_BYTES)
+            .ok_or_else(|| format!("picker item `id` must contain 1..={MAX_ITEM_ID_BYTES} bytes"))?
+            .to_string();
+        let result = envelope
+            .get("value")
+            .cloned()
+            .ok_or_else(|| "picker item envelope requires a `value` field".to_string())?;
         let (label, detail) = match &result {
             Value::String(label) => (label.clone(), None),
             Value::Object(object) => {
@@ -113,6 +135,7 @@ impl PickerEntry {
             }
         };
         Ok(Self {
+            id,
             index,
             label,
             detail,
@@ -121,16 +144,17 @@ impl PickerEntry {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct PickerRequest {
     id: u64,
+    #[serde(skip)]
     owner: String,
     title: String,
     placeholder: String,
     items: Vec<PickerEntry>,
     query: String,
     query_cursor: usize,
-    selected: Option<usize>,
+    selected: Option<String>,
     scroll: usize,
     loading: bool,
     loading_label: String,
@@ -147,7 +171,7 @@ impl PickerRequest {
         loading_label: String,
     ) -> Result<Self, String> {
         let entries = parse_entries(0, items)?;
-        let selected = entries.first().map(|entry| entry.index);
+        let selected = entries.first().map(|entry| entry.id.clone());
         Ok(Self {
             id,
             owner,
@@ -165,7 +189,16 @@ impl PickerRequest {
 
     fn add(&mut self, items: Vec<Value>) -> Result<(), String> {
         let start = self.items.len();
-        self.items.extend(parse_entries(start, items)?);
+        let additions = parse_entries(start, items)?;
+        let mut ids = self
+            .items
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect::<HashSet<_>>();
+        if additions.iter().any(|item| !ids.insert(&item.id)) {
+            return Err("picker item IDs must be unique".to_string());
+        }
+        self.items.extend(additions);
         self.ensure_selection();
         Ok(())
     }
@@ -176,7 +209,8 @@ impl PickerRequest {
         loading: bool,
         loading_label: String,
     ) -> Result<(), String> {
-        self.items = parse_entries(0, items)?;
+        let replacement = parse_entries(0, items)?;
+        self.items = replacement;
         self.loading = loading;
         self.loading_label = loading_label;
         self.scroll = 0;
@@ -210,24 +244,26 @@ impl PickerRequest {
 
     fn ensure_selection(&mut self) {
         let filtered = self.filtered_indices();
-        if self.selected.is_some_and(|selected| {
+        if self.selected.as_ref().is_some_and(|selected| {
             filtered
                 .iter()
-                .any(|position| self.items[*position].index == selected)
+                .any(|position| self.items[*position].id == *selected)
         }) {
             self.ensure_selected_visible();
             return;
         }
-        self.selected = filtered.first().map(|position| self.items[*position].index);
+        self.selected = filtered
+            .first()
+            .map(|position| self.items[*position].id.clone());
         self.scroll = 0;
     }
 
     fn ensure_selected_visible(&mut self) {
         let filtered = self.filtered_indices();
-        let Some(position) = self.selected.and_then(|selected| {
+        let Some(position) = self.selected.as_ref().and_then(|selected| {
             filtered
                 .iter()
-                .position(|item| self.items[*item].index == selected)
+                .position(|item| self.items[*item].id == *selected)
         }) else {
             self.scroll = self.scroll.min(filtered.len().saturating_sub(1));
             return;
@@ -283,15 +319,89 @@ struct PickerState {
     next_id: u64,
     active: Option<PickerRequest>,
     queued: VecDeque<PickerRequest>,
+    #[cfg(not(feature = "pure-renderer"))]
     text_resources: Vec<u64>,
     status: String,
     error: bool,
-    hovered: Option<usize>,
-    pressed: Option<usize>,
+    hovered: Option<String>,
+    pressed: Option<String>,
     spinner_phase: usize,
     spinner_worker: Option<SpinnerLease>,
+    #[cfg(not(feature = "pure-renderer"))]
     next_spinner_worker: u64,
     scroll_accumulator: f32,
+}
+
+#[cfg(feature = "pure-renderer")]
+#[derive(Clone, Deserialize, Serialize)]
+struct RenderView {
+    active: Option<PickerRequest>,
+    status: String,
+    error: bool,
+    spinner_phase: usize,
+}
+
+#[cfg(feature = "pure-renderer")]
+#[derive(Default, Deserialize, Serialize)]
+struct InteractionState {
+    picker: Option<u64>,
+    hovered: Option<String>,
+    pressed: Option<String>,
+    selected: Option<String>,
+    scroll_accumulator: f32,
+}
+
+#[cfg(feature = "pure-renderer")]
+#[derive(Deserialize, Serialize)]
+struct InteractionMap {
+    picker: Option<u64>,
+    selected: Option<String>,
+    displayed: Vec<String>,
+    regions: Vec<([f32; 4], String)>,
+}
+
+#[cfg(feature = "pure-renderer")]
+#[derive(Deserialize, Serialize)]
+struct FacetIntent {
+    picker: Option<u64>,
+    target: Option<String>,
+    displayed: Vec<String>,
+    event: facets::InputEvent,
+    activate: bool,
+    navigate: Option<String>,
+    scroll_rows: isize,
+}
+
+#[cfg(feature = "pure-renderer")]
+fn reconcile_sequence(
+    mut sequence: InteractionState,
+    picker: Option<u64>,
+    selected: Option<String>,
+) -> InteractionState {
+    if sequence.picker != picker {
+        sequence = InteractionState {
+            picker,
+            selected,
+            ..InteractionState::default()
+        };
+    }
+    sequence
+}
+
+#[cfg(feature = "pure-renderer")]
+fn navigation_target(displayed: &[String], selected: Option<&str>, down: bool) -> Option<String> {
+    if displayed.is_empty() {
+        return None;
+    }
+    let current = selected
+        .and_then(|id| displayed.iter().position(|candidate| candidate == id))
+        .unwrap_or(0);
+    let next = if down {
+        (current + 1).min(displayed.len() - 1)
+    } else {
+        current.saturating_sub(1)
+    };
+    Some(displayed[next].clone())
 }
 
 impl PickerState {
@@ -303,6 +413,7 @@ impl PickerState {
             next_id: 1,
             active: None,
             queued: VecDeque::new(),
+            #[cfg(not(feature = "pure-renderer"))]
             text_resources: Vec::new(),
             status: String::new(),
             error: false,
@@ -310,6 +421,7 @@ impl PickerState {
             pressed: None,
             spinner_phase: 0,
             spinner_worker: None,
+            #[cfg(not(feature = "pure-renderer"))]
             next_spinner_worker: 1,
             scroll_accumulator: 0.0,
         }
@@ -359,19 +471,24 @@ impl PickerState {
     }
 
     fn start_spinner(&mut self) -> Option<ActorCommand> {
-        if self.spinner_worker.is_some()
-            || !self.active.as_ref().is_some_and(|picker| picker.loading)
+        #[cfg(feature = "pure-renderer")]
+        return None;
+        #[cfg(not(feature = "pure-renderer"))]
         {
-            return None;
+            if self.spinner_worker.is_some()
+                || !self.active.as_ref().is_some_and(|picker| picker.loading)
+            {
+                return None;
+            }
+            let picker = self.active.as_ref()?.id;
+            let worker = self.next_spinner_worker;
+            self.next_spinner_worker = self.next_spinner_worker.checked_add(1)?;
+            self.spinner_worker = Some(SpinnerLease { worker, picker });
+            Some(ActorCommand::SpawnWorker(WorkerRequest {
+                worker,
+                payload: Vec::new(),
+            }))
         }
-        let picker = self.active.as_ref()?.id;
-        let worker = self.next_spinner_worker;
-        self.next_spinner_worker = self.next_spinner_worker.checked_add(1)?;
-        self.spinner_worker = Some(SpinnerLease { worker, picker });
-        Some(ActorCommand::SpawnWorker(WorkerRequest {
-            worker,
-            payload: Vec::new(),
-        }))
     }
 
     fn stop_spinner(&mut self) -> Option<ActorCommand> {
@@ -382,12 +499,16 @@ impl PickerState {
 }
 
 static STATE: Mutex<PickerState> = Mutex::new(PickerState::new());
+#[cfg(feature = "pure-renderer")]
+static PUBLICATION_REVISION: Mutex<u64> = Mutex::new(0);
+#[cfg(feature = "pure-renderer")]
+static LAST_PUBLICATION: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 
 struct PickerActor;
 
 impl Guest for PickerActor {
     fn dispatch(event: Event) -> Vec<ActorCommand> {
-        match event {
+        let commands = match event {
             Event::Lifecycle(LifecycleEvent::Start(_)) => {
                 vec![ActorCommand::LifecycleComplete(Ok(()))]
             }
@@ -395,10 +516,15 @@ impl Guest for PickerActor {
                 vec![ActorCommand::LifecycleComplete(Ok(()))]
             }
             Event::Mailbox(message) => handle_message(&message.sender, &message.body),
+            #[cfg(feature = "pure-renderer")]
+            Event::FacetInput(batch) => handle_facet_input(batch.events),
             Event::Presentation(event) => handle_presentation(event),
             Event::Worker(event) => handle_worker(event),
             _ => Vec::new(),
-        }
+        };
+        #[cfg(feature = "pure-renderer")]
+        publish_render_view();
+        commands
     }
 
     async fn worker_run(_worker: u64, _payload: Vec<u8>) -> Result<Vec<u8>, String> {
@@ -743,15 +869,15 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
         {
             let target = picker_target_at(&state, button.y);
             let commands = if button.pressed {
-                state.hovered = target;
-                state.pressed = target;
+                state.hovered.clone_from(&target);
+                state.pressed.clone_from(&target);
                 if let (Some(target), Some(active)) = (target, state.active.as_mut()) {
                     active.selected = Some(target);
                 }
                 Vec::new()
             } else {
                 let pressed = state.pressed.take();
-                state.hovered = target;
+                state.hovered.clone_from(&target);
                 match (pressed, target) {
                     (Some(pressed), Some(released)) if pressed == released => {
                         select_picker_target(&mut state, pressed)
@@ -786,6 +912,7 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
             redraw_or_record_error(&mut state);
             Vec::new()
         }
+        #[cfg(not(feature = "pure-renderer"))]
         PresentationEvent::RenderHint(hint) => {
             if let Err(error) =
                 brood_plugin_sdk::graphics::render_with_hint(&hint, || redraw(&mut state, None))
@@ -795,6 +922,8 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
             }
             Vec::new()
         }
+        #[cfg(feature = "pure-renderer")]
+        PresentationEvent::RenderHint(_) => Vec::new(),
         _ => Vec::new(),
     }
 }
@@ -851,7 +980,7 @@ fn handle_key(state: &mut PickerState, key: &str) -> Vec<ActorCommand> {
     }
 }
 
-fn picker_target_at(state: &PickerState, y: f32) -> Option<usize> {
+fn picker_target_at(state: &PickerState, y: f32) -> Option<String> {
     if !y.is_finite() {
         return None;
     }
@@ -862,25 +991,25 @@ fn picker_target_at(state: &PickerState, y: f32) -> Option<usize> {
     let active = state.active.as_ref()?;
     let filtered = active.filtered_indices();
     let position = filtered.get(active.scroll + row).copied()?;
-    Some(active.items[position].index)
+    Some(active.items[position].id.clone())
 }
 
-fn set_hovered_target(state: &mut PickerState, target: Option<usize>) -> bool {
+fn set_hovered_target(state: &mut PickerState, target: Option<String>) -> bool {
     if state.hovered == target {
         return false;
     }
-    state.hovered = target;
+    state.hovered.clone_from(&target);
     if let (Some(target), Some(active)) = (target, state.active.as_mut()) {
         active.selected = Some(target);
     }
     true
 }
 
-fn select_picker_target(state: &mut PickerState, target: usize) -> Vec<ActorCommand> {
+fn select_picker_target(state: &mut PickerState, target: String) -> Vec<ActorCommand> {
     let Some(active) = state.active.as_mut() else {
         return Vec::new();
     };
-    if !active.items.iter().any(|item| item.index == target) {
+    if !active.items.iter().any(|item| item.id == target) {
         return Vec::new();
     }
     active.selected = Some(target);
@@ -899,10 +1028,11 @@ fn move_selection(state: &mut PickerState, delta: isize) {
     }
     let current = active
         .selected
+        .as_ref()
         .and_then(|selected| {
             filtered
                 .iter()
-                .position(|position| active.items[*position].index == selected)
+                .position(|position| active.items[*position].id == *selected)
         })
         .unwrap_or_default();
     let next = if delta < 0 {
@@ -910,7 +1040,7 @@ fn move_selection(state: &mut PickerState, delta: isize) {
     } else {
         (current + delta as usize).min(filtered.len() - 1)
     };
-    active.selected = Some(active.items[filtered[next]].index);
+    active.selected = Some(active.items[filtered[next]].id.clone());
     if next < active.scroll {
         active.scroll = next;
     } else if next >= active.scroll + visible_rows {
@@ -922,10 +1052,10 @@ fn select_active(state: &mut PickerState) -> Vec<ActorCommand> {
     let Some(active) = state.active.as_ref() else {
         return Vec::new();
     };
-    let Some(selected) = active.selected else {
+    let Some(selected) = active.selected.as_ref() else {
         return Vec::new();
     };
-    let Some(entry) = active.items.iter().find(|entry| entry.index == selected) else {
+    let Some(entry) = active.items.iter().find(|entry| entry.id == *selected) else {
         return Vec::new();
     };
     let selected_reply = reply(
@@ -934,6 +1064,7 @@ fn select_active(state: &mut PickerState) -> Vec<ActorCommand> {
             message_type: "picker-selected",
             picker: active.id,
             result: entry.result.clone(),
+            item_id: entry.id.clone(),
             index: entry.index,
         },
     );
@@ -973,10 +1104,10 @@ fn ensure_active_selection_visible(state: &mut PickerState) {
         return;
     };
     let filtered = active.filtered_indices();
-    let Some(position) = active.selected.and_then(|selected| {
+    let Some(position) = active.selected.as_ref().and_then(|selected| {
         filtered
             .iter()
-            .position(|item| active.items[*item].index == selected)
+            .position(|item| active.items[*item].id == *selected)
     }) else {
         return;
     };
@@ -988,11 +1119,16 @@ fn ensure_active_selection_visible(state: &mut PickerState) {
 }
 
 fn parse_entries(start: usize, items: Vec<Value>) -> Result<Vec<PickerEntry>, String> {
-    items
+    let entries = items
         .into_iter()
         .enumerate()
         .map(|(offset, item)| PickerEntry::from_value(start + offset, item))
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut ids = HashSet::with_capacity(entries.len());
+    if entries.iter().any(|item| !ids.insert(item.id.as_str())) {
+        return Err("picker item IDs must be unique".to_string());
+    }
+    Ok(entries)
 }
 
 fn char_byte_offset(text: &str, character: usize) -> usize {
@@ -1092,6 +1228,7 @@ struct SelectedReply {
     message_type: &'static str,
     picker: u64,
     result: Value,
+    item_id: String,
     index: usize,
 }
 
@@ -1156,6 +1293,12 @@ fn redraw_for_resize_or_record_error(state: &mut PickerState, resize_epoch: Opti
     if state.pane == 0 {
         return;
     }
+    #[cfg(feature = "pure-renderer")]
+    let result: Result<(), String> = {
+        let _ = resize_epoch;
+        Ok(())
+    };
+    #[cfg(not(feature = "pure-renderer"))]
     let result = if brood_plugin_sdk::graphics::render_is_active() {
         redraw(state, resize_epoch)
     } else {
@@ -1167,7 +1310,14 @@ fn redraw_for_resize_or_record_error(state: &mut PickerState, resize_epoch: Opti
     }
 }
 
+#[cfg(not(feature = "pure-renderer"))]
 fn redraw(state: &mut PickerState, resize_epoch: Option<u64>) -> Result<(), String> {
+    let (packet, frame) = render_picker(state)?;
+    frame.queue(resize_epoch, &packet, &mut state.text_resources)?;
+    Ok(())
+}
+
+fn render_picker(state: &PickerState) -> Result<(Packet, UiFrame), String> {
     let mut packet = Packet::new();
     let mut frame = UiFrame::new(state.pane);
     packet.push(Command::FillRoundedRect {
@@ -1268,9 +1418,9 @@ fn redraw(state: &mut PickerState, resize_epoch: Option<u64>) -> Result<(), Stri
         {
             let item = &active.items[position];
             let y = HEADER_HEIGHT + row as f32 * ROW_HEIGHT;
-            let selected = active.selected == Some(item.index);
-            let pressed = state.pressed == Some(item.index);
-            let hovered = state.hovered == Some(item.index);
+            let selected = active.selected.as_ref() == Some(&item.id);
+            let pressed = state.pressed.as_ref() == Some(&item.id);
+            let hovered = state.hovered.as_ref() == Some(&item.id);
             if pressed || hovered || selected {
                 packet.push(Command::FillRect {
                     rect: Rect::new(0.0, y, state.width, ROW_HEIGHT),
@@ -1364,11 +1514,11 @@ fn redraw(state: &mut PickerState, resize_epoch: Option<u64>) -> Result<(), Stri
             }
         } else if !state.status.is_empty() {
             state.status.clone()
-        } else if let Some(hovered) = state.hovered {
+        } else if let Some(hovered) = &state.hovered {
             let label = active
                 .items
                 .iter()
-                .find(|item| item.index == hovered)
+                .find(|item| item.id == *hovered)
                 .map_or("item", |item| item.label.as_str());
             format!("Click to select {}", truncate(label, 42))
         } else {
@@ -1407,8 +1557,7 @@ fn redraw(state: &mut PickerState, resize_epoch: Option<u64>) -> Result<(), Stri
         width: 1.0,
     });
 
-    frame.queue(resize_epoch, &packet, &mut state.text_resources)?;
-    Ok(())
+    Ok((packet, frame))
 }
 
 fn draw_spinner(packet: &mut Packet, phase: usize, center_y: f32) {
@@ -1503,6 +1652,373 @@ fn draw_highlighted_text(
     Ok(())
 }
 
+#[cfg(feature = "pure-renderer")]
+fn publish_render_view() {
+    let view = {
+        let state = STATE.lock().expect("picker state mutex poisoned");
+        if state.pane == 0 {
+            return;
+        }
+        RenderView {
+            active: state.active.clone(),
+            status: state.status.clone(),
+            error: state.error,
+            spinner_phase: state.spinner_phase,
+        }
+    };
+    let bytes = serde_json::to_vec(&view).expect("serialize picker render view");
+    assert!(
+        bytes.len() <= MAX_PUBLICATION_BYTES,
+        "picker render view exceeds bounded publication cache"
+    );
+    let mut last = LAST_PUBLICATION
+        .lock()
+        .expect("picker publication cache mutex poisoned");
+    if *last == bytes {
+        return;
+    }
+    let mut revision = PUBLICATION_REVISION
+        .lock()
+        .expect("picker publication revision mutex poisoned");
+    let next = revision.checked_add(1).expect("picker revision exhausted");
+    if brood_plugin_sdk::publication::publish(next, &bytes).is_ok() {
+        *revision = next;
+        last.clone_from(&bytes);
+    }
+}
+
+#[cfg(feature = "pure-renderer")]
+fn handle_facet_input(events: Vec<Vec<u8>>) -> Vec<ActorCommand> {
+    let Ok(mut state) = STATE.lock() else {
+        return Vec::new();
+    };
+    let mut commands = Vec::new();
+    for bytes in events {
+        let Ok(intent) = serde_json::from_slice::<FacetIntent>(&bytes) else {
+            state.error = true;
+            state.status = "Invalid picker facet intent".to_string();
+            continue;
+        };
+        if intent.picker != state.active.as_ref().map(|picker| picker.id) {
+            continue;
+        }
+        if let Some(navigate) = intent.navigate.as_ref()
+            && intent.displayed.contains(navigate)
+            && state
+                .active
+                .as_ref()
+                .is_some_and(|picker| picker.items.iter().any(|item| item.id == *navigate))
+            && let Some(active) = state.active.as_mut()
+        {
+            active.selected = Some(navigate.clone());
+            active.ensure_selected_visible();
+        }
+        match intent.event {
+            facets::InputEvent::PointerMotion { .. } => {
+                if intent
+                    .target
+                    .as_ref()
+                    .is_none_or(|target| intent.displayed.contains(target))
+                {
+                    set_hovered_target(&mut state, intent.target);
+                }
+            }
+            facets::InputEvent::PointerButton {
+                button, pressed, ..
+            } if button == LEFT_BUTTON => {
+                if let Some(target) = intent
+                    .target
+                    .filter(|target| intent.displayed.contains(target))
+                    && state
+                        .active
+                        .as_ref()
+                        .is_some_and(|picker| picker.items.iter().any(|item| item.id == target))
+                {
+                    if pressed {
+                        set_hovered_target(&mut state, Some(target));
+                    } else if intent.activate {
+                        commands.extend(select_picker_target(&mut state, target));
+                    }
+                }
+            }
+            facets::InputEvent::PointerScroll { .. } => {
+                let visible_rows = state.visible_rows();
+                let rows = intent.scroll_rows;
+                if let Some(active) = state.active.as_mut() {
+                    let max_scroll = active.filtered_indices().len().saturating_sub(visible_rows);
+                    active.scroll = if rows < 0 {
+                        active
+                            .scroll
+                            .saturating_add(rows.unsigned_abs())
+                            .min(max_scroll)
+                    } else {
+                        active.scroll.saturating_sub(rows as usize)
+                    };
+                }
+            }
+            facets::InputEvent::Key {
+                logical_key,
+                pressed: true,
+                ..
+            } => commands.extend(handle_key(&mut state, &logical_key)),
+            facets::InputEvent::Text { text }
+            | facets::InputEvent::Paste { text }
+            | facets::InputEvent::Composition {
+                text,
+                committed: true,
+            } => {
+                if let Some(active) = state.active.as_mut() {
+                    let inserted = text
+                        .chars()
+                        .filter(|character| !character.is_control())
+                        .collect::<String>();
+                    active.insert_query_text(&inserted);
+                }
+            }
+            facets::InputEvent::Image { .. } => {
+                state.error = true;
+                state.status = "Picker does not accept image input".to_string();
+            }
+            facets::InputEvent::PointerLeave
+            | facets::InputEvent::FocusLost
+            | facets::InputEvent::CaptureLost => {
+                state.hovered = None;
+                state.pressed = None;
+            }
+            _ => {}
+        }
+    }
+    commands
+}
+
+#[cfg(feature = "pure-renderer")]
+impl Facets for PickerActor {
+    fn render(input: Vec<u8>) -> Vec<u8> {
+        let decode = facet_codec::DecodeLimits {
+            max_wire_bytes: input.len(),
+            max_allocated_bytes: input.len().saturating_mul(4).max(4096),
+            max_allocations: 4096,
+        };
+        let request = facet_codec::decode_render_request(&input, decode)
+            .expect("valid picker render request");
+        let view: RenderView =
+            serde_json::from_slice(&request.application_view).expect("valid picker render view");
+        let mut interaction_state: InteractionState =
+            serde_json::from_slice(&request.sequence_state).unwrap_or_default();
+        let view_picker = view.active.as_ref().map(|picker| picker.id);
+        interaction_state = reconcile_sequence(
+            interaction_state,
+            view_picker,
+            view.active
+                .as_ref()
+                .and_then(|picker| picker.selected.clone()),
+        );
+        interaction_state.selected = view
+            .active
+            .as_ref()
+            .and_then(|picker| picker.selected.clone());
+        let panes = request
+            .panes
+            .iter()
+            .map(|pane| {
+                let mut state = PickerState::new();
+                state.pane = pane.pane;
+                state.width = (pane.logical_width as f32).max(320.0);
+                state.height = (pane.logical_height as f32).max(240.0);
+                state.active = view.active.clone();
+                state.status = view.status.clone();
+                state.error = view.error;
+                state.hovered = interaction_state.hovered.clone();
+                state.pressed = interaction_state.pressed.clone();
+                state.scroll_accumulator = interaction_state.scroll_accumulator;
+                state.spinner_phase =
+                    ((request.target_time_ns / (SPINNER_INTERVAL_MS * 1_000_000)) % 8) as usize;
+                let (packet, resources) = render_picker(&state).expect("bounded picker rendering");
+                resources.finish_facet();
+                let (displayed, regions) = state.active.as_ref().map_or_else(
+                    || (Vec::new(), Vec::new()),
+                    |active| {
+                        let filtered = active.filtered_indices();
+                        let rows = state.visible_rows();
+                        let displayed = filtered
+                            .iter()
+                            .map(|position| active.items[*position].id.clone())
+                            .collect::<Vec<_>>();
+                        let regions = filtered
+                            .iter()
+                            .skip(active.scroll)
+                            .take(rows)
+                            .enumerate()
+                            .map(|(row, position)| {
+                                (
+                                    [
+                                        0.0,
+                                        HEADER_HEIGHT + row as f32 * ROW_HEIGHT,
+                                        state.width,
+                                        ROW_HEIGHT,
+                                    ],
+                                    active.items[*position].id.clone(),
+                                )
+                            })
+                            .collect();
+                        (displayed, regions)
+                    },
+                );
+                let interaction = serde_json::to_vec(&InteractionMap {
+                    picker: state.active.as_ref().map(|picker| picker.id),
+                    selected: state
+                        .active
+                        .as_ref()
+                        .and_then(|picker| picker.selected.clone()),
+                    displayed,
+                    regions,
+                })
+                .expect("serialize picker interaction map");
+                facets::PaneOutput {
+                    pane: pane.pane,
+                    content: facets::PaneContent::Draw {
+                        packet: packet.encode().expect("valid picker packet"),
+                        interaction,
+                    },
+                }
+            })
+            .collect();
+        let response = facets::RenderResponse {
+            token: request.token,
+            panes,
+            next_frame_ns: view
+                .active
+                .as_ref()
+                .is_some_and(|picker| picker.loading)
+                .then_some(
+                    request
+                        .target_time_ns
+                        .saturating_add(SPINNER_INTERVAL_MS * 1_000_000),
+                ),
+        };
+        facet_codec::encode_render_response_owned(
+            &response,
+            request.limits.max_output_bytes as usize,
+        )
+        .expect("bounded picker render response")
+    }
+
+    fn interpret(input: Vec<u8>) -> Vec<u8> {
+        let decode = facet_codec::DecodeLimits {
+            max_wire_bytes: input.len(),
+            max_allocated_bytes: input.len().saturating_mul(4).max(4096),
+            max_allocations: 4096,
+        };
+        let request =
+            facet_codec::decode_input_request(&input, decode).expect("valid picker input request");
+        let map: InteractionMap =
+            serde_json::from_slice(&request.interaction).expect("valid picker interaction map");
+        let mut sequence: InteractionState =
+            serde_json::from_slice(&request.sequence_state).unwrap_or_default();
+        sequence = reconcile_sequence(sequence, map.picker, map.selected.clone());
+        sequence.selected.clone_from(&map.selected);
+        let point = match &request.event {
+            facets::InputEvent::PointerMotion { x, y }
+            | facets::InputEvent::PointerButton { x, y, .. }
+            | facets::InputEvent::PointerScroll { x, y, .. } => Some((*x as f32, *y as f32)),
+            _ => None,
+        };
+        let target = point.and_then(|(x, y)| {
+            map.regions
+                .iter()
+                .find(|(rect, _)| {
+                    x >= rect[0] && x < rect[0] + rect[2] && y >= rect[1] && y < rect[1] + rect[3]
+                })
+                .map(|(_, id)| id.clone())
+        });
+        let mut activate = false;
+        let mut navigate = None;
+        let mut scroll_rows = 0;
+        match &request.event {
+            facets::InputEvent::PointerMotion { .. } => sequence.hovered.clone_from(&target),
+            facets::InputEvent::PointerButton {
+                button,
+                pressed: true,
+                ..
+            } if *button == LEFT_BUTTON => {
+                sequence.hovered.clone_from(&target);
+                sequence.pressed.clone_from(&target);
+                sequence.selected.clone_from(&target);
+            }
+            facets::InputEvent::PointerButton {
+                button,
+                pressed: false,
+                ..
+            } if *button == LEFT_BUTTON => {
+                sequence.hovered.clone_from(&target);
+                activate = sequence.pressed == target && target.is_some();
+                if activate {
+                    sequence.selected.clone_from(&target);
+                }
+                sequence.pressed = None;
+            }
+            facets::InputEvent::Key {
+                logical_key,
+                pressed: true,
+                ..
+            } if logical_key == "ArrowUp" || logical_key == "ArrowDown" => {
+                if let Some(next) = navigation_target(
+                    &map.displayed,
+                    sequence.selected.as_deref(),
+                    logical_key == "ArrowDown",
+                ) {
+                    navigate = Some(next);
+                    sequence.selected.clone_from(&navigate);
+                }
+            }
+            facets::InputEvent::Key {
+                logical_key,
+                pressed: true,
+                ..
+            } if matches!(logical_key.as_str(), "Enter" | "Return" | "NumpadEnter") => {
+                navigate.clone_from(&sequence.selected);
+                activate = navigate.is_some();
+            }
+            facets::InputEvent::PointerScroll { vertical, .. } => {
+                sequence.scroll_accumulator += *vertical as f32;
+                scroll_rows =
+                    (sequence.scroll_accumulator / SCROLL_PIXELS_PER_ROW).trunc() as isize;
+                sequence.scroll_accumulator -= scroll_rows as f32 * SCROLL_PIXELS_PER_ROW;
+            }
+            facets::InputEvent::PointerLeave
+            | facets::InputEvent::FocusLost
+            | facets::InputEvent::CaptureLost => {
+                sequence.hovered = None;
+                sequence.pressed = None;
+            }
+            _ => {}
+        }
+        let event = serde_json::to_vec(&FacetIntent {
+            picker: map.picker,
+            target,
+            displayed: map.displayed,
+            event: request.event,
+            activate,
+            navigate,
+            scroll_rows,
+        })
+        .expect("serialize picker facet intent");
+        let next_sequence_state =
+            serde_json::to_vec(&sequence).expect("serialize picker sequence state");
+        let response = facets::InputResponse {
+            token: request.token,
+            next_sequence_state,
+            events: vec![event],
+            requests: vec![facets::HostRequest::Render],
+        };
+        facet_codec::encode_input_response_owned(
+            &response,
+            request.limits.max_output_bytes as usize,
+        )
+        .expect("bounded picker input response")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1514,7 +2030,11 @@ mod tests {
             owner.to_string(),
             String::new(),
             String::new(),
-            labels.iter().map(|label| json!(label)).collect(),
+            labels
+                .iter()
+                .enumerate()
+                .map(|(index, label)| json!({"id": format!("item-{index}"), "value": label}))
+                .collect(),
             false,
             String::new(),
         )
@@ -1567,7 +2087,10 @@ mod tests {
     fn streamed_items_keep_append_order_indices() {
         let mut picker = request(7, "caller", &["alpha"]);
         picker
-            .add(vec![json!({"label":"beta","value":2}), json!("gamma")])
+            .add(vec![
+                json!({"id":"beta", "value":{"label":"beta","value":2}}),
+                json!({"id":"gamma", "value":"gamma"}),
+            ])
             .expect("append picker items");
         assert_eq!(
             picker
@@ -1608,6 +2131,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "pure-renderer"))]
     #[test]
     fn promoting_a_picker_cancels_the_old_spinner_and_leases_a_new_one() {
         let mut state = PickerState::new();
@@ -1641,7 +2165,7 @@ mod tests {
         let mut picker = request(1, "caller", &["alpha", "beta", "alpine"]);
         picker.query = "bt".to_string();
         picker.ensure_selection();
-        assert_eq!(picker.selected, Some(1));
+        assert_eq!(picker.selected.as_deref(), Some("item-1"));
     }
 
     #[test]
@@ -1651,15 +2175,18 @@ mod tests {
         state.active = Some(request(1, "caller", &["alpha", "beta", "gamma"]));
         assert_eq!(
             picker_target_at(&state, HEADER_HEIGHT + ROW_HEIGHT + 1.0),
-            Some(1)
+            Some("item-1".to_string())
         );
-        assert!(set_hovered_target(&mut state, Some(1)));
-        assert_eq!(state.hovered, Some(1));
+        assert!(set_hovered_target(&mut state, Some("item-1".to_string())));
+        assert_eq!(state.hovered.as_deref(), Some("item-1"));
         assert_eq!(
-            state.active.as_ref().and_then(|picker| picker.selected),
-            Some(1)
+            state
+                .active
+                .as_ref()
+                .and_then(|picker| picker.selected.as_deref()),
+            Some("item-1")
         );
-        assert!(!set_hovered_target(&mut state, Some(1)));
+        assert!(!set_hovered_target(&mut state, Some("item-1".to_string())));
     }
 
     #[test]
@@ -1671,14 +2198,17 @@ mod tests {
                 "caller".to_string(),
                 "Choose".to_string(),
                 String::new(),
-                vec![json!("alpha"), json!({"label":"beta","value":{"id":42}})],
+                vec![
+                    json!({"id":"alpha", "value":"alpha"}),
+                    json!({"id":"beta", "value":{"label":"beta","value":{"id":42}}}),
+                ],
                 false,
                 String::new(),
             )
             .expect("valid picker request"),
         );
         if let Some(active) = state.active.as_mut() {
-            active.selected = Some(1);
+            active.selected = Some("beta".to_string());
         }
         let commands = select_active(&mut state);
         let Some(ActorCommand::SendLocalMessage(message)) = commands.first() else {
@@ -1689,6 +2219,7 @@ mod tests {
         assert_eq!(body["type"], "picker-selected");
         assert_eq!(body["picker"], 9);
         assert_eq!(body["index"], 1);
+        assert_eq!(body["item_id"], "beta");
         assert_eq!(body["result"]["value"]["id"], 42);
     }
 
@@ -1707,15 +2238,111 @@ mod tests {
         picker.query = "loc".to_string();
         picker
             .update(
-                vec![json!({"label":"Local","value":{"backend":1}})],
+                vec![json!({"id":"backend:1", "value":{"label":"Local","value":{"backend":1}}})],
                 false,
                 String::new(),
             )
             .expect("replace picker results");
         assert!(!picker.loading);
         assert_eq!(picker.query, "loc");
-        assert_eq!(picker.selected, Some(0));
+        assert_eq!(picker.selected.as_deref(), Some("backend:1"));
+    }
+
+    #[test]
+    fn update_preserves_selected_identity_across_reorder_and_rejects_removed_identity() {
+        let mut picker = request(5, "caller", &["alpha", "beta"]);
+        picker.selected = Some("item-1".to_string());
+        picker
+            .update(
+                vec![
+                    json!({"id":"item-1", "value":"beta"}),
+                    json!({"id":"item-0", "value":"alpha"}),
+                ],
+                false,
+                String::new(),
+            )
+            .unwrap();
+        assert_eq!(picker.selected.as_deref(), Some("item-1"));
+        picker
+            .update(
+                vec![json!({"id":"item-0", "value":"alpha"})],
+                false,
+                String::new(),
+            )
+            .unwrap();
+        assert_eq!(picker.selected.as_deref(), Some("item-0"));
+    }
+
+    #[test]
+    fn duplicate_update_is_transactional() {
+        let mut picker = request(6, "caller", &["alpha"]);
+        let error = picker
+            .update(
+                vec![
+                    json!({"id":"duplicate", "value":"one"}),
+                    json!({"id":"duplicate", "value":"two"}),
+                ],
+                false,
+                String::new(),
+            )
+            .unwrap_err();
+        assert_eq!(error, "picker item IDs must be unique");
+        assert_eq!(picker.items.len(), 1);
+        assert_eq!(picker.items[0].id, "item-0");
+    }
+
+    #[cfg(feature = "pure-renderer")]
+    #[test]
+    fn facet_navigation_uses_committed_order_and_stable_identity() {
+        let committed = vec!["c".to_string(), "a".to_string(), "b".to_string()];
+        assert_eq!(
+            navigation_target(&committed, Some("a"), true).as_deref(),
+            Some("b")
+        );
+        assert_eq!(
+            navigation_target(&committed, Some("a"), false).as_deref(),
+            Some("c")
+        );
+        let reordered_current = ["b", "c", "a"];
+        assert_eq!(
+            navigation_target(&committed, Some("a"), true)
+                .filter(|id| reordered_current.contains(&id.as_str()))
+                .as_deref(),
+            Some("b")
+        );
+        let removed_current = ["c", "a"];
+        assert!(
+            navigation_target(&committed, Some("a"), true)
+                .filter(|id| removed_current.contains(&id.as_str()))
+                .is_none()
+        );
+    }
+
+    #[cfg(feature = "pure-renderer")]
+    #[test]
+    fn facet_sequence_is_scoped_to_picker_and_retry_is_deterministic() {
+        let sequence = InteractionState {
+            picker: Some(7),
+            hovered: Some("same-id".to_string()),
+            pressed: Some("same-id".to_string()),
+            selected: Some("same-id".to_string()),
+            scroll_accumulator: 3.0,
+        };
+        let reset = reconcile_sequence(sequence, Some(8), Some("new".to_string()));
+        assert_eq!(reset.picker, Some(8));
+        assert_eq!(reset.selected.as_deref(), Some("new"));
+        assert!(reset.hovered.is_none() && reset.pressed.is_none());
+        assert_eq!(reset.scroll_accumulator, 0.0);
+
+        let displayed = vec!["first".to_string(), "second".to_string()];
+        assert_eq!(
+            navigation_target(&displayed, Some("first"), true),
+            navigation_target(&displayed, Some("first"), true)
+        );
     }
 }
 
+#[cfg(feature = "pure-renderer")]
+export_visual_plugin!(PickerActor);
+#[cfg(not(feature = "pure-renderer"))]
 bindings::export!(PickerActor with_types_in bindings);

@@ -722,7 +722,22 @@ interface actor {
         render-hint(render-hint),
     }
 
+    /// One atomically admitted semantic result from a committed input frame.
+    /// The actor validates stable intent against current application state.
+    record facet-input-batch {
+        client-generation: u64,
+        actor-generation: u64,
+        facet-generation: u64,
+        input-sequence: u64,
+        frame: u64,
+        pane: u64,
+        snapshot-revision: u64,
+        sequence-revision: u64,
+        events: list<list<u8>>,
+    }
+
     variant event {
+        facet-input(facet-input-batch),
         mailbox(mailbox-message),
         completion(completion),
         worker(worker-event),
@@ -790,4 +805,29 @@ interface actor {
 world brood-plugin {
     import host;
     export actor;
+}
+
+/// Bounded publication channel from a pure render facet to its owning host.
+interface render-publication {
+    enum publication-error {
+        unavailable,
+        invalid-revision,
+        limit-reached,
+        invalidated,
+    }
+
+    publish: func(revision: u64, bytes: list<u8>) -> result<_, publication-error>;
+}
+
+/// Optional pure computations exported by visual plugins. Payloads remain
+/// opaque until the renderer protocol is finalized.
+interface facets {
+    render: func(input: list<u8>) -> list<u8>;
+    interpret: func(input: list<u8>) -> list<u8>;
+}
+
+world brood-visual-plugin {
+    include brood-plugin;
+    import render-publication;
+    export facets;
 }

@@ -2,9 +2,12 @@ use std::{collections::BTreeMap, sync::Mutex};
 
 use brood_graphics::{Color, Command, Packet, Rect, theme::ashen};
 use brood_keybindings::{ACTIONS, Action, Binding, MOD_ALT, MOD_CTRL, MOD_SHIFT, MOD_SUPER};
+#[cfg(not(feature = "pure-renderer"))]
+use brood_plugin_sdk::bindings;
+#[cfg(feature = "pure-renderer")]
+use brood_plugin_sdk::{Facets, export_visual_plugin, facet_codec, facets};
 use brood_plugin_sdk::{
     actor::send_local,
-    bindings,
     exports::brood::plugin::actor::{
         Command as ActorCommand, Event, Guest, LifecycleEvent, PresentationEvent,
     },
@@ -21,6 +24,8 @@ const PANEL_HEIGHT: f32 = 190.0;
 const PANEL_MARGIN: f32 = 16.0;
 const SIDE_MARGIN: f32 = 20.0;
 const RADIUS: f32 = 9.0;
+#[cfg(feature = "pure-renderer")]
+const MAX_PUBLICATION_BYTES: usize = 1024 * 1024;
 
 const BG: Color = ashen::BACKGROUND;
 const PANEL_RAISED: Color = ashen::SURFACE_RAISED;
@@ -63,7 +68,7 @@ enum KeybindingsMessage {
     },
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct BindingOverride {
     action: String,
     key_code: i32,
@@ -91,6 +96,12 @@ struct PickerRequest {
 
 #[derive(Serialize)]
 struct PickerItem {
+    id: &'static str,
+    value: PickerItemBody,
+}
+
+#[derive(Serialize)]
+struct PickerItemBody {
     label: &'static str,
     detail: String,
     value: PickerItemValue,
@@ -161,7 +172,81 @@ struct KeybindingsState {
     status: String,
     error: bool,
     backdrop_pressed: bool,
+    #[cfg(not(feature = "pure-renderer"))]
     text_resources: Vec<u64>,
+}
+
+#[cfg(feature = "pure-renderer")]
+#[derive(Deserialize, Serialize)]
+struct RenderView {
+    visible: bool,
+    capture_action: Option<String>,
+    bindings: Vec<BindingOverride>,
+    status: String,
+    error: bool,
+}
+
+#[cfg(feature = "pure-renderer")]
+#[derive(Default, Deserialize, Serialize)]
+struct InteractionState {
+    capture_action: Option<String>,
+    backdrop_pressed: bool,
+}
+
+#[cfg(feature = "pure-renderer")]
+#[derive(Deserialize, Serialize)]
+enum FacetIntent {
+    Event {
+        capture_action: Option<String>,
+        event: facets::InputEvent,
+        close_backdrop: bool,
+    },
+}
+
+#[cfg(feature = "pure-renderer")]
+impl KeybindingsState {
+    fn render_view(&self) -> RenderView {
+        RenderView {
+            visible: self.visible,
+            capture_action: self.capture_action().map(|action| action.id.to_string()),
+            bindings: self
+                .bindings
+                .iter()
+                .map(|(action, binding)| BindingOverride {
+                    action: action.clone(),
+                    key_code: binding.key_code,
+                    modifiers: binding.modifiers,
+                })
+                .collect(),
+            status: self.status.clone(),
+            error: self.error,
+        }
+    }
+
+    fn from_render_view(view: RenderView, pane: u64, width: f32, height: f32) -> Self {
+        let mut state = Self::new();
+        state.pane = pane;
+        state.width = width;
+        state.height = height;
+        state.visible = view.visible;
+        state.capture = view
+            .capture_action
+            .as_deref()
+            .and_then(|id| ACTIONS.iter().position(|action| action.id == id));
+        state.bindings = view
+            .bindings
+            .into_iter()
+            .map(|binding| {
+                (
+                    binding.action,
+                    Binding::new(binding.key_code, binding.modifiers),
+                )
+            })
+            .collect();
+        state.status = view.status;
+        state.error = view.error;
+        state
+    }
 }
 
 impl KeybindingsState {
@@ -179,6 +264,7 @@ impl KeybindingsState {
             status: String::new(),
             error: false,
             backdrop_pressed: false,
+            #[cfg(not(feature = "pure-renderer"))]
             text_resources: Vec::new(),
         }
     }
@@ -193,6 +279,10 @@ impl KeybindingsState {
 }
 
 static STATE: Mutex<Option<KeybindingsState>> = Mutex::new(None);
+#[cfg(feature = "pure-renderer")]
+static PUBLICATION_REVISION: Mutex<u64> = Mutex::new(0);
+#[cfg(feature = "pure-renderer")]
+static LAST_PUBLICATION: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 
 struct KeybindingsActor;
 
@@ -202,7 +292,7 @@ impl Guest for KeybindingsActor {
             return Vec::new();
         };
         let state = slot.get_or_insert_with(KeybindingsState::new);
-        match event {
+        let commands = match event {
             Event::Lifecycle(LifecycleEvent::Start(_)) => {
                 vec![ActorCommand::LifecycleComplete(Ok(()))]
             }
@@ -210,9 +300,14 @@ impl Guest for KeybindingsActor {
                 vec![ActorCommand::LifecycleComplete(Ok(()))]
             }
             Event::Mailbox(message) => handle_message(state, &message.sender, &message.body),
+            #[cfg(feature = "pure-renderer")]
+            Event::FacetInput(batch) => handle_facet_input(state, batch.events),
             Event::Presentation(event) => handle_presentation(state, event),
             _ => Vec::new(),
-        }
+        };
+        #[cfg(feature = "pure-renderer")]
+        publish_render_view(state);
+        commands
     }
 
     async fn worker_run(_worker: u64, _payload: Vec<u8>) -> Result<Vec<u8>, String> {
@@ -296,15 +391,18 @@ fn open_action_picker(state: &mut KeybindingsState) -> Option<ActorCommand> {
     let items = ACTIONS
         .iter()
         .map(|action| PickerItem {
-            label: action.title,
-            detail: format!(
-                "{} · {} · {} · {}",
-                action.category,
-                action.scope.label(),
-                binding_label(state.binding(action)),
-                action.id
-            ),
-            value: PickerItemValue { action: action.id },
+            id: action.id,
+            value: PickerItemBody {
+                label: action.title,
+                detail: format!(
+                    "{} · {} · {} · {}",
+                    action.category,
+                    action.scope.label(),
+                    binding_label(state.binding(action)),
+                    action.id
+                ),
+                value: PickerItemValue { action: action.id },
+            },
         })
         .collect();
     let body = serde_json::to_vec(&PickerRequest {
@@ -402,6 +500,7 @@ fn handle_presentation(
                 Vec::new()
             }
         }
+        #[cfg(not(feature = "pure-renderer"))]
         PresentationEvent::RenderHint(hint) => {
             if let Err(error) =
                 brood_plugin_sdk::graphics::render_with_hint(&hint, || redraw(state, None))
@@ -411,6 +510,8 @@ fn handle_presentation(
             }
             Vec::new()
         }
+        #[cfg(feature = "pure-renderer")]
+        PresentationEvent::RenderHint(_) => Vec::new(),
         _ => Vec::new(),
     }
 }
@@ -575,6 +676,12 @@ fn redraw_for_resize_or_record_error(state: &mut KeybindingsState, resize_epoch:
     if state.pane == 0 {
         return;
     }
+    #[cfg(feature = "pure-renderer")]
+    let result: Result<(), String> = {
+        let _ = resize_epoch;
+        Ok(())
+    };
+    #[cfg(not(feature = "pure-renderer"))]
     let result = if brood_plugin_sdk::graphics::render_is_active() {
         redraw(state, resize_epoch)
     } else {
@@ -586,7 +693,14 @@ fn redraw_for_resize_or_record_error(state: &mut KeybindingsState, resize_epoch:
     }
 }
 
+#[cfg(not(feature = "pure-renderer"))]
 fn redraw(state: &mut KeybindingsState, resize_epoch: Option<u64>) -> Result<(), String> {
+    let (packet, frame) = render_keybindings(state)?;
+    frame.queue(resize_epoch, &packet, &mut state.text_resources)?;
+    Ok(())
+}
+
+fn render_keybindings(state: &KeybindingsState) -> Result<(Packet, UiFrame), String> {
     let panel = state.panel();
     let mut packet = Packet::new();
     let mut frame = UiFrame::new(state.pane);
@@ -694,8 +808,7 @@ fn redraw(state: &mut KeybindingsState, resize_epoch: Option<u64>) -> Result<(),
         panel.width - SIDE_MARGIN * 2.0,
     )?;
 
-    frame.queue(resize_epoch, &packet, &mut state.text_resources)?;
-    Ok(())
+    Ok((packet, frame))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -716,9 +829,291 @@ fn add_text(
     Ok(())
 }
 
+#[cfg(feature = "pure-renderer")]
+fn publish_render_view(state: &KeybindingsState) {
+    if state.pane == 0 {
+        return;
+    }
+    let bytes =
+        serde_json::to_vec(&state.render_view()).expect("serialize keybindings render view");
+    assert!(
+        bytes.len() <= MAX_PUBLICATION_BYTES,
+        "keybindings render view exceeds bounded publication cache"
+    );
+    let mut last = LAST_PUBLICATION
+        .lock()
+        .expect("keybindings publication cache mutex poisoned");
+    if *last == bytes {
+        return;
+    }
+    let mut revision = PUBLICATION_REVISION
+        .lock()
+        .expect("keybindings publication revision mutex poisoned");
+    let next = revision
+        .checked_add(1)
+        .expect("keybindings revision exhausted");
+    if brood_plugin_sdk::publication::publish(next, &bytes).is_ok() {
+        *revision = next;
+        last.clone_from(&bytes);
+    }
+}
+
+#[cfg(feature = "pure-renderer")]
+fn handle_facet_input(state: &mut KeybindingsState, events: Vec<Vec<u8>>) -> Vec<ActorCommand> {
+    let mut commands = Vec::new();
+    for bytes in events {
+        let Ok(FacetIntent::Event {
+            capture_action,
+            event,
+            close_backdrop,
+        }) = serde_json::from_slice(&bytes)
+        else {
+            state.error = true;
+            state.status = "Invalid keybindings facet intent".to_string();
+            continue;
+        };
+        if capture_action.as_deref() != state.capture_action().map(|action| action.id) {
+            continue;
+        }
+        if close_backdrop {
+            commands.extend(close_editor(state));
+            continue;
+        }
+        if let facets::InputEvent::Key {
+            code,
+            logical_key,
+            modifiers,
+            pressed: true,
+            repeat: false,
+        } = &event
+            && state.capture.is_some()
+        {
+            commands.extend(capture_key(
+                state,
+                *code,
+                logical_key,
+                i32::try_from(*modifiers).unwrap_or(i32::MAX),
+            ));
+        } else if matches!(
+            event,
+            facets::InputEvent::Text { .. }
+                | facets::InputEvent::Paste { .. }
+                | facets::InputEvent::Image { .. }
+                | facets::InputEvent::Composition { .. }
+        ) {
+            state.error = true;
+            state.status = "Shortcut capture requires a physical keyboard event".to_string();
+        }
+    }
+    commands
+}
+
+#[cfg(feature = "pure-renderer")]
+impl Facets for KeybindingsActor {
+    fn render(input: Vec<u8>) -> Vec<u8> {
+        let limits = facet_codec::DecodeLimits {
+            max_wire_bytes: input.len(),
+            max_allocated_bytes: input.len().saturating_mul(4).max(4096),
+            max_allocations: 4096,
+        };
+        let request = facet_codec::decode_render_request(&input, limits)
+            .expect("valid keybindings render request");
+        let view: RenderView = serde_json::from_slice(&request.application_view)
+            .expect("valid keybindings render view");
+        let panes = request
+            .panes
+            .iter()
+            .map(|pane| {
+                let interaction =
+                    serde_json::to_vec(&view).expect("serialize keybindings interaction snapshot");
+                let state = KeybindingsState::from_render_view(
+                    view.render_clone(),
+                    pane.pane,
+                    pane.logical_width as f32,
+                    pane.logical_height as f32,
+                );
+                let (packet, resources) =
+                    render_keybindings(&state).expect("bounded keybindings rendering");
+                resources.finish_facet();
+                facets::PaneOutput {
+                    pane: pane.pane,
+                    content: facets::PaneContent::Draw {
+                        packet: packet.encode().expect("valid keybindings packet"),
+                        interaction,
+                    },
+                }
+            })
+            .collect();
+        let response = facets::RenderResponse {
+            token: request.token,
+            panes,
+            next_frame_ns: None,
+        };
+        facet_codec::encode_render_response_owned(
+            &response,
+            request.limits.max_output_bytes as usize,
+        )
+        .expect("bounded keybindings render response")
+    }
+
+    fn interpret(input: Vec<u8>) -> Vec<u8> {
+        let limits = facet_codec::DecodeLimits {
+            max_wire_bytes: input.len(),
+            max_allocated_bytes: input.len().saturating_mul(4).max(4096),
+            max_allocations: 4096,
+        };
+        let request = facet_codec::decode_input_request(&input, limits)
+            .expect("valid keybindings input request");
+        let view: RenderView = serde_json::from_slice(&request.interaction)
+            .expect("keybindings committed interaction snapshot");
+        let mut sequence: InteractionState =
+            serde_json::from_slice(&request.sequence_state).unwrap_or_default();
+        if sequence.capture_action != view.capture_action {
+            sequence = InteractionState {
+                capture_action: view.capture_action.clone(),
+                backdrop_pressed: false,
+            };
+        }
+        let panel = FloatingPanel::in_viewport(
+            request.geometry.logical_width as f32,
+            request.geometry.logical_height as f32,
+        );
+        let mut close_backdrop = false;
+        if let facets::InputEvent::PointerButton {
+            x,
+            y,
+            button,
+            pressed,
+            ..
+        } = &request.event
+            && *button == LEFT_BUTTON
+        {
+            let outside = !panel.contains(*x as f32, *y as f32);
+            if *pressed {
+                sequence.backdrop_pressed = outside;
+            } else {
+                close_backdrop = sequence.backdrop_pressed && outside;
+                sequence.backdrop_pressed = false;
+            }
+        }
+        if matches!(
+            request.event,
+            facets::InputEvent::PointerLeave
+                | facets::InputEvent::FocusLost
+                | facets::InputEvent::CaptureLost
+        ) {
+            sequence.backdrop_pressed = false;
+        }
+        let event = serde_json::to_vec(&FacetIntent::Event {
+            capture_action: view.capture_action,
+            event: request.event,
+            close_backdrop,
+        })
+        .expect("serialize keybindings facet intent");
+        let next_sequence_state =
+            serde_json::to_vec(&sequence).expect("serialize keybindings sequence state");
+        let response = facets::InputResponse {
+            token: request.token,
+            next_sequence_state,
+            events: vec![event],
+            requests: vec![facets::HostRequest::Render],
+        };
+        facet_codec::encode_input_response_owned(
+            &response,
+            request.limits.max_output_bytes as usize,
+        )
+        .expect("bounded keybindings input response")
+    }
+}
+
+#[cfg(feature = "pure-renderer")]
+impl RenderView {
+    fn render_clone(&self) -> Self {
+        Self {
+            visible: self.visible,
+            capture_action: self.capture_action.clone(),
+            bindings: self.bindings.clone(),
+            status: self.status.clone(),
+            error: self.error,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "pure-renderer")]
+    fn facet_input(
+        event: facets::InputEvent,
+        capture_action: Option<&str>,
+        sequence_state: Vec<u8>,
+    ) -> facets::InputResponse {
+        let view = RenderView {
+            visible: true,
+            capture_action: capture_action.map(str::to_string),
+            bindings: Vec::new(),
+            status: String::new(),
+            error: false,
+        };
+        let request = facets::InputRequest {
+            token: facets::InputToken {
+                scope: facets::Scope {
+                    client_generation: 1,
+                    actor_generation: 2,
+                    facet_generation: 3,
+                },
+                input_sequence: 4,
+                frame: 5,
+                pane: 9,
+                snapshot_revision: 6,
+                sequence_revision: 7,
+            },
+            geometry: facets::PaneTarget {
+                pane: 9,
+                logical_width: 800.0,
+                logical_height: 600.0,
+                physical_width: 800,
+                physical_height: 600,
+                scale: 1.0,
+                clip: [0.0, 0.0, 800.0, 600.0],
+                visible: true,
+                focused: true,
+            },
+            event,
+            interaction: serde_json::to_vec(&view).unwrap(),
+            sequence_state,
+            limits: facets::InvocationLimits {
+                max_output_bytes: 16 * 1024,
+                max_packet_bytes: 16 * 1024,
+                max_interaction_bytes: 16 * 1024,
+                max_sequence_bytes: 4096,
+                max_events: 8,
+                max_event_bytes: 4096,
+                max_host_requests: 4,
+                max_resources: 32,
+                max_resource_bytes: 1024 * 1024,
+            },
+        };
+        let mut wire = vec![0; 16 * 1024];
+        let len = facet_codec::encode_input_request(&request, &mut wire).unwrap();
+        wire.truncate(len);
+        let output = <KeybindingsActor as Facets>::interpret(wire);
+        facet_codec::decode_input_response(
+            &output,
+            facet_codec::DecodeLimits {
+                max_wire_bytes: output.len(),
+                max_allocated_bytes: 64 * 1024,
+                max_allocations: 64,
+            },
+        )
+        .unwrap()
+    }
+
+    #[cfg(feature = "pure-renderer")]
+    fn decoded_intent(response: &facets::InputResponse) -> FacetIntent {
+        serde_json::from_slice(&response.events[0]).unwrap()
+    }
 
     #[test]
     fn action_picker_contains_every_binding_and_preserves_action_identity() {
@@ -732,7 +1127,8 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&message.body).unwrap();
         assert_eq!(value["type"], "picker-create");
         assert_eq!(value["items"].as_array().map(Vec::len), Some(ACTIONS.len()));
-        assert_eq!(value["items"][0]["value"]["action"], ACTIONS[0].id);
+        assert_eq!(value["items"][0]["id"], ACTIONS[0].id);
+        assert_eq!(value["items"][0]["value"]["value"]["action"], ACTIONS[0].id);
     }
 
     #[test]
@@ -769,14 +1165,10 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&message.body).unwrap();
         let item = value["items"]
             .as_array()
-            .and_then(|items| {
-                items
-                    .iter()
-                    .find(|item| item["value"]["action"] == "sessions.picker")
-            })
+            .and_then(|items| items.iter().find(|item| item["id"] == "sessions.picker"))
             .expect("session picker binding");
         assert!(
-            item["detail"]
+            item["value"]["detail"]
                 .as_str()
                 .unwrap()
                 .contains(&binding_label(override_binding))
@@ -800,6 +1192,90 @@ mod tests {
         assert!(panel.x + panel.width <= 360.0);
         assert!(panel.y + panel.height <= 320.0);
     }
+
+    #[cfg(feature = "pure-renderer")]
+    #[test]
+    fn backdrop_sequence_is_capture_scoped_and_loss_clears_it() {
+        let press = facet_input(
+            facets::InputEvent::PointerButton {
+                x: 1.0,
+                y: 1.0,
+                button: LEFT_BUTTON,
+                pressed: true,
+                modifiers: 0,
+            },
+            Some(ACTIONS[0].id),
+            Vec::new(),
+        );
+        let pressed: InteractionState = serde_json::from_slice(&press.next_sequence_state).unwrap();
+        assert!(pressed.backdrop_pressed);
+
+        let release_after_replacement = facet_input(
+            facets::InputEvent::PointerButton {
+                x: 1.0,
+                y: 1.0,
+                button: LEFT_BUTTON,
+                pressed: false,
+                modifiers: 0,
+            },
+            Some(ACTIONS[1].id),
+            press.next_sequence_state,
+        );
+        let FacetIntent::Event { close_backdrop, .. } = decoded_intent(&release_after_replacement);
+        assert!(!close_backdrop);
+
+        for event in [
+            facets::InputEvent::FocusLost,
+            facets::InputEvent::CaptureLost,
+        ] {
+            let seeded = serde_json::to_vec(&InteractionState {
+                capture_action: Some(ACTIONS[0].id.to_string()),
+                backdrop_pressed: true,
+            })
+            .unwrap();
+            let response = facet_input(event, Some(ACTIONS[0].id), seeded);
+            let state: InteractionState =
+                serde_json::from_slice(&response.next_sequence_state).unwrap();
+            assert!(!state.backdrop_pressed);
+        }
+    }
+
+    #[cfg(feature = "pure-renderer")]
+    #[test]
+    fn wire_retry_is_identical_and_physical_key_is_bound_to_current_action() {
+        let event = facets::InputEvent::Key {
+            code: 31,
+            logical_key: "KeyS".to_string(),
+            modifiers: (MOD_CTRL | MOD_SHIFT) as u32,
+            pressed: true,
+            repeat: false,
+        };
+        let first = facet_input(event.clone(), Some(ACTIONS[0].id), Vec::new());
+        let retry = facet_input(event, Some(ACTIONS[0].id), Vec::new());
+        assert_eq!(first, retry);
+
+        let intent = decoded_intent(&first);
+        let mut current = KeybindingsState::new();
+        current.capture = Some(0);
+        current.visible = true;
+        let bytes = serde_json::to_vec(&intent).unwrap();
+        let commands = handle_facet_input(&mut current, vec![bytes.clone()]);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(
+            current.binding(&ACTIONS[0]),
+            Binding::new(39, MOD_CTRL | MOD_SHIFT)
+        );
+
+        let mut replacement = KeybindingsState::new();
+        replacement.capture = Some(1);
+        replacement.visible = true;
+        let before = replacement.binding(&ACTIONS[1]);
+        assert!(handle_facet_input(&mut replacement, vec![bytes]).is_empty());
+        assert_eq!(replacement.binding(&ACTIONS[1]), before);
+    }
 }
 
+#[cfg(feature = "pure-renderer")]
+export_visual_plugin!(KeybindingsActor);
+#[cfg(not(feature = "pure-renderer"))]
 bindings::export!(KeybindingsActor with_types_in bindings);
