@@ -88,7 +88,7 @@ use crate::{
     scheduling_domain::{
         ActorProgressMetrics, BACKEND_ACTOR_EVENTS_PER_ACTOR, BACKEND_ACTOR_EVENTS_PER_TURN,
         BACKEND_LIFECYCLE_CAPACITY, BoundedWorkMetrics, CallbackMetrics, LifecycleAdmission,
-        bounded_round_robin_plan, try_admit_lifecycle_request_id,
+        bounded_round_robin_plan, observed_actor_event_backlog, try_admit_lifecycle_request_id,
     },
     session_bus::{SessionBusHandle, SessionBusRealm},
     state_services::{FocusService, SurfaceSessionService, TestHarnessService},
@@ -1823,7 +1823,6 @@ impl Brood {
             BACKEND_ACTOR_EVENTS_PER_TURN,
             BACKEND_ACTOR_EVENTS_PER_ACTOR,
         );
-        let mut saturated_actors = 0;
         for (index, actor_budget) in &plan.actors {
             let Some(actor_name) = actor_names.get(*index) else {
                 continue;
@@ -1840,9 +1839,6 @@ impl Brood {
                         events.push((actor_name.clone(), Ok(event)));
                         actor_events += 1;
                     }
-                    if actor_events == *actor_budget {
-                        saturated_actors += 1;
-                    }
                 }
                 brood_wasm::HostedWasmActor::Preview1(actor) => {
                     if let Some(message) = actor.try_take_failure() {
@@ -1854,7 +1850,17 @@ impl Brood {
 
         self.backend_actor_drain_cursor = plan.next_cursor;
 
-        let observed_backlog = saturated_actors + plan.unvisited_actors;
+        // An actor omitted from this turn's bounded round-robin plan is not
+        // necessarily ready. Counting every unvisited actor as backlog makes
+        // this source self-wake forever as soon as the actor population exceeds
+        // the eight actors covered by one 64-event turn. Inspect the bounded
+        // observer queues after draining instead, so a wake represents work
+        // which is actually queued.
+        let observed_backlog =
+            observed_actor_event_backlog(self.wasm_io_actors.values().map(|actor| match actor {
+                brood_wasm::HostedWasmActor::Component(actor) => actor.pending_event_count(),
+                brood_wasm::HostedWasmActor::Preview1(_) => 0,
+            }));
         self.stats
             .backend_actor_events
             .record_batch(events.len(), observed_backlog);

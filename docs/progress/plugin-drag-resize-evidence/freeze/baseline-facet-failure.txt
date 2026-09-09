@@ -1,0 +1,12 @@
+visual facet failed actor=diff-viewer-sb1-s1 generation=17: facet invocation failed: error while executing at wasm backtrace:
+    0:   0xbe63 - brood_diff_viewer_plugin.wasm!serde_json::de::Deserializer<R>::parse_object_colon::h74a53336b8e7b2ec
+    1:  0x1372a - brood_diff_viewer_plugin.wasm!<serde_json::de::VariantAccess<R> as serde_core::de::VariantAccess>::struct_variant::hd6b883dc395e9b31
+    2:   0xa83b - brood_diff_viewer_plugin.wasm!brood_diff_viewer_plugin::_::<impl serde_core::de::Deserialize for brood_diff_viewer_plugin::DisplayRow>::deserialize::h2cc65d78da665124
+    3:  0x23eed - brood_diff_viewer_plugin.wasm!<serde_core::de::impls::<impl serde_core::de::Deserialize for alloc::vec::Vec<T>>::deserialize::VecVisitor<T> as serde_core::de::Visitor>::visit_seq::hb747c6a85cebec72
+    4:  0x14331 - brood_diff_viewer_plugin.wasm!<&mut serde_json::de::Deserializer<R> as serde_core::de::Deserializer>::deserialize_seq::h43e2d629fd008bab
+    5:  0x1519a - brood_diff_viewer_plugin.wasm!<&mut serde_json::de::Deserializer<R> as serde_core::de::Deserializer>::deserialize_struct::h0b8df75e6f9d0d1a
+    6:   0xec29 - brood_diff_viewer_plugin.wasm!<&mut serde_json::de::Deserializer<R> as serde_core::de::Deserializer>::deserialize_struct::h44d7a63fe3946679
+    7:   0xe2fa - brood_diff_viewer_plugin.wasm!serde_json::de::from_trait::hc59ca8c414f6ea01
+    8:   0x576c - brood_diff_viewer_plugin.wasm!<brood_diff_viewer_plugin::DiffViewer as brood_plugin_sdk::bindings::exports::brood::plugin::facets::Guest>::render::h63d3db0ea4cef070
+    9:  0x22f4b - brood_diff_viewer_plugin.wasm!brood_plugin_sdk::bindings::exports::brood::plugin::facets::_export_render_cabi::h959cc7299a773d2c
+   10:   0xb54f - brood_diff_viewer_plugin.wasm!brood:plugin/facets@0.1.0#render: wasm trap: all fuel consumed by WebAssembly

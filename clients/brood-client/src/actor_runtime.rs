@@ -82,6 +82,7 @@ pub struct PresentationWasmRuntime {
     started_panes_awaiting_start_barrier: VecDeque<u64>,
     pending_pane_creations: VecDeque<u64>,
     pending_pane_removals: VecDeque<u64>,
+    pending_visual_actor_failures: StdMutex<VecDeque<VisualActorFailure>>,
     retired_facet_hosts: BTreeMap<u64, Arc<crate::plugin_graphics::ActorPresentationHost>>,
     bound_backend_id: Option<BackendId>,
     bound_session_id: Option<u64>,
@@ -124,6 +125,12 @@ enum PendingActorEvent {
         actor: String,
         event: ComponentChildEvent,
     },
+}
+
+struct VisualActorFailure {
+    actor: String,
+    generation: u64,
+    message: String,
 }
 
 impl PendingActorEvent {
@@ -433,6 +440,7 @@ impl PresentationWasmRuntime {
             started_panes_awaiting_start_barrier: VecDeque::new(),
             pending_pane_creations: VecDeque::new(),
             pending_pane_removals: VecDeque::new(),
+            pending_visual_actor_failures: StdMutex::new(VecDeque::new()),
             retired_facet_hosts: BTreeMap::new(),
             bound_backend_id: bound_session.map(|(backend, _session)| backend),
             bound_session_id: bound_session.map(|(_backend, session)| session),
@@ -509,6 +517,81 @@ impl PresentationWasmRuntime {
         self.diagnostics
             .actor_failures
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn queue_visual_actor_failure(&self, actor: &str, generation: u64, message: String) {
+        let mut failures = self
+            .pending_visual_actor_failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !failures
+            .iter()
+            .any(|failure| failure.actor == actor && failure.generation == generation)
+        {
+            failures.push_back(VisualActorFailure {
+                actor: actor.to_owned(),
+                generation,
+                message,
+            });
+        }
+        drop(failures);
+        if let Some(proxy) = &self.event_proxy {
+            drop(proxy.send_event(ClientEvent::ActorHostMessagesReady));
+        }
+    }
+
+    fn retire_failed_visual_actors(&mut self) {
+        let failures = {
+            let mut pending = self
+                .pending_visual_actor_failures
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            pending.drain(..).collect::<Vec<_>>()
+        };
+        for failure in failures {
+            let current = self
+                .actors
+                .get(&failure.actor)
+                .is_some_and(|actor| actor.actor.generation() == failure.generation);
+            if !current {
+                continue;
+            }
+            let discarded_inputs = {
+                let mut pending = self
+                    .pending_actor_events
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                discard_pending_events_for_actor(&mut pending, &failure.actor)
+            };
+            if let Ok(mut cursor) = self.last_flushed_input_actor.lock()
+                && cursor.as_deref() == Some(failure.actor.as_str())
+            {
+                *cursor = None;
+            }
+            self.note_actor_failure();
+            eprintln!(
+                "retiring failed visual actor={} generation={} discarded_pending_inputs={} message={}",
+                failure.actor, failure.generation, discarded_inputs, failure.message
+            );
+            if self.is_init_child(&failure.actor) {
+                self.send_init_child_event(ComponentChildEvent::Failed {
+                    id: failure.actor.clone(),
+                    message: failure.message,
+                });
+                self.remove_failed_init_child(&failure.actor);
+            } else if let Some(actor) = self.actors.remove(&failure.actor) {
+                if let Some(facets) = &actor.facets
+                    && let Ok(mut facets) = facets.lock()
+                {
+                    facets.retire_generation(actor.actor.generation());
+                    for pane in &actor.panes {
+                        self.retired_facet_hosts
+                            .insert(*pane, Arc::clone(&facets.host));
+                    }
+                }
+                self.spawn_actor_stop(failure.actor, actor, StopDisposition::Failed);
+            }
+        }
     }
 
     fn start_direct_component_actor(&self, id: &str) -> Result<()> {
@@ -932,6 +1015,7 @@ impl PresentationWasmRuntime {
     }
 
     pub fn drain_events(&mut self) -> Result<()> {
+        self.retire_failed_visual_actors();
         self.flush_pending_actor_events()?;
         // A retained input means the component command lane is full. The actor
         // may be waiting for us to consume its observer output before it can
@@ -2175,9 +2259,11 @@ impl PresentationWasmRuntime {
                         );
                         facets.failed = true;
                         facets.coordinator.invalidate();
-                        self.diagnostics
-                            .actor_failures
-                            .fetch_add(1, Ordering::Relaxed);
+                        self.queue_visual_actor_failure(
+                            actor_name,
+                            hosted.actor.generation(),
+                            format!("facet input admission failed: {error:#}"),
+                        );
                     } else {
                         let watermark = self.graphics.as_ref().and_then(|graphics| {
                             graphics.admit_actor_event(
@@ -2453,9 +2539,11 @@ impl PresentationWasmRuntime {
                 facets.failed = true;
                 facets.coordinator.invalidate();
                 facets.prepared = None;
-                self.diagnostics
-                    .actor_failures
-                    .fetch_add(1, Ordering::Relaxed);
+                self.queue_visual_actor_failure(
+                    name,
+                    component.generation(),
+                    format!("facet service failed: {error:#}"),
+                );
             }
         }
         host_requests
@@ -2639,9 +2727,11 @@ impl PresentationWasmRuntime {
                 );
                 facets.failed = true;
                 facets.coordinator.invalidate();
-                self.diagnostics
-                    .actor_failures
-                    .fetch_add(1, Ordering::Relaxed);
+                self.queue_visual_actor_failure(
+                    &identity.name,
+                    identity.generation,
+                    format!("facet render dispatch failed: {error:#}"),
+                );
             }
         }
         drop(facets);
@@ -3649,6 +3739,15 @@ fn next_flushable_actor_event(
         .position(|command| command.actor() == selected)
 }
 
+fn discard_pending_events_for_actor(
+    pending: &mut VecDeque<PendingActorEvent>,
+    actor: &str,
+) -> usize {
+    let before = pending.len();
+    pending.retain(|event| event.actor() != actor);
+    before.saturating_sub(pending.len())
+}
+
 fn actor_output_has_capacity(
     retained_input: usize,
     events: usize,
@@ -3877,6 +3976,24 @@ mod tests {
             }),
             watermark: Some(watermark),
         }
+    }
+
+    #[test]
+    fn failed_generation_discards_only_its_named_retained_input() {
+        let mut pending = VecDeque::from([
+            pending_key("failed", 1, 1),
+            pending_key("peer", 2, 2),
+            pending_hint("failed", 3),
+            pending_key("peer", 4, 4),
+        ]);
+
+        assert_eq!(discard_pending_events_for_actor(&mut pending, "failed"), 2);
+        assert_eq!(pending.len(), 2);
+        assert!(pending.iter().all(|event| event.actor() == "peer"));
+        assert_eq!(
+            next_flushable_actor_event(&pending, &BTreeSet::new(), None),
+            Some(0)
+        );
     }
 
     fn requested_host_message(index: usize) -> ComponentActorEvent {

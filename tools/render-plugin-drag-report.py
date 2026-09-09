@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Build contact sheets after both native drag lanes finish."""
+"""Build contact sheets after the native drag workloads finish."""
 import json
 from pathlib import Path
 import subprocess
 import sys
 
 root = Path(sys.argv[1])
-for lane in ("plugins", "resize-proof"):
+for lane in ("plugins", "resize-proof", "large-diff", "large-diff-fractional"):
     output = root / lane
     report = output / "drag-results.json"
     if not report.exists():

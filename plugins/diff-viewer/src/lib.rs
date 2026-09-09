@@ -211,6 +211,7 @@ impl ViewerState {
         }))
     }
 
+    #[cfg_attr(feature = "pure-renderer", allow(dead_code))]
     fn render_view(&self) -> RenderView {
         RenderView {
             width: self.width,
@@ -280,8 +281,8 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
     match event {
         PresentationEvent::PaneCreated(created) => {
             state.pane = created.pane;
-            state.width = created.width.max(480.0);
-            state.height = created.height.max(320.0);
+            state.width = created.width.max(1.0);
+            state.height = created.height.max(1.0);
             state.scroll = 0.0;
             state.scrollbar_drag = None;
             let command = state.begin_refresh();
@@ -293,8 +294,8 @@ fn handle_presentation(event: PresentationEvent) -> Vec<ActorCommand> {
             commands
         }
         PresentationEvent::PaneResized(resized) if resized.pane == state.pane => {
-            let width = resized.width.max(480.0);
-            let height = resized.height.max(320.0);
+            let width = resized.width.max(1.0);
+            let height = resized.height.max(1.0);
             if (state.width - width).abs() < 0.5 && (state.height - height).abs() < 0.5 {
                 #[cfg(not(feature = "pure-renderer"))]
                 if let Some(resize_epoch) = resized.resize_epoch
@@ -535,10 +536,22 @@ fn redraw_with_cache(
     text_cache.queue(resize_epoch, &packet)
 }
 
+#[cfg_attr(feature = "pure-renderer", allow(dead_code))]
 fn build_packet(
     view: &RenderView,
     geometry: (f32, f32),
     text_cache: &mut TextLayoutCache,
+) -> Result<Packet, String> {
+    let content_height = view.document.rows.iter().map(DisplayRow::height).sum();
+    build_packet_window(view, geometry, text_cache, content_height, 0.0)
+}
+
+fn build_packet_window(
+    view: &RenderView,
+    geometry: (f32, f32),
+    text_cache: &mut TextLayoutCache,
+    content_height: f32,
+    row_origin: f32,
 ) -> Result<Packet, String> {
     let state = ViewerState {
         pane: 0,
@@ -590,16 +603,18 @@ fn build_packet(
             state.document.files, state.document.additions, state.document.deletions
         )
     };
-    add_text(
-        &mut packet,
-        text_cache,
-        &summary,
-        13.0,
-        if state.loading { MODIFIED } else { MUTED },
-        142.0,
-        17.0,
-        (refresh_rect.x - 154.0).max(80.0),
-    )?;
+    if refresh_rect.x >= 300.0 {
+        add_text(
+            &mut packet,
+            text_cache,
+            &summary,
+            13.0,
+            if state.loading { MODIFIED } else { MUTED },
+            142.0,
+            17.0,
+            refresh_rect.x - 154.0,
+        )?;
+    }
     packet.push(Command::FillRoundedRect {
         rect: refresh_rect,
         radius: 5.0,
@@ -648,7 +663,7 @@ fn build_packet(
         color: BORDER,
     });
 
-    let mut y = content_top - state.scroll;
+    let mut y = content_top + row_origin - state.scroll;
     for row in &state.document.rows {
         let height = row.height();
         if y + height >= content_top && y <= content_bottom {
@@ -719,7 +734,7 @@ fn build_packet(
         )?;
     }
 
-    draw_scrollbar(&state, &mut packet);
+    draw_scrollbar_for_content(&state, content_height, &mut packet);
     packet.push(Command::FillRect {
         rect: Rect::new(
             0.0,
@@ -729,8 +744,12 @@ fn build_packet(
         ),
         color: SURFACE,
     });
-    let footer = if state.document.truncated {
+    let footer = if state.document.truncated && state.width < 480.0 {
+        "Diff capped at 900 KiB"
+    } else if state.document.truncated {
         "Diff capped at 900 KiB · refine the change set or review from the CLI"
+    } else if state.width < 480.0 {
+        "Scroll · Home / End"
     } else {
         "Scroll or drag the bar · j/k, Page Up/Down, Home, and End"
     };
@@ -903,8 +922,13 @@ fn draw_row(
     Ok(())
 }
 
+#[cfg_attr(feature = "pure-renderer", allow(dead_code))]
 fn draw_scrollbar(state: &ViewerState, packet: &mut Packet) {
-    let Some(geometry) = scrollbar_geometry(state) else {
+    draw_scrollbar_for_content(state, state.content_height(), packet);
+}
+
+fn draw_scrollbar_for_content(state: &ViewerState, content_height: f32, packet: &mut Packet) {
+    let Some(geometry) = scrollbar_geometry_for_content(state, content_height) else {
         return;
     };
     let dragging = state.scrollbar_drag.is_some();
@@ -961,8 +985,15 @@ fn rect_contains(rect: Rect, x: f32, y: f32) -> bool {
         && y < rect.y + rect.height
 }
 
+#[cfg_attr(feature = "pure-renderer", allow(dead_code))]
 fn scrollbar_geometry(state: &ViewerState) -> Option<ScrollbarGeometry> {
-    let content_height = state.content_height();
+    scrollbar_geometry_for_content(state, state.content_height())
+}
+
+fn scrollbar_geometry_for_content(
+    state: &ViewerState,
+    content_height: f32,
+) -> Option<ScrollbarGeometry> {
     let viewport = state.viewport_height();
     if content_height <= viewport {
         return None;
@@ -973,7 +1004,8 @@ fn scrollbar_geometry(state: &ViewerState) -> Option<ScrollbarGeometry> {
         .max(28.0)
         .min(track_height);
     let travel = (track_height - thumb_height).max(0.0);
-    let thumb_y = track_top + travel * state.scroll / state.max_scroll().max(1.0);
+    let max_scroll = (content_height - viewport).max(0.0);
+    let thumb_y = track_top + travel * state.scroll / max_scroll.max(1.0);
     Some(ScrollbarGeometry {
         track_top,
         track_height,

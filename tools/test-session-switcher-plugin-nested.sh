@@ -103,6 +103,18 @@ for index in $(seq 1 180); do
   printf 'changed project line %03d with enough content to exercise split diff scrolling\n' "$index"
 done > "$PROJECT/tracked.txt"
 printf 'untracked session-local diff\n' > "$PROJECT/untracked.txt"
+if [[ "${BROOD_PLUGIN_DRAG_LARGE_DIFF:-0}" == 1 ]]; then
+  # Match the large implementation diff which exposed a facet fuel failure.
+  python3 - "$PROJECT/implementation.patch" <<'PYFIXTURE'
+import sys
+from pathlib import Path
+# Many short changed lines force the existing 900 KiB document cap and expose
+# whole-document facet decoding cost without depending on repository history.
+Path(sys.argv[1]).write_text("".join(
+    f"implementation line {i:05d}: preserve every row while resizing and scrolling.\n"
+    for i in range(16000)))
+PYFIXTURE
+fi
 
 CLIENT_PID=""
 SERVER_PID=""
@@ -376,6 +388,7 @@ fi
 printf '%s\n' \
   'xwayland disable' \
   "output HEADLESS-1 mode $OUTPUT_MODE" \
+  "output HEADLESS-1 scale ${BROOD_PLUGIN_DRAG_OUTPUT_SCALE:-1}" \
   'seat seat0 fallback true' \
   'default_border none' \
   'default_floating_border none' \
@@ -407,6 +420,10 @@ done
   echo "ERR timed out waiting for the Sway Wayland socket" >&2
   exit 1
 }
+
+if [[ -n "${BROOD_PLUGIN_DRAG_DIFF_COMPONENT:-}" ]]; then
+  cp -L --remove-destination "$BROOD_PLUGIN_DRAG_DIFF_COMPONENT" "$PACKAGE/brood_diff_viewer_plugin.component.wasm"
+fi
 
 DRAG_ACTOR_ARGS=()
 if [[ "${BROOD_PLUGIN_DRAG_PROOF_ONLY:-0}" == 1 ]]; then
@@ -463,6 +480,9 @@ if [[ "${BROOD_PLUGIN_DRAG_TEST:-0}" == 1 ]]; then
   ctl status-json > "$OUT/drag-server-before.json"
   drag_result=0
   env XDG_RUNTIME_DIR="$RUNTIME_DIR" WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+    BROOD_DRAG_CTL_BIN="$HOST_BIN_DIR/brood" \
+    BROOD_DRAG_DBUS_DESTINATION="$DBUS_DESTINATION" \
+    BROOD_DRAG_DBUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS" \
     python3 "$ROOT/tools/test-plugin-divider-drags.py" \
       --out "$OUT" --client-pid "$CLIENT_PID" || drag_result=$?
   ctl status-json > "$OUT/drag-server-after.json"

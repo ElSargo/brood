@@ -193,3 +193,12 @@ Verification:
 - The drag report counts anchored host acceptance records, excluding the
   separate accepted-notification log line that previously doubled its
   informational submission counter. This does not change gate thresholds.
+
+## 2026-09-09: large-diff freeze follow-up
+
+The user’s live session exposed a second failure class after smooth drag pacing
+was restored: a capped large diff exhausted facet fuel, and a permanently failed
+visual generation remained eligible for resize cohorts. The isolated reproduction,
+compact diff publication, generation retirement, additional backend idle-loop fix,
+and real-workload verification are recorded in
+[plugin-drag-resize-freeze.md](plugin-drag-resize-freeze.md).

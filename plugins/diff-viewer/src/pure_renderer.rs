@@ -26,12 +26,206 @@ struct Interaction {
     viewport: f32,
 }
 static PUBLICATION: Mutex<(u64, Vec<u8>)> = Mutex::new((0, Vec::new()));
+
+const VIEW_MAGIC: &[u8; 4] = b"BDV1";
+
+fn put_u32(out: &mut Vec<u8>, value: usize) {
+    out.extend_from_slice(&(value.min(u32::MAX as usize) as u32).to_le_bytes());
+}
+fn put_string(out: &mut Vec<u8>, value: &str) {
+    put_u32(out, value.len());
+    out.extend_from_slice(value.as_bytes());
+}
+fn encode_view(state: &ViewerState) -> Vec<u8> {
+    let mut out = Vec::with_capacity(128 + state.document.rows.len() * 12);
+    out.extend_from_slice(VIEW_MAGIC);
+    out.extend_from_slice(&state.document_revision.to_le_bytes());
+    out.extend_from_slice(&state.scroll.to_bits().to_le_bytes());
+    put_u32(&mut out, state.document.files);
+    put_u32(&mut out, state.document.additions);
+    put_u32(&mut out, state.document.deletions);
+    out.push(u8::from(state.document.truncated));
+    out.push(u8::from(state.loading));
+    match &state.error {
+        Some(error) => {
+            out.push(1);
+            put_string(&mut out, error);
+        }
+        None => out.push(0),
+    }
+    put_u32(&mut out, state.document.rows.len());
+    for row in &state.document.rows {
+        match row {
+            DisplayRow::File {
+                path,
+                additions,
+                deletions,
+            } => {
+                out.push(0);
+                put_u32(&mut out, *additions);
+                put_u32(&mut out, *deletions);
+                put_string(&mut out, path);
+            }
+            DisplayRow::Hunk(text) => {
+                out.push(1);
+                put_string(&mut out, text);
+            }
+            DisplayRow::Code {
+                old_line,
+                new_line,
+                left,
+                right,
+                kind,
+            } => {
+                out.push(2);
+                out.push(u8::from(*kind == ChangeKind::Changed));
+                out.extend_from_slice(&old_line.unwrap_or(0).to_le_bytes());
+                out.extend_from_slice(&new_line.unwrap_or(0).to_le_bytes());
+                match left {
+                    Some(s) => {
+                        out.push(1);
+                        put_string(&mut out, s);
+                    }
+                    None => out.push(0),
+                }
+                match right {
+                    Some(s) => {
+                        out.push(1);
+                        put_string(&mut out, s);
+                    }
+                    None => out.push(0),
+                }
+            }
+            DisplayRow::Gap => out.push(3),
+        }
+    }
+    out
+}
+
+struct Cursor<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+impl<'a> Cursor<'a> {
+    fn take(&mut self, len: usize) -> &'a [u8] {
+        let end = self
+            .at
+            .checked_add(len)
+            .filter(|e| *e <= self.bytes.len())
+            .expect("diff view bounds");
+        let value = &self.bytes[self.at..end];
+        self.at = end;
+        value
+    }
+    fn u8(&mut self) -> u8 {
+        self.take(1)[0]
+    }
+    fn u32(&mut self) -> u32 {
+        u32::from_le_bytes(self.take(4).try_into().expect("u32"))
+    }
+    fn u64(&mut self) -> u64 {
+        u64::from_le_bytes(self.take(8).try_into().expect("u64"))
+    }
+    fn string(&mut self) -> &'a str {
+        let len = self.u32() as usize;
+        std::str::from_utf8(self.take(len)).expect("diff utf8")
+    }
+    fn maybe_string(&mut self) -> Option<&'a str> {
+        (self.u8() != 0).then(|| self.string())
+    }
+}
+
+struct ViewHeader {
+    scroll: f32,
+    document_revision: u64,
+    files: usize,
+    additions: usize,
+    deletions: usize,
+    truncated: bool,
+    loading: bool,
+    error: Option<String>,
+    rows: usize,
+    row_offset: usize,
+}
+fn decode_header(bytes: &[u8]) -> ViewHeader {
+    let mut c = Cursor { bytes, at: 0 };
+    assert_eq!(c.take(4), VIEW_MAGIC, "diff view version");
+    let document_revision = c.u64();
+    let scroll = f32::from_bits(c.u32());
+    let files = c.u32() as usize;
+    let additions = c.u32() as usize;
+    let deletions = c.u32() as usize;
+    let truncated = c.u8() != 0;
+    let loading = c.u8() != 0;
+    let error = c.maybe_string().map(str::to_owned);
+    let rows = c.u32() as usize;
+    ViewHeader {
+        scroll,
+        document_revision,
+        files,
+        additions,
+        deletions,
+        truncated,
+        loading,
+        error,
+        rows,
+        row_offset: c.at,
+    }
+}
+
+fn decode_row(c: &mut Cursor<'_>, materialize: bool) -> (Option<DisplayRow>, f32) {
+    let tag = c.u8();
+    let height = match tag {
+        0 => FILE_HEADER_HEIGHT,
+        1 => HUNK_HEADER_HEIGHT,
+        2 => CODE_ROW_HEIGHT,
+        3 => FILE_GAP_HEIGHT,
+        _ => panic!("diff row tag"),
+    };
+    let row = match tag {
+        0 => {
+            let additions = c.u32() as usize;
+            let deletions = c.u32() as usize;
+            let path = c.string();
+            materialize.then(|| DisplayRow::File {
+                path: path.to_owned(),
+                additions,
+                deletions,
+            })
+        }
+        1 => {
+            let text = c.string();
+            materialize.then(|| DisplayRow::Hunk(text.to_owned()))
+        }
+        2 => {
+            let kind = if c.u8() != 0 {
+                ChangeKind::Changed
+            } else {
+                ChangeKind::Context
+            };
+            let old = c.u32();
+            let new = c.u32();
+            let left = c.maybe_string();
+            let right = c.maybe_string();
+            materialize.then(|| DisplayRow::Code {
+                old_line: (old != 0).then_some(old),
+                new_line: (new != 0).then_some(new),
+                left: left.map(str::to_owned),
+                right: right.map(str::to_owned),
+                kind,
+            })
+        }
+        3 => materialize.then_some(DisplayRow::Gap),
+        _ => panic!("diff row tag"),
+    };
+    (row, height)
+}
 pub(super) fn publish() {
     let state = STATE.lock().expect("diff state");
     if state.pane == 0 {
         return;
     }
-    let bytes = serde_json::to_vec(&state.render_view()).expect("diff view");
+    let bytes = encode_view(&state);
     drop(state);
     let mut last = PUBLICATION.lock().expect("diff publication");
     if last.1 == bytes {
@@ -219,51 +413,91 @@ impl Facets for DiffViewer {
     fn render(input: Vec<u8>) -> Vec<u8> {
         let request = facet_codec::decode_render_request(&input, limits(input.len()))
             .expect("diff render request");
-        let view: RenderView =
-            serde_json::from_slice(&request.application_view).expect("diff immutable view");
+        let header = decode_header(&request.application_view);
         let sequence: Sequence =
             serde_json::from_slice(&request.sequence_state).unwrap_or_default();
         let panes = request
             .panes
             .iter()
             .map(|pane| {
-                let mut view = view.clone();
-                view.width = pane.logical_width as f32;
-                view.height = pane.logical_height as f32;
-                let sequence = if sequence.document == view.document_revision {
+                let width = pane.logical_width as f32;
+                let height = pane.logical_height as f32;
+                let sequence = if sequence.document == header.document_revision {
                     sequence.clone()
                 } else {
                     Sequence::default()
                 };
-                view.refresh_pressed = sequence.refresh_pressed;
-                view.refresh_hovered = sequence.refresh_hovered;
-                view.scrollbar_hovered =
-                    sequence.scrollbar_hovered || sequence.drag_offset.is_some();
+                let viewport = (height - HEADER_HEIGHT - FOOTER_HEIGHT).max(1.0);
+                let mut cursor = Cursor {
+                    bytes: &request.application_view,
+                    at: header.row_offset,
+                };
+                let mut content_height = 0.0;
+                let mut row_origin = 0.0;
+                let mut visible = Vec::new();
+                for _ in 0..header.rows {
+                    let row_height = match cursor.bytes[cursor.at] {
+                        0 => FILE_HEADER_HEIGHT,
+                        1 => HUNK_HEADER_HEIGHT,
+                        2 => CODE_ROW_HEIGHT,
+                        3 => FILE_GAP_HEIGHT,
+                        _ => panic!("diff row tag"),
+                    };
+                    let materialize = content_height + row_height >= header.scroll
+                        && content_height <= header.scroll + viewport;
+                    let (row, decoded_height) = decode_row(&mut cursor, materialize);
+                    if let Some(row) = row {
+                        if visible.is_empty() {
+                            row_origin = content_height;
+                        }
+                        visible.push(row);
+                    }
+                    content_height += decoded_height;
+                }
+                let view = RenderView {
+                    width,
+                    height,
+                    scroll: header.scroll,
+                    document: DiffDocument {
+                        rows: visible,
+                        files: header.files,
+                        additions: header.additions,
+                        deletions: header.deletions,
+                        truncated: header.truncated,
+                    },
+                    document_revision: header.document_revision,
+                    loading: header.loading,
+                    error: header.error.clone(),
+                    scrollbar_hovered: sequence.scrollbar_hovered || sequence.drag_offset.is_some(),
+                    refresh_hovered: sequence.refresh_hovered,
+                    refresh_pressed: sequence.refresh_pressed,
+                };
                 let mut state = ViewerState::new();
-                state.width = view.width;
-                state.height = view.height;
-                state.document = view.document.clone();
-                state.scroll = view.scroll;
-                let bar = scrollbar_geometry(&state);
+                state.width = width;
+                state.height = height;
+                state.scroll = header.scroll;
+                let bar = scrollbar_geometry_for_content(&state, content_height);
                 let rect = refresh_button_rect(&state);
                 let map = Interaction {
-                    document: view.document_revision,
+                    document: header.document_revision,
                     refresh: [rect.x, rect.y, rect.width, rect.height],
-                    loading: view.loading,
+                    loading: header.loading,
                     bar_hit: [
-                        view.width - SCROLLBAR_HIT_WIDTH,
+                        width - SCROLLBAR_HIT_WIDTH,
                         HEADER_HEIGHT,
                         SCROLLBAR_HIT_WIDTH,
                         state.viewport_height(),
                     ],
                     bar,
-                    max_scroll: state.max_scroll(),
+                    max_scroll: (content_height - state.viewport_height()).max(0.0),
                     viewport: state.viewport_height(),
                 };
-                let packet = build_packet(
+                let packet = build_packet_window(
                     &view,
-                    (view.width, view.height),
+                    (width, height),
                     &mut TextLayoutCache::new(pane.pane),
+                    content_height,
+                    row_origin,
                 )
                 .expect("diff packet");
                 facets::PaneOutput {
@@ -455,5 +689,41 @@ mod tests {
                 .0
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn large_publication_materializes_only_the_visible_tail_rows() {
+        let mut state = ViewerState::new();
+        state.document_revision = 9;
+        state.document.rows = (0..48_000)
+            .map(|line| DisplayRow::Code {
+                old_line: Some(line + 1),
+                new_line: Some(line + 1),
+                left: Some("a moderately long source line".into()),
+                right: Some("a moderately long source line".into()),
+                kind: ChangeKind::Context,
+            })
+            .collect();
+        state.scroll = CODE_ROW_HEIGHT * 47_970.0;
+        let bytes = encode_view(&state);
+        let header = decode_header(&bytes);
+        let mut cursor = Cursor {
+            bytes: &bytes,
+            at: header.row_offset,
+        };
+        let viewport = 600.0;
+        let mut y = 0.0;
+        let mut materialized = Vec::new();
+        for _ in 0..header.rows {
+            let height = CODE_ROW_HEIGHT;
+            let visible = y + height >= header.scroll && y <= header.scroll + viewport;
+            let (row, decoded_height) = decode_row(&mut cursor, visible);
+            materialized.extend(row);
+            y += decoded_height;
+        }
+        assert_eq!(cursor.at, bytes.len());
+        assert_eq!(y, CODE_ROW_HEIGHT * 48_000.0);
+        assert!(materialized.len() <= 32, "only viewport rows are decoded");
+        assert!(materialized.len() >= 29, "viewport remains fully populated");
     }
 }

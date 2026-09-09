@@ -25,6 +25,74 @@ frames = out / "drag-frames"
 frames.mkdir(exist_ok=True)
 
 
+def ctl_status_json():
+    command = [
+        os.environ["BROOD_DRAG_CTL_BIN"],
+        "ctl",
+        "--dbus-destination",
+        os.environ["BROOD_DRAG_DBUS_DESTINATION"],
+        "--dbus-address",
+        os.environ["BROOD_DRAG_DBUS_ADDRESS"],
+        "status-json",
+    ]
+    completed = subprocess.run(command, check=True, capture_output=True, text=True)
+    return json.loads(completed.stdout)
+
+
+def terminal_actor_ids(status):
+    return sorted(
+        actor[0]
+        for actor in status.get("plugin_actors", [])
+        if isinstance(actor, list)
+        and actor
+        and "terminal-session" in str(actor[0])
+    )
+
+
+def write_status(name, status):
+    path = out / f"many-actors-{name}-status.json"
+    path.write_text(json.dumps(status, indent=2) + "\n")
+    return str(path)
+
+
+def wait_for_terminal_actor_count(minimum=9, seconds=30):
+    until = time.monotonic() + seconds
+    latest = None
+    while time.monotonic() < until:
+        latest = ctl_status_json()
+        if len(terminal_actor_ids(latest)) >= minimum:
+            return latest
+        time.sleep(.1)
+    raise RuntimeError(
+        f"timed out waiting for {minimum} terminal-session actors; "
+        f"found {terminal_actor_ids(latest or {})}"
+    )
+
+
+def idle_callback_check(name, before, seconds=1.0, maximum_per_second=240):
+    time.sleep(seconds)
+    after = ctl_status_json()
+    before_count = int(before.get("smithay_callback_count", 0))
+    after_count = int(after.get("smithay_callback_count", 0))
+    delta = max(0, after_count - before_count)
+    result = {
+        "seconds": seconds,
+        "before": before_count,
+        "after": after_count,
+        "delta": delta,
+        "rate_per_second": delta / seconds,
+        "maximum_per_second": maximum_per_second,
+        "before_file": write_status(f"{name}-before", before),
+        "after_file": write_status(f"{name}-after", after),
+    }
+    if result["rate_per_second"] > maximum_per_second:
+        raise RuntimeError(
+            f"smithay callback idle rate {result['rate_per_second']:.1f}/s "
+            f"exceeds {maximum_per_second}/s"
+        )
+    return result
+
+
 def text():
     return log.read_text(errors="replace")
 
@@ -109,7 +177,10 @@ def drag_case(name, expected, delta=-180, boundary="tile", fixed=()):
                                    stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, text=True)
         def gesture():
             x, y = start - 30, height - 30
-            dy = -240 if delta < 0 else 240
+            scale = float(os.environ.get("BROOD_PLUGIN_DRAG_OUTPUT_SCALE", "1"))
+            # Respect the client's logical minimum height at fractional scale;
+            # restoring must also keep pointer coordinates inside the output.
+            dy = -min(240, max(0, height - int(320 * scale))) if delta < 0 else min(240, 720 - height)
             process.stdin.write(f"motion {x} {y}\npress-right\n")
             process.stdin.flush()
             time.sleep(.02)
@@ -198,10 +269,115 @@ def drag_case(name, expected, delta=-180, boundary="tile", fixed=()):
     return result
 
 
+def many_actors_mode():
+    close_terminals = os.environ.get("BROOD_PLUGIN_DRAG_CLOSE_TERMINALS") == "1"
+    initial_status = ctl_status_json()
+    write_status("initial", initial_status)
+    for _ in range(9):
+        key(20)
+    populated_status = wait_for_terminal_actor_count()
+    write_status("populated", populated_status)
+    terminal_ids = terminal_actor_ids(populated_status)
+    if len(terminal_ids) <= 8:
+        raise RuntimeError(f"expected more than 8 terminal actors, found {terminal_ids}")
+
+    if close_terminals:
+        before_close = len(terminal_ids)
+        layout_before_close = len(re.findall(r"^accepted synchronized layout ", text(), re.MULTILINE))
+        for _ in range(9):
+            key(16)
+        until = time.monotonic() + 30
+        closed_status = populated_status
+        while time.monotonic() < until:
+            closed_status = ctl_status_json()
+            if len(terminal_actor_ids(closed_status)) < before_close:
+                break
+            time.sleep(.1)
+        if len(terminal_actor_ids(closed_status)) >= before_close:
+            raise RuntimeError("terminal actors did not begin closing")
+        write_status("closed", closed_status)
+        wait_for(
+            lambda: len(re.findall(r"^accepted synchronized layout ", text(), re.MULTILINE))
+            > layout_before_close
+        )
+
+    started = len(text())
+    key(32)
+    wait_for(lambda: bool(re.findall(r"started presentation WASM actor id=diff-viewer-\S+ ", text()[started:])))
+    diff_match = re.findall(
+        r"started presentation WASM actor id=(diff-viewer-\S+) ", text()[started:]
+    )
+    diff_actor = diff_match[-1]
+    wait_for(lambda: f"presentation actor worker finished actor={diff_actor}" in text()[started:], 30)
+    expect_failure = os.environ.get("BROOD_PLUGIN_DRAG_EXPECT_FACET_FAILURE") == "1"
+    if expect_failure:
+        wait_for(lambda: f"retiring failed visual actor={diff_actor} " in text()[started:])
+        wait_for(lambda: not visible_actor("diff-viewer"))
+        # Replace the failed pane with another real terminal so both the root
+        # and workspace dividers exercise topology after generation retirement.
+        key(20)
+        wait_for(lambda: sum(name.startswith("terminal-ui") and pane in projection()
+                            for name, pane in actor_panes().items()) >= 2)
+    def diff_presented_after_worker():
+        tail = text()[started:].split(f"presentation actor worker finished actor={diff_actor}", 1)
+        return len(tail) == 2 and bool(re.search(
+            rf"facet native pair committed .*actor={re.escape(diff_actor)} ", tail[1]))
+    if not expect_failure:
+        wait_for(diff_presented_after_worker)
+        if os.environ.get("BROOD_PLUGIN_DRAG_LARGE_DIFF") == "1":
+            # End/Home exercise navigation far beyond the materialized rows.
+            key(107, "--none")
+            capture("large-diff-end")
+            key(102, "--none")
+            capture("large-diff-home")
+
+    expected = ["terminal-ui"] if expect_failure else ["diff-viewer", "terminal-ui"]
+
+    root = drag_case(
+        "many-actors-root",
+        expected,
+        -100,
+        boundary="shell",
+    )
+    root_status = ctl_status_json()
+    write_status("root", root_status)
+    try:
+        root["idle_callbacks"] = idle_callback_check("root-idle", root_status)
+    except Exception as error:
+        root["idle_callback_error"] = str(error)
+        root["errors"].append(str(error))
+        (out / "drag-results.json").write_text(json.dumps(results, indent=2))
+
+    tile = drag_case(
+        "many-actors-tile",
+        expected,
+        100,
+        boundary="tile",
+    )
+    tile_status = ctl_status_json()
+    write_status("tile", tile_status)
+    try:
+        tile["idle_callbacks"] = idle_callback_check("tile-idle", tile_status)
+    except Exception as error:
+        tile["idle_callback_error"] = str(error)
+        tile["errors"].append(str(error))
+    if not close_terminals and len(terminal_actor_ids(tile_status)) <= 8:
+        raise RuntimeError("terminal-session actor count dropped below 9 after drags")
+
+    floating_window()
+    drag_case("many-actors-window-narrow", expected, -400, boundary="window")
+    drag_case("many-actors-window-restore", expected, 400, boundary="window")
+    if not expect_failure and f"visual facet failed actor={diff_actor}" in text()[started:]:
+        results[-1]["errors"].append("diff facet failed during navigation or resizing")
+    (out / "drag-results.json").write_text(json.dumps(results, indent=2))
+
+
 def floating_window():
     socket = next(Path(os.environ["XDG_RUNTIME_DIR"]).glob("sway-ipc.*.sock"))
+    scale = float(os.environ.get("BROOD_PLUGIN_DRAG_OUTPUT_SCALE", "1"))
+    width, height = round(1280 / scale), round(720 / scale)
     subprocess.run(["swaymsg", "-s", str(socket),
-                    f'[pid={args.client_pid}] floating enable, border none, resize set 1280 720, move position 0 0'],
+                    f'[pid={args.client_pid}] floating enable, border none, resize set {width} {height}, move position 0 0'],
                    check=True, stdout=subprocess.DEVNULL)
     subprocess.run(["swaymsg", "-s", str(socket), "floating_modifier Mod4"],
                    check=True, stdout=subprocess.DEVNULL)
@@ -211,12 +387,19 @@ def floating_window():
 try:
     def shell_ready():
         panes, sizes = actor_panes(), projection()
+        records = re.findall(r"resize-present .*?composition_size=(\d+)x(\d+)", text())
+        if not records:
+            return False
+        width, height = map(int, records[-1])
         return (visible_actor("terminal-ui")
-                and sizes.get(panes.get("session-switcher"), [])[1:] == [320, 686, 320, 686]
-                and sizes.get(panes.get("status-bar"), [])[1:] == [1280, 34, 1280, 34])
+                and abs(width - 1280) <= 2 and abs(height - 720) <= 2
+                and sizes.get(panes.get("session-switcher"), [])[1:] == [320, height - 34, 320, height - 34]
+                and sizes.get(panes.get("status-bar"), [])[1:] == [width, 34, width, 34])
     wait_for(shell_ready)
     time.sleep(.5)
-    if os.environ.get("BROOD_PLUGIN_DRAG_PROOF_ONLY") == "1":
+    if os.environ.get("BROOD_PLUGIN_DRAG_MANY_ACTORS") == "1":
+        many_actors_mode()
+    elif os.environ.get("BROOD_PLUGIN_DRAG_PROOF_ONLY") == "1":
         drag_case("resize-proof-narrow", ["resize-proof-fast"])
         drag_case("resize-proof-wide", ["resize-proof-fast"], 180)
     else:
@@ -263,7 +446,10 @@ try:
         drag_case("keybindings-window-wide", ["keybindings"], 700, "window")
 except Exception as error:
     results.append({"case": "setup-or-runtime-failure", "errors": [str(error)]})
-    capture("failure")
+    try:
+        results[-1]["failure_frame"] = capture("failure")
+    except Exception as capture_error:
+        results[-1]["failure_capture_error"] = str(capture_error)
 finally:
     (out / "drag-results.json").write_text(json.dumps(results, indent=2))
     summary = ["# Real plugin divider drag results", "",

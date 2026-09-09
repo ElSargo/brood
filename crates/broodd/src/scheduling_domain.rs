@@ -207,6 +207,18 @@ pub fn bounded_round_robin_plan(
     }
 }
 
+/// Count observer events which remain ready after a bounded actor drain.
+///
+/// Actor population is deliberately absent from this calculation: actors which
+/// were outside one round-robin quantum do not require another callback unless
+/// their observer queue actually contains work.
+#[must_use]
+pub fn observed_actor_event_backlog(pending_events: impl IntoIterator<Item = usize>) -> usize {
+    pending_events
+        .into_iter()
+        .fold(0usize, usize::saturating_add)
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CallbackMetricsSnapshot {
     pub callbacks: u64,
@@ -334,5 +346,26 @@ impl BoundedWorkMetrics {
     pub const fn record_completion(&mut self, depth: usize) {
         self.completed = self.completed.saturating_add(1);
         self.current_depth = depth;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{bounded_round_robin_plan, observed_actor_event_backlog};
+
+    #[test]
+    fn unvisited_idle_actors_do_not_create_an_observer_backlog() {
+        let actor_count = 9;
+        let plan = bounded_round_robin_plan(actor_count, 0, 64, 8);
+        assert_eq!(plan.actors.len(), 8);
+        assert_eq!(plan.unvisited_actors, 1);
+
+        let pending = vec![0; actor_count];
+        assert_eq!(observed_actor_event_backlog(pending), 0);
+    }
+
+    #[test]
+    fn observer_backlog_counts_only_events_still_queued() {
+        assert_eq!(observed_actor_event_backlog([0, 2, 0, 3]), 5);
     }
 }
