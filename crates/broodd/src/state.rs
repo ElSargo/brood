@@ -19,6 +19,7 @@
     clippy::useless_let_if_seq,
     reason = "remaining suppressions cover checked geometry conversions, protocol-owned Smithay resources, and experimental state policies tracked by dedicated issues"
 )]
+mod package_daemon;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     ffi::OsString,
@@ -688,6 +689,9 @@ enum BackendLifecycleCompletion {
 #[derive(Clone, Debug)]
 enum HostedReplacementPurpose {
     Generic,
+    DaemonChild {
+        id: String,
+    },
     RealmRoot {
         session: SurfaceSessionId,
     },
@@ -892,6 +896,9 @@ pub struct Brood {
     pending_legacy_replacement: Option<u64>,
     pending_legacy_actor_names: BTreeSet<String>,
     starting_realm_children: BTreeSet<(SurfaceSessionId, String)>,
+    starting_daemon_children: BTreeSet<String>,
+    stop_daemon_while_starting: BTreeSet<String>,
+    stopping_daemon_children: BTreeMap<String, String>,
     stop_requested_while_starting: BTreeSet<(SurfaceSessionId, String)>,
     backend_init_actor: Option<PathBuf>,
     backend_init: Option<RealmInitState>,
@@ -899,6 +906,7 @@ pub struct Brood {
     pending_managed_worktrees: BTreeMap<u64, PendingManagedWorktree>,
     session_init_actor: Option<PathBuf>,
     realm_inits: BTreeMap<SurfaceSessionId, RealmInitState>,
+    package_host: brood_cli::package_runtime::PackageHost,
     pending_realm_artifacts: BTreeMap<u64, PendingRealmArtifact>,
     queued_realm_artifacts: VecDeque<(u64, String)>,
     next_realm_artifact_request: u64,
@@ -972,6 +980,10 @@ impl Brood {
         let (backend_lifecycle_completion_sender, backend_lifecycle_completions) =
             tokio::sync::mpsc::channel(BACKEND_LIFECYCLE_CAPACITY);
 
+        let package_signal = loop_signal.clone();
+        let package_host =
+            brood_cli::package_runtime::PackageHost::new(move || package_signal.wakeup());
+
         Self {
             start_time,
             socket_name,
@@ -1041,6 +1053,9 @@ impl Brood {
             pending_legacy_replacement: None,
             pending_legacy_actor_names: BTreeSet::new(),
             starting_realm_children: BTreeSet::new(),
+            starting_daemon_children: BTreeSet::new(),
+            stop_daemon_while_starting: BTreeSet::new(),
+            stopping_daemon_children: BTreeMap::new(),
             stop_requested_while_starting: BTreeSet::new(),
             backend_init_actor: None,
             backend_init: None,
@@ -1048,6 +1063,7 @@ impl Brood {
             pending_managed_worktrees: BTreeMap::new(),
             session_init_actor: None,
             realm_inits: BTreeMap::new(),
+            package_host,
             pending_realm_artifacts: BTreeMap::new(),
             queued_realm_artifacts: VecDeque::new(),
             next_realm_artifact_request: 1,
@@ -1797,6 +1813,8 @@ impl Brood {
 
     fn drain_hosted_actor_events(&mut self) {
         enum InitRequest {
+            StartDaemon(String, String, Vec<String>),
+            StopDaemon(String),
             StartActor(SurfaceSessionId, String, String, Vec<String>),
             StopActor(SurfaceSessionId, String),
             StartApp(SurfaceSessionId, String, Vec<String>),
@@ -1877,6 +1895,12 @@ impl Brood {
                     self.plugin_actor_failures = self.plugin_actor_failures.saturating_add(1);
                     self.plugin_actor_last_status = Some(format!("{actor_name}:dispatcher_failed"));
                     warn!(actor = %actor_name, error = %message, "Preview 1 actor dispatcher failed");
+                    if let Some(id) = self.daemon_child_owner(&actor_name) {
+                        self.send_daemon_child_event(brood_wasm::ComponentChildEvent::Failed {
+                            id,
+                            message: message.clone(),
+                        });
+                    }
                     if let Some((session, child_id)) = self.realm_init_child_owner(&actor_name) {
                         self.send_realm_init_child_event(
                             session,
@@ -1905,6 +1929,12 @@ impl Brood {
                         self.fail_pending_managed_worktrees(&format!(
                             "worktree backend stopped unexpectedly: {message}"
                         ));
+                    }
+                    if let Some(id) = self.daemon_child_owner(&actor_name) {
+                        self.send_daemon_child_event(brood_wasm::ComponentChildEvent::Failed {
+                            id,
+                            message: message.clone(),
+                        });
                     }
                     if let Some((session, child_id)) = self.realm_init_child_owner(&actor_name) {
                         self.send_realm_init_child_event(
@@ -1948,6 +1978,11 @@ impl Brood {
                             "worktree backend stopped before creation completed",
                         );
                     }
+                    if let Some(id) = self.daemon_child_owner(&actor_name) {
+                        self.send_daemon_child_event(brood_wasm::ComponentChildEvent::Stopped {
+                            id,
+                        });
+                    }
                     if let Some((session, child_id)) = self.realm_init_child_owner(&actor_name) {
                         self.send_realm_init_child_event(
                             session,
@@ -1961,7 +1996,9 @@ impl Brood {
                     capabilities,
                     presentation_scope: _,
                 } => {
-                    if let Some(session) = self.realm_init_root_session(&actor_name) {
+                    if actor_name == BACKEND_INIT_ACTOR_ID {
+                        init_requests.push(InitRequest::StartDaemon(id, path, capabilities));
+                    } else if let Some(session) = self.realm_init_root_session(&actor_name) {
                         init_requests.push(InitRequest::StartActor(
                             session,
                             id,
@@ -1971,7 +2008,9 @@ impl Brood {
                     }
                 }
                 brood_wasm::ComponentActorEvent::ActorStopRequested { id } => {
-                    if let Some(session) = self.realm_init_root_session(&actor_name) {
+                    if actor_name == BACKEND_INIT_ACTOR_ID {
+                        init_requests.push(InitRequest::StopDaemon(id));
+                    } else if let Some(session) = self.realm_init_root_session(&actor_name) {
                         init_requests.push(InitRequest::StopActor(session, id));
                     }
                 }
@@ -1993,6 +2032,41 @@ impl Brood {
             }
         }
         for (actor_name, payload) in host_messages {
+            let policy_scope = if actor_name == BACKEND_INIT_ACTOR_ID {
+                Some((
+                    brood_cli::package_runtime::contract::Realm::Daemon,
+                    "daemon".to_string(),
+                ))
+            } else {
+                self.realm_init_root_session(&actor_name).map(|session| {
+                    (
+                        brood_cli::package_runtime::contract::Realm::SurfaceSession,
+                        session.raw().to_string(),
+                    )
+                })
+            };
+            if let Some((realm, scope)) = policy_scope
+                && let Some(actor) = self.wasm_io_actors.get(&actor_name)
+                && self.package_host.policy_report(
+                    realm,
+                    &scope,
+                    &actor_name,
+                    actor.generation(),
+                    &payload,
+                )
+            {
+                continue;
+            }
+            if let Some(actor) = self.wasm_io_actors.get(&actor_name)
+                && self.package_host.service_request(
+                    &actor_name,
+                    actor.generation(),
+                    &payload,
+                    || self.package_resource_samples(),
+                )
+            {
+                continue;
+            }
             if actor_name == BACKEND_INIT_ACTOR_ID {
                 self.handle_backend_actor_host_message(&payload);
             } else {
@@ -2054,6 +2128,10 @@ impl Brood {
         }
         for request in init_requests {
             match request {
+                InitRequest::StartDaemon(id, path, capabilities) => {
+                    self.handle_daemon_child_start(id, &path, &capabilities);
+                }
+                InitRequest::StopDaemon(id) => self.handle_daemon_child_stop(id),
                 InitRequest::StartActor(session, id, path, capabilities) => {
                     self.handle_realm_init_start(session, id, &path, &capabilities);
                 }
@@ -5243,6 +5321,7 @@ impl Brood {
     /// Service lifecycle requests and failure feedback for the session init
     /// actor. This is safe to call on every compositor turn.
     pub(crate) fn service_realm_init_actor(&mut self) {
+        self.service_package_declarations();
         self.drain_backend_lifecycle_completions();
         self.flush_presentation_actor_messages();
         if let Some(fast_path) = self.dmabuf.fast_path.as_mut() {
@@ -5279,6 +5358,230 @@ impl Brood {
             }
             self.send_realm_init_app_event(session, event);
         }
+    }
+
+    fn package_resource_samples(
+        &self,
+    ) -> Vec<(String, u64, std::collections::BTreeMap<String, u64>)> {
+        self.package_host
+            .records()
+            .into_iter()
+            .filter_map(|record| {
+                let actor = self.wasm_io_actors.get(&record.actor)?;
+                let stats = actor.runtime_io_stats();
+                Some((
+                    record.actor,
+                    actor.generation(),
+                    std::collections::BTreeMap::from([
+                        ("resources".into(), stats.resources as u64),
+                        ("streams".into(), stats.streams as u64),
+                        ("children".into(), stats.children as u64),
+                        ("timers".into(), stats.timers as u64),
+                    ]),
+                ))
+            })
+            .collect()
+    }
+
+    fn service_package_declarations(&mut self) {
+        self.flush_package_services();
+        if !self.package_host.poll() {
+            return;
+        }
+        self.package_host
+            .observe_resources(self.package_resource_samples());
+        self.package_host.sync_services();
+        {
+            let mut broker = self.package_host.services.borrow_mut();
+            let route = self
+                .dmabuf
+                .fast_path
+                .as_ref()
+                .map(|path| format!("presentation:{}", path.generation));
+            broker.retain_routes(&route.iter().cloned().collect::<Vec<_>>());
+            if let Some(route) = route {
+                broker.connect(&route, Some(self.sessions.active().raw().to_string()));
+            }
+            if let Err(error) = broker.publish().and_then(|()| broker.reconcile()) {
+                warn!(%error, "package services pending");
+            }
+        }
+        self.flush_package_services();
+        if let Ok(body) = self.package_host.update(
+            brood_cli::package_runtime::contract::Realm::Daemon,
+            "daemon",
+        ) && let Err(error) =
+            self.send_backend_actor_message(brood_cli::package_runtime::contract::HOST_SENDER, body)
+            && self.backend_init.is_some()
+        {
+            warn!(%error, "daemon package declaration pending");
+        }
+        for (session, init) in &self.realm_inits {
+            let Some(actor) = self.wasm_io_actors.get(&init.actor_id) else {
+                continue;
+            };
+            let body = self.package_host.update(
+                brood_cli::package_runtime::contract::Realm::SurfaceSession,
+                &session.raw().to_string(),
+            );
+            match body.and_then(|body| {
+                actor.try_send_message(
+                    brood_cli::package_runtime::contract::HOST_SENDER.into(),
+                    body,
+                )
+            }) {
+                Ok(()) => {}
+                Err(error) => {
+                    warn!(session = session.raw(), error = %error, "package declaration delivery pending");
+                }
+            }
+        }
+    }
+
+    pub(crate) fn accept_package_packet(&mut self, payload: &[u8]) -> anyhow::Result<()> {
+        let generation = self
+            .dmabuf
+            .fast_path
+            .as_ref()
+            .context("presentation disconnected")?
+            .generation;
+        let route = format!("presentation:{generation}");
+        self.package_host
+            .services
+            .borrow_mut()
+            .connect(&route, Some(self.sessions.active().raw().to_string()));
+        self.package_host.service_packet(&route, payload)?;
+        self.flush_package_services();
+        Ok(())
+    }
+
+    fn flush_package_services(&mut self) {
+        use brood_cli::{
+            package_runtime::contract::services::{GUEST_SENDER, HOST_ENDPOINT},
+            package_services::Delivery,
+        };
+        let mut blocked = std::collections::BTreeSet::new();
+        for _ in 0..64 {
+            let delivery = self
+                .package_host
+                .services
+                .borrow_mut()
+                .pop_unblocked(&blocked);
+            let Some(delivery) = delivery else {
+                break;
+            };
+            let result =
+                match &delivery {
+                    Delivery::Guest {
+                        actor,
+                        generation,
+                        event,
+                    } => self
+                        .wasm_io_actors
+                        .get(actor)
+                        .filter(|actor| actor.generation() == *generation)
+                        .map_or(Ok(()), |actor| {
+                            serde_json::to_vec(event)
+                                .map_err(anyhow::Error::from)
+                                .and_then(|body| actor.try_send_message(GUEST_SENDER.into(), body))
+                        }),
+                    Delivery::Remote { route, packet } => {
+                        if self.dmabuf.fast_path.as_ref().is_some_and(|path| {
+                            *route == format!("presentation:{}", path.generation)
+                        }) {
+                            packet
+                                .encode()
+                                .map_err(anyhow::Error::msg)
+                                .and_then(|body| {
+                                    self.send_presentation_actor_message(
+                                        BackendActorRealm::Daemon,
+                                        HOST_ENDPOINT,
+                                        HOST_ENDPOINT,
+                                        &body,
+                                    )
+                                })
+                        } else {
+                            Ok(())
+                        }
+                    }
+                };
+            if result.is_err() {
+                blocked.insert(delivery.lane());
+                self.package_host.services.borrow_mut().retry(delivery);
+            }
+        }
+        self.package_host
+            .services
+            .borrow_mut()
+            .defer_lanes(&blocked);
+    }
+
+    pub(crate) fn package_query(
+        &self,
+        bytes: &[u8],
+    ) -> brood_cli::package_runtime::contract::introspection::Response {
+        let query: serde_json::Value = serde_json::from_slice(bytes).unwrap_or_default();
+        let mut snapshot = self.package_instances(0, usize::MAX);
+        if let Some(snapshot) = snapshot.as_object_mut() {
+            snapshot.insert(
+                "catalogue".into(),
+                self.package_host.query_catalogue(&query),
+            );
+        }
+        brood_cli::introspection::snapshot_query(
+            self.brood_dbus_destination
+                .as_deref()
+                .unwrap_or("broodd:local"),
+            bytes,
+            &snapshot,
+        )
+    }
+
+    pub(crate) fn package_instances(&self, offset: usize, limit: usize) -> serde_json::Value {
+        let all_records = self.package_host.records();
+        let total = all_records.len();
+        let mut records: Vec<_> = all_records.into_iter().skip(offset).take(limit).collect();
+        for record in &mut records {
+            if let Some(actor) = self.wasm_io_actors.get(&record.actor) {
+                record.generation = Some(actor.generation());
+                if actor.mailbox_is_closed() {
+                    record.lifecycle = "failed".into();
+                }
+                let resources = actor.runtime_io_stats();
+                record.resources_observed_at_unix_ms = Some(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |time| {
+                            u64::try_from(time.as_millis()).unwrap_or(u64::MAX)
+                        }),
+                );
+                record
+                    .resources
+                    .insert("resources".into(), resources.resources as u64);
+                record
+                    .resources
+                    .insert("streams".into(), resources.streams as u64);
+                record
+                    .resources
+                    .insert("children".into(), resources.children as u64);
+                record
+                    .resources
+                    .insert("timers".into(), resources.timers as u64);
+            } else if record.lifecycle == "running" {
+                record.lifecycle = "unavailable".into();
+                record
+                    .recent_failures
+                    .push("the host no longer has this actor generation".into());
+            }
+        }
+        for record in &mut records {
+            record.assess_resources();
+        }
+        serde_json::json!({"schema_version": 1, "endpoint": self.brood_dbus_destination,
+            "observed_at_unix_ms": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |duration| duration.as_millis()),
+            "catalogue": self.package_host.describe(), "instances": records,
+            "total": total, "next_offset": (offset.saturating_add(limit) < total).then_some(offset.saturating_add(limit)),
+            "services": self.package_host.services.borrow().describe()})
     }
 
     fn handle_realm_init_start(
@@ -5344,41 +5647,60 @@ impl Brood {
                     .contains(&(session, id.to_string())),
             "init child actor is already running or starting"
         );
-        let relative = Path::new(guest_path);
-        ensure!(
-            !guest_path.trim().is_empty()
-                && !relative.is_absolute()
-                && !relative.components().any(|component| matches!(
-                    component,
-                    std::path::Component::ParentDir
-                        | std::path::Component::RootDir
-                        | std::path::Component::Prefix(_)
-                )),
-            "init child actor path must stay inside the init package root"
-        );
-        let root = self
-            .realm_inits
-            .get(&session)
-            .context("session init actor is not running")?
-            .root
-            .clone();
-        let canonical_root = root
-            .canonicalize()
-            .with_context(|| format!("resolve init package root {}", root.display()))?;
-        let unresolved = root.join(relative);
-        if !unresolved.exists() {
-            return Err(MissingRealmArtifact {
-                path: guest_path.to_string(),
+        let path = if guest_path.starts_with("package://") {
+            let (path, declaration) = self.package_host.resolve(
+                brood_cli::package_runtime::contract::Realm::SurfaceSession,
+                &session.raw().to_string(),
+                id,
+                guest_path,
+                capabilities,
+            )?;
+            self.package_host.starting(
+                brood_cli::package_runtime::contract::Realm::SurfaceSession,
+                &session.raw().to_string(),
+                &actor_id,
+                &session_init_actor_id(session),
+                declaration,
+            );
+            path
+        } else {
+            let relative = Path::new(guest_path);
+            ensure!(
+                !guest_path.trim().is_empty()
+                    && !relative.is_absolute()
+                    && !relative.components().any(|component| matches!(
+                        component,
+                        std::path::Component::ParentDir
+                            | std::path::Component::RootDir
+                            | std::path::Component::Prefix(_)
+                    )),
+                "init child actor path must stay inside the init package root"
+            );
+            let root = self
+                .realm_inits
+                .get(&session)
+                .context("session init actor is not running")?
+                .root
+                .clone();
+            let canonical_root = root
+                .canonicalize()
+                .with_context(|| format!("resolve init package root {}", root.display()))?;
+            let unresolved = root.join(relative);
+            if !unresolved.exists() {
+                return Err(MissingRealmArtifact {
+                    path: guest_path.to_string(),
+                }
+                .into());
             }
-            .into());
-        }
-        let path = unresolved.canonicalize().with_context(|| {
-            format!("resolve init child actor {}", root.join(relative).display())
-        })?;
-        ensure!(
-            path.starts_with(&canonical_root),
-            "init child actor path must stay inside the init package root"
-        );
+            let path = unresolved.canonicalize().with_context(|| {
+                format!("resolve init child actor {}", root.join(relative).display())
+            })?;
+            ensure!(
+                path.starts_with(&canonical_root),
+                "init child actor path must stay inside the init package root"
+            );
+            path
+        };
         ensure!(
             capabilities.iter().all(|capability| {
                 matches!(
@@ -5605,6 +5927,13 @@ impl Brood {
                             self.plugin_actor_last_status =
                                 Some(format!("{actor_id}:replacement_failed"));
                             match purpose {
+                                HostedReplacementPurpose::DaemonChild { id } => {
+                                    self.starting_daemon_children.remove(&id);
+                                    self.stop_daemon_while_starting.remove(&id);
+                                    self.send_daemon_child_event(
+                                        brood_wasm::ComponentChildEvent::Failed { id, message },
+                                    );
+                                }
                                 HostedReplacementPurpose::RealmChild { session, id } => {
                                     self.starting_realm_children.remove(&(session, id.clone()));
                                     self.stop_requested_while_starting
@@ -5677,6 +6006,9 @@ impl Brood {
                         warn!(actor = %actor_id, error = %error, "failed to retire replaced hosted actor");
                     }
                     match purpose {
+                        HostedReplacementPurpose::DaemonChild { id } => {
+                            self.commit_daemon_child(id, &actor_id, generation);
+                        }
                         HostedReplacementPurpose::Generic => {
                             self.plugin_actor_last_status =
                                 Some(format!("{actor_id}:replacement_started"));
@@ -5756,7 +6088,12 @@ impl Brood {
                     self.send_realm_init_child_event(session, event);
                 }
                 BackendLifecycleCompletion::ActorRetired { actor_id, result } => {
-                    if let Err(message) = result {
+                    if let Some(id) = self.stopping_daemon_children.remove(&actor_id) {
+                        self.send_daemon_child_event(match result {
+                            Ok(()) => brood_wasm::ComponentChildEvent::Stopped { id },
+                            Err(message) => brood_wasm::ComponentChildEvent::Failed { id, message },
+                        });
+                    } else if let Err(message) = result {
                         warn!(actor = %actor_id, error = %message, "backend actor retirement failed");
                     }
                 }
@@ -5846,6 +6183,17 @@ impl Brood {
             .and_then(|init| init.children.get(&id))
             .cloned();
         let Some(actor_id) = owned else {
+            if self.package_host.owns(
+                brood_cli::package_runtime::contract::Realm::SurfaceSession,
+                &session.raw().to_string(),
+                &id,
+            ) {
+                self.send_realm_init_child_event(
+                    session,
+                    brood_wasm::ComponentChildEvent::Stopped { id },
+                );
+                return;
+            }
             self.send_realm_init_child_event(
                 session,
                 brood_wasm::ComponentChildEvent::Failed {
@@ -5957,6 +6305,20 @@ impl Brood {
         session: SurfaceSessionId,
         event: brood_wasm::ComponentChildEvent,
     ) {
+        let realm = brood_cli::package_runtime::contract::Realm::SurfaceSession;
+        let scope = session.raw().to_string();
+        match &event {
+            brood_wasm::ComponentChildEvent::Started { id, generation } => {
+                self.package_host.started(realm, &scope, id, *generation);
+            }
+            brood_wasm::ComponentChildEvent::Failed { id, message } => {
+                self.package_host
+                    .outcome(realm, &scope, id, "failed", Some(message));
+            }
+            brood_wasm::ComponentChildEvent::Stopped { id } => self
+                .package_host
+                .outcome(realm, &scope, id, "stopped", None),
+        }
         let Some(init) = self.realm_inits.get(&session) else {
             return;
         };
@@ -6546,6 +6908,18 @@ impl Brood {
         self.wasm_io_actors
             .insert(actor_name.to_string(), candidate);
         match purpose {
+            HostedReplacementPurpose::DaemonChild { id } => {
+                let generation = self
+                    .wasm_io_actors
+                    .get(actor_name)
+                    .context("daemon child disappeared before publication")?
+                    .generation();
+                if let Some((config, _)) = lifecycle {
+                    self.configured_plugin_lifecycles
+                        .insert(actor_name.into(), config.clone());
+                }
+                self.commit_daemon_child(id, actor_name, generation);
+            }
             HostedReplacementPurpose::Generic => {
                 self.plugin_actor_last_status = Some(format!("{actor_name}:component_started"));
             }

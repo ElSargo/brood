@@ -165,6 +165,7 @@ struct WorktreeManager;
 
 impl Guest for WorktreeManager {
     fn dispatch(event: Event) -> Vec<Command> {
+        if let Some(commands) = brood_plugin_sdk::packages::dispatch(&event) { return commands; }
         match event {
             Event::Lifecycle(LifecycleEvent::Start(_)) => {
                 vec![Command::LifecycleComplete(Ok(()))]

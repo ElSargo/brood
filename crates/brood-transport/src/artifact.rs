@@ -129,10 +129,17 @@ impl ArtifactOffer {
         let bytes = fs::metadata(&path)
             .with_context(|| format!("inspect offered artifact {}", path.display()))?
             .len();
+        let mut marker = vec![0; brood_package_contract::BUNDLE_MAGIC.len()];
+        let read = fs::File::open(&path)?.read(&mut marker)?;
+        let kind = if marker.get(..read) == Some(brood_package_contract::BUNDLE_MAGIC) {
+            ArtifactKind::PackageBundle
+        } else {
+            ArtifactKind::WasmActor
+        };
         let manifest = ArtifactManifest {
             id: id.to_string(),
             realm,
-            kind: ArtifactKind::WasmActor,
+            kind,
             digest: digest_file(&path)?,
             bytes,
             abi_version: ARTIFACT_ABI_VERSION,
@@ -232,11 +239,11 @@ impl Iterator for ArtifactTransferMessages {
                 Ok(0) if actual_digest == self.digest => Ok(ArtifactMessage::Complete {
                     digest: self.digest,
                 }),
-                Ok(0) => Ok(ArtifactMessage::Rejected {
+                Ok(0) => Ok(ArtifactMessage::TransferAborted {
                     digest: self.digest,
                     reason: "offered artifact changed while it was streamed".to_string(),
                 }),
-                Ok(_) => Ok(ArtifactMessage::Rejected {
+                Ok(_) => Ok(ArtifactMessage::TransferAborted {
                     digest: self.digest,
                     reason: "offered artifact grew while it was streamed".to_string(),
                 }),
@@ -251,7 +258,7 @@ impl Iterator for ArtifactTransferMessages {
         let read = match self.file.read(&mut bytes) {
             Ok(0) => {
                 self.finished = true;
-                return Some(Ok(ArtifactMessage::Rejected {
+                return Some(Ok(ArtifactMessage::TransferAborted {
                     digest: self.digest,
                     reason: "offered artifact was truncated while streaming".to_string(),
                 }));
@@ -367,6 +374,20 @@ impl ArtifactExchange {
             } => Ok(self.handle_chunk(digest, offset, bytes)),
             ArtifactMessage::Complete { digest } => self.handle_complete(digest),
             ArtifactMessage::Accepted { digest } => Ok(self.handle_accepted(digest)),
+            ArtifactMessage::TransferAborted { digest, reason } => {
+                if let Some(incoming) = self.incoming.remove(&digest) {
+                    self.incoming_bytes =
+                        self.incoming_bytes.saturating_sub(incoming.manifest.bytes);
+                }
+                Ok(ArtifactExchangeUpdate {
+                    events: vec![ArtifactExchangeEvent::PeerRejected {
+                        manifest: self.available.get(&digest).cloned(),
+                        digest,
+                        reason: format!("peer aborted outgoing transfer: {reason}"),
+                    }],
+                    ..ArtifactExchangeUpdate::default()
+                })
+            }
             ArtifactMessage::Rejected { digest, reason } => {
                 Ok(self.handle_rejected(digest, reason))
             }
@@ -683,14 +704,9 @@ impl ArtifactExchange {
         }
     }
 
-    fn handle_rejected(
-        &mut self,
-        digest: ArtifactDigest,
-        reason: String,
-    ) -> ArtifactExchangeUpdate {
-        if let Some(incoming) = self.incoming.remove(&digest) {
-            self.incoming_bytes = self.incoming_bytes.saturating_sub(incoming.manifest.bytes);
-        }
+    fn handle_rejected(&self, digest: ArtifactDigest, reason: String) -> ArtifactExchangeUpdate {
+        // This is rejection of our outgoing offer. A simultaneous incoming
+        // transfer may have identical bytes and must keep its receive state.
         ArtifactExchangeUpdate {
             outbound: Vec::new(),
             transfers: Vec::new(),
@@ -850,6 +866,80 @@ fn bounded_rejection_reason(mut reason: String) -> String {
     }
     reason.truncate(end);
     reason
+}
+
+/// Bounded duplex egress: a large outgoing artifact must not stop the exchange
+/// from reading the peer's simultaneous transfer and releasing QUIC flow credit.
+pub struct ArtifactSender {
+    sender: tokio::sync::mpsc::Sender<ArtifactOutput>,
+    task: tokio::task::JoinHandle<Result<()>>,
+}
+
+enum ArtifactOutput {
+    Message(ArtifactMessage),
+    Transfer(ArtifactTransfer),
+}
+
+impl ArtifactSender {
+    #[must_use]
+    pub fn to_server(lane: crate::NetworkSendLane) -> Self {
+        Self::spawn(lane, true)
+    }
+    #[must_use]
+    pub fn to_client(lane: crate::NetworkSendLane) -> Self {
+        Self::spawn(lane, false)
+    }
+    fn spawn(mut lane: crate::NetworkSendLane, to_server: bool) -> Self {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(16);
+        let task = tokio::spawn(async move {
+            while let Some(output) = receiver.recv().await {
+                match output {
+                    ArtifactOutput::Message(message) => {
+                        send_artifact_message(&mut lane, message, to_server).await?;
+                    }
+                    ArtifactOutput::Transfer(transfer) => {
+                        for message in transfer.messages()? {
+                            send_artifact_message(&mut lane, message?, to_server).await?;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        });
+        Self { sender, task }
+    }
+    pub async fn message(&self, message: ArtifactMessage) -> Result<()> {
+        self.sender
+            .send(ArtifactOutput::Message(message))
+            .await
+            .map_err(|error| anyhow!("artifact egress stopped: {error}"))
+    }
+    pub async fn transfer(&self, transfer: ArtifactTransfer) -> Result<()> {
+        self.sender
+            .send(ArtifactOutput::Transfer(transfer))
+            .await
+            .map_err(|error| anyhow!("artifact egress stopped: {error}"))
+    }
+}
+
+impl Drop for ArtifactSender {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn send_artifact_message(
+    lane: &mut crate::NetworkSendLane,
+    message: ArtifactMessage,
+    to_server: bool,
+) -> Result<()> {
+    if to_server {
+        lane.send_client_message(&brood_protocol::ClientMessage::Artifact(message))
+            .await
+    } else {
+        lane.send_server_message(&brood_protocol::ServerMessage::Artifact(message))
+            .await
+    }
 }
 
 #[cfg(test)]
@@ -1030,7 +1120,7 @@ mod tests {
             .unwrap_or_else(|error| unreachable!("{error}"));
         assert!(matches!(
             messages.last(),
-            Some(ArtifactMessage::Rejected { .. })
+            Some(ArtifactMessage::TransferAborted { .. })
         ));
         assert!(
             !messages
@@ -1188,5 +1278,50 @@ mod tests {
 
     fn test_root(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("brood-artifact-{name}-{}", std::process::id()))
+    }
+    #[test]
+    fn rejection_of_outgoing_identical_bytes_preserves_incoming_transfer() {
+        let root = test_root("opposite-direction-rejection");
+        fs::create_dir_all(&root).unwrap_or_else(|error| unreachable!("{error}"));
+        let path = root.join("same.wasm");
+        fs::write(&path, b"\0asm identical bytes both directions")
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        let outgoing = ArtifactOffer::from_path("same", ArtifactRealm::Session, &path, vec![])
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        let incoming = ArtifactOffer::from_path("same", ArtifactRealm::Client, &path, vec![])
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        let digest = outgoing.manifest.digest;
+        let mut receiver = ArtifactExchange::new(
+            ArtifactRealm::Client,
+            ["same".into()],
+            root.join("cache"),
+            vec![outgoing],
+        )
+        .unwrap_or_else(|error| unreachable!("{error}"));
+        receiver
+            .handle(ArtifactMessage::Offer(incoming.manifest))
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        receiver
+            .handle(ArtifactMessage::Rejected {
+                digest,
+                reason: "session destination denied the offer".into(),
+            })
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        assert!(receiver.incoming.contains_key(&digest));
+        receiver
+            .handle(ArtifactMessage::Chunk {
+                digest,
+                offset: 0,
+                bytes: fs::read(path).unwrap_or_else(|error| unreachable!("{error}")),
+            })
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        let received = receiver
+            .handle(ArtifactMessage::Complete { digest })
+            .unwrap_or_else(|error| unreachable!("{error}"));
+        assert!(matches!(
+            received.events.as_slice(),
+            [ArtifactExchangeEvent::Installed(_)]
+        ));
+        fs::remove_dir_all(root).unwrap_or_else(|error| unreachable!("{error}"));
     }
 }

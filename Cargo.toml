@@ -1,5 +1,7 @@
 [workspace]
+exclude = ["crates/brood-package-manifest"]
 members = [
+    "crates/brood-package-contract",
     "clients/brood-client",
     "crates/bmux",
     "crates/brood-capsuled",
@@ -25,6 +27,7 @@ resolver = "3"
 edition = "2024"
 
 [workspace.dependencies]
+brood-package-contract = { path = "crates/brood-package-contract" }
 anyhow = "1.0.102"
 base64 = "0.22.1"
 bytemuck = { version = "1.25.0", features = ["derive"] }

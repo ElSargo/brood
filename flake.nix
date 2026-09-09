@@ -12,6 +12,7 @@
 
   outputs =
     {
+      self,
       crane,
       nixpkgs,
       rust-overlay,
@@ -37,6 +38,7 @@
         system:
         import ./nix/packages.nix {
           inherit crane;
+          sourceInfo = self;
           pkgs = pkgsFor system;
         }
       );
@@ -46,6 +48,7 @@
         let
           packages = import ./nix/packages.nix {
             inherit crane;
+            sourceInfo = self;
             pkgs = pkgsFor system;
           };
         in
@@ -58,6 +61,7 @@
         system:
         (import ./nix/packages.nix {
           inherit crane;
+          sourceInfo = self;
           pkgs = pkgsFor system;
         }).formatter
       );

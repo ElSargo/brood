@@ -15,7 +15,7 @@ directories so implementation work does not silently rewrite product goals.
 
 - [[overview]] explains what Brood is.
 - [[architecture]] maps the current implementation and intended boundaries.
-- [[CONTEXT]] is the glossary and terminology source of truth.
+- [[../CONTEXT]] is the glossary and terminology source of truth.
 
 ## Current Behavior
 

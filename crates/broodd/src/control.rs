@@ -3312,7 +3312,12 @@ fn drain_fast_path_actor_messages(state: &mut Brood) {
     for (realm, decoded) in messages {
         match (realm, decoded) {
             (Ok(brood_protocol::BackendActorRealm::Daemon), Ok((sender, recipient, body))) => {
-                let result = if recipient == "computer-use" {
+                let result = if recipient
+                    == brood_cli::package_runtime::contract::services::HOST_ENDPOINT
+                    && sender == brood_cli::package_runtime::contract::services::HOST_ENDPOINT
+                {
+                    state.accept_package_packet(&body)
+                } else if recipient == "computer-use" {
                     crate::computer_use::handle_observer_command(state, sender, &body)
                         .map_err(anyhow::Error::msg)
                 } else {
@@ -4104,6 +4109,31 @@ fn execute_tokens(tokens: &[String], state: &mut Brood) -> Result<String> {
     };
 
     let response = match command.as_str() {
+        "package-store" if args.is_empty() => {
+            serde_json::to_string(&brood_cli::package_runtime::default_store())?
+        }
+        "package-query" => {
+            let bytes = match args {
+                [request] => request.as_bytes(),
+                _ => b"",
+            };
+            serde_json::to_string(&state.package_query(bytes))?
+        }
+        "package-instances" => {
+            let (offset, limit) = match args {
+                [] => (0, 100),
+                [offset, limit] => (offset.parse::<usize>()?, limit.parse::<usize>()?),
+                _ => bail!("package-instances accepts an optional offset and limit"),
+            };
+            ensure!(
+                (1..=100).contains(&limit),
+                "instance page limit must be between 1 and 100"
+            );
+            serde_json::to_string(&state.package_instances(offset, limit))?
+        }
+        "knowledge" => {
+            brood_cli::knowledge::endpoint_query(args, &format!("broodd:{}", std::process::id()))?
+        }
         "handshake" => {
             let [client_version] = args else {
                 bail!("usage: handshake <protocol-version>");

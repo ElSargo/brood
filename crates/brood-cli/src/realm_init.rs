@@ -14,28 +14,28 @@ pub enum RealmKind {
     Client,
 }
 
-#[derive(Default, serde::Deserialize)]
-struct RootConfig {
+#[derive(Default, serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
+pub struct RootConfig {
     #[serde(default)]
     init: InitConfig,
     #[serde(default)]
     client: ClientConfig,
 }
 
-#[derive(Default, serde::Deserialize)]
+#[derive(Default, serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
 struct InitConfig {
     backend: Option<PathBuf>,
     session: Option<PathBuf>,
     client: Option<PathBuf>,
 }
 
-#[derive(Default, serde::Deserialize)]
+#[derive(Default, serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
 struct ClientConfig {
     #[serde(rename = "key-policy")]
     key_policy: Option<ClientKeyPolicyConfig>,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
 struct ClientKeyPolicyConfig {
     provider: String,
     path: PathBuf,

@@ -20,6 +20,10 @@ pub struct Args {
 pub enum Command {
     /// Print startup information and exit.
     Check,
+    /// Plan, build, and inspect self-describing packages.
+    Package(crate::package::PackageArgs),
+    /// Discover and export extension documentation from this executable, offline.
+    Knowledge(crate::knowledge::KnowledgeArgs),
     /// Enter a new Brood session environment for a shell or command.
     Enter(EnterArgs),
     /// Show the current Brood session in the active presentation surface.
@@ -58,6 +62,10 @@ pub struct TestArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum TestCommand {
+    /// Build and activate a real external package in isolated session and presentation realms.
+    Packages(NestedTestArgs),
+    /// Prove offline extension discovery with the checkout hidden and networking disabled.
+    Knowledge(NestedTestArgs),
     /// Prove server-only computer-use capture with SHM and DMA-BUF clients.
     ComputerUse(NestedTestArgs),
     /// Drive real calculations and menu configuration in `SpeedCrunch`.

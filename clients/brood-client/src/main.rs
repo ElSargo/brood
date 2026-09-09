@@ -1033,6 +1033,9 @@ fn main() -> Result<()> {
             ClientMessage::Lifecycle(ClientLifecycle::Disconnect),
         );
     }
+    if let Some(runtime) = &application.wasm_runtime {
+        eprintln!("PACKAGE_INSTANCES {}", runtime.package_instances());
+    }
     let actor_runtime_diagnostics = application
         .wasm_runtime
         .as_ref()
@@ -5550,6 +5553,12 @@ impl Application {
                 name: actor.name,
                 generation: actor.generation,
             };
+            // The init root can retire an actor before asynchronous teardown
+            // removes its graphics scheduler registration. Hints from that
+            // generation are stale work, not a failure of the presentation.
+            if runtime.actor_identity(&identity.name).as_ref() != Some(&identity) {
+                continue;
+            }
             if let Some(targets) = runtime.facet_targets(&identity)? {
                 let renderer = self
                     .renderer
@@ -12449,6 +12458,16 @@ impl ApplicationHandler<ClientEvent> for Application {
                 received_at,
             } => {
                 if !self.backend_registry.observe(backend, None) {
+                    return;
+                }
+                if sender == brood_cli::package_runtime::contract::services::HOST_ENDPOINT
+                    && recipient == brood_cli::package_runtime::contract::services::HOST_ENDPOINT
+                {
+                    if let Some(runtime) = self.wasm_runtime.as_mut()
+                        && let Err(error) = runtime.accept_package_packet(backend, &body)
+                    {
+                        eprintln!("rejected package endpoint message: {error:#}");
+                    }
                     return;
                 }
                 if sender == COMPUTER_USE_SERVER_ACTOR && recipient == COMPUTER_USE_OBSERVER_ACTOR {

@@ -1,7 +1,4 @@
-wit_bindgen::generate!({
-    path: "../../crates/brood-wasm/wit",
-    world: "brood-plugin",
-});
+use brood_plugin_sdk::{bindings, exports};
 
 use exports::brood::plugin::actor::{
     ActorStartRequest, AppStartRequest, ChildEvent, Command, Event, Guest, LifecycleEvent,
@@ -116,6 +113,7 @@ struct ExampleInitActor;
 
 impl Guest for ExampleInitActor {
     fn dispatch(event: Event) -> Vec<Command> {
+        if let Some(commands) = brood_plugin_sdk::packages::dispatch(&event) { return commands; }
         match event {
             Event::Lifecycle(LifecycleEvent::Start(context))
                 if context
@@ -1091,4 +1089,4 @@ mod tests {
     }
 }
 
-export!(ExampleInitActor with_types_in self);
+bindings::export!(ExampleInitActor with_types_in bindings);

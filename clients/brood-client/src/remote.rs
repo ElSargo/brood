@@ -860,23 +860,20 @@ fn handle_reliable_message(
 }
 
 async fn exchange_artifacts(
-    mut send: NetworkSendLane,
+    send: NetworkSendLane,
     mut receive: NetworkReceiveLane,
     mut exchange: ArtifactExchange,
     proxy: EventLoopProxy<ClientEvent>,
 ) -> Result<()> {
+    let send = brood_transport::ArtifactSender::to_server(send);
     let mut outbound = VecDeque::from(exchange.initial_messages());
     let mut transfers = VecDeque::<brood_transport::ArtifactTransfer>::new();
     loop {
         while let Some(message) = outbound.pop_front() {
-            send.send_client_message(&ClientMessage::Artifact(message))
-                .await?;
+            send.message(message).await?;
         }
         while let Some(transfer) = transfers.pop_front() {
-            for message in transfer.messages()? {
-                send.send_client_message(&ClientMessage::Artifact(message?))
-                    .await?;
-            }
+            send.transfer(transfer).await?;
         }
         let message = receive_server_artifact(&mut receive).await?;
         let update = exchange.handle(message)?;
@@ -886,6 +883,23 @@ async fn exchange_artifacts(
             match event {
                 ArtifactExchangeEvent::Installed(artifact) => {
                     let digest = artifact.manifest.digest;
+                    if artifact.manifest.kind == brood_protocol::ArtifactKind::PackageBundle {
+                        let receipt = tokio::task::spawn_blocking(move || {
+                            brood_cli::package_runtime::import_remote_bundle(
+                                &artifact.manifest.id,
+                                &artifact.path,
+                                brood_cli::package_runtime::contract::Realm::PresentationClient,
+                                &brood_cli::package_runtime::default_store(),
+                            )
+                        })
+                        .await
+                        .context("join package destination installation")?;
+                        let result = receipt
+                            .map(|receipt| eprintln!("PACKAGE_DESTINATION_RECEIPT {receipt}"))
+                            .map_err(|error| format!("{error:#}"));
+                        outbound.push_back(exchange.finish_installation(digest, result)?);
+                        continue;
+                    }
                     let (completion, installed) = tokio::sync::oneshot::channel();
                     proxy
                         .send_event(ClientEvent::RemoteArtifactInstalled {

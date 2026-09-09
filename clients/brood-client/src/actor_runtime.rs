@@ -68,6 +68,7 @@ pub struct PresentationWasmRuntime {
     event_proxy: Option<EventLoopProxy<ClientEvent>>,
     graphics: Option<PluginGraphicsBridge>,
     init: Option<PresentationInitState>,
+    package_host: brood_cli::package_runtime::PackageHost,
     failed_init_children: BTreeSet<String>,
     starting_init_children: BTreeSet<String>,
     stopping_init_children: BTreeSet<String>,
@@ -408,6 +409,12 @@ impl PresentationWasmRuntime {
         // actors. Keep their completed values bounded too: each completion
         // owns an actor and can therefore retain a complete Wasmtime store.
         let (lifecycle_completion_sender, lifecycle_completions) = mpsc::channel(64);
+        let package_proxy = event_proxy.clone();
+        let package_host = brood_cli::package_runtime::PackageHost::new(move || {
+            if let Some(proxy) = &package_proxy {
+                drop(proxy.send_event(ClientEvent::ActorHostMessagesReady));
+            }
+        });
         let mut runtime = Self {
             executor,
             io_executor,
@@ -426,6 +433,7 @@ impl PresentationWasmRuntime {
             event_proxy,
             graphics: graphics.cloned(),
             init: None,
+            package_host,
             failed_init_children: BTreeSet::new(),
             starting_init_children: BTreeSet::new(),
             stopping_init_children: BTreeSet::new(),
@@ -1281,6 +1289,7 @@ impl PresentationWasmRuntime {
         graphics: Option<&PluginGraphicsBridge>,
     ) -> Result<()> {
         self.drain_lifecycle_completions();
+        self.service_package_declarations();
         let retained_input = self
             .pending_actor_events
             .lock()
@@ -1583,6 +1592,28 @@ impl PresentationWasmRuntime {
                         .push_back(SessionCommandEnvelope { actor_id, request });
                 }
                 ComponentActorEvent::HostMessageRequested { payload } => {
+                    if actor_id == CLIENT_INIT_ACTOR_ID
+                        && let Some(actor) = self.actors.get(&actor_id)
+                        && self.package_host.policy_report(
+                            brood_cli::package_runtime::contract::Realm::PresentationClient,
+                            &std::process::id().to_string(),
+                            &actor_id,
+                            actor.actor.generation(),
+                            &payload,
+                        )
+                    {
+                        continue;
+                    }
+                    if let Some(actor) = self.actors.get(&actor_id)
+                        && self.package_host.service_request(
+                            &actor_id,
+                            actor.actor.generation(),
+                            &payload,
+                            || self.package_resource_samples(),
+                        )
+                    {
+                        continue;
+                    }
                     let sender = self
                         .actor_identity(&actor_id)
                         .context("component host message lost its actor identity")?;
@@ -1630,6 +1661,203 @@ impl PresentationWasmRuntime {
         }
     }
 
+    fn package_resource_samples(
+        &self,
+    ) -> Vec<(String, u64, std::collections::BTreeMap<String, u64>)> {
+        self.package_host
+            .records()
+            .into_iter()
+            .filter_map(|record| {
+                let (stats, generation) = {
+                    let actor = self.actors.get(&record.actor)?;
+                    (actor.actor.runtime_io_stats(), actor.actor.generation())
+                };
+                Some((
+                    record.actor,
+                    generation,
+                    std::collections::BTreeMap::from([
+                        ("resources".into(), stats.resources as u64),
+                        ("streams".into(), stats.streams as u64),
+                        ("children".into(), stats.children as u64),
+                        ("timers".into(), stats.timers as u64),
+                    ]),
+                ))
+            })
+            .collect()
+    }
+
+    fn service_package_declarations(&mut self) {
+        self.flush_package_services();
+        if !self.package_host.poll() {
+            return;
+        }
+        self.package_host
+            .observe_resources(self.package_resource_samples());
+        self.package_host.sync_services();
+        {
+            let mut broker = self.package_host.services.borrow_mut();
+            let routes: Vec<_> = self
+                .connected_backends
+                .iter()
+                .map(|backend| format!("backend:{}", backend.0))
+                .collect();
+            broker.retain_routes(&routes);
+            for route in routes {
+                broker.connect(&route, None);
+            }
+            if let Err(error) = broker.publish().and_then(|()| broker.reconcile()) {
+                eprintln!("presentation package services pending: {error:#}");
+            }
+        }
+        self.flush_package_services();
+        let Some(root) = self.actors.get(CLIENT_INIT_ACTOR_ID) else {
+            return;
+        };
+        let body = self.package_host.update(
+            brood_cli::package_runtime::contract::Realm::PresentationClient,
+            &std::process::id().to_string(),
+        );
+        if let Err(error) = body.and_then(|body| {
+            root.actor.try_send_message(
+                brood_cli::package_runtime::contract::HOST_SENDER.into(),
+                body,
+            )
+        }) {
+            eprintln!("presentation package declaration pending: {error:#}");
+        }
+    }
+
+    pub fn accept_package_packet(&mut self, backend: BackendId, payload: &[u8]) -> Result<()> {
+        ensure!(
+            self.connected_backends.contains(&backend),
+            "package endpoint disconnected"
+        );
+        let route = format!("backend:{}", backend.0);
+        self.package_host
+            .services
+            .borrow_mut()
+            .connect(&route, None);
+        self.package_host.service_packet(&route, payload)?;
+        self.flush_package_services();
+        Ok(())
+    }
+
+    fn flush_package_services(&mut self) {
+        use brood_cli::{
+            package_runtime::contract::services::{GUEST_SENDER, HOST_ENDPOINT},
+            package_services::Delivery,
+        };
+        let mut blocked = std::collections::BTreeSet::new();
+        for _ in 0..64 {
+            let delivery = self
+                .package_host
+                .services
+                .borrow_mut()
+                .pop_unblocked(&blocked);
+            let Some(delivery) = delivery else {
+                break;
+            };
+            let result = match &delivery {
+                Delivery::Guest {
+                    actor,
+                    generation,
+                    event,
+                } => self
+                    .actors
+                    .get(actor)
+                    .filter(|actor| actor.actor.generation() == *generation)
+                    .map_or(Ok(()), |actor| {
+                        serde_json::to_vec(event)
+                            .map_err(anyhow::Error::from)
+                            .and_then(|body| {
+                                actor.actor.try_send_message(GUEST_SENDER.into(), body)
+                            })
+                    }),
+                Delivery::Remote { route, packet } => {
+                    if let Some(backend) = self
+                        .connected_backends
+                        .iter()
+                        .find(|backend| *route == format!("backend:{}", backend.0))
+                        .copied()
+                    {
+                        if self.outbound_backend_messages.len() >= 256 {
+                            self.package_host.services.borrow_mut().retry(delivery);
+                            break;
+                        }
+                        packet.encode().map_err(anyhow::Error::msg).map(|body| {
+                            self.outbound_backend_messages
+                                .push_back(BackendActorMessageRequest {
+                                    backend,
+                                    sender: HOST_ENDPOINT.into(),
+                                    realm: BackendActorRealm::Daemon,
+                                    actor: HOST_ENDPOINT.into(),
+                                    body,
+                                });
+                        })
+                    } else {
+                        Ok(())
+                    }
+                }
+            };
+            if result.is_err() {
+                blocked.insert(delivery.lane());
+                self.package_host.services.borrow_mut().retry(delivery);
+            }
+        }
+        if !self.outbound_backend_messages.is_empty()
+            && let Some(proxy) = &self.event_proxy
+        {
+            drop(proxy.send_event(ClientEvent::ActorHostMessagesReady));
+        }
+        self.package_host
+            .services
+            .borrow_mut()
+            .defer_lanes(&blocked);
+    }
+
+    pub fn package_instances(&self) -> serde_json::Value {
+        let mut records = self.package_host.records();
+        for record in &mut records {
+            if let Some(hosted) = self.actors.get(&record.actor) {
+                record.generation = Some(hosted.actor.generation());
+                if hosted.actor.mailbox_is_closed() {
+                    record.lifecycle = "failed".into();
+                }
+                let resources = hosted.actor.runtime_io_stats();
+                record.resources_observed_at_unix_ms = Some(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |time| {
+                            u64::try_from(time.as_millis()).unwrap_or(u64::MAX)
+                        }),
+                );
+                record
+                    .resources
+                    .insert("resources".into(), resources.resources as u64);
+                record
+                    .resources
+                    .insert("streams".into(), resources.streams as u64);
+                record
+                    .resources
+                    .insert("children".into(), resources.children as u64);
+                record
+                    .resources
+                    .insert("timers".into(), resources.timers as u64);
+            } else if record.lifecycle == "running" {
+                record.lifecycle = "unavailable".into();
+                record
+                    .recent_failures
+                    .push("the host no longer has this actor generation".into());
+            }
+        }
+        for record in &mut records {
+            record.assess_resources();
+        }
+        serde_json::json!({"schema_version": 1, "endpoint": format!("presentation:{}", std::process::id()),
+            "observed_at_unix_ms": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |duration| duration.as_millis()),
+            "catalogue": self.package_host.describe(), "instances": records, "services": self.package_host.services.borrow().describe()})
+    }
+
     fn start_init_child(
         &mut self,
         id: &str,
@@ -1652,34 +1880,53 @@ impl PresentationWasmRuntime {
                 && !self.stopping_init_children.contains(id),
             "init actor cannot replace an actor it does not own"
         );
-        let relative = Path::new(guest_path);
-        ensure!(
-            !guest_path.trim().is_empty()
-                && !relative.is_absolute()
-                && !relative.components().any(|component| matches!(
-                    component,
-                    std::path::Component::ParentDir
-                        | std::path::Component::RootDir
-                        | std::path::Component::Prefix(_)
-                )),
-            "init child actor path must stay inside the init package root"
-        );
-        let root = self
-            .init
-            .as_ref()
-            .context("client init actor is not running")?
-            .root
-            .clone();
-        let canonical_root = root
-            .canonicalize()
-            .with_context(|| format!("resolve init package root {}", root.display()))?;
-        let path = root.join(relative).canonicalize().with_context(|| {
-            format!("resolve init child actor {}", root.join(relative).display())
-        })?;
-        ensure!(
-            path.starts_with(&canonical_root),
-            "init child actor path must stay inside the init package root"
-        );
+        let path = if guest_path.starts_with("package://") {
+            let (path, declaration) = self.package_host.resolve(
+                brood_cli::package_runtime::contract::Realm::PresentationClient,
+                &std::process::id().to_string(),
+                id,
+                guest_path,
+                capabilities,
+            )?;
+            self.package_host.starting(
+                brood_cli::package_runtime::contract::Realm::PresentationClient,
+                &std::process::id().to_string(),
+                id,
+                CLIENT_INIT_ACTOR_ID,
+                declaration,
+            );
+            path
+        } else {
+            let relative = Path::new(guest_path);
+            ensure!(
+                !guest_path.trim().is_empty()
+                    && !relative.is_absolute()
+                    && !relative.components().any(|component| matches!(
+                        component,
+                        std::path::Component::ParentDir
+                            | std::path::Component::RootDir
+                            | std::path::Component::Prefix(_)
+                    )),
+                "init child actor path must stay inside the init package root"
+            );
+            let root = self
+                .init
+                .as_ref()
+                .context("client init actor is not running")?
+                .root
+                .clone();
+            let canonical_root = root
+                .canonicalize()
+                .with_context(|| format!("resolve init package root {}", root.display()))?;
+            let path = root.join(relative).canonicalize().with_context(|| {
+                format!("resolve init child actor {}", root.join(relative).display())
+            })?;
+            ensure!(
+                path.starts_with(&canonical_root),
+                "init child actor path must stay inside the init package root"
+            );
+            path
+        };
         let spec = PresentationActorSpec {
             id: id.to_string(),
             path,
@@ -1715,6 +1962,18 @@ impl PresentationWasmRuntime {
     }
 
     fn handle_init_stop(&mut self, id: String) {
+        if !self.actors.contains_key(&id)
+            && !self.starting_init_children.contains(&id)
+            && !self.stopping_init_children.contains(&id)
+            && self.package_host.owns(
+                brood_cli::package_runtime::contract::Realm::PresentationClient,
+                &std::process::id().to_string(),
+                &id,
+            )
+        {
+            self.send_init_child_event(ComponentChildEvent::Stopped { id });
+            return;
+        }
         if !self.is_init_child(&id) {
             self.send_init_child_event(ComponentChildEvent::Failed {
                 id,
@@ -1746,6 +2005,13 @@ impl PresentationWasmRuntime {
             init.children.remove(&id);
         }
         self.failed_init_children.remove(&id);
+        self.package_host.outcome(
+            brood_cli::package_runtime::contract::Realm::PresentationClient,
+            &std::process::id().to_string(),
+            &id,
+            "stopping",
+            None,
+        );
         self.spawn_actor_stop(id, actor, StopDisposition::Requested);
     }
 
@@ -2010,6 +2276,21 @@ impl PresentationWasmRuntime {
     }
 
     fn send_init_child_event(&self, event: ComponentChildEvent) {
+        let realm = brood_cli::package_runtime::contract::Realm::PresentationClient;
+        let scope = std::process::id().to_string();
+        match &event {
+            ComponentChildEvent::Started { id, generation } => {
+                self.package_host.started(realm, &scope, id, *generation);
+            }
+            ComponentChildEvent::Failed { id, message } => {
+                self.package_host
+                    .outcome(realm, &scope, id, "failed", Some(message));
+            }
+            ComponentChildEvent::Stopped { id } => self
+                .package_host
+                .outcome(realm, &scope, id, "stopped", None),
+        }
+
         let Some(PresentationActor {
             actor: HostedWasmActor::Component(actor),
             ..
@@ -2863,6 +3144,10 @@ impl PresentationWasmRuntime {
 
     pub fn disconnect_backend(&mut self, backend: BackendId) -> Result<()> {
         self.connected_backends.remove(&backend);
+        self.package_host
+            .services
+            .borrow_mut()
+            .disconnect(&format!("backend:{}", backend.0));
         let revision = self
             .session_snapshots
             .get(&backend)

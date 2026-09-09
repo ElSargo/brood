@@ -4,7 +4,12 @@
 //! dependency edges determine installation order; placement paths determine
 //! the immutable package tree visible to the root and its members.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+
+pub mod catalogue;
+pub mod extension;
+pub use brood_package_contract as contract;
+pub mod installation;
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
@@ -21,17 +26,19 @@ pub const INSTALLED_MANIFEST_FILE: &str = "brood-package.toml";
 pub const INSTALLED_ROOT_FILE: &str = "brood-package-root";
 
 /// A complete package declaration.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct Manifest {
     pub schema_version: u32,
     pub package: Package,
     #[serde(default)]
     pub artifacts: Vec<Artifact>,
+    #[serde(default)]
+    pub extension: Option<extension::Extension>,
 }
 
 /// Package-level identity and root selection.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct Package {
     /// Stable package identity. Versions and content hashes are separate from identity.
@@ -43,7 +50,7 @@ pub struct Package {
 }
 
 /// One runnable artifact installed into a package tree.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct Artifact {
     pub id: ArtifactId,
@@ -62,7 +69,7 @@ pub struct Artifact {
 }
 
 /// Runtime-recognized artifact container.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ArtifactKind {
     WasmComponent,
@@ -71,7 +78,7 @@ pub enum ArtifactKind {
 }
 
 /// Brood guest ABI implemented by an artifact.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ArtifactAbi {
     BroodComponentV1,
@@ -81,7 +88,7 @@ pub enum ArtifactAbi {
 
 macro_rules! string_id {
     ($name:ident) => {
-        #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd)]
+        #[derive(Clone, Debug, Deserialize, Serialize, Eq, Hash, Ord, PartialEq, PartialOrd)]
         #[serde(transparent)]
         pub struct $name(pub String);
 
@@ -264,6 +271,20 @@ impl Manifest {
             }
         }
 
+        for (index, artifact) in self.artifacts.iter().enumerate() {
+            for other in self.artifacts.iter().skip(index + 1) {
+                if artifact.placement.starts_with(&other.placement)
+                    || other.placement.starts_with(&artifact.placement)
+                {
+                    issue(
+                        &mut issues,
+                        "artifacts.placement",
+                        "artifact placements must not overlap",
+                    );
+                }
+            }
+        }
+
         if !artifacts.contains_key(self.package.root.as_str()) {
             issue(
                 &mut issues,
@@ -298,6 +319,10 @@ impl Manifest {
                 "artifacts.dependencies",
                 format!("dependency cycle includes: {}", cycle.join(", ")),
             );
+        }
+
+        if let Some(extension) = &self.extension {
+            extension.validate(self, &mut issues);
         }
 
         if issues.is_empty() {
@@ -422,10 +447,17 @@ fn validate_relative_path(issues: &mut Vec<ValidationIssue>, field: &str, path: 
             field,
             "must be a non-empty portable relative path without `.` or `..` components",
         );
-    } else if matches!(
-        path.to_str(),
-        Some(INSTALLED_MANIFEST_FILE | INSTALLED_ROOT_FILE)
-    ) {
+    } else if path.components().next().is_some_and(|component| {
+        matches!(
+            component.as_os_str().to_str(),
+            Some(
+                INSTALLED_MANIFEST_FILE
+                    | INSTALLED_ROOT_FILE
+                    | "brood-knowledge.json"
+                    | "installation.json"
+            )
+        )
+    }) {
         issue(
             issues,
             field,

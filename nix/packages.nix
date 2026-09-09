@@ -1,4 +1,8 @@
-{ pkgs, crane }:
+{
+  pkgs,
+  crane,
+  sourceInfo ? { },
+}:
 
 let
   lib = pkgs.lib;
@@ -42,18 +46,43 @@ let
       craneLib.filterCargoSources path type
       || lib.hasSuffix ".wit" path
       || lib.hasSuffix ".witx" path
+      || lib.hasSuffix ".md" path
+      || lib.hasSuffix ".json" path
       || lib.hasSuffix "/.cargo/config.toml" path;
   };
 
-  packageManifestSrc = lib.cleanSourceWith {
-    src = ../crates/brood-package-manifest;
-    filter = craneLib.filterCargoSources;
-  };
+  packageManifestSrc = pkgs.runCommand "brood-package-manifest-source" { } ''
+    mkdir -p "$out"
+    cp -R ${
+      lib.cleanSourceWith {
+        src = ../crates/brood-package-manifest;
+        filter = craneLib.filterCargoSources;
+      }
+    }/. "$out/"
+    chmod -R u+w "$out"
+    cp -R ${
+      lib.cleanSourceWith {
+        src = ../crates/brood-package-contract;
+        filter = craneLib.filterCargoSources;
+      }
+    } "$out/brood-package-contract"
+    substituteInPlace "$out/Cargo.toml" \
+      --replace-fail '../brood-package-contract' 'brood-package-contract' \
+      --replace-fail '[workspace]' $'[workspace]\nexclude = ["brood-package-contract"]'
+  '';
 
   packageManifestTool = craneLib.buildPackage {
     pname = "brood-package-manifest";
     version = "0.1.0";
     src = packageManifestSrc;
+    # Cargo resolves metadata for the shared contract's optional host schema
+    # dependency even when this standalone binary does not enable the feature.
+    cargoVendorDir = craneLib.vendorMultipleCargoDeps {
+      cargoLockList = [
+        ../Cargo.lock
+        ../crates/brood-package-manifest/Cargo.lock
+      ];
+    };
     strictDeps = true;
     cargoExtraArgs = "--locked";
     # The repository fixture lives outside this isolated workspace. Its full
@@ -74,6 +103,7 @@ let
       "plugins/diff-viewer/Cargo.lock is required by the default client init package";
     craneLib.vendorMultipleCargoDeps {
       cargoLockList = builtins.filter builtins.pathExists [
+        "${src}/Cargo.lock"
         "${src}/examples/wasm-component-actor/Cargo.lock"
         "${src}/examples/wasm-facet-probe/Cargo.lock"
         "${src}/examples/wasm-paired-facet-probe/Cargo.lock"
@@ -106,6 +136,18 @@ let
     pname = "brood";
     version = "0.1.0";
     src = craneSrc;
+    # Flake content identity survives source filtering and the Git-free sandbox.
+    BROOD_BUILD_SOURCE_INFO = builtins.toJSON {
+      nar_hash = sourceInfo.narHash or null;
+      revision = sourceInfo.rev or (sourceInfo.dirtyRev or null);
+      modification_status =
+        if sourceInfo ? rev then
+          "clean"
+        else if sourceInfo ? dirtyRev then
+          "modified"
+        else
+          "unavailable";
+    };
     strictDeps = true;
     nativeBuildInputs = [ pkgs.pkg-config ];
     buildInputs = profiles.nativeLibs;
@@ -124,7 +166,11 @@ let
       src = ../. + "/${member}";
       filter =
         path: type:
-        craneLib.filterCargoSources path type || lib.hasSuffix ".wit" path || lib.hasSuffix ".witx" path;
+        craneLib.filterCargoSources path type
+        || lib.hasSuffix ".wit" path
+        || lib.hasSuffix ".witx" path
+        || lib.hasSuffix ".md" path
+        || lib.hasSuffix ".json" path;
     };
 
   mkWorkspaceSrc =
@@ -142,9 +188,31 @@ let
         mkdir -p "$out/${dirOf member}"
         cp -R ${mkMemberSrc member} "$out/${member}"
       '') members}
+      ${lib.optionalString (builtins.elem "crates/brood-cli" members) ''
+        ${lib.concatMapStringsSep "\n"
+          (member: ''
+            rm -rf "$out/${member}"
+            mkdir -p "$out/${dirOf member}"
+            cp -R ${mkMemberSrc member} "$out/${member}"
+          '')
+          [
+            "docs"
+            "crates/brood-plugin-sdk"
+            "examples/wasm-init-child"
+            "examples/package-init"
+            "examples/self-describing-pair"
+          ]
+        }
+        cp ${../CONTEXT.md} "$out/CONTEXT.md"
+        ${lib.optionalString (!(builtins.elem "crates/broodd" members)) ''
+          mkdir -p "$out/crates/broodd/src"
+          cp ${../crates/broodd/src/config.rs} "$out/crates/broodd/src/config.rs"
+        ''}
+      ''}
     '';
 
   foundationMembers = [
+    "crates/brood-package-contract"
     "crates/brood-computer-use"
     "crates/brood-dmabuf"
     "crates/brood-graphics"
@@ -163,6 +231,7 @@ let
     "crates/bmux"
     "crates/brood-capsuled"
     "crates/brood-cli"
+    "crates/brood-package-manifest"
   ];
 
   mkWorkspaceArtifactLayer =
@@ -478,68 +547,70 @@ let
     '';
   };
 
-  runtimeFiles = pkgs.runCommand "brood-runtime-files" { nativeBuildInputs = [ pkgs.makeWrapper ]; } ''
-    mkdir -p "$out"
+  runtimeFiles =
+    pkgs.runCommand "brood-runtime-files" { nativeBuildInputs = [ pkgs.makeWrapper ]; }
+      ''
+        mkdir -p "$out"
 
-    install -D ${src}/brood.toml "$out/brood.toml"
+        install -D ${src}/brood.toml "$out/brood.toml"
 
-    default_client_package="packages/org.brood.default-client"
-    if [[ -d ${wasmModules}/$default_client_package ]]; then
-      cp -R ${wasmModules}/packages "$out/packages"
-      chmod -R u+w "$out/packages"
-    else
-      echo "ERR packaged WASM modules did not include $default_client_package" >&2
-      exit 2
-    fi
-    client_root="$(<"$out/$default_client_package/brood-package-root")"
-    substituteInPlace "$out/brood.toml" \
-      --replace-fail \
-      'client = "plugins/session-switcher/target/wasm32-unknown-unknown/release/brood_session_switcher_plugin.component.wasm"' \
-      "client = \"$default_client_package/$client_root\""
+        default_client_package="packages/org.brood.default-client"
+        if [[ -d ${wasmModules}/$default_client_package ]]; then
+          cp -R ${wasmModules}/packages "$out/packages"
+          chmod -R u+w "$out/packages"
+        else
+          echo "ERR packaged WASM modules did not include $default_client_package" >&2
+          exit 2
+        fi
+        client_root="$(<"$out/$default_client_package/brood-package-root")"
+        substituteInPlace "$out/brood.toml" \
+          --replace-fail \
+          'client = "plugins/session-switcher/target/wasm32-unknown-unknown/release/brood_session_switcher_plugin.component.wasm"' \
+          "client = \"$default_client_package/$client_root\""
 
-    mkdir -p "$out/apps"
-    cp -R ${src}/apps/. "$out/apps/"
-    chmod -R u+w "$out/apps"
-    rm -rf "$out/apps/__pycache__"
+        mkdir -p "$out/apps"
+        cp -R ${src}/apps/. "$out/apps/"
+        chmod -R u+w "$out/apps"
+        rm -rf "$out/apps/__pycache__"
 
-    if [[ -d ${wasmModules}/examples ]]; then
-      cp -R ${wasmModules}/examples "$out/examples"
-    else
-      echo "ERR packaged WASM modules did not include an examples directory" >&2
-      exit 2
-    fi
+        if [[ -d ${wasmModules}/examples ]]; then
+          cp -R ${wasmModules}/examples "$out/examples"
+        else
+          echo "ERR packaged WASM modules did not include an examples directory" >&2
+          exit 2
+        fi
 
-    if [[ -d ${wasmModules}/plugins ]]; then
-      cp -R ${wasmModules}/plugins "$out/plugins"
-      chmod u+w "$out/plugins"
-    else
-      echo "ERR packaged WASM modules did not include a plugins directory" >&2
-      exit 2
-    fi
+        if [[ -d ${wasmModules}/plugins ]]; then
+          cp -R ${wasmModules}/plugins "$out/plugins"
+          chmod u+w "$out/plugins"
+        else
+          echo "ERR packaged WASM modules did not include a plugins directory" >&2
+          exit 2
+        fi
 
-    install -D \
-      ${wasmModules}/runtimes/computer-use-js/target/wasm32-wasip1/release/brood_computer_use_js_runtime.wasm \
-      "$out/runtimes/computer-use-js.wasm"
+        install -D \
+          ${wasmModules}/runtimes/computer-use-js/target/wasm32-wasip1/release/brood_computer_use_js_runtime.wasm \
+          "$out/runtimes/computer-use-js.wasm"
 
-    agent_runtime="$out/share/brood-agent"
-    mkdir -p "$agent_runtime/src"
-    install -m 0644 ${src}/agents/brood-agent/src/agent.mjs "$agent_runtime/src/agent.mjs"
-    install -m 0644 ${src}/agents/brood-agent/src/computer-use.mjs "$agent_runtime/src/computer-use.mjs"
-    install -m 0644 ${src}/agents/brood-agent/src/cli.mjs "$agent_runtime/src/cli.mjs"
-    install -m 0644 ${src}/agents/brood-agent/LICENSE "$agent_runtime/LICENSE"
-    install -m 0644 ${src}/agents/brood-agent/THIRD_PARTY_NOTICES.md "$agent_runtime/THIRD_PARTY_NOTICES.md"
-    makeWrapper ${pkgs.nodejs}/bin/node "$out/bin/brood-agent" \
-      --add-flags "$agent_runtime/src/cli.mjs"
+        agent_runtime="$out/share/brood-agent"
+        mkdir -p "$agent_runtime/src"
+        install -m 0644 ${src}/agents/brood-agent/src/agent.mjs "$agent_runtime/src/agent.mjs"
+        install -m 0644 ${src}/agents/brood-agent/src/computer-use.mjs "$agent_runtime/src/computer-use.mjs"
+        install -m 0644 ${src}/agents/brood-agent/src/cli.mjs "$agent_runtime/src/cli.mjs"
+        install -m 0644 ${src}/agents/brood-agent/LICENSE "$agent_runtime/LICENSE"
+        install -m 0644 ${src}/agents/brood-agent/THIRD_PARTY_NOTICES.md "$agent_runtime/THIRD_PARTY_NOTICES.md"
+        makeWrapper ${pkgs.nodejs}/bin/node "$out/bin/brood-agent" \
+          --add-flags "$agent_runtime/src/cli.mjs"
 
-    # The editor runtime belongs to the local client package only. Keep it
-    # outside wasmModules so consumers of a single backend component (notably
-    # the SSH bundle) do not inherit Node or the client-side Neovim runtime.
-    session_switcher_root="$out/$default_client_package"
-    runtime_dir="$session_switcher_root/share/brood/neovim-wasm"
-    mkdir -p "$runtime_dir"
-    cp -R ${neovimWasm}/share/brood/neovim-wasm/. "$runtime_dir/"
+        # The editor runtime belongs to the local client package only. Keep it
+        # outside wasmModules so consumers of a single backend component (notably
+        # the SSH bundle) do not inherit Node or the client-side Neovim runtime.
+        session_switcher_root="$out/$default_client_package"
+        runtime_dir="$session_switcher_root/share/brood/neovim-wasm"
+        mkdir -p "$runtime_dir"
+        cp -R ${neovimWasm}/share/brood/neovim-wasm/. "$runtime_dir/"
 
-  '';
+      '';
 
   brood = pkgs.symlinkJoin {
     name = "brood";

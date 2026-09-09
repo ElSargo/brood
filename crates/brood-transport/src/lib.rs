@@ -4,7 +4,7 @@ mod artifact;
 mod network;
 
 pub use artifact::{
-    ArtifactExchange, ArtifactExchangeEvent, ArtifactExchangeUpdate, ArtifactOffer,
+    ArtifactExchange, ArtifactExchangeEvent, ArtifactExchangeUpdate, ArtifactOffer, ArtifactSender,
     ArtifactTransfer, ArtifactTransferMessages, InstalledArtifact, default_artifact_cache,
     digest_file, digest_hex, package_offers,
 };

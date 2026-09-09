@@ -1,5 +1,4 @@
 use std::{
-    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
     time::Duration,
@@ -9,31 +8,8 @@ use anyhow::{Context, Result, ensure};
 use tracing::{info, warn};
 
 use crate::state::Brood;
-
-#[derive(Debug, serde::Deserialize)]
-pub struct BroodConfig {
-    #[serde(default)]
-    session: SessionConfig,
-    #[serde(default)]
-    module: BTreeMap<String, ModuleConfig>,
-    #[serde(default)]
-    startup: BTreeMap<String, StartupAppConfig>,
-}
-
-#[derive(Debug, Default, serde::Deserialize)]
-struct SessionConfig {
-    runner: Option<SessionRunnerConfig>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
-pub struct SessionRunnerConfig {
-    #[serde(default = "default_enabled")]
-    pub(crate) enabled: bool,
-    pub(crate) kind: String,
-    #[serde(default)]
-    pub(crate) command: Vec<String>,
-    pub(crate) cache_root: Option<PathBuf>,
-}
+pub use brood_cli::configuration::SessionRunnerConfig;
+use brood_cli::configuration::{BroodConfig, ModuleResourceConfig, StartupRealm};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionRunnerSource {
@@ -81,30 +57,6 @@ const BUILTIN_RUNNER_DETECTORS: &[SessionRunnerDetector] = &[SessionRunnerDetect
     runner: nix_develop_runner,
 }];
 
-#[derive(Debug, serde::Deserialize)]
-struct ModuleConfig {
-    #[serde(default = "default_enabled")]
-    enabled: bool,
-    kind: String,
-    path: PathBuf,
-    #[serde(default)]
-    capabilities: Vec<String>,
-    #[serde(default, rename = "startup-message")]
-    startup_message: Option<String>,
-    #[serde(default)]
-    lifecycle: Option<ModuleLifecycleConfig>,
-    #[serde(default)]
-    resources: ModuleResourceConfig,
-}
-
-#[derive(Debug, Default, serde::Deserialize)]
-struct ModuleResourceConfig {
-    #[serde(rename = "filesystem-watches")]
-    filesystem_watches: Option<usize>,
-    #[serde(rename = "filesystem-watch-events")]
-    filesystem_watch_events: Option<usize>,
-}
-
 fn configured_plugin_resources(
     resources: &ModuleResourceConfig,
 ) -> Result<crate::state::ConfiguredPluginResources> {
@@ -128,36 +80,6 @@ fn configured_plugin_resources(
         filesystem_watches,
         filesystem_watch_events,
     })
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct ModuleLifecycleConfig {
-    #[serde(default = "default_lifecycle_timeout_ms", rename = "start-timeout-ms")]
-    start_timeout_ms: u64,
-    #[serde(default = "default_lifecycle_timeout_ms", rename = "stop-timeout-ms")]
-    stop_timeout_ms: u64,
-    #[serde(default)]
-    data: BTreeMap<String, String>,
-}
-
-const fn default_lifecycle_timeout_ms() -> u64 {
-    1_000
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct StartupAppConfig {
-    #[serde(default = "default_enabled")]
-    enabled: bool,
-    #[serde(default)]
-    realm: StartupRealm,
-    argv: Vec<String>,
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
-#[serde(rename_all = "kebab-case")]
-enum StartupRealm {
-    #[default]
-    Session,
 }
 
 pub fn load_runtime_settings(_state: &mut Brood, config_path: &Path) -> Result<()> {
@@ -479,8 +401,4 @@ fn resolve_startup_arg(config_dir: &Path, arg: &str) -> String {
 
 fn is_relative_path_like_arg(path: &Path, arg: &str) -> bool {
     !arg.starts_with('-') && (arg.starts_with('.') || path.components().count() > 1)
-}
-
-const fn default_enabled() -> bool {
-    true
 }

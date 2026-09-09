@@ -22,6 +22,7 @@ design-level tensions in [[../frictions/README]].
 - [[systems/artifact-distribution]]
 - [[systems/session-isolation]]
 - [[systems/plugin-runtime]]
+- [[systems/self-describing-extensions]]
 - [[systems/plugin-io-and-resources]]
 - [[systems/input-shortcuts]]
 - [[systems/layout-actor]]

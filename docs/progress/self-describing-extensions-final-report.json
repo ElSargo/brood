@@ -1,0 +1,79 @@
+{
+  "status": "verified",
+  "date": "2026-09-10",
+  "scope": "Self-describing extensions target; packaged production snapshot with current checkout acceptance harness",
+  "runtime": {
+    "outcome": "passed",
+    "source_removed_before_apply": true,
+    "prebuilt": "captured-artifacts-activate-without-source-or-toolchain",
+    "existing_session_instances": 1,
+    "subsequent_session_instances": 2,
+    "presentation_instances": 1,
+    "subsequent_presentation_instances": 1,
+    "repeat_duplicated": false,
+    "common_introspection": "offline-and-connected-pagination",
+    "guest_introspection": "exact-installed-and-executable-documents-before-registration",
+    "guest_resource_sampling": "allocated-timer-observed-before-registration",
+    "diagnostics": "schema-rejection-independent-of-running-actor",
+    "host_contracts": "unsupported-version-pending-before-start",
+    "resource_expectations": "observed-timer-and-explicit-unsupported-memory-sampling",
+    "state_migration": "quiescence-explicit-attestation-and-rollback-guard",
+    "root_policy": "acknowledged-with-pending-reasons",
+    "distribution": "authenticated-artifact-lane-with-disjoint-stores",
+    "denied_destination": "explicit-partial-success",
+    "daemon_instances": 1,
+    "disable_enable": "teardown-and-reactivation",
+    "remove": "state-and-artifacts-retained",
+    "disconnect_stop": "root-retirement-and-rebind",
+    "incompatible_peer": "pending",
+    "disconnected_endpoint": "unreachable",
+    "failed_replacement": "failed",
+    "plan_digest": "b378c96465fc2975d8c5cca3da1313a82dd393b2282967b24688885c5e3d2fb6",
+    "peer_binding": "acknowledged-with-schema-validated-ping-pong",
+    "evidence": "/tmp/brood-package-final-dependency-proof/packages-giciygpy",
+    "executables": {
+      "brood": {
+        "path": "/nix/store/f1dr551imwcbvax58z2hbanbp3lcv8zb-broodd-0.1.0/bin/brood",
+        "sha256": "326dd64b7e52cfb3731a162e02e4775fdaf2d369cd7481f45f3da64f85a14437"
+      },
+      "client": {
+        "path": "/nix/store/j270ak5y389vnhwlzx6p4kkkfrmcv387-brood/bin/brood-client",
+        "sha256": "a261a4b18e08def492353be9cec7ed73157ddb14c17cb9877d6e56729a14bffd"
+      },
+      "remote": {
+        "path": "/nix/store/j270ak5y389vnhwlzx6p4kkkfrmcv387-brood/bin/brood-remote",
+        "sha256": "46dc8607a5c1bd930af08e64a937b2b975bb7654c12df7fe33c8d9685915e0e5"
+      }
+    },
+    "failed_build": "public-apply-preserves-selection-and-generations-with-phase-evidence",
+    "installation_dependency": "captured-library-disable-retires-four-dependent-instances-and-enable-restarts",
+    "remote_dependencies": "exact-library-transfer-both-directions-with-independent-destination-authorization-and-explicit-pending-on-denial"
+  },
+  "offline": {
+    "checkout_visible": false,
+    "network_namespace": "isolated",
+    "entry_count": 188,
+    "bundle_digest": "7e5fb982373512d0fcb8d77ca0dcfd4b81a9e4edd7ddbfc3001ef53e22f521f9",
+    "binary_sha256": "326dd64b7e52cfb3731a162e02e4775fdaf2d369cd7481f45f3da64f85a14437",
+    "packaged_source": {
+      "modification_status": "unavailable",
+      "nar_hash": "sha256-iTZUxT4RUUldAXkFMnpwKKLz+kZcDgTuoWCmZyshXOM=",
+      "revision": null
+    },
+    "example": "examples/wasm-init-child/src/lib.rs",
+    "common_introspection": "description-search-exact-chunk-reconstruction-and-generated-schemas",
+    "outcome": "passed"
+  },
+  "checks": {
+    "installation_integration_tests": 23,
+    "cli_unit_tests": 18,
+    "knowledge_integration_tests": 2,
+    "clippy": "CLI/backend all targets passed",
+    "nix_builds": [
+      "standalone package-manifest",
+      "default full package"
+    ],
+    "formatting": "Rust/Nix formatting and git diff --check passed"
+  },
+  "source_note": "The embedded NAR identifies the tested production snapshot. Later test-only lint annotations, acceptance harness changes, and these progress notes are not claimed to have been embedded in that snapshot."
+}

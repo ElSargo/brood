@@ -894,6 +894,8 @@ pub enum ArtifactRealm {
 #[serde(rename_all = "kebab-case")]
 pub enum ArtifactKind {
     WasmActor,
+    /// Self-describing immutable package, not a replacement realm root.
+    PackageBundle,
 }
 
 /// Placement of one artifact inside a lazily hydrated package.
@@ -961,6 +963,9 @@ impl ArtifactManifest {
             return Err(ArtifactValidationError::Capabilities);
         }
         if let Some(package) = &self.package {
+            if self.kind == ArtifactKind::PackageBundle {
+                return Err(ArtifactValidationError::PackagePath);
+            }
             package.validate()?;
         }
         Ok(())
@@ -998,6 +1003,11 @@ pub enum ArtifactMessage {
         digest: ArtifactDigest,
         reason: String,
     },
+    /// The sender aborted its outgoing bytes, independently of peer offers.
+    TransferAborted {
+        digest: ArtifactDigest,
+        reason: String,
+    },
 }
 
 impl ArtifactMessage {
@@ -1008,14 +1018,17 @@ impl ArtifactMessage {
             Self::Chunk { bytes, .. } if bytes.len() > MAX_ARTIFACT_CHUNK_BYTES => {
                 Err(ArtifactValidationError::Chunk(bytes.len()))
             }
-            Self::Rejected { reason, .. } if reason.len() > MAX_ARTIFACT_REJECTION_BYTES => {
+            Self::Rejected { reason, .. } | Self::TransferAborted { reason, .. }
+                if reason.len() > MAX_ARTIFACT_REJECTION_BYTES =>
+            {
                 Err(ArtifactValidationError::Rejection(reason.len()))
             }
             Self::Request { .. }
             | Self::Chunk { .. }
             | Self::Complete { .. }
             | Self::Accepted { .. }
-            | Self::Rejected { .. } => Ok(()),
+            | Self::Rejected { .. }
+            | Self::TransferAborted { .. } => Ok(()),
         }
     }
 }

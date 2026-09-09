@@ -859,13 +859,14 @@ async fn relay(
 }
 
 async fn exchange_session_artifacts(
-    mut send: NetworkSendLane,
+    send: NetworkSendLane,
     mut receive: NetworkReceiveLane,
     mut exchange: ArtifactExchange,
     target: ControlTarget,
     session_package: Option<String>,
     package_cache: PathBuf,
 ) -> Result<()> {
+    let send = brood_transport::ArtifactSender::to_client(send);
     let mut outbound = VecDeque::from(exchange.initial_messages());
     let mut transfers = VecDeque::<ArtifactTransfer>::new();
     let mut waiting_by_digest = HashMap::<ArtifactDigest, Vec<u64>>::new();
@@ -879,14 +880,10 @@ async fn exchange_session_artifacts(
     let mut incoming = Box::pin(receive_client_artifact(&mut receive));
     loop {
         while let Some(message) = outbound.pop_front() {
-            send.send_server_message(&ServerMessage::Artifact(message))
-                .await?;
+            send.message(message).await?;
         }
         while let Some(transfer) = transfers.pop_front() {
-            for message in transfer.messages()? {
-                send.send_server_message(&ServerMessage::Artifact(message?))
-                    .await?;
-            }
+            send.transfer(transfer).await?;
         }
 
         tokio::select! {
@@ -1081,6 +1078,25 @@ async fn install_session_artifact(
         "remote artifact {:?} targets the wrong realm",
         artifact.manifest.id
     );
+    if artifact.manifest.kind == brood_protocol::ArtifactKind::PackageBundle {
+        let target = target.clone();
+        let package = artifact.manifest.id.clone();
+        let path = artifact.path.clone();
+        let receipt = tokio::task::spawn_blocking(move || {
+            let store_json = request_internal_command(&target, &["package-store".into()], false)?;
+            let store: PathBuf = serde_json::from_str(&store_json)?;
+            brood_cli::package_runtime::import_remote_bundle(
+                &package,
+                &path,
+                brood_cli::package_runtime::contract::Realm::SurfaceSession,
+                &store,
+            )
+        })
+        .await
+        .context("join session package destination installation")??;
+        eprintln!("PACKAGE_DESTINATION_RECEIPT {receipt}");
+        return Ok(());
+    }
     if let Some(member) = &artifact.manifest.package {
         if member.root {
             ensure!(

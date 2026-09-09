@@ -64,6 +64,10 @@ pub fn run_cli() -> Result<CommandOutcome> {
     };
 
     match command {
+        Command::Knowledge(args) => {
+            brood_cli::knowledge::run(&args).map(|()| CommandOutcome::Completed)
+        }
+        Command::Package(args) => brood_cli::package::run(args).map(|()| CommandOutcome::Completed),
         Command::Check => {
             println!("brood: ok");
             Ok(CommandOutcome::Completed)

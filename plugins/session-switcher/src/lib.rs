@@ -1007,6 +1007,7 @@ struct SessionSwitcher;
 
 impl Guest for SessionSwitcher {
     fn dispatch(event: Event) -> Vec<ActorCommand> {
+        if let Some(commands) = brood_plugin_sdk::packages::dispatch(&event) { return commands; }
         #[cfg(feature = "pure-renderer")]
         let _publication_turn = PublicationTurn;
         match event {

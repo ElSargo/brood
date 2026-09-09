@@ -4,6 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
+brood-package-contract.workspace = true
 anyhow.workspace = true
 brood-protocol.workspace = true
 postcard.workspace = true

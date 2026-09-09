@@ -81,6 +81,9 @@ fn assemble(
     output_root: &Path,
 ) -> Result<(), Box<dyn Error>> {
     let manifest = Manifest::from_path(manifest_path)?;
+    if manifest.extension.is_some() {
+        return Err("self-describing manifests require the plan/apply API to verify and install knowledge with artifacts".into());
+    }
     if output_root.exists() {
         return Err(format!("package output already exists: {}", output_root.display()).into());
     }

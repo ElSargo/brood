@@ -19,10 +19,19 @@ name = "brood-graphics"
 version = "0.1.0"
 
 [[package]]
+name = "brood-package-contract"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "brood-plugin-sdk"
 version = "0.1.0"
 dependencies = [
  "brood-graphics",
+ "brood-package-contract",
  "brood-protocol",
  "serde",
  "wit-bindgen",
