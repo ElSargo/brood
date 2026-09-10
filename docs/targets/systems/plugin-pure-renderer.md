@@ -99,7 +99,7 @@ isolation follows merely from calling something a facet.
 Conceptually:
 
 ```text
-render(pinned application revision, pane targets, target time, configuration)
+render(pinned application revision, pane targets, target time, configuration, theme)
     -> complete { pane draw outputs, interaction snapshot, next-frame demand }
 ```
 
@@ -109,6 +109,12 @@ inputs include exact logical/physical extent, scale, clipping, visibility,
 focus, negotiated visual parameters, monotonic target time, cutoff, and limits.
 The implementation WIT defines exact field syntax after the storage prototype;
 this document does not freeze a pointer or serialized-state ABI prematurely.
+
+The host supplies an immutable, revisioned snapshot of resolved Helix theme
+roles under [[themes]]. Plugins map their own semantic coloring to these roles
+during rendering. Theme changes create render demand independently of actor
+publication, and theme revision participates in invocation validity and retained
+output reuse.
 
 One invocation covers the relevant owned pane set. Every requested pane returns
 one explicit draw or no-change entry; duplicates, omissions, foreign panes, and

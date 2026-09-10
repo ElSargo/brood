@@ -79,7 +79,7 @@ impl ClientPointerPolicy {
             }
             self.catalogue
                 .insert(provider.name.clone(), path.to_path_buf());
-            eprintln!(
+            tracing::info!(
                 "registered pointer-policy provider={} path={}",
                 provider.name,
                 path.display()

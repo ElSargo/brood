@@ -266,7 +266,7 @@ impl PresentationFacets {
         use brood_wasm::PresentationHost;
         if let Some(token) = self.render_candidate.take() {
             let _retired = self.host.finish_actor_frame(generation, token, Vec::new());
-            eprintln!(
+            tracing::info!(
                 "facet render opportunity retired generation={generation} candidate={}",
                 token.0
             );
@@ -822,7 +822,7 @@ impl PresentationWasmRuntime {
                 }
             },
         );
-        eprintln!(
+        tracing::info!(
             "started presentation WASM actor id={} kind=core path={}",
             spec.id,
             spec.path.display()
@@ -878,7 +878,7 @@ impl PresentationWasmRuntime {
             Arc::clone(&self.snapshot_reclaimer),
             self.facet_executor.clone(),
         ))?;
-        eprintln!(
+        tracing::info!(
             "{}",
             started_hosted_actor_log(&spec.id, actor.kind(), actor.generation(), pane, &spec.path,)
         );
@@ -1444,7 +1444,7 @@ impl PresentationWasmRuntime {
                     }
                 }
                 ComponentActorEvent::WorkerCancelled { worker } => {
-                    eprintln!(
+                    tracing::info!(
                         "presentation actor worker cancelled actor={actor_id} worker={}",
                         worker.raw()
                     );
@@ -1584,9 +1584,11 @@ impl PresentationWasmRuntime {
                             "presentation actor {actor_id:?} requested a different session"
                         );
                     }
-                    eprintln!(
+                    tracing::info!(
                         "queued presentation actor session command actor={} request={} operation={:?}",
-                        actor_id, request.request, request.operation
+                        actor_id,
+                        request.request,
+                        request.operation
                     );
                     self.outbound_session_commands
                         .push_back(SessionCommandEnvelope { actor_id, request });
@@ -2187,7 +2189,7 @@ impl PresentationWasmRuntime {
                         continue;
                     }
 
-                    eprintln!(
+                    tracing::info!(
                         "{}",
                         started_hosted_actor_log(
                             &id,
@@ -2238,7 +2240,7 @@ impl PresentationWasmRuntime {
                     match disposition {
                         StopDisposition::Requested => match result {
                             Ok(()) => {
-                                eprintln!("stopped presentation init child actor id={id}");
+                                tracing::info!("stopped presentation init child actor id={id}");
                                 self.send_init_child_event(ComponentChildEvent::Stopped { id });
                             }
                             Err(message) => {
@@ -2732,7 +2734,7 @@ impl PresentationWasmRuntime {
                     let mut requests = None;
                     let delivered = facets.coordinator.try_deliver(|batch| {
                         component.try_send_facet_input(batch)?;
-                        eprintln!("facet input delivered actor={name} generation={} input={} frame={} snapshot={} events={}", component.generation(),
+                        tracing::info!("facet input delivered actor={name} generation={} input={} frame={} snapshot={} events={}", component.generation(),
                             batch.token.input_sequence, batch.token.frame, batch.token.snapshot_revision, batch.events.len());
                         requests = Some((
                             batch.token.pane,
@@ -2988,9 +2990,11 @@ impl PresentationWasmRuntime {
         ) {
             Ok(()) => {
                 facets.render_candidate = Some(hint.token);
-                eprintln!(
+                tracing::info!(
                     "facet render started actor={} generation={} candidate={} snapshot={revision} renderer={renderer_generation}",
-                    identity.name, identity.generation, hint.token.0
+                    identity.name,
+                    identity.generation,
+                    hint.token.0
                 );
             }
             Err(error) if error.is::<crate::plugin_facets::RenderAdmissionDeferred>() => {

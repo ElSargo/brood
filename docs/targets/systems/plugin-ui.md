@@ -24,12 +24,13 @@ The presentation client owns:
 - validation and rendering of canvas draw packets;
 - native text shaping and platform font integration;
 - final clipping, composition, scheduling, and renderer recovery;
+- active theme resolution and revisioned role snapshots under [[themes]];
 - projection of optional accessibility metadata onto platform APIs.
 
 The plugin actor, facets, and SDK own:
 
 - pane-local application and UI state;
-- components, layout, styling, themes, and widget identity;
+- components, layout, styling, semantic-to-theme-role mapping, and widget identity;
 - widget hit testing and event dispatch;
 - text-editing behavior and document state;
 - packet encoding and submission;

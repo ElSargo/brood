@@ -728,7 +728,7 @@ fn promote_actor_frame_in_state(
             return Ok((ActorFramePromotion::Stale, Some(frame.token)));
         };
         replace_facet_target(state, &frame.actor, next_frame_ns);
-        eprintln!(
+        tracing::info!(
             "facet native pair committed route=ordinary actor={} generation={} native_revision={} candidate={} snapshot={} pane_count={} panes={promoted_panes:?}",
             frame.actor.name,
             frame.actor.generation,
@@ -767,7 +767,7 @@ fn promote_actor_frame_in_state(
         state.actor_frames_promoted_multi_pane =
             state.actor_frames_promoted_multi_pane.saturating_add(1);
     }
-    eprintln!(
+    tracing::info!(
         "render scheduling actor-frame promoted actor={} generation={} token={} revision={} pane_count={} panes={panes:?} resize_epochs={resize_epochs:?}",
         actor.name,
         actor.generation,
@@ -1037,7 +1037,7 @@ fn deferred_actor_frame_resolution_plan_in_state(
             };
             replace_facet_target(state, &frame.actor, next_frame_ns);
             let panes = frame.scenes.keys().copied().collect::<BTreeSet<_>>();
-            eprintln!(
+            tracing::info!(
                 "facet native pair committed route=synchronized actor={} generation={} native_revision={} candidate={} snapshot={} resize_epoch={} pane_count={} panes={panes:?}",
                 frame.actor.name,
                 frame.actor.generation,
@@ -2124,7 +2124,8 @@ fn start_glyph_raster_worker(
                     });
                 let elapsed = started.elapsed();
                 finish_glyph_raster(&shared, &proxy, &request, result);
-                if std::env::var_os("BROOD_TRACE_PLUGIN_TEXT").is_some() || elapsed.as_millis() >= 8
+                if std::env::var_os("BROOD_TRACE_PLUGIN_TEXT").is_some()
+                    || (tracing::enabled!(tracing::Level::INFO) && elapsed.as_millis() >= 8)
                 {
                     eprintln!(
                         "plugin glyph raster pane={pane} handle={handle} time_us={}",
@@ -2570,7 +2571,9 @@ impl ActorPresentationHost {
             return Err(PresentationError::LimitReached);
         }
         let elapsed = started.elapsed();
-        if std::env::var_os("BROOD_TRACE_PLUGIN_TEXT").is_some() || elapsed.as_millis() >= 8 {
+        if std::env::var_os("BROOD_TRACE_PLUGIN_TEXT").is_some()
+            || (tracing::enabled!(tracing::Level::INFO) && elapsed.as_millis() >= 8)
+        {
             eprintln!(
                 "plugin text layout pane={pane} handle={handle} bytes={} time_us={}",
                 retained_bytes,

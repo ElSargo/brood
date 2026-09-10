@@ -359,6 +359,28 @@ fn terminal_snapshot_completes_revision(body: &[u8]) -> bool {
     reason = "the client runtime and selected backend/session bindings intentionally span the complete event-loop setup"
 )]
 pub fn run_cli() -> Result<()> {
+    // Keep proof log records unadorned; existing harnesses consume these lines.
+    // Release runs are quiet unless the operator opts in through RUST_LOG.
+    let default_filter = if cfg!(debug_assertions) {
+        "warn,brood_client=info"
+    } else {
+        "warn"
+    };
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::builder()
+                .with_default_directive(tracing::level_filters::LevelFilter::WARN.into())
+                .parse_lossy(
+                    std::env::var("RUST_LOG").unwrap_or_else(|_| default_filter.to_owned()),
+                ),
+        )
+        .with_writer(std::io::stderr)
+        .without_time()
+        .with_level(false)
+        .with_target(false)
+        .with_ansi(false)
+        .try_init()
+        .map_err(|error| anyhow!("{error}"))?;
     let args = ClientArgs::parse_from(brood_launch::args());
     let config_path = args
         .config
@@ -620,7 +642,7 @@ pub fn run_cli() -> Result<()> {
         bound_session_id,
         remote_connections,
     ) = if args.no_server {
-        eprintln!("starting Brood presentation without a backend");
+        tracing::info!("starting Brood presentation without a backend");
         (None, None, None, false, false, None, Vec::new())
     } else if !args.remote_connect.is_empty() {
         let mut artifact_offers = args
@@ -691,7 +713,7 @@ pub fn run_cli() -> Result<()> {
                     },
                     &event_proxy,
                 )?;
-            eprintln!(
+            tracing::info!(
                 "selected presentation backend={:?} transport carrier={:?} frames={:?} generation={} peer={connect}",
                 connection.backend,
                 connection.profile.carrier,
@@ -847,24 +869,26 @@ pub fn run_cli() -> Result<()> {
             .context("local backend configuration is unavailable")?;
         let target = local.target.clone();
         let handshake = connect_or_spawn(&target, &local.server)?;
-        eprintln!(
+        tracing::info!(
             "connected to Brood server pid={} protocol={}",
-            handshake.server_pid, handshake.protocol_version
+            handshake.server_pid,
+            handshake.protocol_version
         );
         let fast_path = open_presentation_fast_path(&target, &args.frame_transport.capabilities())?;
         let backend = backend_registry.allocate(Some(fast_path.generation));
         initial_local_backend = Some(backend);
-        eprintln!(
+        tracing::info!(
             "selected presentation transport carrier={:?} frames={:?}",
-            fast_path.profile.carrier, fast_path.profile.frames
+            fast_path.profile.carrier,
+            fast_path.profile.frames
         );
         if fast_path.active_session != 0 {
-            eprintln!(
+            tracing::info!(
                 "attached presentation to active session id={}",
                 fast_path.active_session
             );
         } else {
-            eprintln!("attached presentation to an empty session catalogue");
+            tracing::info!("attached presentation to an empty session catalogue");
         }
 
         let dmabuf_import_enabled =
@@ -1034,7 +1058,7 @@ pub fn run_cli() -> Result<()> {
         );
     }
     if let Some(runtime) = &application.wasm_runtime {
-        eprintln!("PACKAGE_INSTANCES {}", runtime.package_instances());
+        tracing::info!("PACKAGE_INSTANCES {}", runtime.package_instances());
     }
     let actor_runtime_diagnostics = application
         .wasm_runtime
@@ -1049,7 +1073,9 @@ pub fn run_cli() -> Result<()> {
         .take()
         .map_or(Ok(()), PresentationWasmRuntime::shutdown)
         .context("stop presentation WASM runtime");
-    if let Some(metrics) = graphics_diagnostics {
+    if let Some(metrics) = graphics_diagnostics
+        && tracing::enabled!(tracing::Level::INFO)
+    {
         let scenario = std::env::var("BROOD_RENDER_SCHEDULING_SCENARIO")
             .unwrap_or_else(|_missing| "unspecified".to_owned());
         let idle = application.render_scheduling_idle_measurement.map_or_else(
@@ -1139,73 +1165,76 @@ pub fn run_cli() -> Result<()> {
                 "past_deadline_sources_lifetime": application.past_deadline_sources,
             },
         });
-        eprintln!("render scheduling diagnostics {report}");
+        tracing::info!("render scheduling diagnostics {report}");
     }
-    if let Some(graphics) = application.plugin_graphics.as_ref()
+    if tracing::enabled!(tracing::Level::INFO)
+        && let Some(graphics) = application.plugin_graphics.as_ref()
         && let Ok(metrics) = graphics.diagnostics()
     {
-        eprintln!(
+        tracing::info!(
             "plugin graphics diagnostics {metrics_json}",
             metrics_json = serde_json::to_string(&metrics)?
         );
     }
-    let mut input_diagnostics = latency_summary(
-        &application.plugin_key_to_present_latencies,
-        application.plugin_key_to_present_samples,
-        application.plugin_last_key_to_present_us,
-        application.plugin_max_key_to_present_us,
-    );
-    let by_backend = serde_json::Value::Array(
-        application
-            .plugin_key_to_present_by_backend
-            .iter()
-            .map(|(backend, samples)| {
-                let stages = application.plugin_latency_stages_by_backend.get(backend);
-                serde_json::json!({
-                    "backend": backend.0,
-                    "latency": latency_summary(
-                        samples,
-                        samples.len() as u64,
-                        samples.back().copied().unwrap_or_default(),
-                        samples.iter().copied().max().unwrap_or_default(),
-                    ),
-                    "stages": {
-                        "input_to_transport_queue": stages
-                            .map(|stages| stage_summary(&stages.input_to_transport_queue))
+    if tracing::enabled!(tracing::Level::INFO) {
+        let mut input_diagnostics = latency_summary(
+            &application.plugin_key_to_present_latencies,
+            application.plugin_key_to_present_samples,
+            application.plugin_last_key_to_present_us,
+            application.plugin_max_key_to_present_us,
+        );
+        let by_backend = serde_json::Value::Array(
+            application
+                .plugin_key_to_present_by_backend
+                .iter()
+                .map(|(backend, samples)| {
+                    let stages = application.plugin_latency_stages_by_backend.get(backend);
+                    serde_json::json!({
+                        "backend": backend.0,
+                        "latency": latency_summary(
+                            samples,
+                            samples.len() as u64,
+                            samples.back().copied().unwrap_or_default(),
+                            samples.iter().copied().max().unwrap_or_default(),
+                        ),
+                        "stages": {
+                            "input_to_transport_queue": stages
+                                .map(|stages| stage_summary(&stages.input_to_transport_queue))
+                                .unwrap_or_default(),
+                            "transport_send_queue": stages
+                                .map(|stages| stage_summary(&stages.transport_send_queue))
+                                .unwrap_or_default(),
+                            "remote_round_trip": stages
+                                .map(|stages| stage_summary(&stages.remote_round_trip))
+                                .unwrap_or_default(),
+                            "transport_round_trip": stages
+                                .map(|stages| stage_summary(&stages.transport_round_trip))
+                                .unwrap_or_default(),
+                            "client_dispatch": stages
+                                .map(|stages| stage_summary(&stages.client_dispatch))
+                                .unwrap_or_default(),
+                            "plugin_render": stages
+                                .map(|stages| stage_summary(&stages.plugin_render))
+                                .unwrap_or_default(),
+                            "presentation": stages
+                                .map(|stages| stage_summary(&stages.presentation))
+                                .unwrap_or_default(),
+                        },
+                        "traces": application
+                            .plugin_input_traces_by_backend
+                            .get(backend)
+                            .cloned()
                             .unwrap_or_default(),
-                        "transport_send_queue": stages
-                            .map(|stages| stage_summary(&stages.transport_send_queue))
-                            .unwrap_or_default(),
-                        "remote_round_trip": stages
-                            .map(|stages| stage_summary(&stages.remote_round_trip))
-                            .unwrap_or_default(),
-                        "transport_round_trip": stages
-                            .map(|stages| stage_summary(&stages.transport_round_trip))
-                            .unwrap_or_default(),
-                        "client_dispatch": stages
-                            .map(|stages| stage_summary(&stages.client_dispatch))
-                            .unwrap_or_default(),
-                        "plugin_render": stages
-                            .map(|stages| stage_summary(&stages.plugin_render))
-                            .unwrap_or_default(),
-                        "presentation": stages
-                            .map(|stages| stage_summary(&stages.presentation))
-                            .unwrap_or_default(),
-                    },
-                    "traces": application
-                        .plugin_input_traces_by_backend
-                        .get(backend)
-                        .cloned()
-                        .unwrap_or_default(),
+                    })
                 })
-            })
-            .collect(),
-    );
-    let input_diagnostics_object = input_diagnostics
-        .as_object_mut()
-        .context("latency summary must be a JSON object")?;
-    input_diagnostics_object.insert("by_backend".to_string(), by_backend);
-    eprintln!("plugin input diagnostics {input_diagnostics}");
+                .collect(),
+        );
+        let input_diagnostics_object = input_diagnostics
+            .as_object_mut()
+            .context("latency summary must be a JSON object")?;
+        input_diagnostics_object.insert("by_backend".to_string(), by_backend);
+        tracing::info!("plugin input diagnostics {input_diagnostics}");
+    }
     let backend_shutdown_result = application
         .backend_commands
         .as_mut()
@@ -2553,7 +2582,7 @@ fn spawn_catalog_updates(
                                     automation: window.automation,
                                 })
                                 .collect::<Vec<_>>();
-                            eprintln!(
+                            tracing::info!(
                                 "presentation shared catalog revision={} active={} sessions={} windows={}",
                                 snapshot.revision,
                                 decoded.active_session,
@@ -3046,9 +3075,10 @@ impl LocalInputLane {
             eprintln!("failed to notify presentation input consumer: {error}");
         }
         if had_deferred && self.deferred.is_empty() {
-            eprintln!(
+            tracing::info!(
                 "drained deferred presentation input records high_water={} coalesced_motion={}",
-                self.deferred_high_water, self.coalesced_motion
+                self.deferred_high_water,
+                self.coalesced_motion
             );
             self.deferred_high_water = 0;
             self.coalesced_motion = 0;
@@ -3881,7 +3911,7 @@ impl PointerInteractionRegistry {
             .records
             .get(&interaction)
             .context("new pointer interaction disappeared")?;
-        eprintln!(
+        tracing::info!(
             "pointer-interaction issued interaction={} lease={} lease_generation={} holder={} holder_generation={} zone={}",
             interaction.0,
             record.binding.lease.id.0,
@@ -3977,7 +4007,7 @@ impl PointerInteractionRegistry {
             debug_assert!(record.sequences.len() < MAX_POINTER_INTERACTION_SEQUENCES);
             record.sequences.push_back(entry);
         }
-        eprintln!(
+        tracing::info!(
             "pointer-interaction event interaction={} event_sequence={} lease={} lease_generation={} holder={} holder_generation={} phase={:?} terminal={} wall_ns={}",
             interaction.0,
             event_sequence,
@@ -4028,7 +4058,7 @@ impl PointerInteractionRegistry {
 
     fn remove(&mut self, interaction: brood_wasm::InteractionId, reason: &str) {
         if self.records.remove(&interaction).is_some() {
-            eprintln!(
+            tracing::info!(
                 "pointer-interaction retired interaction={} reason={reason}",
                 interaction.0
             );
@@ -4058,7 +4088,7 @@ impl PointerInteractionRegistry {
                     && record.binding.lease.generation == record.zone.lease_generation
             });
             if !keep {
-                eprintln!(
+                tracing::info!(
                     "pointer-interaction retired interaction={} lease={} lease_generation={} holder={} holder_generation={} reason=authority-changed",
                     interaction.0,
                     record.binding.lease.id.0,
@@ -4076,7 +4106,7 @@ impl PointerInteractionRegistry {
             let remove = record.binding.holder_name == actor.name
                 && record.binding.holder_generation == actor.generation;
             if remove {
-                eprintln!(
+                tracing::info!(
                     "pointer-interaction retired interaction={} holder={} holder_generation={} reason={reason}",
                     interaction.0, actor.name, actor.generation
                 );
@@ -4143,7 +4173,7 @@ impl PointerInteractionRegistry {
         );
         entry.claimed_request = Some(request_id);
         record.last_claimed_sequence = Some(event_sequence);
-        eprintln!(
+        tracing::info!(
             "pointer-interaction claimed interaction={} event_sequence={} lease={} lease_generation={} holder={} holder_generation={} request={request_id}",
             interaction.0,
             event_sequence,
@@ -5254,9 +5284,13 @@ impl Drop for WinitCallbackGuard {
             let cpu_ns = self
                 .started_cpu_ns
                 .map(|started| thread_cpu_time_ns().saturating_sub(started));
-            eprintln!(
+            tracing::info!(
                 "slow Winit callback kind={} detail={} wall_ns={} cpu_ns={cpu_ns:?} driver_present_ns={} render_timings={:?}",
-                self.kind, self.detail, sample, self.driver_present_ns, self.render_timings
+                self.kind,
+                self.detail,
+                sample,
+                self.driver_present_ns,
+                self.render_timings
             );
         }
         let mut metrics = metrics
@@ -6113,7 +6147,7 @@ impl Application {
             runtime.connect_backend(backend);
         }
         self.notify_backend_connected(backend)?;
-        eprintln!(
+        tracing::info!(
             "connected local backend={backend:?} server_pid={} session={session_id:?}",
             handshake.server_pid
         );
@@ -6232,18 +6266,18 @@ impl Application {
         }
         match &mut origin {
             RemoteAttachOrigin::Direct { address } => {
-                eprintln!("connected dynamic remote backend={backend:?} address={address}");
+                tracing::info!("connected dynamic remote backend={backend:?} address={address}");
             }
             RemoteAttachOrigin::Ssh(deployment) => {
                 deployment.backend = Some(backend);
-                eprintln!(
+                tracing::info!(
                     "connected in-client SSH backend={backend:?} target={}",
                     deployment.target
                 );
             }
             RemoteAttachOrigin::Container(deployment) => {
                 deployment.backend = Some(backend);
-                eprintln!(
+                tracing::info!(
                     "connected in-client container backend={backend:?} container={}",
                     deployment.description
                 );
@@ -7296,7 +7330,7 @@ impl Application {
                 self.layout_holders
                     .insert(self.layout_leases.root_token().id, holder.clone());
                 renderer.layout_state_dirty = true;
-                eprintln!(
+                tracing::info!(
                     "granted root layout lease actor={} actor_generation={} lease_generation={}",
                     holder.name,
                     holder.generation,
@@ -7444,9 +7478,10 @@ impl Application {
                     .collect::<Vec<_>>();
                 backends.sort_unstable();
                 backends.dedup();
-                eprintln!(
+                tracing::info!(
                     "layout-state backend groups lease={} actor={} backends={backends:?}",
-                    lease.id.0, holder.name
+                    lease.id.0,
+                    holder.name
                 );
             }
             let payload =
@@ -7463,9 +7498,11 @@ impl Application {
             }
             self.layout_publications
                 .insert(lease.id, inventory_revision);
-            eprintln!(
+            tracing::info!(
                 "queued layout-state revision={} lease={} actor={}",
-                inventory_revision, lease.id.0, holder.name
+                inventory_revision,
+                lease.id.0,
+                holder.name
             );
         }
         Ok(())
@@ -7516,7 +7553,7 @@ impl Application {
             return;
         }
         self.last_setup_quiescent_presented_layout_revision = self.presented_layout_revision;
-        eprintln!("{}", trace_setup_layout_quiescence(state));
+        tracing::info!("{}", trace_setup_layout_quiescence(state));
     }
 
     #[allow(
@@ -7574,9 +7611,10 @@ impl Application {
                     && pending.interaction_claim == interaction_claim
             })
         {
-            eprintln!(
+            tracing::info!(
                 "coalesced duplicate synchronized layout terminal actor={} actor_generation={} request={request_id}",
-                actor.name, actor.generation
+                actor.name,
+                actor.generation
             );
             return Ok(());
         }
@@ -7640,7 +7678,7 @@ impl Application {
                         .map_or(0, |pending| pending.attempts);
                     self.pending_synchronized_layout_notifications.pop_front();
                     if let Some(interaction_claim) = interaction_claim {
-                        eprintln!(
+                        tracing::info!(
                             "accepted synchronized layout terminal mailbox actor={} actor_generation={} request={request_id} interaction={} event_sequence={}",
                             actor.name,
                             actor.generation,
@@ -7651,7 +7689,7 @@ impl Application {
                             .terminal_notification_delivered(interaction_claim);
                     }
                     if attempts > 0 {
-                        eprintln!(
+                        tracing::info!(
                             "delivered deferred synchronized layout terminal actor={} actor_generation={} request={request_id} attempts={}",
                             actor.name,
                             actor.generation,
@@ -7683,7 +7721,7 @@ impl Application {
         let cleared = self.pending_synchronized_layout_notifications.len();
         self.pending_synchronized_layout_notifications.clear();
         if cleared > 0 {
-            eprintln!(
+            tracing::info!(
                 "cleared synchronized layout terminal notifications count={cleared} reason={reason}"
             );
         }
@@ -7744,7 +7782,7 @@ impl Application {
                 pending_emit: true,
                 ..NativeResizePresentationTrace::default()
             };
-            eprintln!(
+            tracing::info!(
                 "published settled native window resize native_resize_revision={native_resize_revision} configure_sequence={} base_presented_layout_revision={} size={}x{}",
                 pending.configure_sequence,
                 pending.base_presented_layout_revision,
@@ -7752,7 +7790,7 @@ impl Application {
                 pending.size.1,
             );
         }
-        eprintln!("presented committed layout revision={revision}");
+        tracing::info!("presented committed layout revision={revision}");
         Ok(())
     }
 
@@ -7871,7 +7909,7 @@ impl Application {
             degraded,
             pending_emit: true,
         };
-        eprintln!(
+        tracing::info!(
             "finalized native window resize native_resize_revision={native_resize_revision} configure_sequence={} epoch={epoch} size={}x{} ready={wait_ready}/{wait_total} degraded={degraded} elapsed_ms={}",
             pending.configure_sequence,
             pending.size.0,
@@ -7895,7 +7933,7 @@ impl Application {
                 .renderer
                 .as_ref()
                 .map_or((0, 0), Renderer::managed_resize_counts);
-            eprintln!(
+            tracing::info!(
                 "window-resize-present native_resize_revision={} configure_sequence={} width={} height={} epoch={} phase={} wait_ready={}/{} staged_count={} managed_expectations={} managed_staged_resources={} degraded={}",
                 trace.native_resize_revision,
                 trace.configure_sequence,
@@ -8917,7 +8955,7 @@ impl Application {
                 )?;
                 return Ok(aborted_focus_change);
             }
-            eprintln!(
+            tracing::info!(
                 "synchronized interaction superseded interaction={} superseded_epochs={superseded_epochs}",
                 request.interaction.map_or(0, |interaction| interaction.0)
             );
@@ -9034,7 +9072,7 @@ impl Application {
                     trace_layout_pane_rects(&target.layout, renderer.layout_extent())
                 })
         });
-        eprintln!(
+        tracing::info!(
             "accepted synchronized layout actor={} request={} interaction={} event_sequence={} native_resize_revision={} epoch={} base_revision={} target_revision={} region_final=0/{} pane_ready=0/{} wait={} affected={} mode={:?} actor_generation={} focus={} recovered_regions=[] wait_for_panes=[{}] target_rects=[{}]",
             sender.name,
             request_id,
@@ -9407,9 +9445,13 @@ impl Application {
             }
         }
         let focus_change = self.reproject_active_region_target()?;
-        eprintln!(
+        tracing::info!(
             "layout-region response-accepted epoch={} lease={} lease_generation={} actor={} actor_generation={} kind={response_kind} response_us={elapsed_us}",
-            resize_epoch.id, lease.id.0, lease.generation, sender.name, sender.generation,
+            resize_epoch.id,
+            lease.id.0,
+            lease.generation,
+            sender.name,
+            sender.generation,
         );
         self.discover_changed_rest_region(lease)?;
         self.discover_and_dispatch_layout_regions()?;
@@ -9474,7 +9516,7 @@ impl Application {
             }
             match delivery {
                 Ok(()) => {
-                    eprintln!(
+                    tracing::info!(
                         "layout-region issued epoch={} lease={} lease_generation={} holder={} holder_generation={} source={}:{}:{}:{} target={}:{}:{}:{} accepted_us={}",
                         epoch.id,
                         region.lease.id.0,
@@ -9691,7 +9733,7 @@ impl Application {
                     .wait_pane_owners
                     .get(&pane)
                     .map_or(0, |lease| lease.id.0);
-                eprintln!(
+                tracing::info!(
                     "layout-region pane-notified epoch={epoch} pane={pane} owner_lease={owner} wait={} accepted_us={accepted_us}",
                     active.wait_panes.contains(&pane),
                 );
@@ -9772,7 +9814,7 @@ impl Application {
             .context("renderer disappeared while scheduling synchronized presentation")?
             .window
             .request_redraw();
-        eprintln!(
+        tracing::info!(
             "synchronized layout ready actor={} request={} interaction={} event_sequence={} epoch={} target_revision={} region_final={}/{} pane_ready={}/{} recovered_regions=[{}] recovered_count={} recovered_managed={:?} recovered_managed_content={:?} missing={missing:?} degraded={degraded} duration_us={}",
             active.requester.name,
             active.request_id,
@@ -9901,7 +9943,7 @@ impl Application {
                 active.interaction_claim,
             )?;
         }
-        eprintln!(
+        tracing::info!(
             "{} synchronized layout actor={} request={} interaction={} event_sequence={} native_resize_revision={} epoch={} target_revision={} region_final={}/{} pane_ready={}/{} recovered_regions=[{}] recovered_count={} recovered_managed={:?} recovered_managed_content={:?} missing={missing_panes:?} duration_us={}",
             if degraded { "degraded" } else { "completed" },
             active.requester.name,
@@ -11075,14 +11117,14 @@ impl Application {
                 transaction.latest_size,
                 transaction.started,
             ));
-            eprintln!(
+            tracing::info!(
                 "scheduled settled native window base revision={pending_revision} configure_sequence={} size={}x{}",
                 transaction.configure_sequence,
                 transaction.latest_size.0,
                 transaction.latest_size.1
             );
         }
-        eprintln!(
+        tracing::info!(
             "settled presentation window resize events={} from={}x{} to={}x{} elapsed_ms={}",
             transaction.events,
             transaction.initial_size.0,
@@ -11132,7 +11174,7 @@ impl Application {
             }
         };
         if let Some(cancelled) = self.pending_native_window_resize.take() {
-            eprintln!(
+            tracing::info!(
                 "superseded native window settlement native_resize_revision={} configure_sequence={} with configure_sequence={configure_sequence}",
                 cancelled.native_resize_revision.unwrap_or(0),
                 cancelled.configure_sequence,
@@ -11318,7 +11360,7 @@ impl Application {
                 &active.ready_panes,
                 &recovery.plugin_pane_realms,
             );
-            eprintln!(
+            tracing::info!(
                 "re-armed synchronized resize request={} epoch={} ready={}/{} after renderer recovery",
                 active.request_id,
                 active.epoch.id,
@@ -11600,7 +11642,7 @@ impl ApplicationHandler<ClientEvent> for Application {
                         .as_mut()
                         .context("client WASM runtime is unavailable")?
                         .install_artifact_actor(&manifest.id, &path)?;
-                    eprintln!(
+                    tracing::info!(
                         "installed remote client artifact id={} pane={} digest={}",
                         manifest.id,
                         pane,
@@ -12234,7 +12276,7 @@ impl ApplicationHandler<ClientEvent> for Application {
                 resize_epoch,
                 ready_at,
             } => {
-                eprintln!(
+                tracing::info!(
                     "accepted plugin content reuse pane={pane} resize_epoch={resize_epoch} ready_us={}",
                     ready_at.elapsed().as_micros()
                 );
@@ -12273,7 +12315,7 @@ impl ApplicationHandler<ClientEvent> for Application {
                 result,
             } => match result {
                 Ok(_response) if description.starts_with("render-scheduling-proof-status-") => {}
-                Ok(response) => eprintln!(
+                Ok(response) => tracing::info!(
                     "presentation backend command completed command={description} response={}",
                     response.trim()
                 ),
@@ -12381,7 +12423,7 @@ impl ApplicationHandler<ClientEvent> for Application {
                 actor_id,
                 completion,
             } => {
-                eprintln!(
+                tracing::info!(
                     "presentation session command completed actor={} request={} operation={:?} success={} session={:?} message={}",
                     actor_id,
                     completion.request,
@@ -12495,7 +12537,7 @@ impl ApplicationHandler<ClientEvent> for Application {
                                     })
                                 })
                                 .collect::<Vec<_>>();
-                            eprintln!(
+                            tracing::info!(
                                 "computer-use observer update backend={} event_cursor={} tasks={} approvals={} observations={} task_states={}",
                                 backend.0,
                                 update.event_cursor,
@@ -12607,7 +12649,7 @@ impl ApplicationHandler<ClientEvent> for Application {
                     );
                     return;
                 }
-                eprintln!(
+                tracing::info!(
                     "managed resize status backend={} connection_generation={} pane={} epoch={} result={:?}",
                     backend.0,
                     connection_generation,
@@ -13112,7 +13154,7 @@ impl ApplicationHandler<ClientEvent> for Application {
                 {
                     return;
                 }
-                eprintln!(
+                tracing::info!(
                     "presentation pointer button target={target:?} pressed={pressed} client_grab_active={}",
                     self.pointer_grab.is_some()
                 );
@@ -13155,7 +13197,7 @@ impl ApplicationHandler<ClientEvent> for Application {
                         .as_mut()
                         .is_some_and(|grab| grab.release(button_code));
                 if grab_ended {
-                    eprintln!("presentation pointer grab ended target={target:?}");
+                    tracing::info!("presentation pointer grab ended target={target:?}");
                     self.pointer_grab = None;
                     route_pointer_motion(
                         renderer,
@@ -13179,7 +13221,7 @@ impl ApplicationHandler<ClientEvent> for Application {
                 {
                     return;
                 }
-                eprintln!(
+                tracing::info!(
                     "presentation pointer scroll target={target:?} client_grab_active={}",
                     self.pointer_grab.is_some()
                 );
@@ -13530,7 +13572,7 @@ impl ApplicationHandler<ClientEvent> for Application {
                             return;
                         }
                         self.automation_unlock_key_down = true;
-                        eprintln!(
+                        tracing::info!(
                             "computer-use interaction unlock requested backend={}",
                             backend.0
                         );
@@ -13641,7 +13683,7 @@ impl ApplicationHandler<ClientEvent> for Application {
                     for message in evaluation.actor_messages {
                         if let Some(runtime) = self.wasm_runtime.as_ref() {
                             match runtime.send_key_policy_message(&message.actor, message.payload) {
-                                Ok(()) => eprintln!(
+                                Ok(()) => tracing::info!(
                                     "sent key-policy actor message actor={}",
                                     message.actor
                                 ),
@@ -15555,7 +15597,7 @@ fn flush_renderer_managed_resize_requests(lane: Option<&mut InputLane>, renderer
                 resize_epoch,
                 recover_through_epoch,
             );
-            eprintln!(
+            tracing::info!(
                 "requested managed window resize window_id={window} logical_size={logical_width}x{logical_height} pixel_size={pixel_width}x{pixel_height} scale_120={scale_120} resize_epoch={resize_epoch:?} recover_through_epoch={recover_through_epoch:?}"
             );
         } else if let Some(epoch) = resize_epoch {
@@ -15830,7 +15872,7 @@ fn dispatch_focus_change(
                 focused: false,
             },
         )?;
-        eprintln!("focused away from plugin pane={pane}");
+        tracing::info!("focused away from plugin pane={pane}");
     }
     if let Some(pane) = change.plugin_focus {
         send_presentation_event(
@@ -15840,13 +15882,13 @@ fn dispatch_focus_change(
                 focused: window_focused,
             },
         )?;
-        eprintln!("focused local plugin pane={pane}");
+        tracing::info!("focused local plugin pane={pane}");
     }
     if let Some(window_id) = change.managed_window {
         if let Some(sender) = input_sender.as_mut() {
             send_window_focus(sender, window_id);
         }
-        eprintln!("focused backend-managed window={window_id}");
+        tracing::info!("focused backend-managed window={window_id}");
     }
     Ok(())
 }
@@ -15878,9 +15920,9 @@ fn apply_key_policy_host_message(
                     } else {
                         false
                     };
-                    eprintln!("key-policy close local pane={pane} changed={closed}");
+                    tracing::info!("key-policy close local pane={pane} changed={closed}");
                 } else {
-                    eprintln!("key-policy close ignored without a focused pane");
+                    tracing::info!("key-policy close ignored without a focused pane");
                 }
                 None
             } else {
@@ -15894,7 +15936,7 @@ fn apply_key_policy_host_message(
             let focused = renderer.focused_pane_id();
             let change = renderer.focus_pane(pane);
             let deferred = renderer.pending_focus_pane == Some(pane);
-            eprintln!(
+            tracing::info!(
                 "presentation key policy requested pane focus pane={pane} focused={focused:?} \
                  inventory={inventory:?} changed={} deferred={deferred}",
                 change.is_some(),
@@ -15969,7 +16011,7 @@ fn apply_key_policy_host_message(
                         let preview = decode_agent_image_preview(&bytes)
                             .context("create clipboard image preview")?;
                         let byte_count = bytes.len();
-                        eprintln!(
+                        tracing::info!(
                             "delivering clipboard image pane={pane} mime={mime_type} bytes={byte_count}"
                         );
                         send_presentation_event(
@@ -16052,7 +16094,7 @@ fn deliver_dropped_image(
             ) {
                 eprintln!("dropped image event was rejected: {error:#}");
             } else {
-                eprintln!(
+                tracing::info!(
                     "delivered dropped image pane={pane} name={name:?} mime={mime_type} bytes={byte_count}"
                 );
             }
@@ -16382,7 +16424,7 @@ fn cancel_policy_pointer_capture(
         interactions.remove(active.interaction, "cancel-authority-unavailable");
     }
     renderer.set_zone_pointer_state(None, None, CursorRole::Default);
-    eprintln!(
+    tracing::info!(
         "pointer-policy capture cancelled interaction={} event_sequence={sequence} reason={reason}",
         active.interaction.0
     );
@@ -16658,9 +16700,12 @@ fn route_layout_zone_pointer(
             local_position: effective.local_position,
         });
         renderer.set_zone_pointer_state(None, Some(hit.zone), hit.cursor);
-        eprintln!(
+        tracing::info!(
             "pointer-policy capture acquired interaction={} lease={} generation={} zone={} event_sequence={sequence}",
-            interaction.0, hit.zone.lease.0, hit.zone.lease_generation, hit.zone.local_item.0
+            interaction.0,
+            hit.zone.lease.0,
+            hit.zone.lease_generation,
+            hit.zone.local_item.0
         );
     } else if let Some(active) = capture.as_mut() {
         active.event_sequence = sequence;
@@ -16781,7 +16826,7 @@ fn route_layout_zone_pointer(
             None,
             hover.map_or(CursorRole::Default, |hit| hit.cursor),
         );
-        eprintln!(
+        tracing::info!(
             "pointer-policy capture released interaction={} event_sequence={sequence} phase={phase:?}",
             released.interaction.0
         );
@@ -17030,7 +17075,7 @@ impl ImportedFrame {
                         offset: u64::from(frame.offset),
                     },
                 )?;
-                eprintln!(
+                tracing::info!(
                     "imported window DMA-BUF window_id={} app_id={} resource_id={} size={}x{} format={:?} color_space={:?} stride={} modifier={} y_inverted={}",
                     window_id,
                     frame.app_id,
@@ -17083,7 +17128,7 @@ impl ImportedFrame {
                     view_formats: &[view_format],
                 });
                 write_shared_image(&texture, queue, &frame.image, sequence)?;
-                eprintln!(
+                tracing::info!(
                     "uploaded window shared-memory image window_id={} app_id={} resource_id={} size={}x{} format={:?} color_space={:?} stride={}",
                     window_id,
                     frame.app_id,
@@ -17140,7 +17185,7 @@ impl ImportedFrame {
                     frame.stride,
                     &frame.pixels,
                 )?;
-                eprintln!(
+                tracing::info!(
                     "uploaded network image window_id={window_id} resource_id={resource_id} \
                      sequence={sequence} size={}x{} format={format:?} color_space={:?} stride={} \
                      compressed_bytes={} decoded_bytes={}",
@@ -18077,7 +18122,7 @@ impl Renderer {
         let divider_resize_mode = DividerResizeMode::from_environment();
         plugin_graphics.set_raster_scale(window.scale_factor() as f32);
         surface.configure(&device, &config);
-        eprintln!(
+        tracing::info!(
             "configured presentation surface format={:?} color_space={:?} \
              present_mode={:?} maximum_frame_latency={}",
             config.format,
@@ -18085,7 +18130,7 @@ impl Renderer {
             config.present_mode,
             config.desired_maximum_frame_latency,
         );
-        eprintln!("configured divider resize mode={divider_resize_mode:?}");
+        tracing::info!("configured divider resize mode={divider_resize_mode:?}");
         Ok(Self {
             generation,
             window,
@@ -18177,7 +18222,7 @@ impl Renderer {
         let Some(active_task) = active_task else {
             self.automation_presentation = None;
             if self.automation_spectator.take().is_some() {
-                eprintln!("computer-use spectator stopped");
+                tracing::info!("computer-use spectator stopped");
                 self.window.request_redraw();
             }
             return Ok(());
@@ -18186,9 +18231,12 @@ impl Renderer {
         self.automation_presentation = automation_presentation;
         if presentation_changed {
             if let Some(state) = &self.automation_presentation {
-                eprintln!(
+                tracing::info!(
                     "computer-use presentation task={} backend={} locked={} panes={:?}",
-                    state.task, state.backend.0, state.locked, self.automation_owned_panes
+                    state.task,
+                    state.backend.0,
+                    state.locked,
+                    self.automation_owned_panes
                 );
             }
             self.window.request_redraw();
@@ -18287,7 +18335,7 @@ impl Renderer {
                 },
             ],
         });
-        eprintln!(
+        tracing::info!(
             "computer-use spectator frame task={} observation_sequence={} frame_sequence={} size={}x{} png_bytes={}",
             frame.task.0,
             frame.sequence,
@@ -18682,7 +18730,7 @@ impl Renderer {
                         .get(&resource_key)
                         .context("staged managed frame lost its imported resource")?
                         .extent;
-                    eprintln!(
+                    tracing::info!(
                         "staged managed frame backend={} connection_generation={} pane={} backend_pane={} epoch={} sequence={} resource={} source={}x{} resource_extent={}x{}",
                         backend.0,
                         connection_generation,
@@ -19297,7 +19345,7 @@ impl Renderer {
             );
         }
         if !valid {
-            eprintln!(
+            tracing::info!(
                 "retaining accepted actor layout until its replacement is ready inventory_panes={}",
                 panes.len()
             );
@@ -19310,7 +19358,7 @@ impl Renderer {
             && Some(requested) == self.focused_pane_id()
         {
             self.pending_focus_pane = None;
-            eprintln!("fulfilled deferred pane focus pane={requested}");
+            tracing::info!("fulfilled deferred pane focus pane={requested}");
         }
     }
 
@@ -19392,7 +19440,7 @@ impl Renderer {
                 LayoutSource::NativeFallback => "native-fallback",
                 LayoutSource::Actor => "actor",
             };
-            eprintln!("presentation layout source changed source={source}");
+            tracing::info!("presentation layout source changed source={source}");
         }
         self.layout_source = source;
         let fallback_dividers = if source == LayoutSource::NativeFallback {
@@ -19422,7 +19470,7 @@ impl Renderer {
         source: LayoutSource,
     ) -> Option<FocusChange> {
         if self.layout_source != source {
-            eprintln!("presentation layout source changed source=actor");
+            tracing::info!("presentation layout source changed source=actor");
         }
         self.layout_source = source;
         let extent = self.layout_extent();
@@ -20152,7 +20200,7 @@ impl Renderer {
         // Renderer replacement must not expose a partial retained actor frame:
         // make every recovered texture visible, then project layout once.
         for (pane, sequence, texture) in compiled {
-            eprintln!(
+            tracing::info!(
                 "accepted plugin renderer replay pane={pane} sequence={sequence} batch_panes={}",
                 panes.len()
             );
@@ -20463,9 +20511,8 @@ impl Renderer {
             prepared.remove(0),
             self.plugin_panes.get(&pane).map(|current| &current.scene),
         );
-        if target_changed
-            || snapshot.sequence <= 3
-            || snapshot.sequence.is_multiple_of(120)
+        if (tracing::enabled!(tracing::Level::INFO)
+            && (target_changed || snapshot.sequence <= 3 || snapshot.sequence.is_multiple_of(120)))
             || std::env::var_os("BROOD_TRACE_PLUGIN_GRAPHICS").is_some()
         {
             eprintln!(
@@ -20589,7 +20636,7 @@ impl Renderer {
             previous,
         );
         self.staged_plugin_panes.insert((pane, resize_epoch), scene);
-        eprintln!(
+        tracing::info!(
             "staged plugin draw pane={pane} sequence={snapshot_sequence} resize_epoch={resize_epoch} gpu_target={width}x{height} scale={scale:.2}"
         );
         Ok(GraphicsRefresh::Applied(None))
@@ -21108,7 +21155,7 @@ impl Renderer {
         let commands = encoder.finish();
         let encoded = Instant::now();
         if encoded.duration_since(acquired) >= Duration::from_millis(5) {
-            eprintln!(
+            tracing::info!(
                 "slow frame encoding setup_us={} plugins_us={} slowest_plugin_us={} composition_us={} finish_us={}",
                 plugin_encode_started.duration_since(acquired).as_micros(),
                 plugins_encoded
@@ -21295,7 +21342,7 @@ impl Renderer {
             route.view_pane,
             epoch,
         );
-        eprintln!(
+        tracing::info!(
             "admitted managed resize expectation backend={} connection_generation={} pane={} backend_pane={} epoch={epoch} wait={wait} logical_size={}x{} pixel_size={}x{} scale_120={scale_120}",
             route.backend.0,
             route.connection_generation,

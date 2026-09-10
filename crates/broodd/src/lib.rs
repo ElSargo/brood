@@ -52,6 +52,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 
 pub fn run_cli() -> Result<CommandOutcome> {
     fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(EnvFilter::from_default_env())
         .try_init()
         .map_err(|err| anyhow::anyhow!("{err}"))?;
@@ -118,6 +119,7 @@ fn run_container(args: ContainerArgs) -> Result<CommandOutcome> {
 
 pub fn run_session_cli() -> Result<()> {
     fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(EnvFilter::from_default_env())
         .try_init()
         .map_err(|err| anyhow::anyhow!("{err}"))?;
