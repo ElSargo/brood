@@ -37,6 +37,7 @@ may announce a finished investigation but is not the complaint store.
 ## Files and ownership
 
 Use one directory per complaint under a configurable durable complaints root.
+A good candidate is ~/.local/share/brood/complaints
 The default root belongs to the user's Brood data directory on the presentation
 machine, so complaints about Brood do not depend on an active project or get
 scattered among session working directories. The UI exposes its location.

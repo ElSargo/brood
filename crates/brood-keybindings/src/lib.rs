@@ -31,6 +31,7 @@ pub const KEY_J: i32 = 44;
 pub const KEY_K: i32 = 45;
 pub const KEY_L: i32 = 46;
 pub const KEY_B: i32 = 56;
+pub const KEY_C: i32 = 54;
 pub const KEY_N: i32 = 57;
 pub const KEY_M: i32 = 58;
 pub const KEY_COMMA: i32 = 59;
@@ -154,6 +155,13 @@ pub const ACTIONS: &[Action] = &[
         category: "Applications",
         scope: Scope::Always,
         default_binding: Binding::new(KEY_I, CTRL_ALT),
+    },
+    Action {
+        id: "complaints.capture",
+        title: "Capture a complaint",
+        category: "Brood",
+        scope: Scope::Always,
+        default_binding: Binding::new(KEY_C, CTRL_ALT),
     },
     Action {
         id: "sessions.toggle",

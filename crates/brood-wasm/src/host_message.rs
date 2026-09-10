@@ -44,6 +44,9 @@ pub enum HostMessage {
     },
     RequestBackendCatalogue,
     CreateLocalBackend,
+    ComplaintCapture {
+        action: String,
+    },
     ToggleShortcutPassthrough,
     SetShortcutPassthrough {
         enabled: bool,

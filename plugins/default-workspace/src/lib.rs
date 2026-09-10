@@ -604,6 +604,7 @@ fn messages_for_action<'a>(
         "terminal.new" => &[Message::TerminalAction("new")],
         "editor.open" => &[Message::EditorAction("open")],
         "inbox.show" => &[Message::InboxAction("show")],
+        "complaints.capture" => &[Message::ComplaintCapture("open")],
         "sessions.toggle" => &[Message::SessionSwitcherAction("toggle")],
         "sessions.picker" => &[Message::SessionSwitcherAction("picker")],
         "diff.toggle" => &[Message::DiffViewerAction("toggle")],
@@ -852,6 +853,7 @@ enum Message<'a> {
     InboxAction(&'a str),
     TerminalAction(&'a str),
     EditorAction(&'a str),
+    ComplaintCapture(&'a str),
 }
 
 #[allow(
@@ -2445,6 +2447,12 @@ fn write_consume_payload(output: &mut [u8], messages: &[Message<'_>]) -> i32 {
             }
             Message::EditorAction(action) => {
                 payload.bytes(br#"{"kind":"editor-action","action":"#);
+                payload.byte(b'"');
+                payload.quoted_body(action.as_bytes());
+                payload.bytes(br#""}"#);
+            }
+            Message::ComplaintCapture(action) => {
+                payload.bytes(br#"{"type":"complaint-capture","action":"#);
                 payload.byte(b'"');
                 payload.quoted_body(action.as_bytes());
                 payload.bytes(br#""}"#);

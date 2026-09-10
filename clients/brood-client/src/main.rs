@@ -70,6 +70,7 @@ use winit::{
 mod actor_runtime;
 mod backend_registry;
 mod clipboard;
+pub mod complaint_capture;
 mod facet_events;
 mod key_policy;
 mod layout;
@@ -96,6 +97,7 @@ use brood_wasm::{
 };
 use brood_wayland_drop::{DropBridge as WaylandDropBridge, DropEvent as WaylandDropEvent};
 use clipboard::{ClipboardBridge, ClipboardContent};
+use complaint_capture::{ComplaintStore, Origin as ComplaintOrigin};
 use key_policy::{ClientKeyPolicy, KeyPolicyAppPane, KeyPolicySnapshot};
 use layout::{
     LayoutSource, convert_actor_layout_fragment, convert_actor_layout_lease, native_flat_dividers,
@@ -5347,6 +5349,8 @@ const fn window_event_callback_kind(event: &WindowEvent) -> &'static str {
 #[derive(Default)]
 struct Application {
     renderer: Option<Renderer>,
+    complaint_store: ComplaintStore,
+    complaint_editor_open: bool,
     error: Option<anyhow::Error>,
     input_sender: Option<InputLane>,
     actor_message_sender: Option<ActorMessageLane>,
@@ -13376,6 +13380,44 @@ impl ApplicationHandler<ClientEvent> for Application {
                 let text_input =
                     plugin_text_input(&event.logical_key, event.text.as_deref(), self.modifiers);
                 let logical_key = plugin_logical_key(&event.logical_key);
+                if self.complaint_editor_open {
+                    if event.state == ElementState::Pressed && !event.repeat {
+                        match logical_key.as_str() {
+                            "Escape" => {
+                                self.complaint_editor_open = false;
+                                self.complaint_store.close_editor();
+                                renderer.window.set_title("Brood");
+                            }
+                            "Enter" => match self.complaint_store.save(true) {
+                                Ok(path) => {
+                                    tracing::info!("complaint saved path={}", path.display());
+                                    self.complaint_editor_open = false;
+                                    renderer.window.set_title("Brood — complaint saved");
+                                }
+                                Err(error) => {
+                                    renderer
+                                        .window
+                                        .set_title("Brood — complaint save failed; Enter to retry");
+                                    eprintln!("complaint save failed: {error:#}");
+                                }
+                            },
+                            "Backspace" => {
+                                if let Some(draft) = self.complaint_store.draft_mut() {
+                                    draft.note.pop();
+                                }
+                            }
+                            _ => {
+                                if let Some(text) = event.text.as_deref()
+                                    && !text.chars().any(char::is_control)
+                                    && let Some(draft) = self.complaint_store.draft_mut()
+                                {
+                                    draft.note.push_str(text);
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
                 let render_scheduling_proof =
                     std::env::var_os("BROOD_RENDER_SCHEDULING_PROOF").is_some();
                 if render_scheduling_proof
@@ -13694,6 +13736,62 @@ impl ApplicationHandler<ClientEvent> for Application {
                         }
                     }
                     for message in evaluation.host_messages {
+                        if let HostMessage::ComplaintCapture { action } = &message {
+                            if action == "open" || action == "fresh" {
+                                let scale_milli = (renderer.window.scale_factor() * 1000.0)
+                                    .round()
+                                    .to_u32()
+                                    .unwrap_or(1000);
+                                let origin = ComplaintOrigin {
+                                    client_id: String::new(),
+                                    backend_id: renderer.active_backend.map(|backend| backend.0),
+                                    session_id: (renderer.active_session != 0)
+                                        .then_some(renderer.active_session),
+                                    focused_pane: renderer.focused_pane_id(),
+                                    visible_panes: renderer.default_visible_pane_inventory(),
+                                    frame_sequence: renderer.current_sequence,
+                                    layout_revision: self.presented_layout_revision,
+                                    presentation_width: renderer.config.width,
+                                    presentation_height: renderer.config.height,
+                                    scale_milli,
+                                };
+                                let client_id = format!("presentation-{}", std::process::id());
+                                if action == "fresh" {
+                                    self.complaint_store.fresh(origin, &client_id);
+                                } else {
+                                    self.complaint_store.open(origin, &client_id);
+                                }
+                                if self.complaint_store.draft().is_some_and(|draft| {
+                                    draft.manifest.screenshot.status
+                                        == complaint_capture::CollectionStatus::Pending
+                                }) && let Err(error) = self.complaint_store.mark_screenshot_unavailable(
+                                    "composed presentation readback is not available in this renderer",
+                                ) {
+                                    eprintln!("complaint screenshot status failed: {error:#}");
+                                }
+                                if let Some(draft) = self.complaint_store.draft() {
+                                    let diagnostics = serde_json::json!({
+                                        "schema_version": 1,
+                                        "collected_at_unix_ms": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis(),
+                                        "frame_sequence": draft.manifest.origin.frame_sequence,
+                                        "layout_revision": draft.manifest.origin.layout_revision,
+                                        "backend_connected": self.backend_connected,
+                                        "frame_transport": "presentation-client-composition",
+                                    });
+                                    if let Err(error) =
+                                        self.complaint_store.record_diagnostics(&diagnostics)
+                                    {
+                                        eprintln!("complaint diagnostics failed: {error:#}");
+                                    }
+                                }
+                                self.complaint_editor_open = true;
+                                renderer.window.set_title(
+                                    "Brood — complaint: type note, Enter saves, Esc closes",
+                                );
+                                renderer.window.request_redraw();
+                            }
+                            continue;
+                        }
                         if let Err(error) = apply_key_policy_host_message(
                             renderer,
                             &mut self.input_sender,
@@ -15979,7 +16077,8 @@ fn apply_key_policy_host_message(
         | HostMessage::DeploySshBackend { .. }
         | HostMessage::DeployContainerBackend { .. }
         | HostMessage::RequestBackendCatalogue
-        | HostMessage::CreateLocalBackend => None,
+        | HostMessage::CreateLocalBackend
+        | HostMessage::ComplaintCapture { .. } => None,
         HostMessage::SetClipboard { text } => {
             clipboard
                 .context("presentation clipboard service is unavailable")?
