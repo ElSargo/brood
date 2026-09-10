@@ -4616,7 +4616,10 @@ fn synchronized_resize_wait_set_is_ready(active: &ActiveSynchronizedResize) -> b
 }
 
 fn synchronized_resize_requires_degraded_completion(active: &ActiveSynchronizedResize) -> bool {
-    !active.recovered_regions.is_empty() || !active.recovered_managed_panes.is_empty()
+    // Host-owned topology changes recover managed applications per pane. Their
+    // minimum-size fallback must not downgrade or discard exact plugin frames.
+    !active.recovered_regions.is_empty()
+        || (!active.host_owned && !active.recovered_managed_panes.is_empty())
 }
 
 fn prepare_synchronized_resize_presentation(
@@ -10008,6 +10011,33 @@ impl Application {
             .as_ref()
             .is_some_and(|active| synchronized_resize_preview_timed_out(active, now));
         if timed_out_preview {
+            if let Some(epoch) = self
+                .active_synchronized_resize
+                .as_ref()
+                .filter(|active| active.host_owned)
+                .map(|active| active.epoch.id)
+            {
+                // A cold application may miss the cutoff, or acknowledge a
+                // repeated size without attaching a new buffer. Select its
+                // explicit recovery before deciding whether exact plugin
+                // content is still missing and the whole layout must abort.
+                if let Some(renderer) = self.renderer.as_mut() {
+                    renderer.recover_managed_resize_timeout(epoch);
+                }
+                self.reconcile_managed_resize_recovery()?;
+                if self
+                    .active_synchronized_resize
+                    .as_ref()
+                    .is_some_and(|active| {
+                        matches!(
+                            active.presentation,
+                            SynchronizedResizePresentation::Ready { .. }
+                        )
+                    })
+                {
+                    return Ok(None);
+                }
+            }
             // A degraded promotion would project the previous immutable facet
             // into the new pane bounds. Abort the preview and retain the last
             // complete composition instead.
@@ -21472,25 +21502,28 @@ impl Renderer {
                 );
                 continue;
             }
-            if let Some(window) = self
+            let window = self
                 .current_windows
                 .iter()
-                .find(|window| window.window_id == pane)
-            {
-                let surface_extent = self
-                    .imported_frames
-                    .get(&window.resource_id)
-                    .map(|frame| frame.extent);
-                invariant.record(
-                    pane,
-                    surface_extent,
-                    surface_extent,
-                    window.rect,
-                    layout_rect,
-                );
-            } else {
-                invariant.record(pane, None, None, layout_rect, layout_rect);
-            }
+                .find(|window| window.window_id == pane);
+            let pane_rect = window.map_or(layout_rect, |window| window.rect);
+            let frame_ready =
+                window.is_some_and(|window| self.imported_frames.contains_key(&window.resource_id));
+            let available = self
+                .available_windows
+                .iter()
+                .any(|window| window.pane == pane);
+            // As with plugins, validate the surface actually drawn into the
+            // viewport. Managed recovery draws a scaled frame or a native
+            // placeholder; neither has to share the backing buffer's extent.
+            let rendered_extent = managed_pane_rendered_extent(available, frame_ready, pane_rect);
+            invariant.record(
+                pane,
+                rendered_extent,
+                rendered_extent,
+                pane_rect,
+                layout_rect,
+            );
         }
         invariant
     }
@@ -21872,6 +21905,16 @@ fn default_visible_panes(
 
 const fn managed_pane_uses_placeholder(available: bool, frame_ready: bool) -> bool {
     available && !frame_ready
+}
+
+fn managed_pane_rendered_extent(
+    available: bool,
+    frame_ready: bool,
+    rect: [i32; 4],
+) -> Option<(u32, u32)> {
+    (frame_ready || managed_pane_uses_placeholder(available, frame_ready))
+        .then(|| positive_rect_extent(rect))
+        .flatten()
 }
 
 fn clip_rect_to_extent(rect: [i32; 4], extent: (u32, u32)) -> Option<[i32; 4]> {
@@ -22876,6 +22919,24 @@ mod tests {
         assert_eq!(mismatched.geometry_mismatches, 1);
         assert_eq!(mismatched.details.len(), 2);
         assert!(!mismatched.is_exact());
+    }
+
+    #[test]
+    fn managed_recovery_geometry_matches_the_drawn_viewport() {
+        let rect = [480, 0, 480, 686];
+        assert_eq!(
+            managed_pane_rendered_extent(true, false, rect),
+            Some((480, 686))
+        );
+        assert_eq!(
+            managed_pane_rendered_extent(true, true, rect),
+            Some((480, 686))
+        );
+        assert_eq!(managed_pane_rendered_extent(false, false, rect), None);
+        assert_eq!(
+            managed_pane_rendered_extent(true, true, [0, 0, 0, 686]),
+            None
+        );
     }
 
     #[test]
@@ -26427,6 +26488,33 @@ mod tests {
             active.presentation,
             SynchronizedResizePresentation::Waiting
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn host_cohort_admits_managed_recovery_only_after_exact_plugin_readiness() -> Result<()> {
+        let mut active = active_resize_with_inventory(SynchronizedResizePresentation::Waiting)?;
+        active.host_owned = true;
+        let managed_pane = *active.wait_panes.first().unwrap();
+        active.recovered_managed_panes.insert(managed_pane);
+        active.ready_panes.insert(managed_pane);
+        assert_eq!(
+            prepare_synchronized_resize_presentation(&mut active, false),
+            None
+        );
+        active.ready_panes = active.wait_panes.clone();
+        assert_eq!(
+            prepare_synchronized_resize_presentation(&mut active, false),
+            Some((false, Vec::new()))
+        );
+
+        active.presentation = SynchronizedResizePresentation::Waiting;
+        active.host_owned = false;
+        active.interaction_preview = true;
+        assert_eq!(
+            prepare_synchronized_resize_presentation(&mut active, false),
+            None
+        );
         Ok(())
     }
 

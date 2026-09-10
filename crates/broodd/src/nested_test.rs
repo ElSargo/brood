@@ -16,6 +16,7 @@ pub fn run(args: TestArgs) -> Result<()> {
         TestCommand::ComputerUseAgent(args) => run_computer_use_agent(args),
         TestCommand::CodingAgent(args) => run_coding_agent(args),
         TestCommand::Nested(args) => run_nested(args),
+        TestCommand::Chromium(args) => run_chromium(args),
         TestCommand::RenderScheduling(args) => run_render_scheduling(args),
         TestCommand::Editor(args) => run_editor(args),
         TestCommand::Resize(args) => run_resize(args),
@@ -111,6 +112,23 @@ fn run_nested(args: NestedTestArgs) -> Result<()> {
         .with_context(|| format!("run {}", script.display()))?;
     if !status.success() {
         bail!("nested terminal proof exited with {status}");
+    }
+    Ok(())
+}
+
+fn run_chromium(args: NestedTestArgs) -> Result<()> {
+    let root = find_checkout_root()?;
+    let script = root.join("tools/test-chromium-nested.sh");
+    let mut command = Command::new("bash");
+    command.arg(&script).current_dir(&root);
+    if let Some(out_dir) = args.out_dir {
+        command.env("BROOD_CHROMIUM_OUT", out_dir);
+    }
+    let status = command
+        .status()
+        .with_context(|| format!("run {}", script.display()))?;
+    if !status.success() {
+        bail!("Chromium nested proof exited with {status}");
     }
     Ok(())
 }

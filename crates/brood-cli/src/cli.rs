@@ -78,6 +78,8 @@ pub enum TestCommand {
     CodingAgent(NestedTestArgs),
     /// Run the external-client nested terminal workload.
     Nested(NestedTestArgs),
+    /// Verify Chromium launch and input in an offscreen presentation.
+    Chromium(NestedTestArgs),
     /// Run the external-client Neovim editor workload.
     Editor(NestedTestArgs),
     /// Capture and validate synchronized divider resizing frame by frame.
