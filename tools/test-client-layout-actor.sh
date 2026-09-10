@@ -16,7 +16,7 @@ for tool in weston weston-simple-egl gtk4-demo python3; do
   fi
 done
 
-cargo build -p brood-client -p broodd --bins
+bash "$ROOT/tools/brood-build.sh" --host-only
 cargo build \
   --manifest-path plugins/default-workspace/Cargo.toml \
   --target wasm32-unknown-unknown \

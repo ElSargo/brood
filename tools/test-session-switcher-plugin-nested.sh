@@ -175,7 +175,7 @@ mkdir -p "$ROOT/target"
 exec 9>"$ROOT/target/brood-plugin-artifacts.lock"
 flock 9
 if [[ -z "$PREBUILT_PACKAGE" ]]; then
-cargo build -p broodd -p brood-client --bins --locked "${HOST_BUILD_ARGS[@]}"
+bash "$ROOT/tools/brood-build.sh" --host-only "${HOST_BUILD_ARGS[@]}"
 SWITCHER_BUILD_ARGS=(
   build
   --manifest-path plugins/session-switcher/Cargo.toml

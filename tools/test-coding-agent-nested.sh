@@ -125,7 +125,7 @@ trap 'echo "ERR coding-agent line=$LINENO command=$BASH_COMMAND callers=${BASH_L
 mkdir -p "$ROOT/target"
 exec 9>"$ROOT/target/brood-plugin-artifacts.lock"
 flock 9
-cargo build -p broodd -p brood-client --bins
+bash "$ROOT/tools/brood-build.sh" --host-only
 if [[ -n "$COMPUTER_USE" ]]; then
   cargo build \
     --manifest-path runtimes/computer-use-js/Cargo.toml \
@@ -134,7 +134,7 @@ if [[ -n "$COMPUTER_USE" ]]; then
     --locked
 fi
 if [[ -n "$SSH_TARGET" ]]; then
-  cargo build --release -p brood-remote --bin brood-remote --locked
+  bash "$ROOT/tools/brood-build.sh" --host-only --release
 fi
 cargo build \
   --manifest-path plugins/coding-agent/Cargo.toml \

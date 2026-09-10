@@ -2,6 +2,7 @@ use std::{
     env,
     ffi::OsString,
     fs,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Command, ExitStatus},
     time::{SystemTime, UNIX_EPOCH},
@@ -31,7 +32,7 @@ pub fn run_if_configured(args: &RunArgs) -> Result<bool> {
     let cache_root = runner_cache_root(selection.runner.cache_root.as_deref());
     let cache_dir = create_cache_dir(&cache_root)?;
     let current_exe = env::current_exe().context("resolve current exe")?;
-    let inner_binary = session_server_path(&current_exe);
+    let inner_binary = runner_entry(&current_exe, &cache_dir, "brood-sessiond", "session")?;
     let session_args = args.session.clone();
     let record = LaunchRecord {
         id: launch_context::new_launch_id(),
@@ -86,7 +87,7 @@ pub fn run_project_command_if_configured(
     let cache_root = runner_cache_root(selection.runner.cache_root.as_deref());
     let cache_dir = create_cache_dir(&cache_root)?;
     let current_exe = env::current_exe().context("resolve current exe")?;
-    let inner_binary = runner_exec_path(&current_exe);
+    let inner_binary = runner_entry(&current_exe, &cache_dir, "brood-runner-exec", "runner-exec")?;
     let record = LaunchRecord {
         id: launch_context::new_launch_id(),
         project_dir: selection.project_dir.clone(),
@@ -139,6 +140,9 @@ fn runner_scope_command(
 ) -> Result<Command> {
     let (program, configured_args) = runner_program(runner, current_exe, &record.project_dir)?;
     let mut args = runner_activation_args(record, inner_binary);
+    if runner.command.is_empty() && brood_launch::is_unified(current_exe) {
+        args.insert(0, "runner-nix-develop".into());
+    }
     args.extend(configured_args);
     launch_context::write_launch_record(record)?;
 
@@ -207,15 +211,29 @@ fn runner_command_program(program: &str, project_dir: &Path) -> OsString {
     }
 }
 
-fn session_server_path(current_exe: &Path) -> PathBuf {
-    sidecar_binary_path(current_exe, "brood-sessiond")
-}
-
-fn runner_exec_path(current_exe: &Path) -> PathBuf {
-    sidecar_binary_path(current_exe, "brood-runner-exec")
+// Preserve the custom runner's single executable argument. Its private entry
+// selects the unified role and is removed with the launch's existing cache.
+fn runner_entry(current_exe: &Path, cache_dir: &Path, alias: &str, role: &str) -> Result<PathBuf> {
+    if !brood_launch::is_unified(current_exe) {
+        return Ok(sidecar_binary_path(current_exe, alias));
+    }
+    let executable = current_exe
+        .to_str()
+        .context("runner executable path is not UTF-8")?;
+    let quoted = executable.replace('\'', "'\\''");
+    let entry = cache_dir.join(alias);
+    fs::write(
+        &entry,
+        format!("#!/bin/sh\nexec '{quoted}' {role} \"$@\"\n"),
+    )?;
+    fs::set_permissions(&entry, fs::Permissions::from_mode(0o700))?;
+    Ok(entry)
 }
 
 fn sidecar_binary_path(current_exe: &Path, name: &str) -> PathBuf {
+    if brood_launch::is_unified(current_exe) {
+        return current_exe.to_path_buf();
+    }
     let mut path = current_exe
         .parent()
         .unwrap_or_else(|| Path::new("."))

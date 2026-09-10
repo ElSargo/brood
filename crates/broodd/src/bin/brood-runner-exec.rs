@@ -1,11 +1,11 @@
+use crate::launch_context;
 use anyhow::{Result, bail};
-use broodd::launch_context;
 use std::process::Command;
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
-fn main() -> Result<()> {
+pub fn run_cli() -> Result<()> {
     let record = launch_context::current_launch_record()?;
     let Some((program, args)) = record.program_argv.split_first() else {
         bail!("Brood launch record has empty program argv");

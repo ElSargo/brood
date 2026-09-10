@@ -236,6 +236,16 @@ for _ in $(seq 1 300); do
 done
 ACTION_PANE="$(jq -r '.windows[] | select(.application_id == "org.brood.ComputerUseProof") | .pane' "$OUT/action-ready/automation.json")"
 EXISTING_WINDOW_PANE="$ACTION_PANE"
+# Window discovery can precede the first committed buffer. Wait for usable
+# geometry before asserting the discovery contract and starting input actions.
+for _ in $(seq 1 100); do
+  ctl computer-use windows 1 > "$OUT/existing-windows.json"
+  if jq -e --argjson pane "$ACTION_PANE" 'any(.windows[]; .pane == $pane and .content_width > 0 and .content_height > 0)' \
+    "$OUT/existing-windows.json" > /dev/null; then
+    break
+  fi
+  sleep 0.05
+done
 ctl computer-use windows 1 > "$OUT/existing-windows.json"
 jq -e --argjson pane "$ACTION_PANE" '
   .protocol_version == 1

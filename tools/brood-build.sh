@@ -5,12 +5,14 @@ usage() {
   cat <<'EOF'
 Usage: tools/brood-build.sh [--host-only | --wasm-only] [--jobs N]
 
-Build the Brood host programs and every WASM module. Independent Cargo graphs
-run in parallel, Cargo rebuilds only stale crates, and Component Model encoding
-runs only when its core module changed.
+Build the full Brood executable and every WASM module from current sources.
+Host and guest builds overlap; guest workspaces share a dependency cache.
+Cargo checks freshness, and unchanged components are not encoded again.
 
 Options:
-  --host-only  Build only the host programs.
+  --host-only  Build only the full Brood executable.
+  --server     Select the server executable instead of the full build.
+  --release    Build the host with release optimizations.
   --wasm-only  Build only the WASM modules.
   --jobs N     Limit the shared parallel jobserver (default: available CPUs).
   --self-test  Check the build-script Preview 1 memory contract.
@@ -52,7 +54,7 @@ componentize_if_stale() {
 copy_if_stale() {
   local source="$1"
   local destination="$2"
-  if [[ ! -s "$destination" || "$source" -nt "$destination" ]]; then
+  if ! cmp -s "$source" "$destination"; then
     install -D "$source" "$destination"
   fi
 }
@@ -126,6 +128,8 @@ build_wasm_one() {
   local core=
   local component=
   local -a cargo_config_args=()
+  local shared_target="$ROOT/target/guests"
+  local artifact_name
 
   case "$crate_dir" in
     examples/wasm-preview1-worker|plugins/workspace-file-log)
@@ -145,11 +149,16 @@ build_wasm_one() {
     --quiet \
     "${cargo_config_args[@]}" \
     --manifest-path "$crate_dir/Cargo.toml" \
+    --target-dir "$shared_target" \
     --target "$wasm_target" \
     --release \
     --locked
 
   release_dir="$crate_dir/target/$wasm_target/release"
+  # Keep manifest artifact paths stable while sharing Cargo's dependency cache.
+  artifact_name="$(sed -n 's/^name = "\(.*\)"/\1/p' "$crate_dir/Cargo.toml" | head -n 1)"
+  artifact_name="${artifact_name//-/_}.wasm"
+  copy_if_stale "$shared_target/$wasm_target/release/$artifact_name" "$release_dir/$artifact_name"
   case "$crate_dir" in
     examples/wasm-preview1-worker)
       verify_preview1_memory_ceiling "$release_dir/brood_preview1_worker_example.wasm"
@@ -237,7 +246,30 @@ build_wasm_one() {
 }
 
 if [[ "${1:-}" == "--build-host" ]]; then
-  cargo build --quiet --workspace --bins --locked
+  host_args=(--quiet --locked)
+  if [[ "${BROOD_BUILD_VARIANT:-full}" == server ]]; then
+    host_args+=(--no-default-features --features server)
+  fi
+  if [[ "${BROOD_BUILD_RELEASE:-0}" == 1 ]]; then
+    host_args+=(--release)
+  fi
+  cargo build "${host_args[@]}"
+  # Legacy tools can use aliases; there is still only one linked executable.
+  output_dir="${CARGO_TARGET_DIR:-target}/${BROOD_BUILD_RELEASE_DIR:-debug}"
+  for pair in brood-client:client brood-sessiond:session brood-remote:remote brood-capsuled:capsule brood-computer-use-mcp:computer-use-mcp brood-runner-exec:runner-exec brood-runner-nix-develop:runner-nix-develop bmux:bmux brood-profile:profile; do
+    alias="${pair%%:*}"
+    role="${pair#*:}"
+    # A launcher survives readlink/canonicalize in existing proof tools.
+    temporary="$output_dir/$alias.tmp.$$"
+    # shellcheck disable=SC2016 # Expand executable location when the launcher runs.
+    printf '#!/bin/sh\nexec "$(dirname -- "$0")/brood" %s "$@"\n' "$role" >"$temporary"
+    chmod +x "$temporary"
+    if [[ -L "$output_dir/$alias" ]] || ! cmp -s "$temporary" "$output_dir/$alias"; then
+      mv -f "$temporary" "$output_dir/$alias"
+    else
+      rm "$temporary"
+    fi
+  done
   exit
 fi
 if [[ "${1:-}" == "--build-wasm-one" ]]; then
@@ -250,6 +282,16 @@ if [[ "${1:-}" == "--build-wasm-one" ]]; then
 fi
 if [[ "${1:-}" == "--assemble-local-client" ]]; then
   assemble_local_client
+  exit
+fi
+if [[ "${1:-}" == "--assemble-local-runtime" ]]; then
+  output_dir="${CARGO_TARGET_DIR:-$ROOT/target}/${BROOD_BUILD_RELEASE_DIR:-debug}"
+  mkdir -p "$ROOT/target/dev"
+  ln -sfn "$(realpath "$output_dir")" "$ROOT/target/dev/bin"
+  for asset in brood.toml plugins examples runtimes; do
+    ln -sfn "$ROOT/$asset" "$ROOT/target/dev/$asset"
+  done
+  echo "build=package id=brood-dev path=$ROOT/target/dev status=finished"
   exit
 fi
 if [[ "${1:-}" == "--self-test" ]]; then
@@ -265,6 +307,13 @@ mode=all
 jobs="${BROOD_BUILD_JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)}"
 while (($# > 0)); do
   case "$1" in
+    --server)
+      export BROOD_BUILD_VARIANT=server
+      ;;
+    --release)
+      export BROOD_BUILD_RELEASE=1
+      export BROOD_BUILD_RELEASE_DIR=release
+      ;;
     --host-only)
       mode=host
       ;;

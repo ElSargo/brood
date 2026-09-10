@@ -121,6 +121,7 @@ let
     pkgs.gnumake
     pkgs.neovim
     pkgs.pkg-config
+    pkgs.mold
     sessionSwitcherPython
     pkgs.ripgrep
     rust

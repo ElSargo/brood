@@ -500,8 +500,8 @@ fn request_native_command(socket_path: &str, command: &[String]) -> Result<Strin
     Ok(response.output.unwrap_or_default())
 }
 
-fn main() -> Result<()> {
-    let mut adapter = Adapter::new(AdapterArgs::parse())?;
+pub fn run_cli() -> Result<()> {
+    let mut adapter = Adapter::new(AdapterArgs::parse_from(brood_launch::args()))?;
     let stdin = io::stdin();
     let mut stdout = io::stdout().lock();
     for line in stdin.lock().lines() {

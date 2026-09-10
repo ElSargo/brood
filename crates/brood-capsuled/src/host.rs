@@ -175,6 +175,11 @@ fn bubblewrap_invocation(
         runtime_directory.as_os_str().to_owned(),
         "--".into(),
         executables.capsuled.as_os_str().to_owned(),
+    ]);
+    if brood_launch::is_unified(&executables.capsuled) {
+        arguments.push("capsule".into());
+    }
+    arguments.extend([
         "inner".into(),
         "--broker-socket".into(),
         plan.broker_socket.as_os_str().to_owned(),

@@ -11,6 +11,8 @@ mod clipboard;
 mod command;
 mod compositor;
 mod computer_use;
+#[path = "bin/brood-computer-use-mcp.rs"]
+pub mod computer_use_mcp;
 mod config;
 mod control;
 mod debug_dump;
@@ -20,6 +22,10 @@ mod input;
 pub mod launch_context;
 mod nested_test;
 mod plugin_runtime;
+#[path = "bin/brood-runner-exec.rs"]
+pub mod runner_exec;
+#[path = "bin/brood-runner-nix-develop.rs"]
+pub mod runner_nix_develop;
 mod runtime;
 pub mod scheduling_domain;
 mod session_bus;
@@ -29,8 +35,6 @@ pub mod session_volume;
 pub(crate) mod state;
 pub(crate) mod state_services;
 mod wasm_test;
-
-use std::process::Command as ProcessCommand;
 
 use anyhow::{Context, Result};
 use brood_cli::{Args, Command};
@@ -101,7 +105,7 @@ pub fn run_cli() -> Result<CommandOutcome> {
 
 fn run_container(args: ContainerArgs) -> Result<CommandOutcome> {
     let remote = brood_cli::control::sidecar_binary("BROOD_REMOTE_BIN", "brood-remote")?;
-    let status = ProcessCommand::new(&remote)
+    let status = brood_launch::command(&remote, "remote")
         .arg("podman")
         .args(args.args)
         .status()
@@ -120,7 +124,7 @@ pub fn run_session_cli() -> Result<()> {
 
     let args = match launch_context::current_launch_record() {
         Ok(record) => record.session_args.unwrap_or_default(),
-        Err(_) => SessionArgs::parse(),
+        Err(_) => SessionArgs::parse_from(brood_launch::args()),
     };
     info!(?args, "starting brood session server");
     runtime::serve_session(args)

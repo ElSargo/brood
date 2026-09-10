@@ -1,6 +1,8 @@
 [workspace]
 exclude = ["crates/brood-package-manifest"]
+default-members = ["crates/broodd"]
 members = [
+    "crates/brood-launch",
     "crates/brood-package-contract",
     "clients/brood-client",
     "crates/bmux",
@@ -27,6 +29,7 @@ resolver = "3"
 edition = "2024"
 
 [workspace.dependencies]
+brood-launch = { path = "crates/brood-launch" }
 brood-package-contract = { path = "crates/brood-package-contract" }
 anyhow = "1.0.102"
 base64 = "0.22.1"
@@ -92,6 +95,13 @@ wayland-protocols = { version = "0.32.12", features = ["client", "staging"] }
 wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
 zbus = { version = "5.13.2", default-features = false, features = ["blocking-api", "tokio"] }
 zstd = "0.13.3"
+
+# Line tables retain useful backtraces without enormous local debug artifacts.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.release]
+strip = "debuginfo"
 
 [profile.profiling]
 inherits = "release"

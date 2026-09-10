@@ -10,7 +10,7 @@ pub const BROODD_DBUS_DESTINATION_ENV: &str = "BROODD_DBUS_DESTINATION";
 pub const BROOD_PANE_ID_ENV: &str = "BROOD_PANE_ID";
 
 #[derive(Debug, Parser)]
-#[command(about = "Brood command line", version)]
+#[command(about = "Brood command line", version, after_help = brood_launch::help())]
 pub struct Args {
     #[command(subcommand)]
     pub command: Option<Command>,

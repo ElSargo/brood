@@ -3,7 +3,8 @@
 **/target/
 **/*.rs.bk
 /Cargo.nix
-/.cargo/
+/.cargo/*
+!/.cargo/config.toml
 /vendor/
 
 # Local implementation references

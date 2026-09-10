@@ -461,3 +461,5 @@ mod tests {
         flush();
     }
 }
+
+pub mod cli;

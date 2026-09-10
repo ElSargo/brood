@@ -21,7 +21,7 @@ export BROOD_PROFILE_RUN="${BROOD_PROFILE_RUN:-$(date -u +%Y%m%dT%H%M%SZ)}"
 
 # Analyze every process stream after instrumented applications have performed
 # their bounded shutdown flush.
-nix develop --command cargo run --profile profiling -p brood-profiler -- \
+nix develop --command cargo run --profile profiling -- profile \
   report "$out_dir" --json "$out_dir/report.json"
-nix develop --command cargo run --profile profiling -p brood-profiler -- \
+nix develop --command cargo run --profile profiling -- profile \
   chrome "$out_dir" --output "$out_dir/trace.json"

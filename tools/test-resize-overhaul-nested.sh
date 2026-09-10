@@ -103,7 +103,7 @@ trap cleanup EXIT
 
 CLIENT_BIN="${BROOD_RESIZE_CLIENT:-$ROOT/target/debug/brood-client}"
 if [[ -z "${BROOD_RESIZE_CLIENT:-}" ]]; then
-  cargo build -p brood-client --bin brood-client --locked
+  bash "$ROOT/tools/brood-build.sh" --host-only
 fi
 
 WORKSPACE_MODULE="${BROOD_RESIZE_WORKSPACE_MODULE:-$ROOT/plugins/default-workspace/target/wasm32-unknown-unknown/release/brood_default_workspace_plugin.wasm}"

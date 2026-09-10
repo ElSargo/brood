@@ -42,7 +42,7 @@ git -C "$PROJECT" -c user.name=Brood -c user.email=brood@example.invalid \
   commit --quiet --allow-empty -m initial
 git -C "$PROJECT" branch managed-retry
 
-cargo build -p broodd --bins --locked
+bash "$ROOT/tools/brood-build.sh" --host-only
 cargo build \
   --manifest-path plugins/worktree-manager/Cargo.toml \
   --target wasm32-unknown-unknown \

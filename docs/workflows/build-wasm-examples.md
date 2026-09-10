@@ -14,14 +14,14 @@ The repository contains several kinds of WASM artifact. Build each with the targ
 expected by its runtime instead of treating every `.wasm` file as interchangeable.
 
 For normal development, build all stale host and WASM artifacts through the
-parallel aggregate builder:
+aggregate builder:
 
 ```sh
 nix develop --command ./tools/brood-build.sh
 ```
 
-Cargo remains responsible for dependency-aware freshness. Independent guest
-workspaces build concurrently, while Component Model encoding is skipped when
+Cargo remains responsible for dependency-aware freshness. Guest workspaces share a dependency cache and run in sequence while the host
+build overlaps them. Component Model encoding is skipped when
 the validated component is newer than its core module. The default client
 package is then co-located with its root component for direct use by the
 repository configuration. The builder's `--help` output defines its exact

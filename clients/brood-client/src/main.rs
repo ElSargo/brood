@@ -13,7 +13,7 @@ use std::{
     net::ToSocketAddrs,
     os::fd::AsFd,
     path::PathBuf,
-    process::{Child, ChildStdin, Command, Stdio},
+    process::{Child, ChildStdin, Stdio},
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -358,8 +358,8 @@ fn terminal_snapshot_completes_revision(body: &[u8]) -> bool {
     clippy::useless_let_if_seq,
     reason = "the client runtime and selected backend/session bindings intentionally span the complete event-loop setup"
 )]
-fn main() -> Result<()> {
-    let args = ClientArgs::parse();
+pub fn run_cli() -> Result<()> {
+    let args = ClientArgs::parse_from(brood_launch::args());
     let config_path = args
         .config
         .clone()
@@ -2142,7 +2142,6 @@ fn backend_deployer_path() -> Option<PathBuf> {
         .or_else(|| {
             std::env::current_exe()
                 .ok()
-                .map(|executable| executable.with_file_name("brood-remote"))
                 .filter(|deployer| deployer.is_file())
         })
         .or_else(|| {
@@ -2166,7 +2165,7 @@ fn start_container_backend_deployment(
         || image.to_string(),
         |connection| format!("{connection}::{image}"),
     );
-    let mut command = Command::new(deployer);
+    let mut command = brood_launch::command(deployer, "remote");
     command
         .arg("attach-container")
         .arg(image)
@@ -2246,7 +2245,7 @@ fn start_ssh_backend_deployment(
     proxy: winit::event_loop::EventLoopProxy<ClientEvent>,
 ) -> Result<()> {
     let client = std::env::current_exe().context("resolve running brood-client executable")?;
-    let mut command = Command::new(deployer);
+    let mut command = brood_launch::command(deployer, "remote");
     command
         .arg("attach-ssh")
         .arg(&target)

@@ -14,7 +14,7 @@ if ! command -v weston-simple-egl >/dev/null 2>&1; then
   exit 2
 fi
 
-cargo build -p brood-remote -p broodd -p brood-client --bins
+bash "$ROOT/tools/brood-build.sh" --host-only
 cargo build \
   --manifest-path examples/wasm-component-actor/Cargo.toml \
   --locked \

@@ -388,8 +388,8 @@ struct PendingWindow {
 }
 
 #[tokio::main(worker_threads = 2)]
-async fn main() -> Result<()> {
-    match Args::parse().command {
+pub async fn run_cli() -> Result<()> {
+    match Args::parse_from(brood_launch::args()).command {
         Command::GenerateCertificate {
             server_name,
             certificate,

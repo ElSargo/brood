@@ -2,12 +2,13 @@
 name = "bmux"
 version = "0.1.0"
 edition.workspace = true
+autobins = false
 
-[[bin]]
-name = "bmux"
+[lib]
 path = "src/main.rs"
 
 [dependencies]
+brood-launch.workspace = true
 anyhow.workspace = true
 base64.workspace = true
 brood-cli.workspace = true

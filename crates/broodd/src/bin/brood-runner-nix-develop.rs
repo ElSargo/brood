@@ -1,5 +1,4 @@
 use std::{
-    env,
     ffi::OsString,
     fs::{self, File},
     io::ErrorKind,
@@ -21,7 +20,7 @@ const CACHE_NAMESPACE: &str = "nix-develop";
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0100_0000_01b3;
 
-fn main() -> Result<ActivatedChildExit> {
+pub fn run_cli() -> Result<ActivatedChildExit> {
     let args = ActivationArgs::parse()?;
     let activation_script = cached_activation_script(&args)?;
 
@@ -29,7 +28,7 @@ fn main() -> Result<ActivatedChildExit> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ActivatedChildExit {
+pub enum ActivatedChildExit {
     Code(u8),
     Signal(i32),
 }
@@ -48,7 +47,8 @@ impl ActivatedChildExit {
             .with_context(|| format!("activated child returned unrecognized exit status {status}"))
     }
 
-    fn shell_code(self) -> u8 {
+    #[must_use]
+    pub fn shell_code(self) -> u8 {
         match self {
             Self::Code(code) => code,
             Self::Signal(signal) => u8::try_from(128_i32.saturating_add(signal)).unwrap_or(u8::MAX),
@@ -72,7 +72,7 @@ struct ActivationArgs {
 
 impl ActivationArgs {
     fn parse() -> Result<Self> {
-        let args: Vec<OsString> = env::args_os().skip(1).collect();
+        let args: Vec<OsString> = brood_launch::args().into_iter().skip(1).collect();
         ensure!(
             args.len() == 5,
             "usage: brood-runner-nix-develop <project-dir> <working-dir> <session-cache-dir> <runner-cache-root> <inner-binary>"

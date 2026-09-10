@@ -391,6 +391,7 @@ dependencies = [
  "anyhow",
  "base64",
  "brood-cli",
+ "brood-launch",
  "serde",
  "serde_json",
 ]
@@ -405,6 +406,7 @@ checksum = "dc0b364ead1874514c8c2855ab558056ebfeb775653e7ae45ff72f28f8f3166c"
 name = "brood-capsuled"
 version = "0.1.0"
 dependencies = [
+ "brood-launch",
  "clap",
  "postcard",
  "rustix 1.1.4",
@@ -420,6 +422,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "brood-ipc",
+ "brood-launch",
  "brood-package-contract",
  "brood-package-manifest",
  "brood-protocol",
@@ -432,6 +435,7 @@ dependencies = [
  "tempfile",
  "toml",
  "zbus",
+ "zstd",
 ]
 
 [[package]]
@@ -445,6 +449,7 @@ dependencies = [
  "brood-graphics",
  "brood-ipc",
  "brood-keybindings",
+ "brood-launch",
  "brood-layout",
  "brood-profiler",
  "brood-protocol",
@@ -518,6 +523,10 @@ name = "brood-keybindings"
 version = "0.1.0"
 
 [[package]]
+name = "brood-launch"
+version = "0.1.0"
+
+[[package]]
 name = "brood-layout"
 version = "0.1.0"
 dependencies = [
@@ -566,6 +575,7 @@ name = "brood-profiler"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "brood-launch",
  "clap",
  "rustix 1.1.4",
  "serde",
@@ -589,6 +599,7 @@ dependencies = [
  "anyhow",
  "brood-cli",
  "brood-ipc",
+ "brood-launch",
  "brood-protocol",
  "brood-transport",
  "clap",
@@ -658,11 +669,16 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64",
+ "bmux",
+ "brood-capsuled",
  "brood-cli",
+ "brood-client",
  "brood-computer-use",
  "brood-ipc",
+ "brood-launch",
  "brood-profiler",
  "brood-protocol",
+ "brood-remote",
  "brood-wasm",
  "calloop 0.14.4",
  "calloop-wayland-source 0.4.1",

@@ -218,11 +218,7 @@ pub struct ServerLaunch {
 
 impl ServerLaunch {
     pub fn discover() -> Result<Self> {
-        let current_executable = env::current_exe().context("resolve current executable")?;
-        let executable = env::var_os("BROODD_BIN").map_or_else(
-            || current_executable.with_file_name("brood-sessiond"),
-            PathBuf::from,
-        );
+        let executable = brood_launch::executable("BROODD_BIN", "brood-sessiond")?;
         let current_directory = env::current_dir().context("determine current directory")?;
         Ok(Self {
             executable,
@@ -621,14 +617,14 @@ pub fn handshake(target: &ControlTarget) -> Result<Handshake> {
 
 pub fn launch_client() -> Result<ExitStatus> {
     let client = sidecar_binary("BROOD_CLIENT_BIN", "brood-client")?;
-    Command::new(&client)
+    brood_launch::command(&client, "client")
         .status()
         .with_context(|| format!("start presentation client {}", client.display()))
 }
 
 pub fn spawn_client(target: &ControlTarget) -> Result<Child> {
     let client = sidecar_binary("BROOD_CLIENT_BIN", "brood-client")?;
-    let mut command = Command::new(&client);
+    let mut command = brood_launch::command(&client, "client");
     command
         .arg("--dbus-destination")
         .arg(&target.destination)
@@ -643,26 +639,9 @@ pub fn spawn_client(target: &ControlTarget) -> Result<Child> {
         .with_context(|| format!("spawn presentation client {}", client.display()))
 }
 
-/// Resolve a packaged companion binary.
-///
-/// Development builds prefer a sibling binary. Split packages fall back to
-/// the wrapper-provided `PATH`.
+/// Resolve the unified executable, preserving explicit companion overrides.
 pub fn sidecar_binary(variable: &str, name: &str) -> Result<PathBuf> {
-    if let Some(configured) = env::var_os(variable) {
-        return Ok(PathBuf::from(configured));
-    }
-    let sibling = env::current_exe()
-        .context("resolve current executable")?
-        .with_file_name(name);
-    Ok(sibling_or_path(sibling, name))
-}
-
-fn sibling_or_path(sibling: PathBuf, name: &str) -> PathBuf {
-    if sibling.is_file() {
-        sibling
-    } else {
-        PathBuf::from(name)
-    }
+    Ok(brood_launch::executable(variable, name)?)
 }
 
 pub fn connect_or_spawn(target: &ControlTarget, launch: &ServerLaunch) -> Result<Handshake> {
@@ -773,7 +752,7 @@ fn spawn_server(target: &ControlTarget, launch: &ServerLaunch) -> Result<(PathBu
         .with_context(|| format!("open {}", log_path.display()))?;
     let log_err = log.try_clone().context("clone Brood server log")?;
 
-    let mut command = Command::new(&launch.executable);
+    let mut command = brood_launch::command(&launch.executable, "session");
     command
         .arg("--headless")
         .arg("--no-initial-surface-session")
@@ -826,9 +805,9 @@ pub fn session_marker_value(marker: &str, key: &str) -> Option<String> {
 
 #[cfg(test)]
 mod control_tests {
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
-    use super::{ControlTarget, sibling_or_path};
+    use super::ControlTarget;
 
     #[test]
     fn explicit_bus_address_stabilizes_private_ipc_discovery() {
@@ -848,16 +827,5 @@ mod control_tests {
         );
         assert_eq!(target.local_ipc_path(), same_target.local_ipc_path());
         assert_ne!(target.local_ipc_path(), other_target.local_ipc_path());
-    }
-
-    #[test]
-    fn split_package_sidecar_falls_back_to_wrapper_path() {
-        assert_eq!(
-            sibling_or_path(
-                PathBuf::from("/definitely/missing/brood-client"),
-                "brood-client"
-            ),
-            Path::new("brood-client")
-        );
     }
 }

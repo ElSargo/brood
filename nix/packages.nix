@@ -28,6 +28,34 @@ let
       in
       base != "target" && relative != "nix" && !lib.hasPrefix "nix/" relative;
   };
+  # Host implementation and documentation edits must not rebuild every guest.
+  guestSrc = lib.cleanSourceWith {
+    inherit src;
+    filter =
+      path: type:
+      let
+        relative = lib.removePrefix "${sourceRoot}/" (toString path);
+      in
+      type == "directory"
+      || builtins.elem relative [
+        "Cargo.toml"
+        "Cargo.lock"
+        "tools/brood-build.sh"
+        "tools/brood-build.mk"
+      ]
+      || lib.any (prefix: lib.hasPrefix prefix relative) [
+        "plugins/"
+        "examples/wasm-"
+        "runtimes/"
+        "packages/"
+        "crates/brood-plugin-sdk/"
+        "crates/brood-package-contract/"
+        "crates/brood-graphics/"
+        "crates/brood-protocol/"
+        "crates/brood-keybindings/"
+        "crates/brood-wasm/wit/"
+      ];
+  };
   nativePkgConfigPath = lib.concatStringsSep ":" [
     (lib.makeSearchPathOutput "dev" "lib/pkgconfig" profiles.nativeLibs)
     (lib.makeSearchPath "lib/pkgconfig" profiles.nativeLibs)
@@ -95,40 +123,40 @@ let
   # sandbox. The conditional entries keep older source snapshots evaluable
   # before the new examples exist in the tree.
   wasmCargoVendorDir =
-    assert lib.assertMsg (builtins.pathExists "${src}/plugins/keybindings/Cargo.lock")
+    assert lib.assertMsg (builtins.pathExists "${guestSrc}/plugins/keybindings/Cargo.lock")
       "plugins/keybindings/Cargo.lock is required by the default client init package";
-    assert lib.assertMsg (builtins.pathExists "${src}/plugins/picker/Cargo.lock")
+    assert lib.assertMsg (builtins.pathExists "${guestSrc}/plugins/picker/Cargo.lock")
       "plugins/picker/Cargo.lock is required by the default client init package";
-    assert lib.assertMsg (builtins.pathExists "${src}/plugins/diff-viewer/Cargo.lock")
+    assert lib.assertMsg (builtins.pathExists "${guestSrc}/plugins/diff-viewer/Cargo.lock")
       "plugins/diff-viewer/Cargo.lock is required by the default client init package";
     craneLib.vendorMultipleCargoDeps {
       cargoLockList = builtins.filter builtins.pathExists [
-        "${src}/Cargo.lock"
-        "${src}/examples/wasm-component-actor/Cargo.lock"
-        "${src}/examples/wasm-facet-probe/Cargo.lock"
-        "${src}/examples/wasm-paired-facet-probe/Cargo.lock"
-        "${src}/examples/wasm-init-actor/Cargo.lock"
-        "${src}/examples/wasm-init-child/Cargo.lock"
-        "${src}/examples/wasm-plugin-graphics/Cargo.lock"
-        "${src}/examples/wasm-preview1-worker/Cargo.lock"
-        "${src}/plugins/component-workspace-watch/Cargo.lock"
-        "${src}/plugins/component-runtime-io/Cargo.lock"
-        "${src}/plugins/coding-agent/Cargo.lock"
-        "${src}/plugins/default-workspace/Cargo.lock"
-        "${src}/plugins/diff-viewer/Cargo.lock"
-        "${src}/plugins/inbox/Cargo.lock"
-        "${src}/plugins/keybindings/Cargo.lock"
-        "${src}/plugins/neovim-client/Cargo.lock"
-        "${src}/plugins/neovim-files/Cargo.lock"
-        "${src}/plugins/picker/Cargo.lock"
-        "${src}/plugins/resize-proof/Cargo.lock"
-        "${src}/plugins/session-switcher/Cargo.lock"
-        "${src}/plugins/status-bar/Cargo.lock"
-        "${src}/plugins/worktree-manager/Cargo.lock"
-        "${src}/plugins/terminal-session/Cargo.lock"
-        "${src}/plugins/terminal-ui/Cargo.lock"
-        "${src}/plugins/workspace-file-log/Cargo.lock"
-        "${src}/runtimes/computer-use-js/Cargo.lock"
+        "${guestSrc}/Cargo.lock"
+        "${guestSrc}/examples/wasm-component-actor/Cargo.lock"
+        "${guestSrc}/examples/wasm-facet-probe/Cargo.lock"
+        "${guestSrc}/examples/wasm-paired-facet-probe/Cargo.lock"
+        "${guestSrc}/examples/wasm-init-actor/Cargo.lock"
+        "${guestSrc}/examples/wasm-init-child/Cargo.lock"
+        "${guestSrc}/examples/wasm-plugin-graphics/Cargo.lock"
+        "${guestSrc}/examples/wasm-preview1-worker/Cargo.lock"
+        "${guestSrc}/plugins/component-workspace-watch/Cargo.lock"
+        "${guestSrc}/plugins/component-runtime-io/Cargo.lock"
+        "${guestSrc}/plugins/coding-agent/Cargo.lock"
+        "${guestSrc}/plugins/default-workspace/Cargo.lock"
+        "${guestSrc}/plugins/diff-viewer/Cargo.lock"
+        "${guestSrc}/plugins/inbox/Cargo.lock"
+        "${guestSrc}/plugins/keybindings/Cargo.lock"
+        "${guestSrc}/plugins/neovim-client/Cargo.lock"
+        "${guestSrc}/plugins/neovim-files/Cargo.lock"
+        "${guestSrc}/plugins/picker/Cargo.lock"
+        "${guestSrc}/plugins/resize-proof/Cargo.lock"
+        "${guestSrc}/plugins/session-switcher/Cargo.lock"
+        "${guestSrc}/plugins/status-bar/Cargo.lock"
+        "${guestSrc}/plugins/worktree-manager/Cargo.lock"
+        "${guestSrc}/plugins/terminal-session/Cargo.lock"
+        "${guestSrc}/plugins/terminal-ui/Cargo.lock"
+        "${guestSrc}/plugins/workspace-file-log/Cargo.lock"
+        "${guestSrc}/runtimes/computer-use-js/Cargo.lock"
       ];
     };
 
@@ -136,6 +164,16 @@ let
     pname = "brood";
     version = "0.1.0";
     src = craneSrc;
+    strictDeps = true;
+    nativeBuildInputs = [
+      pkgs.pkg-config
+      pkgs.mold
+    ];
+    buildInputs = profiles.nativeLibs;
+  };
+
+  # Provenance belongs to the final artifact, not registry dependency caches.
+  sourceProvenance = {
     # Flake content identity survives source filtering and the Git-free sandbox.
     BROOD_BUILD_SOURCE_INFO = builtins.toJSON {
       nar_hash = sourceInfo.narHash or null;
@@ -148,9 +186,6 @@ let
         else
           "unavailable";
     };
-    strictDeps = true;
-    nativeBuildInputs = [ pkgs.pkg-config ];
-    buildInputs = profiles.nativeLibs;
   };
 
   # buildDepsOnly intentionally compiles dummy versions of workspace crates.
@@ -212,6 +247,7 @@ let
     '';
 
   foundationMembers = [
+    "crates/brood-launch"
     "crates/brood-package-contract"
     "crates/brood-computer-use"
     "crates/brood-dmabuf"
@@ -239,6 +275,7 @@ let
       name,
       members,
       cargoArtifacts,
+      buildArgs ? "--locked -p broodd --bin brood",
     }:
     craneLib.cargoBuild (
       craneBaseArgs
@@ -249,7 +286,7 @@ let
         # Keep the Cargo unit graph identical to buildDepsOnly. Building a
         # subset as roots changes feature unification and recompiles registry
         # crates even when their sources are cached.
-        cargoExtraArgs = "--locked -p bmux -p broodd -p brood-capsuled -p brood-client -p brood-remote --bins";
+        cargoExtraArgs = buildArgs;
       }
     );
 
@@ -302,8 +339,8 @@ let
   brooddArtifacts = craneLib.buildDepsOnly (
     craneBaseArgs
     // {
-      cargoBuildExtraArgs = "-p bmux -p broodd -p brood-capsuled -p brood-client -p brood-remote --bins";
-      cargoCheckExtraArgs = "-p bmux -p broodd -p brood-capsuled -p brood-client -p brood-remote --all-targets";
+      cargoBuildExtraArgs = "-p broodd --bin brood";
+      cargoCheckExtraArgs = "-p broodd --bin brood";
     }
   );
 
@@ -325,82 +362,62 @@ let
     cargoArtifacts = serviceArtifacts;
   };
 
-  brooddMembers = commandMembers ++ [ "crates/broodd" ];
+  brooddMembers = commandMembers ++ [
+    "crates/brood-remote"
+    "clients/brood-client"
+    "crates/broodd"
+  ];
   brooddLibArtifacts = mkWorkspaceArtifactLayer {
     name = "broodd-lib-artifacts";
+    buildArgs = "--locked -p broodd --lib";
     members = brooddMembers;
     cargoArtifacts = commandArtifacts;
   };
 
-  mkBinaryPackage =
-    {
-      name,
-      members,
-      cargoArtifacts,
-      bins,
-    }:
+  # Only the final executable is linked. Compatibility names are symlinks,
+  # not separately compiled binaries.
+  aliases = {
+    brood-client = "client";
+    brood-sessiond = "session";
+    brood-remote = "remote";
+    brood-capsuled = "capsule";
+    brood-computer-use-mcp = "computer-use-mcp";
+    brood-runner-exec = "runner-exec";
+    brood-runner-nix-develop = "runner-nix-develop";
+    bmux = "bmux";
+    brood-profile = "profile";
+  };
+  serverAliases = builtins.removeAttrs aliases [ "brood-client" ];
+  mkUnifiedPackage =
+    name: features: artifacts:
     craneLib.buildPackage (
       craneBaseArgs
+      // sourceProvenance
       // {
         pname = name;
-        src = mkWorkspaceSrc "${name}-binary" members;
-        inherit cargoArtifacts;
-        cargoBuildExtraArgs = "-p bmux -p broodd -p brood-capsuled -p brood-client -p brood-remote --bins";
+        src = mkWorkspaceSrc name brooddMembers;
+        cargoArtifacts = artifacts;
+        cargoBuildExtraArgs = "-p broodd --bin brood ${features}";
         doCheck = false;
         doNotPostBuildInstallCargoBinaries = true;
         installPhaseCommand = ''
-          mkdir -p "$out/bin"
-          ${lib.concatMapStringsSep "\n" (bin: ''
-            install -Dm755 "target/release/${bin}" "$out/bin/${bin}"
-          '') bins}
+          install -Dm755 target/release/brood "$out/bin/brood"
+          ${lib.concatMapStringsSep "\n" (alias: ''
+            ln -s brood "$out/bin/${alias}"
+          '') (builtins.attrNames (if features == "" then aliases else serverAliases))}
         '';
       }
     );
-
-  brooddBins = mkBinaryPackage {
-    name = "broodd";
-    members = brooddMembers;
-    cargoArtifacts = brooddLibArtifacts;
-    bins = [
-      "bmux"
-      "brood"
-      "brood-computer-use-mcp"
-      "brood-runner-exec"
-      "brood-runner-nix-develop"
-      "brood-sessiond"
-    ];
-  };
-
-  capsuledBins = mkBinaryPackage {
-    name = "brood-capsuled";
-    members = commandMembers;
-    cargoArtifacts = commandArtifacts;
-    bins = [ "brood-capsuled" ];
-  };
-
-  clientBins = mkBinaryPackage {
-    name = "brood-client";
-    members = commandMembers ++ [ "clients/brood-client" ];
-    cargoArtifacts = commandArtifacts;
-    bins = [ "brood-client" ];
-  };
-
-  remoteBins = mkBinaryPackage {
-    name = "brood-remote";
-    members = commandMembers ++ [ "crates/brood-remote" ];
-    cargoArtifacts = commandArtifacts;
-    bins = [ "brood-remote" ];
-  };
-
-  broodd = pkgs.symlinkJoin {
-    name = "brood-native-binaries";
-    paths = [
-      brooddBins
-      capsuledBins
-      clientBins
-      remoteBins
-    ];
-  };
+  broodd = mkUnifiedPackage "brood-full" "" brooddLibArtifacts;
+  serverFeatures = "--no-default-features --features server";
+  serverArtifacts = craneLib.buildDepsOnly (
+    craneBaseArgs
+    // {
+      cargoBuildExtraArgs = "-p broodd --bin brood ${serverFeatures}";
+      cargoCheckExtraArgs = "-p broodd --bin brood ${serverFeatures}";
+    }
+  );
+  server = mkUnifiedPackage "brood-server" serverFeatures serverArtifacts;
 
   shellCheck = pkgs.runCommand "brood-shellcheck" { nativeBuildInputs = [ pkgs.shellcheck ]; } ''
     cp -R ${src}/. source
@@ -429,7 +446,7 @@ let
 
   wasmModules = pkgs.stdenvNoCC.mkDerivation {
     name = "brood-wasm-modules";
-    inherit src;
+    src = guestSrc;
     cargoVendorDir = wasmCargoVendorDir;
     nativeBuildInputs = [
       craneLib.configureCargoVendoredDepsHook
@@ -620,25 +637,34 @@ let
     ];
     nativeBuildInputs = [ pkgs.makeWrapper ];
     postBuild = ''
-      for program in bmux brood brood-agent brood-capsuled brood-client brood-computer-use-mcp brood-remote brood-sessiond brood-runner-exec brood-runner-nix-develop; do
+      for program in brood brood-agent; do
         wrapProgram "$out/bin/$program" \
           --prefix PATH : "$out/bin:${appToolPath}" \
           --prefix LD_LIBRARY_PATH : "${nativeLibraryPath}" \
           --prefix GI_TYPELIB_PATH : "${gtkTypelibPath}" \
           --prefix XDG_DATA_DIRS : "${gtkDataDirs}" \
-          --set BROOD_SSH_BACKEND "${sshBackend}" \
+          --set BROOD_SSH_BACKEND "${fullSshBackend}" \
           --set BROOD_SSH_BACKEND_SYSTEM "${pkgs.stdenv.hostPlatform.system}" \
-          --set BROOD_CONTAINER_BACKEND "${containerBackend}" \
+          --set BROOD_CONTAINER_BACKEND "${fullContainerBackend}" \
           --set BROOD_CONTAINER_BACKEND_SYSTEM "${pkgs.stdenv.hostPlatform.system}" \
           --set BROOD_COMPUTER_USE_JS_RUNTIME "$out/runtimes/computer-use-js.wasm" \
           --set BROOD_PODMAN_REAL "${pkgs.podman}/bin/podman" \
           --run 'export GSETTINGS_SCHEMA_DIR="''${GSETTINGS_SCHEMA_DIR:-${gsettingsSchemaDir}}"' \
           --run 'export BROOD_CONFIG="''${BROOD_CONFIG:-'"$out"'/brood.toml}"'
       done
+      ${lib.concatStringsSep "\n" (
+        lib.mapAttrsToList (alias: role: ''
+          rm "$out/bin/${alias}"
+          makeWrapper "$out/bin/brood" "$out/bin/${alias}" --add-flags ${role}
+        '') aliases
+      )}
     '';
   };
 
-  sshBackend =
+  sshBackend = mkSshBackend server;
+  fullSshBackend = mkSshBackend broodd;
+  mkSshBackend =
+    native:
     let
       dynamicLinker =
         if pkgs.stdenv.hostPlatform.isx86_64 then
@@ -658,8 +684,8 @@ let
           "$out/lib" \
           "$out/libexec" \
           "$out/plugins/worktree-manager/target/wasm32-unknown-unknown/release"
-        for program in brood brood-capsuled brood-remote brood-sessiond brood-runner-exec; do
-          cp ${broodd}/bin/"$program" "$out/bin/$program"
+        for program in brood; do
+          cp ${native}/bin/"$program" "$out/bin/$program"
           chmod u+w "$out/bin/$program"
           patchelf \
             --set-interpreter ${lib.escapeShellArg dynamicLinker} \
@@ -667,6 +693,9 @@ let
             "$out/bin/$program"
         done
 
+        for alias in brood-capsuled brood-remote brood-sessiond brood-runner-exec; do
+          ln -s brood "$out/bin/$alias"
+        done
         install -m 0755 ${../tools/brood-ssh-backend-session.sh} \
           "$out/libexec/brood-ssh-backend-session"
         cat >"$out/bin/brood-ssh-backend-session" <<'EOF'
@@ -691,7 +720,10 @@ let
           > "$out/brood.toml"
       '';
 
-  containerBackend =
+  containerBackend = mkContainerBackend server;
+  fullContainerBackend = mkContainerBackend broodd;
+  mkContainerBackend =
+    native:
     let
       dynamicLinker =
         if pkgs.stdenv.hostPlatform.isx86_64 then
@@ -728,9 +760,12 @@ let
           "$out/share/glvnd/egl_vendor.d" \
           "$out/share/X11"
 
-        for program in brood brood-capsuled brood-remote brood-sessiond brood-runner-exec; do
-          cp ${broodd}/bin/"$program" "$out/bin/$program"
+        for program in brood; do
+          cp ${native}/bin/"$program" "$out/bin/$program"
           chmod u+w "$out/bin/$program"
+        done
+        for alias in brood-capsuled brood-remote brood-sessiond brood-runner-exec; do
+          ln -s brood "$out/bin/$alias"
         done
         cp ${pkgs.dbus}/bin/dbus-daemon "$out/bin/dbus-daemon"
         chmod u+w "$out/bin/dbus-daemon"
@@ -1267,6 +1302,8 @@ let
 in
 {
   default = broodWithDesktop;
+  inherit server;
+  full = brood;
   "neovim-wasm" = neovimWasm;
   "dev-workflow" = devWorkflowWithRuntime;
   "dev-workflow-full" = devWorkflowFullWithRuntime;

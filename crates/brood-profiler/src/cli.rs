@@ -5,8 +5,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use crate::{Event, Kind, Value};
 use anyhow::{Context, Result};
-use brood_profiler::{Event, Kind, Value};
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 
@@ -79,8 +79,8 @@ struct Report {
     spans: BTreeMap<String, SpanSummary>,
 }
 
-fn main() -> Result<()> {
-    let args = Args::parse();
+pub fn run_cli() -> Result<()> {
+    let args = Args::parse_from(brood_launch::args());
     match args.command {
         Command::Report { input, json } => {
             let (events, truncated_records) = read_events(&input)?;

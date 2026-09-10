@@ -8,3 +8,5 @@ pub mod init;
 pub mod plan;
 pub mod protocol;
 pub mod transport;
+
+pub mod cli;

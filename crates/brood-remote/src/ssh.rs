@@ -86,7 +86,7 @@ pub fn deploy(args: &SshArgs) -> Result<()> {
     let source = DeploymentSource::prepare(&args.flake)?;
     let client = resolve_client(args.client.as_deref(), &source)?;
     let mut deployment = start_deployment(args, &source, &client)?;
-    let client_result = Command::new(&client)
+    let client_result = brood_launch::command(&client, "client")
         .arg("--remote-connect")
         .arg(deployment.connect.to_string())
         .arg("--include-local")

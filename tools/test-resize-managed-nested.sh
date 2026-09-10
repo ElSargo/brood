@@ -147,7 +147,7 @@ build_fixture() {
     "${wayland_build_flags[@]}"
 }
 
-cargo build -p broodd -p brood-client --bins --locked
+bash "$ROOT/tools/brood-build.sh" --host-only
 componentize_plugin session-switcher brood_session_switcher_plugin
 componentize_plugin status-bar brood_status_bar_plugin
 componentize_plugin inbox brood_inbox_plugin

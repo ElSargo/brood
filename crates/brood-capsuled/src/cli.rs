@@ -1,6 +1,6 @@
 use std::{collections::BTreeSet, env, path::PathBuf, time::Duration};
 
-use brood_capsuled::{
+use crate::{
     broker::serve_path,
     host::{HostExecutables, prepare_isolated},
     init::InitMode,
@@ -44,8 +44,8 @@ enum Mode {
     },
 }
 
-fn main() -> Result<(), MainError> {
-    match Args::parse().mode {
+pub fn run_cli() -> Result<(), MainError> {
+    match Args::parse_from(brood_launch::args()).mode {
         Mode::Outer {
             volume_id,
             broker_socket,
@@ -122,15 +122,15 @@ fn scaffold_plan(volume_id: &str, broker_socket: PathBuf) -> CapsulePlan {
 }
 
 #[derive(Debug, Error)]
-enum MainError {
+pub enum MainError {
     #[error(transparent)]
-    Executable(#[from] brood_capsuled::host::ExecutableError),
+    Executable(#[from] crate::host::ExecutableError),
     #[error(transparent)]
-    Preparation(#[from] brood_capsuled::host::PrepareError),
+    Preparation(#[from] crate::host::PrepareError),
     #[error(transparent)]
-    Cleanup(#[from] brood_capsuled::host::CleanupError),
+    Cleanup(#[from] crate::host::CleanupError),
     #[error(transparent)]
-    Broker(#[from] brood_capsuled::broker::BrokerError),
+    Broker(#[from] crate::broker::BrokerError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }

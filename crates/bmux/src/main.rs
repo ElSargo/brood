@@ -252,8 +252,9 @@ impl Bmux {
     }
 }
 
-fn main() -> ExitCode {
-    match run(env::args_os().skip(1).collect()) {
+#[must_use]
+pub fn run_cli() -> ExitCode {
+    match run(brood_launch::args().into_iter().skip(1).collect()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("bmux: {error:#}");

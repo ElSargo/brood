@@ -157,7 +157,7 @@ REMOTE_HOME="$(
   exit 1
 }
 
-cargo build --release -p brood-client -p brood-remote -p broodd --bins --locked
+bash "$ROOT/tools/brood-build.sh" --host-only --release
 
 build_component() {
   local manifest="$1"

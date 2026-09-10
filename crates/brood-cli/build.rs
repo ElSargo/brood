@@ -69,7 +69,11 @@ fn main() -> Result<()> {
         "examples/self-describing-pair",
     ] {
         let path = root.join(directory);
-        println!("cargo:rerun-if-changed={}", path.display());
+        // Watching a whole example crate also watches its target directory,
+        // making successful guest builds invalidate the host knowledge bundle.
+        if directory == "docs" || directory.ends_with("/src") || directory.ends_with("/wit") {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
         collect(&root, &path, &mut entries)?;
     }
     for required in [
@@ -90,14 +94,24 @@ fn main() -> Result<()> {
             .filter(|o| o.status.success())
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
     };
-    println!(
-        "cargo:rerun-if-changed={}",
-        root.join(".git/HEAD").display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        root.join(".git/index").display()
-    );
+    // Missing .git files in Nix sources must not force every Cargo invocation
+    // to rerun this build script. Resolve worktree paths through Git as well.
+    for git_path in ["HEAD", "index"] {
+        if let Some(path) = git(&["rev-parse", "--git-path", git_path]) {
+            let path = root.join(path);
+            if path.exists() {
+                println!("cargo:rerun-if-changed={}", path.display());
+            }
+        }
+    }
+    if let Some(reference) = git(&["symbolic-ref", "-q", "HEAD"])
+        && let Some(path) = git(&["rev-parse", "--git-path", &reference])
+    {
+        let path = root.join(path);
+        if path.exists() {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
     for file in [
         "crates/broodd/src/config.rs",
         "crates/brood-package-manifest/Cargo.toml",
@@ -163,8 +177,8 @@ fn main() -> Result<()> {
         "entries": entries
     });
     fs::write(
-        Path::new(&env::var("OUT_DIR")?).join("knowledge.json"),
-        serde_json::to_vec(&bundle)?,
+        Path::new(&env::var("OUT_DIR")?).join("knowledge.json.zst"),
+        zstd::stream::encode_all(serde_json::to_vec(&bundle)?.as_slice(), 3)?,
     )?;
     Ok(())
 }

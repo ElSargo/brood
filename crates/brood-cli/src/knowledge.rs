@@ -30,8 +30,10 @@ pub enum KnowledgeCommand {
 
 /// Read contracts without connecting to an endpoint or starting guest code.
 pub fn bundle() -> Result<Value> {
-    let mut bundle: Value =
-        serde_json::from_str(include_str!(concat!(env!("OUT_DIR"), "/knowledge.json")))?;
+    let encoded = zstd::stream::decode_all(
+        include_bytes!(concat!(env!("OUT_DIR"), "/knowledge.json.zst")).as_slice(),
+    )?;
+    let mut bundle: Value = serde_json::from_slice(&encoded)?;
     let command = crate::Args::command();
     bundle
         .as_object_mut()

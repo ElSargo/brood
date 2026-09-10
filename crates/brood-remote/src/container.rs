@@ -196,7 +196,7 @@ impl Podman {
 pub fn deploy(args: &ContainerArgs) -> Result<()> {
     let client = resolve_client(args.client.as_deref())?;
     let mut deployment = start_container(args, &client)?;
-    let status = Command::new(&client)
+    let status = brood_launch::command(&client, "client")
         .arg("--remote-connect")
         .arg(deployment.connect.to_string())
         .arg("--include-local")
@@ -701,12 +701,7 @@ fn resolve_client(configured: Option<&Path>) -> Result<PathBuf> {
     configured
         .map(Path::to_path_buf)
         .or_else(|| env::var_os("BROOD_CLIENT_BIN").map(PathBuf::from))
-        .or_else(|| {
-            env::current_exe()
-                .ok()
-                .map(|executable| executable.with_file_name("brood-client"))
-                .filter(|client| client.is_file())
-        })
+        .or_else(|| env::current_exe().ok().filter(|client| client.is_file()))
         .context("brood-client is unavailable; set BROOD_CLIENT_BIN")?
         .canonicalize()
         .context("resolve brood-client")
@@ -1265,7 +1260,7 @@ fn connect_container(executable: &Path, arguments: &[OsString]) -> Result<()> {
         .map_or(client_arguments, |_| {
             client_arguments.get(1..).unwrap_or_default()
         });
-    let status = Command::new(&client)
+    let status = brood_launch::command(&client, "client")
         .arg("--remote-connect")
         .arg(manifest.connect.to_string())
         .arg("--include-local")

@@ -427,10 +427,15 @@ if [[ "$PURE_RENDERER" == 1 ]]; then
     sleep 0.05
   done
   rg -q 'setup layout quiescent .*native_resize_pending=false .*pending_terminal_notifications=0' "$CLIENT1_LOG"
-  wayland_env "$OUT/virtual-pointer-input" click 240 360 1280 720
-  for _ in $(seq 1 100); do
+  # Startup can report a quiescent status-bar-only layout before the terminal
+  # is composed. Observe focus and retry real input as that layout becomes ready.
+  for attempt in $(seq 1 5); do
+    wayland_env "$OUT/virtual-pointer-input" click 240 360 1280 720
+    for _ in $(seq 1 100); do
+      [[ "$(sed -n 's/.*focused local plugin pane=\([0-9][0-9]*\).*/\1/p' "$CLIENT1_LOG" | tail -1)" == "$TERMINAL_PANE" ]] && break
+      sleep 0.05
+    done
     [[ "$(sed -n 's/.*focused local plugin pane=\([0-9][0-9]*\).*/\1/p' "$CLIENT1_LOG" | tail -1)" == "$TERMINAL_PANE" ]] && break
-    sleep 0.05
   done
   [[ "$(sed -n 's/.*focused local plugin pane=\([0-9][0-9]*\).*/\1/p' "$CLIENT1_LOG" | tail -1)" == "$TERMINAL_PANE" ]]
   capture "$OUT/pure-initial.png"
@@ -510,7 +515,10 @@ PY
   capture "$OUT/pure-after-paste.png"
   awk '/VmHWM|VmRSS/ {print}' "/proc/$CLIENT_PID/status" > "$OUT/client-memory.txt"
   rg -a 'facet render started actor=terminal-ui|facet native pair committed route=.* actor=terminal-ui|visual facet.*terminal-ui' "$CLIENT1_LOG" > "$OUT/pure-facet-evidence.log"
-  ! rg -q 'visual facet.*failed actor=terminal-ui|visual facet failed actor=terminal-ui' "$CLIENT1_LOG"
+  if rg -a -q 'visual facet.*failed actor=terminal-ui|visual facet failed actor=terminal-ui' "$CLIENT1_LOG"; then
+    echo "ERR terminal visual facet failed during the proof" >&2
+    exit 1
+  fi
   echo "terminal_pure_renderer=verified out=$OUT"
   exit 0
 fi

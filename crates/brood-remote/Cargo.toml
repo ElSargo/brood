@@ -2,8 +2,13 @@
 name = "brood-remote"
 version = "0.1.0"
 edition.workspace = true
+autobins = false
+
+[lib]
+path = "src/main.rs"
 
 [dependencies]
+brood-launch.workspace = true
 anyhow.workspace = true
 brood-cli.workspace = true
 brood-ipc.workspace = true
