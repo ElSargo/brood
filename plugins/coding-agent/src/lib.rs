@@ -58,6 +58,8 @@ struct WireMessage {
     prompt: String,
     model: String,
     reasoning: String,
+    provider: String,
+    profile: String,
     status: String,
     log_kind: String,
     text: String,
@@ -92,6 +94,10 @@ struct TurnRequest {
     reasoning: String,
     session_id: u64,
     history: Vec<HistoryTurn>,
+    conversation_id: String,
+    provider: String,
+    profile: String,
+    worker_id: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -115,6 +121,9 @@ struct RunnerRequest<'a> {
     session_id: u64,
     history: &'a [HistoryTurn],
     images: Vec<RunnerImage>,
+    conversation_id: &'a str,
+    provider: &'a str,
+    profile: &'a str,
 }
 
 #[derive(Clone, Debug)]
@@ -179,6 +188,10 @@ struct AgentState {
     draft_images: BTreeMap<u64, ImageAttachment>,
     active_images: Vec<ImageAttachment>,
     history: Vec<HistoryTurn>,
+    conversation_id: String,
+    provider: String,
+    profile: String,
+    next_worker: u64,
 }
 
 impl AgentState {
@@ -187,7 +200,7 @@ impl AgentState {
             id: String::new(),
             session_id,
             model: "default".to_string(),
-            reasoning: "medium".to_string(),
+            reasoning: "default".to_string(),
             status: "idle".to_string(),
             subscribers: Vec::new(),
             active_worker: None,
@@ -200,6 +213,10 @@ impl AgentState {
             draft_images: BTreeMap::new(),
             active_images: Vec::new(),
             history: Vec::new(),
+            conversation_id: String::new(),
+            provider: String::new(),
+            profile: String::new(),
+            next_worker: WORKER_ID,
         }
     }
 }
@@ -502,7 +519,7 @@ fn handle_child(event: ChildEvent) -> Vec<ActorCommand> {
                     id: started.id,
                     status: "idle".to_string(),
                     model: "default".to_string(),
-                    reasoning: "medium".to_string(),
+                    reasoning: "default".to_string(),
                 });
             }
             registry_commands(root)
@@ -703,7 +720,9 @@ fn handle_agent_message(
             agent.model = message.model;
             agent.reasoning = message.reasoning;
             agent.status = "running".to_string();
-            agent.active_worker = Some(WORKER_ID);
+            let worker_id = agent.next_worker;
+            agent.next_worker = agent.next_worker.saturating_add(1);
+            agent.active_worker = Some(worker_id);
             agent.active_images = images;
             agent.active_target = sender
                 .strip_prefix("presentation:")
@@ -716,6 +735,10 @@ fn handle_agent_message(
                 reasoning: agent.reasoning.clone(),
                 session_id: agent.session_id,
                 history: agent.history.clone(),
+                conversation_id: agent.conversation_id.clone(),
+                provider: agent.provider.clone(),
+                profile: agent.profile.clone(),
+                worker_id,
             };
             let mut commands = agent_commands(
                 agent,
@@ -745,18 +768,24 @@ fn handle_agent_message(
             );
             if let Ok(payload) = serde_json::to_vec(&request) {
                 commands.push(ActorCommand::SpawnWorker(WorkerRequest {
-                    worker: WORKER_ID,
+                    worker: worker_id,
                     payload,
                 }));
             }
             commands
         }
-        "configure" => {
+        "configure" if agent.active_worker.is_none() => {
             if !message.model.is_empty() {
                 agent.model = message.model;
             }
             if !message.reasoning.is_empty() {
                 agent.reasoning = message.reasoning;
+            }
+            if !message.provider.is_empty() {
+                agent.provider = message.provider;
+            }
+            if !message.profile.is_empty() {
+                agent.profile = message.profile;
             }
             agent_commands(
                 agent,
@@ -781,7 +810,7 @@ fn handle_agent_message(
                     ..WireMessage::default()
                 },
             );
-            commands.push(ActorCommand::CancelWorker(WORKER_ID));
+            commands.push(ActorCommand::CancelWorker(agent.active_worker.unwrap()));
             commands
         }
         _ => Vec::new(),
@@ -956,7 +985,7 @@ fn handle_worker_event(event: WorkerEvent) -> Vec<ActorCommand> {
         return Vec::new();
     };
     match event {
-        WorkerEvent::Finished(finished) if finished.worker == WORKER_ID => {
+        WorkerEvent::Finished(finished) if agent.active_worker == Some(finished.worker) => {
             if let Ok(history) = serde_json::from_slice::<Vec<HistoryTurn>>(&finished.output) {
                 agent.history = history;
             }
@@ -969,6 +998,8 @@ fn handle_worker_event(event: WorkerEvent) -> Vec<ActorCommand> {
                     kind: "agent-state".to_string(),
                     agent: agent.id.clone(),
                     status: agent.status.clone(),
+                    model: agent.model.clone(),
+                    reasoning: agent.reasoning.clone(),
                     ..WireMessage::default()
                 },
             );
@@ -976,7 +1007,7 @@ fn handle_worker_event(event: WorkerEvent) -> Vec<ActorCommand> {
             agent.active_target = None;
             commands
         }
-        WorkerEvent::Failed(failed) if failed.worker == WORKER_ID => {
+        WorkerEvent::Failed(failed) if agent.active_worker == Some(failed.worker) => {
             agent.active_worker = None;
             agent.active_images.clear();
             agent.status = "failed".to_string();
@@ -995,7 +1026,7 @@ fn handle_worker_event(event: WorkerEvent) -> Vec<ActorCommand> {
             agent.active_target = None;
             commands
         }
-        WorkerEvent::Cancelled(worker) if worker == WORKER_ID => {
+        WorkerEvent::Cancelled(worker) if agent.active_worker == Some(worker) => {
             agent.active_worker = None;
             agent.active_images.clear();
             agent.status = "idle".to_string();
@@ -1301,7 +1332,7 @@ fn apply_ui_message(ui: &mut UiState, message: WireMessage) {
                 ui.views.entry(agent).or_insert_with(|| AgentView {
                     status: "connecting".to_string(),
                     model: "default".to_string(),
-                    reasoning: "medium".to_string(),
+                    reasoning: "default".to_string(),
                     logs: VecDeque::new(),
                 });
                 ui.selected = selected;
@@ -1351,7 +1382,7 @@ fn apply_ui_message(ui: &mut UiState, message: WireMessage) {
                 .or_insert_with(|| AgentView {
                     status: "idle".to_string(),
                     model: "default".to_string(),
-                    reasoning: "medium".to_string(),
+                    reasoning: "default".to_string(),
                     logs: VecDeque::new(),
                 });
             if !message.status.is_empty() {
@@ -1383,6 +1414,10 @@ fn apply_ui_message(ui: &mut UiState, message: WireMessage) {
 }
 
 fn push_log(view: &mut AgentView, kind: String, text: String) {
+    if kind == "reset" {
+        view.logs.clear();
+        return;
+    }
     view.logs.push_back(LogLine { kind, text });
     while view.logs.len() > MAX_LOG_LINES {
         view.logs.pop_front();
@@ -2213,6 +2248,10 @@ fn hex_nibble(byte: u8) -> Result<u8, String> {
 fn can_submit(ui: &UiState) -> bool {
     ui.session_id != 0
         && ui.selected_agent().is_some()
+        && ui
+            .selected_agent()
+            .and_then(|agent| ui.views.get(agent))
+            .is_some_and(|view| !matches!(view.status.as_str(), "running" | "cancelling"))
         && (!ui.prompt.trim().is_empty() || !ui.images.is_empty())
 }
 
@@ -2257,7 +2296,11 @@ fn submit_prompt(ui: &mut UiState) -> Vec<ActorCommand> {
         image_ids,
         ..WireMessage::default()
     });
-    queue_ui_messages(ui, &agent, messages)
+    let commands = queue_ui_messages(ui, &agent, messages);
+    if let Some(view) = ui.views.get_mut(&agent) {
+        view.status = "running".to_string();
+    }
+    commands
 }
 
 fn image_transfer_messages(image: &ImageAttachment) -> Vec<WireMessage> {
@@ -2330,10 +2373,14 @@ fn create_agent(ui: &UiState) -> Option<ActorCommand> {
 fn configure_selected(ui: &mut UiState, model: bool) -> Option<ActorCommand> {
     let agent = ui.selected_agent()?.to_string();
     let view = ui.views.get_mut(&agent)?;
+    if matches!(view.status.as_str(), "running" | "cancelling") {
+        return None;
+    }
     if model {
         view.model = match view.model.as_str() {
-            "default" => "gpt-5.4",
-            "gpt-5.4" => "gpt-5.3-codex",
+            "default" => "gpt-5.6-sol",
+            "gpt-5.6-sol" => "gpt-5.6-terra",
+            "gpt-5.6-terra" => "gpt-5.6-luna",
             _ => "default",
         }
         .to_string();
@@ -3583,6 +3630,9 @@ async fn run_brood_agent_turn(
         session_id: request.session_id,
         history: &request.history,
         images: runner_images,
+        conversation_id: &request.conversation_id,
+        provider: &request.provider,
+        profile: &request.profile,
     };
     let input = serde_json::to_vec(&runner_request)
         .map_err(|error| format!("encode Brood agent turn: {error}"))?;
@@ -3593,7 +3643,7 @@ async fn run_brood_agent_turn(
         return Err(format!("write Brood agent request: {error}"));
     }
     let _ = host::stream_close_write(process.stdin);
-    let result = drain_brood_agent_process(&request.agent, &process).await;
+    let result = drain_brood_agent_process(&request.agent, request.worker_id, &process).await;
     let _ = host::stream_drop(process.stdin).await;
     let _ = host::stream_drop(process.stdout).await;
     let _ = host::stream_drop(process.stderr).await;
@@ -3644,6 +3694,7 @@ async fn cleanup_temporary_images(agent: &str, paths: &[String]) {
 
 async fn drain_brood_agent_process(
     agent: &str,
+    worker_id: u64,
     process: &host::ProcessIo,
 ) -> Result<Vec<u8>, String> {
     let stdout_notification =
@@ -3664,6 +3715,7 @@ async fn drain_brood_agent_process(
     loop {
         stdout_eof |= drain_agent_stream_lines(
             agent,
+            worker_id,
             process.stdout,
             "agent",
             &mut stdout,
@@ -3671,6 +3723,7 @@ async fn drain_brood_agent_process(
         )?;
         stderr_eof |= drain_agent_stream_lines(
             agent,
+            worker_id,
             process.stderr,
             "error",
             &mut stderr,
@@ -3721,6 +3774,7 @@ async fn drain_brood_agent_process(
 
 fn drain_agent_stream_lines(
     agent: &str,
+    worker_id: u64,
     stream: u64,
     fallback_kind: &str,
     pending: &mut Vec<u8>,
@@ -3730,9 +3784,15 @@ fn drain_agent_stream_lines(
         match host::stream_read(stream, 8192).map_err(runtime_error("read Brood agent stream"))? {
             host::StreamReadResult::Data(bytes) => {
                 pending.extend(bytes);
+                if pending.len() > 24 * 1024 * 1024 {
+                    return Err("Brood agent event exceeds 24 MiB".to_string());
+                }
                 while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
                     let line = pending.drain(..=newline).collect::<Vec<_>>();
                     let line = String::from_utf8_lossy(&line);
+                    if !accept_worker_state(agent, worker_id, line.trim()) {
+                        continue;
+                    }
                     let (kind, text, history) = summarize_agent_line(line.trim(), fallback_kind);
                     if let Some(history) = history {
                         *worker_output = Some(history);
@@ -3769,8 +3829,13 @@ fn summarize_agent_line(
         .unwrap_or("");
     match event_type {
         "assistant" => ("agent", event_text(&value), None),
+        "history_user" => ("user", event_text(&value), None),
+        "transcript_reset" => ("reset", event_text(&value), None),
         "reasoning" => ("status", event_text(&value), None),
-        "status" => ("status", event_text(&value), None),
+        "status" | "context" | "compaction" | "session" | "configuration" => {
+            ("status", event_text(&value), None)
+        }
+        "error" => ("error", event_text(&value), None),
         "plan" => ("status", plan_event_text(&value), None),
         "tool_start" => {
             let tool = display_tool_name(&value);
@@ -3822,6 +3887,56 @@ fn summarize_agent_line(
             bounded_text(line, 3000),
             None,
         ),
+    }
+}
+
+fn accept_worker_state(agent: &str, worker_id: u64, line: &str) -> bool {
+    let Ok(mut state) = STATE.lock() else {
+        return false;
+    };
+    let RoleState::Agent(state) = &mut *state else {
+        return false;
+    };
+    if state.id != agent || state.active_worker != Some(worker_id) {
+        return false;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+        return true;
+    };
+    update_runner_state(state, &value);
+    true
+}
+
+fn update_runner_state(state: &mut AgentState, value: &serde_json::Value) {
+    match value.get("type").and_then(serde_json::Value::as_str) {
+        Some("session" | "result") => {
+            if let Some(id) = value
+                .get("conversation_id")
+                .and_then(serde_json::Value::as_str)
+                && !id.is_empty()
+                && id.len() <= 100
+                && id.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+                })
+            {
+                // Retain this as soon as the runner announces it, including when
+                // the worker subsequently fails or is cancelled.
+                state.conversation_id = id.to_string();
+            }
+        }
+        Some("configuration") => {
+            for (key, field) in [
+                ("model", &mut state.model),
+                ("reasoning", &mut state.reasoning),
+                ("provider", &mut state.provider),
+                ("profile", &mut state.profile),
+            ] {
+                if let Some(value) = value.get(key).and_then(serde_json::Value::as_str) {
+                    *field = value.to_string();
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -3911,6 +4026,35 @@ fn runtime_error<T: core::fmt::Debug>(context: &'static str) -> impl FnOnce(T) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runner_session_and_configuration_survive_an_unfinished_turn() {
+        let mut state = AgentState::new(9);
+        state.active_worker = Some(1);
+        update_runner_state(
+            &mut state,
+            &serde_json::json!({"type": "session", "conversation_id": "durable-conversation"}),
+        );
+        update_runner_state(
+            &mut state,
+            &serde_json::json!({"type": "configuration", "provider": "local", "model": "custom", "reasoning": "low", "profile": "fast"}),
+        );
+        update_runner_state(
+            &mut state,
+            &serde_json::json!({"type": "error", "text": "cancelled"}),
+        );
+        state.active_worker = None;
+        assert_eq!(state.conversation_id, "durable-conversation");
+        assert_eq!(state.provider, "local");
+        assert_eq!(state.model, "custom");
+        assert_eq!(state.reasoning, "low");
+        assert_eq!(state.profile, "fast");
+        update_runner_state(
+            &mut state,
+            &serde_json::json!({"type": "result", "conversation_id": "../invalid"}),
+        );
+        assert_eq!(state.conversation_id, "durable-conversation");
+    }
 
     #[test]
     fn selected_agent_bind_seeds_a_non_empty_ui_before_registry_reply() {
@@ -4105,7 +4249,6 @@ mod tests {
     #[test]
     fn markdown_parser_builds_semantic_blocks_without_raw_markers() {
         let blocks = parse_markdown(
-            &ThemeSnapshot::default(),
             "# Result\n\n- **first** item\n\n> note\n\n```rust\nlet value = 4;\n```",
         );
         assert_eq!(blocks[0].kind, MarkdownKind::Heading);

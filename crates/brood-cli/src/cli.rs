@@ -74,6 +74,8 @@ pub enum TestCommand {
     ComputerUseSpeedcrunch(NestedTestArgs),
     /// Drive `SpeedCrunch` through the built-in session-scoped agent pane.
     ComputerUseAgent(NestedTestArgs),
+    /// Verify coding-agent tools, durable state, and compaction with a local provider fixture.
+    CodingAgent(NestedTestArgs),
     /// Run the external-client nested terminal workload.
     Nested(NestedTestArgs),
     /// Run the external-client Neovim editor workload.

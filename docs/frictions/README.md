@@ -24,6 +24,7 @@ When design work resolves a friction, update the applicable page in
 
 ## Open frictions
 
+- [[coding-agent-continuity]]
 - [[structural-lint]]
 - [[package-resolution]]
 - [[terminal-plugin]]

@@ -323,37 +323,28 @@ test("native computer transport surfaces daemon errors", async (t) => {
 });
 
 test("completed turns report aggregate model usage", async () => {
-  const writes = [];
-  const originalWrite = process.stdout.write;
-  process.stdout.write = (chunk) => {
-    writes.push(String(chunk));
-    return true;
-  };
-  try {
-    await runAgent(
-      {
-        session_id: "usage-test",
-        agent: "agent-test",
-        prompt: "finish",
-        model: "test-model",
-        reasoning: "medium",
-        history: [],
-      },
-      {
-        backend: { url: "https://example.invalid", headers: {} },
-        computerUse: { tools() { return []; } },
-        fetchImpl: async () => new Response(
-          'data: {"type":"response.completed","response":{"output":[{"type":"message","content":[{"type":"output_text","text":"done"}]}],"usage":{"input_tokens":11,"input_tokens_details":{"cached_tokens":3},"output_tokens":7,"output_tokens_details":{"reasoning_tokens":5}}}}\n\ndata: [DONE]\n\n',
-          { status: 200, headers: { "content-type": "text/event-stream" } },
-        ),
-      },
-    );
-  } finally {
-    process.stdout.write = originalWrite;
-  }
-  const events = writes.join("").trim().split("\n")
-    .filter((line) => line.startsWith("{"))
-    .map(JSON.parse);
+  const events = [];
+  await runAgent(
+    {
+      session_id: "usage-test",
+      agent: "agent-test",
+      prompt: "finish",
+      model: "test-model",
+      reasoning: "medium",
+      history: [],
+    },
+    {
+      emit: (type, fields) => events.push({ type, ...fields }),
+      persist: false,
+      config: {},
+      backend: { url: "https://example.invalid", headers: {} },
+      computerUse: { tools() { return []; } },
+      fetchImpl: async () => new Response(
+        'data: {"type":"response.completed","response":{"output":[{"type":"message","content":[{"type":"output_text","text":"done"}]}],"usage":{"input_tokens":11,"input_tokens_details":{"cached_tokens":3},"output_tokens":7,"output_tokens_details":{"reasoning_tokens":5}}}}\n\ndata: [DONE]\n\n',
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      ),
+    },
+  );
   assert.deepEqual(events.at(-1).usage, {
     requests: 1,
     input_tokens: 11,
@@ -364,51 +355,41 @@ test("completed turns report aggregate model usage", async () => {
 });
 
 test("transient model failures retry without losing the turn", async () => {
-  const writes = [];
-  const originalWrite = process.stdout.write;
-  process.stdout.write = (chunk) => {
-    writes.push(String(chunk));
-    return true;
-  };
+  const events = [];
   let requests = 0;
-  try {
-    await runAgent(
-      {
-        session_id: "retry-test",
-        agent: "agent-test",
-        prompt: "finish",
-        model: "test-model",
-        reasoning: "medium",
-        history: [],
-      },
-      {
-        backend: { url: "https://example.invalid", headers: {} },
-        computerUse: { tools() { return []; } },
-        modelRetryBaseMs: 0,
-        fetchImpl: async () => {
-          requests += 1;
-          if (requests === 1) return new Response("temporarily unavailable", { status: 503 });
-          if (requests === 2) {
-            return new Response(
-              '{"error":{"message":"prompt_cache_retention is not supported on this model"}}',
-              { status: 400 },
-            );
-          }
+  await runAgent(
+    {
+      session_id: "retry-test",
+      agent: "agent-test",
+      prompt: "finish",
+      model: "test-model",
+      reasoning: "medium",
+      history: [],
+    },
+    {
+      emit: (type, fields) => events.push({ type, ...fields }),
+      persist: false,
+      config: {},
+      backend: { url: "https://example.invalid", headers: {} },
+      computerUse: { tools() { return []; } },
+      modelRetryBaseMs: 0,
+      fetchImpl: async () => {
+        requests += 1;
+        if (requests === 1) return new Response("temporarily unavailable", { status: 503 });
+        if (requests === 2) {
           return new Response(
-            'data: {"type":"response.completed","response":{"output":[{"type":"message","content":[{"type":"output_text","text":"done"}]}],"usage":{"input_tokens":2,"output_tokens":1}}}\n\ndata: [DONE]\n\n',
-            { status: 200, headers: { "content-type": "text/event-stream" } },
+            '{"error":{"message":"rate limited"}}',
+            { status: 429 },
           );
-        },
+        }
+        return new Response(
+          'data: {"type":"response.completed","response":{"output":[{"type":"message","content":[{"type":"output_text","text":"done"}]}],"usage":{"input_tokens":2,"output_tokens":1}}}\n\ndata: [DONE]\n\n',
+          { status: 200, headers: { "content-type": "text/event-stream" } },
+        );
       },
-    );
-  } finally {
-    process.stdout.write = originalWrite;
-  }
-  const events = writes.join("").trim().split("\n")
-    .filter((line) => line.startsWith("{"))
-    .map(JSON.parse);
+    },
+  );
   assert.equal(requests, 3);
-  assert(events.some((event) => event.type === "status" && event.text.includes("503")));
-  assert(events.some((event) => event.type === "status" && event.text.includes("400")));
+  assert.equal(events.filter((event) => event.type === "status" && event.text.includes("retrying")).length, 2);
   assert.equal(events.at(-1).history[0].assistant, "done");
 });

@@ -14,6 +14,7 @@ pub fn run(args: TestArgs) -> Result<()> {
         TestCommand::ComputerUse(args) => run_computer_use(args),
         TestCommand::ComputerUseSpeedcrunch(args) => run_computer_use_speedcrunch(args),
         TestCommand::ComputerUseAgent(args) => run_computer_use_agent(args),
+        TestCommand::CodingAgent(args) => run_coding_agent(args),
         TestCommand::Nested(args) => run_nested(args),
         TestCommand::RenderScheduling(args) => run_render_scheduling(args),
         TestCommand::Editor(args) => run_editor(args),
@@ -40,13 +41,23 @@ fn run_render_scheduling(args: NestedTestArgs) -> Result<()> {
 }
 
 fn run_computer_use_agent(args: NestedTestArgs) -> Result<()> {
+    run_agent_with(args, false)
+}
+
+fn run_coding_agent(args: NestedTestArgs) -> Result<()> {
+    run_agent_with(args, true)
+}
+
+fn run_agent_with(args: NestedTestArgs, offline: bool) -> Result<()> {
     let root = find_checkout_root()?;
     let script = root.join("tools/test-coding-agent-nested.sh");
     let mut command = Command::new("bash");
-    command
-        .arg(&script)
-        .current_dir(&root)
-        .env("BROOD_CODING_AGENT_COMPUTER_USE", "1");
+    command.arg(&script).current_dir(&root);
+    if offline {
+        command.env("BROOD_CODING_AGENT_OFFLINE", "1");
+    } else {
+        command.env("BROOD_CODING_AGENT_COMPUTER_USE", "1");
+    }
     if let Some(out_dir) = args.out_dir {
         command.env("BROOD_CODING_AGENT_OUT", out_dir);
     }

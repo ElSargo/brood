@@ -1,0 +1,114 @@
+{
+  "date": "2026-09-10",
+  "runtime_tests": {
+    "passed": 35,
+    "nix_derivation": "/nix/store/gybj9ykq38bycjv1bh797m9wnx7pyl0k-brood-agent-check"
+  },
+  "plugin_tests": {
+    "default_renderer_passed": 21,
+    "legacy_renderer_passed": 17
+  },
+  "nested_pane": {
+    "command": "nix develop --command target/debug/brood test coding-agent --out-dir /tmp/brood-agent-reliability-cancellation",
+    "artifact_directory": "/tmp/brood-agent-reliability-cancellation",
+    "provider": {
+      "requests": 8,
+      "compactions": 1,
+      "image_colors": [
+        "green",
+        "red"
+      ],
+      "resumed": true,
+      "cancellation_recovered": true
+    },
+    "capture_rmse": 0.102964,
+    "client": {
+      "transport": "LocalSharedMemory / Dmabuf",
+      "cancelled_messages": 1,
+      "renderer_out_of_fuel_errors": 0
+    },
+    "broodd": {
+      "workers_completed": 4,
+      "workers_cancelled": 1,
+      "workers_failed": 0
+    },
+    "interrupted_command_was_not_replayed": true,
+    "delayed_descendant_write_absent": true
+  },
+  "live_provider": {
+    "artifact_directory": "/tmp/brood-agent-live-vpR1zM",
+    "final_marker": "LIVE_AGENT_OK",
+    "events": [
+      {
+        "type": "configuration",
+        "provider": "auto",
+        "model": "gpt-5.6-sol",
+        "reasoning": "medium",
+        "profile": "",
+        "text": "Provider auto \u00b7 model gpt-5.6-sol \u00b7 reasoning medium"
+      },
+      {
+        "type": "result",
+        "usage": {
+          "requests": 4,
+          "input_tokens": 31663,
+          "cached_input_tokens": 0,
+          "output_tokens": 402,
+          "reasoning_tokens": 107
+        },
+        "compactions": 0
+      },
+      {
+        "type": "configuration",
+        "provider": "auto",
+        "model": "gpt-5.6-sol",
+        "reasoning": "medium",
+        "profile": "",
+        "text": "Provider auto \u00b7 model gpt-5.6-sol \u00b7 reasoning medium"
+      },
+      {
+        "type": "compaction",
+        "text": "Conversation compacted",
+        "method": "summary",
+        "before_tokens_estimate": 13867,
+        "after_tokens_estimate": 1940
+      },
+      {
+        "type": "result",
+        "usage": {
+          "requests": 1,
+          "input_tokens": 9403,
+          "cached_input_tokens": 0,
+          "output_tokens": 359,
+          "reasoning_tokens": 0
+        },
+        "compactions": 1
+      },
+      {
+        "type": "configuration",
+        "provider": "auto",
+        "model": "gpt-5.6-sol",
+        "reasoning": "medium",
+        "profile": "",
+        "text": "Provider auto \u00b7 model gpt-5.6-sol \u00b7 reasoning medium"
+      },
+      {
+        "type": "result",
+        "usage": {
+          "requests": 2,
+          "input_tokens": 4400,
+          "cached_input_tokens": 0,
+          "output_tokens": 65,
+          "reasoning_tokens": 12
+        },
+        "compactions": 1
+      }
+    ]
+  },
+  "other_checks": {
+    "cargo_fmt": "passed",
+    "changed_shell_harness": "passed",
+    "workspace_shellcheck": "blocked by existing SC2148 in tools/test-themes-live.sh",
+    "plugin_clippy_with_warnings_denied": "existing duplicate branch and two too-many-arguments warnings in renderer helpers"
+  }
+}

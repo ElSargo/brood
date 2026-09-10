@@ -7,6 +7,7 @@ struct Preview {
     name: String,
     width: u32,
     height: u32,
+    #[serde(skip)]
     rgba: Vec<u8>,
 }
 #[derive(Clone, Serialize, Deserialize)]
@@ -115,6 +116,68 @@ impl View {
     }
 }
 static PUBLICATION: Mutex<(u64, Vec<u8>)> = Mutex::new((0, Vec::new()));
+
+fn encode_view(view: &View) -> Vec<u8> {
+    let metadata = serde_json::to_vec(view).expect("coding-agent view metadata");
+    let mut bytes = Vec::with_capacity(
+        8 + metadata.len()
+            + view
+                .images
+                .iter()
+                .map(|image| image.rgba.len())
+                .sum::<usize>(),
+    );
+    bytes.extend_from_slice(b"BAV1");
+    bytes.extend_from_slice(&(metadata.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(&metadata);
+    for image in &view.images {
+        bytes.extend_from_slice(&image.rgba);
+    }
+    bytes
+}
+
+fn decode_view(bytes: &[u8]) -> Result<View, &'static str> {
+    if bytes.get(..4) != Some(b"BAV1".as_slice()) {
+        return Err("invalid coding-agent view version");
+    }
+    let length = u32::from_le_bytes(
+        bytes
+            .get(4..8)
+            .ok_or("truncated view header")?
+            .try_into()
+            .map_err(|_| "invalid view header")?,
+    ) as usize;
+    let metadata_end = 8usize.checked_add(length).ok_or("view metadata overflow")?;
+    let mut view: View = serde_json::from_slice(
+        bytes
+            .get(8..metadata_end)
+            .ok_or("truncated view metadata")?,
+    )
+    .map_err(|_| "invalid view metadata")?;
+    if view.images.len() > MAX_IMAGES {
+        return Err("too many view images");
+    }
+    let mut offset = metadata_end;
+    for image in &mut view.images {
+        let size = (image.width as usize)
+            .checked_mul(image.height as usize)
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or("view image size overflow")?;
+        let end = offset
+            .checked_add(size)
+            .ok_or("view image offset overflow")?;
+        image.rgba = bytes
+            .get(offset..end)
+            .ok_or("truncated view image")?
+            .to_vec();
+        offset = end;
+    }
+    if offset != bytes.len() {
+        return Err("trailing view bytes");
+    }
+    Ok(view)
+}
+
 pub(super) fn publish() {
     let state = STATE.lock().expect("coding-agent state");
     let RoleState::Ui(ui) = &*state else {
@@ -123,7 +186,9 @@ pub(super) fn publish() {
     if ui.pane == 0 {
         return;
     }
-    let bytes = serde_json::to_vec(&View::from_ui(ui)).expect("coding-agent view");
+    // Pixel arrays in JSON exhausted the renderer's fuel with two attachments.
+    // Keep metadata readable and carry preview pixels as bounded raw bytes.
+    let bytes = encode_view(&View::from_ui(ui));
     drop(state);
     let mut last = PUBLICATION.lock().expect("coding-agent publication");
     if last.1 == bytes {
@@ -241,8 +306,7 @@ impl Facets for CodingAgentPlugin {
         let request = facet_codec::decode_render_request(&input, decode_limits(input.len()))
             .expect("coding-agent render request");
         let theme = ThemeSnapshot::decode(&request.configuration).expect("valid theme snapshot");
-        let view: View =
-            serde_json::from_slice(&request.application_view).expect("coding-agent view");
+        let view = decode_view(&request.application_view).expect("coding-agent view");
         let sequence: Sequence =
             serde_json::from_slice(&request.sequence_state).unwrap_or_default();
         let panes = request
@@ -845,10 +909,15 @@ mod tests {
                 rgba: vec![1, 2, 3, 255],
             },
         );
-        let bytes = serde_json::to_vec(&View::from_ui(&ui)).unwrap();
+        let bytes = encode_view(&View::from_ui(&ui));
         assert!(bytes.len() < 2048);
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(json["images"][0]["rgba"], serde_json::json!([1, 2, 3, 255]));
+        let view = decode_view(&bytes).unwrap();
+        assert_eq!(view.images[0].rgba, [1, 2, 3, 255]);
+        assert!(decode_view(&bytes[..bytes.len() - 1]).is_err());
+        let metadata_length = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+        let json: serde_json::Value =
+            serde_json::from_slice(&bytes[8..8 + metadata_length]).unwrap();
+        assert!(json["images"][0].get("rgba").is_none());
         assert!(json["images"][0].get("handle").is_none());
         assert!(json.get("notification").is_none());
         assert!(json.get("outbox").is_none());

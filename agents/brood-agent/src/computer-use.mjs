@@ -1,4 +1,5 @@
 import { connect } from "node:net";
+import { waitForRetry } from "./transport.mjs";
 
 const SOCKET_ENV = "BROOD_NATIVE_TOOL_SOCKET";
 const PROTOCOL_VERSION = 1;
@@ -150,7 +151,8 @@ export function computerUseTools(session) {
   return tools;
 }
 
-export async function requestNativeTool(socketPath, command) {
+export async function requestNativeTool(socketPath, command, signal) {
+  signal?.throwIfAborted();
   if (!socketPath) throw new Error(`${SOCKET_ENV} is not set`);
   return new Promise((resolve, reject) => {
     const socket = connect(socketPath);
@@ -160,11 +162,15 @@ export async function requestNativeTool(socketPath, command) {
     const finish = (callback, value) => {
       if (settled) return;
       settled = true;
+      signal?.removeEventListener("abort", abort);
       socket.destroy();
       callback(value);
     };
+    const abort = () => finish(reject, signal.reason ?? new Error("Computer tool cancelled"));
+    signal?.addEventListener("abort", abort, { once: true });
     socket.setTimeout(120_000, () => finish(reject, new Error("native computer tool timed out")));
     socket.on("error", (error) => finish(reject, error));
+    socket.on("close", () => finish(reject, new Error("Native computer tool connection closed before a result")));
     socket.on("data", (chunk) => {
       bytes += chunk.length;
       if (bytes > MAX_RESPONSE_BYTES) {
@@ -193,10 +199,6 @@ function requiredString(arguments_, name) {
   const value = arguments_?.[name];
   if (typeof value !== "string" || value.length === 0) throw new Error(`${name} must be a non-empty string`);
   return value;
-}
-
-function sleep(milliseconds) {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 function takePngs(value, images) {
@@ -259,7 +261,8 @@ function resultWithSummary(name, response) {
 }
 
 export class NativeComputerUseClient {
-  constructor({ socketPath = process.env[SOCKET_ENV], session, principal }) {
+  constructor({ socketPath = process.env[SOCKET_ENV], session, principal, signal }) {
+    this.signal = signal;
     this.socketPath = socketPath;
     this.session = Number(session);
     this.principal = String(principal || "brood-agent");
@@ -305,17 +308,18 @@ export class NativeComputerUseClient {
     });
   }
 
-  command(command) {
-    return requestNativeTool(this.socketPath, command);
+  command(command, signal = this.signal) {
+    return requestNativeTool(this.socketPath, command, signal);
   }
 
-  async call(name, arguments_ = {}, callId = "computer-call") {
+  async call(name, arguments_ = {}, callId = "computer-call", signal = this.signal) {
+    signal?.throwIfAborted();
     if (name === "computer_windows") {
-      const response = await this.command(["computer-use", "windows", String(this.session)]);
+      const response = await this.command(["computer-use", "windows", String(this.session)], signal);
       return resultWithSummary(name, response);
     }
     if (name === "computer_launch") {
-      const response = await this.launch(arguments_);
+      const response = await this.launch(arguments_, signal);
       return resultWithSummary(name, response);
     }
     let command;
@@ -385,7 +389,8 @@ export class NativeComputerUseClient {
     } else {
       throw new Error(`unknown native computer tool ${name}`);
     }
-    const response = await this.command(command);
+    if (startedTask) this.ownedTasks.add(startedTask);
+    const response = await this.command(command, signal);
     if (startedTask) {
       this.ownedTasks.add(startedTask);
       this.updateState(startedTask, response, { nextSequence: 1 });
@@ -399,7 +404,7 @@ export class NativeComputerUseClient {
     return resultWithSummary(name, response);
   }
 
-  async launch(arguments_) {
+  async launch(arguments_, signal = this.signal) {
     const command = requiredString(arguments_, "command");
     if (command.length > 256) throw new Error("launch command exceeds 256 bytes");
     const args = arguments_.args ?? [];
@@ -408,16 +413,16 @@ export class NativeComputerUseClient {
     if (command.length + args.reduce((total, arg) => total + arg.length, 0) > MAX_LAUNCH_ARGUMENT_BYTES) throw new Error("launch command and arguments exceed 16 KiB");
     const timeoutMs = arguments_.window_timeout_ms ?? DEFAULT_LAUNCH_TIMEOUT_MS;
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > MAX_LAUNCH_TIMEOUT_MS) throw new Error(`window timeout must be between 1 and ${MAX_LAUNCH_TIMEOUT_MS} milliseconds`);
-    const response = await this.command(["spawn-in-session", String(this.session), command, ...args]);
+    const response = await this.command(["spawn-in-session", String(this.session), command, ...args], signal);
     const pane = Number(response.split(/\s+/).find((field) => field.startsWith("pane_id="))?.slice(8));
     if (!Number.isSafeInteger(pane)) throw new Error("Brood launch response did not contain a pane ID");
     const deadline = Date.now() + timeoutMs;
     while (true) {
-      const status = JSON.parse((await this.command(["hosted-child-status", String(pane)])).trim());
+      const status = JSON.parse((await this.command(["hosted-child-status", String(pane)], signal)).trim());
       if (status.visible === true) return JSON.stringify({ session: this.session, pane, command, args, state: status.state ?? null, visible: true });
       if (status.state === "exited") throw new Error(`${command} exited before creating a managed window: ${status.detail ?? "unknown exit status"}`);
       if (Date.now() >= deadline) throw new Error(`timed out waiting for ${command} to create a managed window; last status: ${JSON.stringify(status)}`);
-      await sleep(25);
+      await waitForRetry(25, signal);
     }
   }
 
@@ -425,6 +430,6 @@ export class NativeComputerUseClient {
     const tasks = [...this.ownedTasks];
     this.ownedTasks.clear();
     this.taskState.clear();
-    await Promise.allSettled(tasks.map((task) => this.command(["computer-use", "stop", task])));
+    await Promise.allSettled(tasks.map((task) => this.command(["computer-use", "stop", task], AbortSignal.timeout(2000))));
   }
 }

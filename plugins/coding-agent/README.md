@@ -14,6 +14,12 @@ the actor dispatcher remains responsive. Output is projected back into actor
 events with a generation-based notification and streamed to the presentation
 actor over the bidirectional realm mailbox.
 
+The runner checkpoints full conversation and tool state independently of the
+pane, compacts long conversations, and exposes a persistent JavaScript REPL,
+patch editing, and resumable command execution. Named providers and profiles
+are configured on the backend. See the [runtime guide](../../agents/brood-agent/README.md)
+for configuration, login recovery, conversation resume, and verification.
+
 The UI supports:
 
 - a multiline prompt editor with a visible insertion cursor, Unicode-safe

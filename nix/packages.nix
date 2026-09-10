@@ -612,12 +612,17 @@ let
 
         agent_runtime="$out/share/brood-agent"
         mkdir -p "$agent_runtime/src"
-        install -m 0644 ${src}/agents/brood-agent/src/agent.mjs "$agent_runtime/src/agent.mjs"
-        install -m 0644 ${src}/agents/brood-agent/src/computer-use.mjs "$agent_runtime/src/computer-use.mjs"
-        install -m 0644 ${src}/agents/brood-agent/src/cli.mjs "$agent_runtime/src/cli.mjs"
+        install -m 0644 ${src}/agents/brood-agent/src/*.mjs "$agent_runtime/src/"
+        install -m 0644 ${src}/agents/brood-agent/agent.example.json "$agent_runtime/agent.example.json"
         install -m 0644 ${src}/agents/brood-agent/LICENSE "$agent_runtime/LICENSE"
         install -m 0644 ${src}/agents/brood-agent/THIRD_PARTY_NOTICES.md "$agent_runtime/THIRD_PARTY_NOTICES.md"
         makeWrapper ${pkgs.nodejs}/bin/node "$out/bin/brood-agent" \
+          --prefix PATH : "${
+            lib.makeBinPath [
+              pkgs.bash
+              pkgs.util-linux
+            ]
+          }" \
           --add-flags "$agent_runtime/src/cli.mjs"
 
         # The editor runtime belongs to the local client package only. Keep it
@@ -1233,10 +1238,30 @@ let
     '';
   };
 
+  agentCheck =
+    pkgs.runCommand "brood-agent-check"
+      {
+        nativeBuildInputs = [
+          pkgs.nodejs
+          pkgs.bash
+          pkgs.coreutils
+          pkgs.util-linux
+        ];
+      }
+      ''
+        cp -R ${src}/agents/brood-agent "$TMPDIR/brood-agent"
+        chmod -R u+w "$TMPDIR/brood-agent"
+        cd "$TMPDIR/brood-agent"
+        node --test test/*.test.mjs
+        mkdir -p "$out"
+        touch "$out/passed"
+      '';
+
   lintCheck = pkgs.runCommand "brood-lint-check" { } ''
     echo "lint=rust command=cargo-check artifacts=${cargoArtifacts}"
     echo "lint=rust command=cargo-clippy check=${clippyCheck}"
     echo "lint=shell check=${shellCheck}"
+    echo "test=agent check=${agentCheck}"
 
     mkdir -p "$out"
     touch "$out/passed"
@@ -1347,6 +1372,7 @@ in
     broodd
     brooddArtifacts
     lintCheck
+    agentCheck
     runtimeFiles
     shellCheck
     softwareE2eCapture
