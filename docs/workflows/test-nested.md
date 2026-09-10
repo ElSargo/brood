@@ -14,6 +14,17 @@ nix develop --command ./tools/test-client-layout-actor.sh
 nix develop --command ./tools/test-session-switcher-plugin-nested.sh
 ```
 
+The Chromium launch proof exercises normal and minimum-constrained pane sizes
+with real page rendering, keyboard input, clicks, and scrolling:
+
+```sh
+nix develop --command cargo run -- test chromium --out-dir /tmp/brood-chromium-proof
+```
+
+It requires Chromium on the test environment's path. Workload setup and binary
+overrides are defined in `tools/test-chromium-nested.sh` and
+`tools/test-chromium-nested.py`.
+
 Audit or run the complete bundled-plugin matrix with:
 
 ```sh

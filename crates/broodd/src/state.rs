@@ -35,10 +35,7 @@ use brood_protocol::{BackendActorRealm, SessionIsolationStatus, managed_resize_e
 #[cfg(feature = "shm-fallback")]
 use smithay::wayland::shm::ShmState;
 use smithay::{
-    backend::{
-        allocator::dmabuf::{Dmabuf, WeakDmabuf},
-        renderer::utils::with_renderer_surface_state,
-    },
+    backend::allocator::dmabuf::{Dmabuf, WeakDmabuf},
     desktop::{PopupManager, Space, Window, WindowSurfaceType},
     input::{Seat, SeatState, keyboard::XkbConfig},
     output::{Mode as OutputMode, Output, PhysicalProperties, Scale as OutputScale, Subpixel},
@@ -4193,10 +4190,11 @@ impl Brood {
                 .managed_resizes
                 .take_commit_observation(pane, serial)
         });
-        let surface_size = with_renderer_surface_state(surface, |state| {
-            state.surface_size().map(|size| (size.w, size.h))
-        })
-        .flatten();
+        // XDG configures describe window geometry, excluding client shadows.
+        // Match the same clamped geometry that Space uses when capturing the
+        // window; the root surface can legitimately be larger (e.g. Chromium).
+        let geometry = window.geometry();
+        let window_size = Some((geometry.size.w, geometry.size.h));
         let candidate = fast_path
             .managed_resizes
             .records
@@ -4218,7 +4216,7 @@ impl Brood {
             candidate,
             current_serial,
             surface_commit,
-            surface_size,
+            window_size,
             new_buffer_size,
         );
         if !suitable {
@@ -4229,7 +4227,7 @@ impl Brood {
                 serial = u32::from(candidate.serial),
                 surface_commit,
                 has_new_buffer = new_buffer_size.is_some(),
-                ?surface_size,
+                ?window_size,
                 sample_size = ?new_buffer_size,
                 expected_logical_size = ?candidate.logical_size,
                 expected_pixel_size = ?candidate.pixel_size,
@@ -8714,12 +8712,12 @@ fn managed_commit_is_suitable(
     record: &ManagedResizeCorrelation,
     current_serial: Option<Serial>,
     surface_commit: u64,
-    surface_size: Option<(i32, i32)>,
+    window_size: Option<(i32, i32)>,
     new_buffer_size: Option<(i32, i32)>,
 ) -> bool {
     Some(record.serial) == current_serial
         && surface_commit > record.sent_after_commit
-        && surface_size == Some(record.logical_size)
+        && window_size == Some(record.logical_size)
         && new_buffer_size.is_some_and(|samples| {
             samples.0 >= record.pixel_size.0 && samples.1 >= record.pixel_size.1
         })

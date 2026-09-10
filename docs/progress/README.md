@@ -18,6 +18,7 @@ interpret evidence.
 
 ## Current records
 
+- [[chromium-launch]]
 - [[computer-use]]
 - [[coding-agent]]
 - [[bmux]]
