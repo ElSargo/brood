@@ -11,6 +11,7 @@ members = [
     "crates/brood-computer-use",
     "crates/brood-dmabuf",
     "crates/brood-graphics",
+    "crates/brood-theme",
     "crates/brood-ipc",
     "crates/brood-keybindings",
     "crates/brood-layout",

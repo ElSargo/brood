@@ -5,7 +5,9 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use brood_graphics::{Color, Command as DrawCommand, Packet, Rect, theme::ashen};
+#[cfg(not(feature = "pure-renderer"))]
+use brood_graphics::{Color, theme::ashen};
+use brood_graphics::{Command as DrawCommand, Packet, Rect};
 #[cfg(feature = "pure-renderer")]
 mod pure_renderer;
 #[cfg(not(feature = "pure-renderer"))]
@@ -25,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use unicode_width::UnicodeWidthChar;
 
 const SNAPSHOT_MAGIC: &[u8; 4] = b"BTRM";
-const SNAPSHOT_VERSION: u8 = 4;
+const SNAPSHOT_VERSION: u8 = 5;
 const SNAPSHOT_FULL: u8 = 1;
 const MAX_SNAPSHOT_ROWS: u16 = 4_096;
 const MAX_SNAPSHOT_COLS: u16 = 4_096;
@@ -41,8 +43,10 @@ const FONT_SIZE: f32 = 16.0;
 const CELL_WIDTH: f32 = 9.0;
 const REQUESTED_LINE_HEIGHT: f32 = 20.0;
 const PADDING: f32 = 8.0;
-const DEFAULT_BG: u32 = ashen::BACKGROUND_RGB;
+const DEFAULT_BG: u32 = brood_graphics::theme::TERMINAL_DEFAULT_BG;
+#[cfg(not(feature = "pure-renderer"))]
 const CURSOR: u32 = ashen::CURSOR_RGB;
+#[cfg(not(feature = "pure-renderer"))]
 const SELECTION_BG: u32 = ashen::SELECTION_RGB;
 const SCROLL_PIXELS_PER_LINE: f32 = 5.0;
 const MOUSE_WHEEL_PIXELS_PER_CLICK: f32 = 15.0;
@@ -2154,12 +2158,19 @@ impl<'a> Reader<'a> {
     }
 }
 
+#[cfg(not(feature = "pure-renderer"))]
 fn rgb(value: u32) -> Color {
     let channels = rgb_channels(value);
     Color::rgba(channels[0], channels[1], channels[2], 1.0)
 }
 
+#[cfg(not(feature = "pure-renderer"))]
 fn rgb_channels(value: u32) -> [f32; 3] {
+    let value = match value {
+        brood_graphics::theme::TERMINAL_DEFAULT_FG => ashen::TEXT_RGB,
+        brood_graphics::theme::TERMINAL_DEFAULT_BG => ashen::BACKGROUND_RGB,
+        value => value,
+    };
     [
         ((value >> 16) & 0xff) as f32 / 255.0,
         ((value >> 8) & 0xff) as f32 / 255.0,
@@ -2177,11 +2188,10 @@ mod tests {
     #[cfg(not(feature = "pure-renderer"))]
     use super::finish_cursor_blink_for_state;
     use super::{
-        Command, DEFAULT_BG, FOCUS_MESSAGE,
-        MAX_RELIABLE_INPUT_BYTES, SNAPSHOT_FULL, SNAPSHOT_MAGIC, SNAPSHOT_VERSION, STATE, UiState,
-        decode_chunk, focus_commands_for_mailbox, paste_bytes, row_cells,
-        terminal_focuses_on_create, terminal_ready_commands, terminal_session_actor,
-        terminal_text_clusters,
+        Command, DEFAULT_BG, FOCUS_MESSAGE, MAX_RELIABLE_INPUT_BYTES, SNAPSHOT_FULL,
+        SNAPSHOT_MAGIC, SNAPSHOT_VERSION, STATE, UiState, decode_chunk, focus_commands_for_mailbox,
+        paste_bytes, row_cells, terminal_focuses_on_create, terminal_ready_commands,
+        terminal_session_actor, terminal_text_clusters,
     };
     use brood_graphics::theme::ashen;
 

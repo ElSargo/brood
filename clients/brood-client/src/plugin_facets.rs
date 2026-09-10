@@ -306,7 +306,8 @@ impl PluginFacetCoordinator {
         wake: Arc<dyn Fn() + Send + Sync>,
     ) -> Result<()> {
         ensure!(!self.render_inflight, "facet render already in flight");
-        let test_delay_completion = parameters.test_delay_completion;
+        let test_delay_completion = parameters.test_delay_completion
+            || std::env::var_os("BROOD_TEST_FACET_DELAY_ALL_RENDERS").is_some();
         let application = copy_snapshot(&snapshot, &self.budget)?;
         let token = self
             .frames

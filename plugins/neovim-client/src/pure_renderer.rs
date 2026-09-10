@@ -117,6 +117,7 @@ impl Facets for NeovimClient {
     fn render(input: Vec<u8>) -> Vec<u8> {
         let request = facet_codec::decode_render_request(&input, decode_limits(input.len()))
             .expect("Neovim render request");
+        let theme = ThemeSnapshot::decode(&request.configuration).expect("valid theme snapshot");
         let view: View =
             serde_json::from_slice(&request.application_view).expect("Neovim immutable view");
         let panes = request
@@ -135,7 +136,7 @@ impl Facets for NeovimClient {
                     status: &view.status,
                     runner_ready: view.runner_ready,
                 };
-                let (packet, _) = build_screen_packet(&state, &mut BTreeMap::new())
+                let (packet, _) = build_screen_packet(&theme, &state, &mut BTreeMap::new())
                     .expect("Neovim screen packet");
                 facets::PaneOutput {
                     pane: pane.pane,

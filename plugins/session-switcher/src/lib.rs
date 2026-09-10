@@ -1,9 +1,10 @@
+use brood_graphics::theme::ThemeSnapshot;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     sync::Mutex,
 };
 
-use brood_graphics::{Color, Command, Packet, Rect, theme::ashen};
+use brood_graphics::{Color, Command, Packet, Rect};
 #[cfg(not(feature = "pure-renderer"))]
 use brood_plugin_sdk::bindings;
 #[cfg(feature = "pure-renderer")]
@@ -69,19 +70,6 @@ const STATUS_BAR_HEIGHT: f64 = 34.0;
 const MAX_PENDING_LAYOUT_REQUESTS: usize = 64;
 const MAX_NATIVE_RESIZE_RETRIES: u8 = 2;
 const MAX_RETIRED_BACKEND_PICKERS: usize = 64;
-
-const BG: Color = ashen::BACKGROUND;
-const SURFACE: Color = ashen::SURFACE;
-const SURFACE_RAISED: Color = ashen::SURFACE_RAISED;
-const HOVER: Color = ashen::INTERACTIVE_HOVER;
-const PRESSED: Color = ashen::INTERACTIVE_PRESSED;
-const ACTIVE: Color = ashen::CURSOR_LINE;
-const BORDER: Color = ashen::BORDER;
-const FG: Color = ashen::TEXT;
-const TEXT: Color = ashen::TEXT_STRONG;
-const MUTED: Color = ashen::MUTED;
-const YELLOW: Color = ashen::ACCENT;
-const RED: Color = ashen::ERROR;
 
 #[derive(Clone, Deserialize, Serialize)]
 struct ViewSession {
@@ -1007,7 +995,9 @@ struct SessionSwitcher;
 
 impl Guest for SessionSwitcher {
     fn dispatch(event: Event) -> Vec<ActorCommand> {
-        if let Some(commands) = brood_plugin_sdk::packages::dispatch(&event) { return commands; }
+        if let Some(commands) = brood_plugin_sdk::packages::dispatch(&event) {
+            return commands;
+        }
         #[cfg(feature = "pure-renderer")]
         let _publication_turn = PublicationTurn;
         match event {
@@ -4745,11 +4735,17 @@ fn redraw(state: &mut SwitcherState, resize_epoch: Option<u64>) -> Result<(), St
             hovered: state.hovered.clone(),
             pressed: state.pressed.clone(),
         };
-        let result =
-            render_switcher(&view, geometry, &interaction, &mut cache).and_then(|rendered| {
-                let _interaction_count = rendered.interactions.len();
-                cache.queue(resize_epoch, &rendered.packet)
-            });
+        let result = render_switcher(
+            &ThemeSnapshot::default(),
+            &view,
+            geometry,
+            &interaction,
+            &mut cache,
+        )
+        .and_then(|rendered| {
+            let _interaction_count = rendered.interactions.len();
+            cache.queue(resize_epoch, &rendered.packet)
+        });
         if result.is_err() {
             cache.abort_frame();
         }
@@ -4759,6 +4755,7 @@ fn redraw(state: &mut SwitcherState, resize_epoch: Option<u64>) -> Result<(), St
 }
 
 fn render_switcher(
+    theme: &ThemeSnapshot,
     view: &RenderView,
     geometry: RenderGeometry,
     interaction: &InteractionState,
@@ -4768,15 +4765,15 @@ fn render_switcher(
     let mut packet = Packet::new();
     packet.push(Command::FillRect {
         rect: Rect::new(0.0, 0.0, geometry.width, geometry.height),
-        color: BG,
+        color: theme.bg("ui.background"),
     });
     packet.push(Command::FillRect {
         rect: Rect::new(0.0, 0.0, geometry.width, HEADER_HEIGHT),
-        color: SURFACE,
+        color: theme.bg("ui.statusline"),
     });
     packet.push(Command::FillRect {
         rect: Rect::new(0.0, HEADER_HEIGHT - 1.0, geometry.width, 1.0),
-        color: BORDER,
+        color: theme.fg("ui.window"),
     });
 
     let header = header_geometry(geometry.width);
@@ -4785,23 +4782,23 @@ fn render_switcher(
         &mut packet,
         if header.narrow_title { "S" } else { "Sessions" },
         17.0,
-        TEXT,
+        theme.fg("ui.text"),
         SIDE_MARGIN,
         14.0,
         (header.input_x - SIDE_MARGIN * 2.0).max(12.0),
     )?;
 
     let input_color = if view.error {
-        RED
+        theme.fg("error")
     } else if view.mode == EditMode::Search {
-        BORDER
+        theme.fg("ui.window")
     } else {
-        YELLOW
+        theme.fg("ui.text.focus")
     };
     packet.push(Command::FillRoundedRect {
         rect: Rect::new(header.input_x, 10.0, header.input_width, 32.0),
         radius: 4.0,
-        color: SURFACE_RAISED,
+        color: theme.bg("ui.menu"),
     });
     packet.push(Command::StrokeRoundedRect {
         rect: Rect::new(header.input_x, 10.0, header.input_width, 32.0),
@@ -4827,7 +4824,11 @@ fn render_switcher(
         &mut packet,
         &truncate_to_width(&prompt, header.input_width - 16.0, 14.0),
         14.0,
-        if view.query.is_empty() { MUTED } else { FG },
+        if view.query.is_empty() {
+            theme.fg("ui.text.inactive")
+        } else {
+            theme.fg("ui.text")
+        },
         header.input_x + 8.0,
         16.0,
         header.input_width - 16.0,
@@ -4840,13 +4841,13 @@ fn render_switcher(
         rect: Rect::new(header.button_x, 10.0, header.button_width, 32.0),
         radius: 4.0,
         color: if view.pending.is_some() {
-            SURFACE_RAISED
+            theme.bg("ui.menu.selected")
         } else if new_pressed {
-            PRESSED
+            theme.bg("ui.selection")
         } else if new_hovered {
-            ashen::ACCENT_GLOW
+            theme.fg("ui.text.focus")
         } else {
-            YELLOW
+            theme.fg("ui.text.focus")
         },
     });
     add_text(
@@ -4860,7 +4861,11 @@ fn render_switcher(
             if header.compact_button { "+" } else { "Create" }
         },
         11.0,
-        if view.pending.is_some() { MUTED } else { BG },
+        if view.pending.is_some() {
+            theme.fg("ui.text.inactive")
+        } else {
+            theme.bg("ui.background")
+        },
         header.button_x + 5.0,
         if new_pressed { 17.0 } else { 16.0 },
         header.button_width - 10.0,
@@ -4888,16 +4893,16 @@ fn render_switcher(
                 packet.push(Command::FillRect {
                     rect: Rect::new(0.0, y, geometry.width, PROJECT_ROW_HEIGHT),
                     color: if toggle_pressed {
-                        PRESSED
+                        theme.bg("ui.selection")
                     } else if toggle_hovered {
-                        HOVER
+                        theme.bg("ui.menu.selected")
                     } else {
-                        SURFACE
+                        theme.bg("ui.statusline")
                     },
                 });
                 packet.push(Command::FillRect {
                     rect: Rect::new(0.0, y + PROJECT_ROW_HEIGHT - 1.0, geometry.width, 1.0),
-                    color: BORDER,
+                    color: theme.fg("ui.window"),
                 });
                 let collapsed = view
                     .collapsed_projects
@@ -4907,7 +4912,7 @@ fn render_switcher(
                     &mut packet,
                     if collapsed { "▸" } else { "▾" },
                     12.0,
-                    MUTED,
+                    theme.fg("ui.text.inactive"),
                     SIDE_MARGIN,
                     y + 8.0,
                     12.0,
@@ -4917,7 +4922,7 @@ fn render_switcher(
                     &mut packet,
                     &truncate_to_width(&project.name, geometry.width - 126.0, 13.0),
                     13.0,
-                    TEXT,
+                    theme.fg("ui.text"),
                     SIDE_MARGIN + 16.0,
                     y + 8.0,
                     geometry.width - 126.0,
@@ -4927,7 +4932,7 @@ fn render_switcher(
                     &mut packet,
                     &project.sessions.len().to_string(),
                     10.0,
-                    MUTED,
+                    theme.fg("ui.text.inactive"),
                     geometry.width - 76.0,
                     y + 9.0,
                     24.0,
@@ -4939,7 +4944,11 @@ fn render_switcher(
                         packet.push(Command::FillRoundedRect {
                             rect: Rect::new(geometry.width - 52.0, y + 4.0, 40.0, 26.0),
                             radius: 4.0,
-                            color: if worktree_pressed { PRESSED } else { HOVER },
+                            color: if worktree_pressed {
+                                theme.bg("ui.selection")
+                            } else {
+                                theme.bg("ui.menu.selected")
+                            },
                         });
                     }
                     add_text(
@@ -4947,7 +4956,7 @@ fn render_switcher(
                         &mut packet,
                         "+WT",
                         11.0,
-                        YELLOW,
+                        theme.fg("ui.text.focus"),
                         geometry.width - 48.0,
                         y + 8.0,
                         34.0,
@@ -4975,25 +4984,30 @@ fn render_switcher(
                     packet.push(Command::FillRect {
                         rect: Rect::new(0.0, y, geometry.width, ROW_HEIGHT),
                         color: if row_pressed {
-                            PRESSED
+                            theme.bg("ui.selection")
                         } else if row_hovered {
-                            HOVER
+                            theme.bg("ui.menu.selected")
                         } else if session.active {
-                            ashen::SELECTION
+                            theme.bg("ui.selection")
                         } else {
-                            ACTIVE
+                            theme.bg("ui.cursorline.primary")
                         },
                     });
                 }
                 if session.active || selected {
                     packet.push(Command::FillRect {
                         rect: Rect::new(0.0, y, 3.0, ROW_HEIGHT),
-                        color: YELLOW,
+                        color: theme.fg("ui.text.focus"),
                     });
                 }
                 packet.push(Command::FillRect {
                     rect: Rect::new(0.0, y + ROW_HEIGHT - 1.0, geometry.width, 1.0),
-                    color: Color::rgba(BORDER.r, BORDER.g, BORDER.b, 0.38),
+                    color: Color::rgba(
+                        theme.fg("ui.window").r,
+                        theme.fg("ui.window").g,
+                        theme.fg("ui.window").b,
+                        0.38,
+                    ),
                 });
                 let close_pressed = interaction.pressed.as_ref() == Some(&close_target);
                 let close_hovered = interaction.hovered.as_ref() == Some(&close_target);
@@ -5001,7 +5015,11 @@ fn render_switcher(
                     packet.push(Command::FillRoundedRect {
                         rect: Rect::new(close_x - 6.0, y + 3.0, 30.0, 24.0),
                         radius: 4.0,
-                        color: if close_pressed { PRESSED } else { HOVER },
+                        color: if close_pressed {
+                            theme.bg("ui.selection")
+                        } else {
+                            theme.bg("ui.menu.selected")
+                        },
                     });
                 }
                 add_text(
@@ -5009,7 +5027,7 @@ fn render_switcher(
                     &mut packet,
                     &truncate_to_width(&session.name, name_width, 13.0),
                     13.0,
-                    FG,
+                    theme.fg("ui.text"),
                     name_x,
                     y + 5.0,
                     name_width,
@@ -5027,13 +5045,26 @@ fn render_switcher(
                         &mut packet,
                         &count,
                         10.0,
-                        if session.active { TEXT } else { MUTED },
+                        if session.active {
+                            theme.fg("ui.text")
+                        } else {
+                            theme.fg("ui.text.inactive")
+                        },
                         count_x,
                         y + 6.0,
                         70.0,
                     )?;
                 }
-                add_text(sink, &mut packet, "×", 16.0, RED, close_x, y + 2.0, 20.0)?;
+                add_text(
+                    sink,
+                    &mut packet,
+                    "×",
+                    16.0,
+                    theme.fg("error"),
+                    close_x,
+                    y + 2.0,
+                    20.0,
+                )?;
             }
         }
         y += item_height(item);
@@ -5050,7 +5081,12 @@ fn render_switcher(
         packet.push(Command::FillRoundedRect {
             rect: Rect::new(geometry.width - 5.0, thumb_y, 3.0, thumb_height),
             radius: 1.5,
-            color: Color::rgba(FG.r, FG.g, FG.b, 0.42),
+            color: Color::rgba(
+                theme.fg("ui.text").r,
+                theme.fg("ui.text").g,
+                theme.fg("ui.text").b,
+                0.42,
+            ),
         });
     }
 
@@ -5061,7 +5097,7 @@ fn render_switcher(
             geometry.width,
             FOOTER_HEIGHT,
         ),
-        color: SURFACE,
+        color: theme.bg("ui.statusline"),
     });
     let footer = if !view.status.is_empty() {
         view.status.clone()
@@ -5085,7 +5121,11 @@ fn render_switcher(
         &mut packet,
         &truncate_to_width(&footer, geometry.width - 28.0, 10.0),
         10.0,
-        if view.error { RED } else { MUTED },
+        if view.error {
+            theme.fg("error")
+        } else {
+            theme.fg("ui.text.inactive")
+        },
         SIDE_MARGIN,
         geometry.height - 21.0,
         geometry.width - 28.0,
@@ -5408,6 +5448,7 @@ impl Facets for SessionSwitcher {
         };
         let request = facet_codec::decode_render_request(&input, decode)
             .expect("valid session-switcher render request");
+        let theme = ThemeSnapshot::decode(&request.configuration).expect("valid theme snapshot");
         let view: RenderView = serde_json::from_slice(&request.application_view)
             .expect("valid session-switcher render view");
         let interaction = serde_json::from_slice(&request.sequence_state).unwrap_or_default();
@@ -5422,7 +5463,7 @@ impl Facets for SessionSwitcher {
                 };
                 let mut sink = TextLayoutCache::new(pane.pane);
                 sink.begin_frame();
-                let rendered = render_switcher(&view, geometry, &interaction, &mut sink)
+                let rendered = render_switcher(&theme, &view, geometry, &interaction, &mut sink)
                     .expect("bounded session-switcher rendering");
                 let packet = rendered.packet.encode().expect("valid graphics packet");
                 let interaction = serde_json::to_vec(&rendered.interactions)
@@ -6240,7 +6281,14 @@ mod tests {
         );
         let release = host_command(&release, "submit-synchronized-layout");
         let release: serde_json::Value = serde_json::from_slice(release).expect("release JSON");
-        assert_eq!(release["request_id"], if cfg!(feature = "pure-renderer") { 2 } else { 1 });
+        assert_eq!(
+            release["request_id"],
+            if cfg!(feature = "pure-renderer") {
+                2
+            } else {
+                1
+            }
+        );
         assert_eq!(release["interaction"], 99);
         assert_eq!(release["event_sequence"], 3);
         assert_eq!(release["wait_for_panes"], serde_json::json!([1, 4, 5, 6]));

@@ -1,0 +1,8 @@
+OK wayland_display=wayland-2 presentation=Attached windows=0 total_windows=0 active_surface_session=1 surface_sessions=1 focused_windows=0 hosted_children=0 frames=1 commits=0 input_events=0 dmabuf=v4 dmabuf_rejected=0 dmabuf_last_error=none
+actor id=host kind=native-host enqueued_messages=0 dropped_messages=0 mailbox_capacity=256 published_frames=0 latest_frame=none mailbox_slots=default:0/0/256
+actor id=debug-toggle kind=builtin-toggle-launcher enqueued_messages=0 dropped_messages=0 mailbox_capacity=64 published_frames=1 latest_frame=toggle_choice:spawn_btop_next=false:retained_depth=1 mailbox_slots=default:0/0/64
+actor id=brood.backend-init kind=wasm-component enqueued_messages=24 dropped_messages=0 mailbox_capacity=64 published_frames=0 latest_frame=none mailbox_slots=default:24/0/64
+actor id=brood.session-init.1 kind=wasm-component enqueued_messages=7 dropped_messages=0 mailbox_capacity=64 published_frames=0 latest_frame=none mailbox_slots=default:7/0/64
+actor id=brood.session.1.coding-agent-1 kind=wasm-component enqueued_messages=0 dropped_messages=0 mailbox_capacity=64 published_frames=0 latest_frame=none mailbox_slots=default:0/0/64
+actor id=brood.session.1.neovim-files kind=wasm-component enqueued_messages=0 dropped_messages=0 mailbox_capacity=64 published_frames=0 latest_frame=none mailbox_slots=default:0/0/64
+actor id=brood.session.1.terminal-session kind=wasm-component enqueued_messages=153 dropped_messages=0 mailbox_capacity=64 published_frames=0 latest_frame=none mailbox_slots=default:153/0/64

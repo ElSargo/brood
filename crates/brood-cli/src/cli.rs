@@ -62,6 +62,8 @@ pub struct TestArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum TestCommand {
+    /// Verify live Helix theme changes in an offscreen presentation.
+    Themes(NestedTestArgs),
     /// Build and activate a real external package in isolated session and presentation realms.
     Packages(NestedTestArgs),
     /// Prove offline extension discovery with the checkout hidden and networking disabled.

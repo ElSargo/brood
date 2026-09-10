@@ -1,4 +1,5 @@
 use super::*;
+use brood_graphics::theme::ThemeSnapshot;
 use brood_plugin_sdk::{Facets, facet_codec, facets};
 use std::collections::{HashMap, HashSet};
 
@@ -1312,6 +1313,7 @@ fn cursor_phase(target_time_ns: u64, focused: bool) -> (bool, Option<u64>) {
 }
 
 fn layout_terminal_text(
+    theme: &ThemeSnapshot,
     cache: &mut HashMap<RunKey, u64>,
     pane: u64,
     run: &Run,
@@ -1331,7 +1333,8 @@ fn layout_terminal_text(
     if let Some(handle) = cache.get(&key) {
         return *handle;
     }
-    let color = rgb_channels(run.fg);
+    let resolved = theme.terminal_color(run.fg);
+    let color = [resolved.r, resolved.g, resolved.b];
     let handle = host::graphics_layout_text(
         pane,
         text,
@@ -1363,6 +1366,7 @@ fn layout_terminal_text(
 }
 
 fn pane_packet(
+    theme: &ThemeSnapshot,
     pane: &facets::PaneTarget,
     snapshot: &Snapshot,
     sequence: &Sequence,
@@ -1379,7 +1383,7 @@ fn pane_packet(
     let mut packet = Packet::new();
     packet.push(DrawCommand::FillRect {
         rect: Rect::new(0.0, 0.0, width, height),
-        color: rgb(DEFAULT_BG),
+        color: theme.bg("ui.background"),
     });
     for (row, runs) in snapshot.rows_data.iter().enumerate() {
         let y = PADDING + row as f32 * line_height;
@@ -1392,7 +1396,7 @@ fn pane_packet(
                         f32::from(run.cells) * cell_width,
                         line_height,
                     ),
-                    color: rgb(run.bg),
+                    color: theme.terminal_color(run.bg),
                 });
             }
         }
@@ -1407,7 +1411,7 @@ fn pane_packet(
                     f32::from(end - start) * cell_width,
                     line_height,
                 ),
-                color: rgb(SELECTION_BG),
+                color: theme.bg("ui.selection"),
             });
         }
         for run in runs {
@@ -1422,6 +1426,7 @@ fn pane_packet(
                     if cluster != " " {
                         packet.push(DrawCommand::DrawTextLayout {
                             layout: layout_terminal_text(
+                                theme,
                                 &mut text_layouts,
                                 pane.pane,
                                 run,
@@ -1444,6 +1449,7 @@ fn pane_packet(
                     .min(usize::from(run.cells)) as u16;
                 packet.push(DrawCommand::DrawTextLayout {
                     layout: layout_terminal_text(
+                        theme,
                         &mut text_layouts,
                         pane.pane,
                         run,
@@ -1459,13 +1465,13 @@ fn pane_packet(
             if run.underline {
                 packet.push(DrawCommand::FillRect {
                     rect: Rect::new(x, y + line_height - 2.0, run_width, 1.0),
-                    color: rgb(run.fg),
+                    color: theme.terminal_color(run.fg),
                 });
             }
             if run.strikethrough {
                 packet.push(DrawCommand::FillRect {
                     rect: Rect::new(x, y + line_height * 0.55, run_width, 1.0),
-                    color: rgb(run.fg),
+                    color: theme.terminal_color(run.fg),
                 });
             }
         }
@@ -1482,14 +1488,19 @@ fn pane_packet(
                 cell_width,
                 line_height,
             ),
-            color: rgb(CURSOR),
+            color: theme
+                .style("ui.cursor.primary.normal")
+                .over(theme.style("ui.cursor"))
+                .bg
+                .map(brood_graphics::theme::rgb_color)
+                .unwrap_or_else(|| theme.fg("ui.text")),
             width: 1.0,
         });
     }
     if snapshot.exited {
         packet.push(DrawCommand::FillRect {
             rect: Rect::new(0.0, height - 3.0, width, 3.0),
-            color: rgb(ashen::ERROR_RGB),
+            color: theme.fg("error"),
         });
     }
     if snapshot.max_viewport_offset > 0 {
@@ -1507,7 +1518,12 @@ fn pane_packet(
             PADDING + travel * from_top as f32 / snapshot.max_viewport_offset.max(1) as f32;
         packet.push(DrawCommand::FillRect {
             rect: Rect::new(width - 3.0, thumb_y, 2.0, thumb_height),
-            color: rgb(CURSOR),
+            color: theme
+                .style("ui.cursor.primary.normal")
+                .over(theme.style("ui.cursor"))
+                .bg
+                .map(brood_graphics::theme::rgb_color)
+                .unwrap_or_else(|| theme.fg("ui.text")),
         });
     }
     let interaction = Interaction {
@@ -1532,6 +1548,7 @@ fn pane_packet(
 }
 
 fn placeholder_content(
+    theme: &ThemeSnapshot,
     pane: &facets::PaneTarget,
     error: bool,
     grid_metrics: GridMetrics,
@@ -1541,12 +1558,12 @@ fn placeholder_content(
     let mut packet = Packet::new();
     packet.push(DrawCommand::FillRect {
         rect: Rect::new(0.0, 0.0, width, height),
-        color: rgb(DEFAULT_BG),
+        color: theme.bg("ui.background"),
     });
     if error {
         packet.push(DrawCommand::FillRect {
             rect: Rect::new(0.0, height - 3.0, width, 3.0),
-            color: rgb(ashen::ERROR_RGB),
+            color: theme.fg("error"),
         });
     }
     let (rows, cols) = grid_metrics.grid_size(width, height);
@@ -1577,6 +1594,7 @@ impl Facets for TerminalUi {
         else {
             return Vec::new();
         };
+        let theme = ThemeSnapshot::decode(&request.configuration).expect("valid theme snapshot");
         let view = decode_view(&request.application_view).unwrap_or(View {
             snapshot: None,
             oversized: true,
@@ -1590,12 +1608,13 @@ impl Facets for TerminalUi {
             .iter()
             .map(|pane| {
                 let content = if view.oversized {
-                    placeholder_content(pane, true, view.grid_metrics)
+                    placeholder_content(&theme, pane, true, view.grid_metrics)
                 } else {
                     view.snapshot.as_ref().map_or_else(
-                        || placeholder_content(pane, false, view.grid_metrics),
+                        || placeholder_content(&theme, pane, false, view.grid_metrics),
                         |snapshot| {
                             let (packet, interaction, next) = pane_packet(
+                                &theme,
                                 pane,
                                 snapshot,
                                 &sequence,
@@ -1616,7 +1635,7 @@ impl Facets for TerminalUi {
                                     Err(()) => true,
                                 }
                             {
-                                placeholder_content(pane, true, view.grid_metrics)
+                                placeholder_content(&theme, pane, true, view.grid_metrics)
                             } else {
                                 facets::PaneContent::Draw {
                                     packet,
@@ -2104,7 +2123,12 @@ mod tests {
         let facets::PaneContent::Draw {
             packet,
             interaction,
-        } = placeholder_content(&pane, true, GridMetrics::default())
+        } = placeholder_content(
+            &ThemeSnapshot::default(),
+            &pane,
+            true,
+            GridMetrics::default(),
+        )
         else {
             panic!("fallback must establish visible pane content");
         };
@@ -2131,7 +2155,12 @@ mod tests {
         let facets::PaneContent::Draw {
             packet,
             interaction,
-        } = placeholder_content(&pane, false, GridMetrics::default())
+        } = placeholder_content(
+            &ThemeSnapshot::default(),
+            &pane,
+            false,
+            GridMetrics::default(),
+        )
         else {
             panic!("startup must establish concrete pane content");
         };

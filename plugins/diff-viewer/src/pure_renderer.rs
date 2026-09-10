@@ -413,6 +413,7 @@ impl Facets for DiffViewer {
     fn render(input: Vec<u8>) -> Vec<u8> {
         let request = facet_codec::decode_render_request(&input, limits(input.len()))
             .expect("diff render request");
+        let theme = ThemeSnapshot::decode(&request.configuration).expect("valid theme snapshot");
         let header = decode_header(&request.application_view);
         let sequence: Sequence =
             serde_json::from_slice(&request.sequence_state).unwrap_or_default();
@@ -493,6 +494,7 @@ impl Facets for DiffViewer {
                     viewport: state.viewport_height(),
                 };
                 let packet = build_packet_window(
+                    &theme,
                     &view,
                     (width, height),
                     &mut TextLayoutCache::new(pane.pane),

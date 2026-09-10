@@ -1,6 +1,7 @@
+use brood_graphics::theme::ThemeSnapshot;
 use std::{collections::BTreeMap, sync::Mutex};
 
-use brood_graphics::{Color, Command, Packet, Rect, theme::ashen};
+use brood_graphics::{Color, Command, Packet, Rect};
 use brood_keybindings::{ACTIONS, Action, Binding, MOD_ALT, MOD_CTRL, MOD_SHIFT, MOD_SUPER};
 #[cfg(not(feature = "pure-renderer"))]
 use brood_plugin_sdk::bindings;
@@ -27,14 +28,6 @@ const RADIUS: f32 = 9.0;
 #[cfg(feature = "pure-renderer")]
 const MAX_PUBLICATION_BYTES: usize = 1024 * 1024;
 
-const BG: Color = ashen::BACKGROUND;
-const PANEL_RAISED: Color = ashen::SURFACE_RAISED;
-const BORDER: Color = ashen::BORDER;
-const TEXT: Color = ashen::TEXT_STRONG;
-const FG: Color = ashen::TEXT;
-const MUTED: Color = ashen::MUTED;
-const ACCENT: Color = ashen::ACCENT;
-const ERROR: Color = ashen::ERROR;
 const SCRIM: Color = Color::rgba(0.0, 0.0, 0.0, 0.48);
 
 #[derive(Deserialize)]
@@ -695,12 +688,15 @@ fn redraw_for_resize_or_record_error(state: &mut KeybindingsState, resize_epoch:
 
 #[cfg(not(feature = "pure-renderer"))]
 fn redraw(state: &mut KeybindingsState, resize_epoch: Option<u64>) -> Result<(), String> {
-    let (packet, frame) = render_keybindings(state)?;
+    let (packet, frame) = render_keybindings(&ThemeSnapshot::default(), state)?;
     frame.queue(resize_epoch, &packet, &mut state.text_resources)?;
     Ok(())
 }
 
-fn render_keybindings(state: &KeybindingsState) -> Result<(Packet, UiFrame), String> {
+fn render_keybindings(
+    theme: &ThemeSnapshot,
+    state: &KeybindingsState,
+) -> Result<(Packet, UiFrame), String> {
     let panel = state.panel();
     let mut packet = Packet::new();
     let mut frame = UiFrame::new(state.pane);
@@ -711,7 +707,7 @@ fn render_keybindings(state: &KeybindingsState) -> Result<(Packet, UiFrame), Str
     packet.push(Command::FillRoundedRect {
         rect: Rect::new(panel.x, panel.y, panel.width, panel.height),
         radius: RADIUS,
-        color: BG,
+        color: theme.bg("ui.background"),
     });
     packet.push(Command::StrokeRoundedRect {
         rect: Rect::new(
@@ -721,7 +717,7 @@ fn render_keybindings(state: &KeybindingsState) -> Result<(Packet, UiFrame), Str
             (panel.height - 1.0).max(1.0),
         ),
         radius: RADIUS,
-        color: BORDER,
+        color: theme.fg("ui.window"),
         width: 1.0,
     });
 
@@ -733,7 +729,7 @@ fn render_keybindings(state: &KeybindingsState) -> Result<(Packet, UiFrame), Str
         &mut frame,
         title,
         18.0,
-        TEXT,
+        theme.fg("ui.text"),
         panel.x + SIDE_MARGIN,
         panel.y + 20.0,
         panel.width - SIDE_MARGIN * 2.0,
@@ -755,7 +751,7 @@ fn render_keybindings(state: &KeybindingsState) -> Result<(Packet, UiFrame), Str
         &mut frame,
         &truncate_to_width(&detail, panel.width - SIDE_MARGIN * 2.0, 12.0),
         12.0,
-        MUTED,
+        theme.fg("ui.text.inactive"),
         panel.x + SIDE_MARGIN,
         panel.y + 52.0,
         panel.width - SIDE_MARGIN * 2.0,
@@ -768,7 +764,7 @@ fn render_keybindings(state: &KeybindingsState) -> Result<(Packet, UiFrame), Str
             48.0,
         ),
         radius: 6.0,
-        color: PANEL_RAISED,
+        color: theme.bg("ui.popup"),
     });
     packet.push(Command::StrokeRoundedRect {
         rect: Rect::new(
@@ -778,7 +774,11 @@ fn render_keybindings(state: &KeybindingsState) -> Result<(Packet, UiFrame), Str
             48.0,
         ),
         radius: 6.0,
-        color: if state.error { ERROR } else { ACCENT },
+        color: if state.error {
+            theme.fg("error")
+        } else {
+            theme.fg("ui.text.focus")
+        },
         width: 1.0,
     });
     add_text(
@@ -791,7 +791,11 @@ fn render_keybindings(state: &KeybindingsState) -> Result<(Packet, UiFrame), Str
             &state.status
         },
         13.0,
-        if state.error { ERROR } else { FG },
+        if state.error {
+            theme.fg("error")
+        } else {
+            theme.fg("ui.text")
+        },
         panel.x + SIDE_MARGIN + 14.0,
         panel.y + 101.0,
         panel.width - SIDE_MARGIN * 2.0 - 28.0,
@@ -802,7 +806,7 @@ fn render_keybindings(state: &KeybindingsState) -> Result<(Packet, UiFrame), Str
         &mut frame,
         "Action selection is provided by the shared picker",
         10.0,
-        MUTED,
+        theme.fg("ui.text.inactive"),
         panel.x + SIDE_MARGIN,
         panel.y + panel.height - 28.0,
         panel.width - SIDE_MARGIN * 2.0,
@@ -918,6 +922,7 @@ impl Facets for KeybindingsActor {
         };
         let request = facet_codec::decode_render_request(&input, limits)
             .expect("valid keybindings render request");
+        let theme = ThemeSnapshot::decode(&request.configuration).expect("valid theme snapshot");
         let view: RenderView = serde_json::from_slice(&request.application_view)
             .expect("valid keybindings render view");
         let panes = request
@@ -933,7 +938,7 @@ impl Facets for KeybindingsActor {
                     pane.logical_height as f32,
                 );
                 let (packet, resources) =
-                    render_keybindings(&state).expect("bounded keybindings rendering");
+                    render_keybindings(&theme, &state).expect("bounded keybindings rendering");
                 resources.finish_facet();
                 facets::PaneOutput {
                     pane: pane.pane,

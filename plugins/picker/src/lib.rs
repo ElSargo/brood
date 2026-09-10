@@ -1,9 +1,10 @@
+use brood_graphics::theme::ThemeSnapshot;
 use std::{
     collections::{HashSet, VecDeque},
     sync::Mutex,
 };
 
-use brood_graphics::{Color, Command, Packet, Rect, theme::ashen};
+use brood_graphics::{Color, Command, Packet, Rect};
 #[cfg(feature = "pure-renderer")]
 use brood_plugin_sdk::{Facets, export_visual_plugin, facet_codec, facets};
 use brood_plugin_sdk::{
@@ -34,18 +35,6 @@ const SCROLL_PIXELS_PER_ROW: f32 = 5.0;
 const MAX_ITEM_ID_BYTES: usize = 8_192;
 #[cfg(feature = "pure-renderer")]
 const MAX_PUBLICATION_BYTES: usize = 8 * 1024 * 1024;
-
-const BG: Color = ashen::BACKGROUND;
-const PANEL: Color = ashen::SURFACE;
-const PANEL_RAISED: Color = ashen::SURFACE_RAISED;
-const HOVER: Color = ashen::INTERACTIVE_HOVER;
-const PRESSED: Color = ashen::INTERACTIVE_PRESSED;
-const PANEL_LIGHT: Color = ashen::BORDER;
-const FG: Color = ashen::TEXT;
-const TEXT: Color = ashen::TEXT_STRONG;
-const MUTED: Color = ashen::MUTED;
-const YELLOW: Color = ashen::ACCENT;
-const RED: Color = ashen::ERROR;
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
@@ -1312,23 +1301,23 @@ fn redraw_for_resize_or_record_error(state: &mut PickerState, resize_epoch: Opti
 
 #[cfg(not(feature = "pure-renderer"))]
 fn redraw(state: &mut PickerState, resize_epoch: Option<u64>) -> Result<(), String> {
-    let (packet, frame) = render_picker(state)?;
+    let (packet, frame) = render_picker(&ThemeSnapshot::default(), state)?;
     frame.queue(resize_epoch, &packet, &mut state.text_resources)?;
     Ok(())
 }
 
-fn render_picker(state: &PickerState) -> Result<(Packet, UiFrame), String> {
+fn render_picker(theme: &ThemeSnapshot, state: &PickerState) -> Result<(Packet, UiFrame), String> {
     let mut packet = Packet::new();
     let mut frame = UiFrame::new(state.pane);
     packet.push(Command::FillRoundedRect {
         rect: Rect::new(0.0, 0.0, state.width, state.height),
         radius: CONTAINER_RADIUS,
-        color: BG,
+        color: theme.bg("ui.background"),
     });
     packet.push(Command::FillRoundedRect {
         rect: Rect::new(0.0, 0.0, state.width, HEADER_HEIGHT),
         radius: CONTAINER_RADIUS,
-        color: PANEL,
+        color: theme.bg("ui.menu"),
     });
     packet.push(Command::FillRect {
         rect: Rect::new(
@@ -1337,11 +1326,11 @@ fn render_picker(state: &PickerState) -> Result<(Packet, UiFrame), String> {
             state.width,
             HEADER_HEIGHT - CONTAINER_RADIUS,
         ),
-        color: PANEL,
+        color: theme.bg("ui.menu"),
     });
     packet.push(Command::FillRect {
         rect: Rect::new(0.0, HEADER_HEIGHT - 1.0, state.width, 1.0),
-        color: PANEL_LIGHT,
+        color: theme.fg("ui.window"),
     });
 
     if let Some(active) = state.active.as_ref() {
@@ -1362,7 +1351,7 @@ fn render_picker(state: &PickerState) -> Result<(Packet, UiFrame), String> {
             &mut frame,
             &truncate_to_width(title, title_width, 17.0),
             17.0,
-            TEXT,
+            theme.fg("ui.text"),
             SIDE_MARGIN,
             14.0,
             title_width,
@@ -1371,12 +1360,12 @@ fn render_picker(state: &PickerState) -> Result<(Packet, UiFrame), String> {
         packet.push(Command::FillRoundedRect {
             rect: Rect::new(query_x, 10.0, query_width, 32.0),
             radius: 4.0,
-            color: PANEL_RAISED,
+            color: theme.bg("ui.popup"),
         });
         packet.push(Command::StrokeRoundedRect {
             rect: Rect::new(query_x, 10.0, query_width, 32.0),
             radius: 4.0,
-            color: YELLOW,
+            color: theme.fg("ui.text.focus"),
             width: 1.0,
         });
         let query = if active.query.is_empty() {
@@ -1394,7 +1383,11 @@ fn render_picker(state: &PickerState) -> Result<(Packet, UiFrame), String> {
             &mut frame,
             &truncate_to_width(&query, query_width - 16.0, 14.0),
             14.0,
-            if active.query.is_empty() { MUTED } else { FG },
+            if active.query.is_empty() {
+                theme.fg("ui.text.inactive")
+            } else {
+                theme.fg("ui.text")
+            },
             query_x + 8.0,
             16.0,
             query_width - 16.0,
@@ -1425,25 +1418,31 @@ fn render_picker(state: &PickerState) -> Result<(Packet, UiFrame), String> {
                 packet.push(Command::FillRect {
                     rect: Rect::new(0.0, y, state.width, ROW_HEIGHT),
                     color: if pressed {
-                        PRESSED
+                        theme.bg("ui.selection")
                     } else if hovered {
-                        HOVER
+                        theme.bg("ui.menu.selected")
                     } else {
-                        ashen::SELECTION
+                        theme.bg("ui.selection")
                     },
                 });
             }
             if selected {
                 packet.push(Command::FillRect {
                     rect: Rect::new(0.0, y, 3.0, ROW_HEIGHT),
-                    color: YELLOW,
+                    color: theme.fg("ui.text.focus"),
                 });
             }
             packet.push(Command::FillRect {
                 rect: Rect::new(0.0, y + ROW_HEIGHT - 1.0, state.width, 1.0),
-                color: Color::rgba(PANEL_LIGHT.r, PANEL_LIGHT.g, PANEL_LIGHT.b, 0.28),
+                color: Color::rgba(
+                    theme.fg("ui.window").r,
+                    theme.fg("ui.window").g,
+                    theme.fg("ui.window").b,
+                    0.28,
+                ),
             });
             draw_highlighted_text(
+                theme,
                 &mut packet,
                 &mut frame,
                 &item.label,
@@ -1460,7 +1459,7 @@ fn render_picker(state: &PickerState) -> Result<(Packet, UiFrame), String> {
                     &mut frame,
                     &truncate_to_width(detail, state.width - SIDE_MARGIN * 2.0, 10.0),
                     10.0,
-                    MUTED,
+                    theme.fg("ui.text.inactive"),
                     SIDE_MARGIN,
                     y + 16.0,
                     state.width - SIDE_MARGIN * 2.0,
@@ -1475,7 +1474,7 @@ fn render_picker(state: &PickerState) -> Result<(Packet, UiFrame), String> {
                 .saturating_sub(active.scroll)
                 .min(visible_rows - 1);
             let loading_y = HEADER_HEIGHT + loading_row as f32 * ROW_HEIGHT;
-            draw_spinner(&mut packet, state.spinner_phase, loading_y + 15.0);
+            draw_spinner(theme, &mut packet, state.spinner_phase, loading_y + 15.0);
             let loading_label = if active.loading_label.trim().is_empty() {
                 "Loading…"
             } else {
@@ -1487,7 +1486,7 @@ fn render_picker(state: &PickerState) -> Result<(Packet, UiFrame), String> {
                 &mut frame,
                 loading_label,
                 13.0,
-                MUTED,
+                theme.fg("ui.text.inactive"),
                 SIDE_MARGIN + 24.0,
                 loading_y + 9.0,
                 state.width - SIDE_MARGIN * 2.0 - 24.0,
@@ -1499,7 +1498,7 @@ fn render_picker(state: &PickerState) -> Result<(Packet, UiFrame), String> {
                 &mut frame,
                 "No matching items",
                 13.0,
-                MUTED,
+                theme.fg("ui.text.inactive"),
                 SIDE_MARGIN,
                 HEADER_HEIGHT + 9.0,
                 state.width - SIDE_MARGIN * 2.0,
@@ -1531,11 +1530,11 @@ fn render_picker(state: &PickerState) -> Result<(Packet, UiFrame), String> {
         packet.push(Command::FillRoundedRect {
             rect: Rect::new(0.0, footer_y, state.width, FOOTER_HEIGHT),
             radius: CONTAINER_RADIUS,
-            color: PANEL,
+            color: theme.bg("ui.menu"),
         });
         packet.push(Command::FillRect {
             rect: Rect::new(0.0, footer_y, state.width, CONTAINER_RADIUS + 1.0),
-            color: PANEL,
+            color: theme.bg("ui.menu"),
         });
         add_text(
             state,
@@ -1543,7 +1542,11 @@ fn render_picker(state: &PickerState) -> Result<(Packet, UiFrame), String> {
             &mut frame,
             &truncate_to_width(&footer, state.width - SIDE_MARGIN * 2.0, 10.0),
             10.0,
-            if state.error { RED } else { MUTED },
+            if state.error {
+                theme.fg("error")
+            } else {
+                theme.fg("ui.text.inactive")
+            },
             SIDE_MARGIN,
             state.height - 21.0,
             state.width - SIDE_MARGIN * 2.0,
@@ -1553,14 +1556,14 @@ fn render_picker(state: &PickerState) -> Result<(Packet, UiFrame), String> {
     packet.push(Command::StrokeRoundedRect {
         rect: Rect::new(0.5, 0.5, state.width - 1.0, state.height - 1.0),
         radius: CONTAINER_RADIUS,
-        color: PANEL_LIGHT,
+        color: theme.fg("ui.window"),
         width: 1.0,
     });
 
     Ok((packet, frame))
 }
 
-fn draw_spinner(packet: &mut Packet, phase: usize, center_y: f32) {
+fn draw_spinner(theme: &ThemeSnapshot, packet: &mut Packet, phase: usize, center_y: f32) {
     let center_x = SIDE_MARGIN + 7.0;
     let points = [
         (0.0, -7.0),
@@ -1578,7 +1581,12 @@ fn draw_spinner(packet: &mut Packet, phase: usize, center_y: f32) {
         packet.push(Command::FillRoundedRect {
             rect: Rect::new(center_x + x - 1.5, center_y + y - 1.5, 3.0, 3.0),
             radius: 1.5,
-            color: Color::rgba(YELLOW.r, YELLOW.g, YELLOW.b, alpha.max(0.3)),
+            color: Color::rgba(
+                theme.fg("ui.text.focus").r,
+                theme.fg("ui.text.focus").g,
+                theme.fg("ui.text.focus").b,
+                alpha.max(0.3),
+            ),
         });
     }
 }
@@ -1603,6 +1611,7 @@ fn add_text(
 
 #[allow(clippy::too_many_arguments)]
 fn draw_highlighted_text(
+    theme: &ThemeSnapshot,
     packet: &mut Packet,
     frame: &mut UiFrame,
     text: &str,
@@ -1639,7 +1648,11 @@ fn draw_highlighted_text(
                 size,
                 available,
                 size + 4.0,
-                if highlighted { YELLOW } else { FG },
+                if highlighted {
+                    theme.fg("ui.text.focus")
+                } else {
+                    theme.fg("ui.text")
+                },
                 run_x,
                 y,
             )
@@ -1801,6 +1814,7 @@ impl Facets for PickerActor {
         };
         let request = facet_codec::decode_render_request(&input, decode)
             .expect("valid picker render request");
+        let theme = ThemeSnapshot::decode(&request.configuration).expect("valid theme snapshot");
         let view: RenderView =
             serde_json::from_slice(&request.application_view).expect("valid picker render view");
         let mut interaction_state: InteractionState =
@@ -1833,7 +1847,8 @@ impl Facets for PickerActor {
                 state.scroll_accumulator = interaction_state.scroll_accumulator;
                 state.spinner_phase =
                     ((request.target_time_ns / (SPINNER_INTERVAL_MS * 1_000_000)) % 8) as usize;
-                let (packet, resources) = render_picker(&state).expect("bounded picker rendering");
+                let (packet, resources) =
+                    render_picker(&theme, &state).expect("bounded picker rendering");
                 resources.finish_facet();
                 let (displayed, regions) = state.active.as_ref().map_or_else(
                     || (Vec::new(), Vec::new()),

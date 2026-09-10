@@ -252,6 +252,7 @@ let
     "crates/brood-computer-use"
     "crates/brood-dmabuf"
     "crates/brood-graphics"
+    "crates/brood-theme"
     "crates/brood-keybindings"
     "crates/brood-layout"
     "crates/brood-profiler"

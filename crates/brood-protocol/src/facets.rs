@@ -73,6 +73,8 @@ pub struct RenderRequest {
     pub panes: Vec<PaneTarget>,
     pub target_time_ns: u64,
     pub cutoff_ns: u64,
+    /// Encoded `brood_graphics::theme::ThemeSnapshot`; its revision equals
+    /// `token.host_configuration_revision`. Immutable for the whole invocation.
     pub configuration: Vec<u8>,
     pub application_view: Vec<u8>,
     pub sequence_state: Vec<u8>,

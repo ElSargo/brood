@@ -1,0 +1,1216 @@
+{
+  "publications": [
+    {
+      "revision": 1,
+      "name": "ashen",
+      "time_ns": 161396991423632
+    },
+    {
+      "revision": 2,
+      "name": "github_light",
+      "time_ns": 161402574796811
+    },
+    {
+      "revision": 3,
+      "name": "github_light_high_contrast",
+      "time_ns": 161404010825153
+    },
+    {
+      "revision": 4,
+      "name": "local",
+      "time_ns": 161404490680249
+    },
+    {
+      "revision": 5,
+      "name": "local",
+      "time_ns": 161405044400428
+    },
+    {
+      "revision": 6,
+      "name": "ashen",
+      "time_ns": 161405351193853
+    },
+    {
+      "revision": 7,
+      "name": "github_light",
+      "time_ns": 161405395353943
+    },
+    {
+      "revision": 8,
+      "name": "ashen",
+      "time_ns": 161405439420238
+    },
+    {
+      "revision": 9,
+      "name": "github_light",
+      "time_ns": 161405484200801
+    },
+    {
+      "revision": 10,
+      "name": "ashen",
+      "time_ns": 161405528995311
+    },
+    {
+      "revision": 11,
+      "name": "github_light",
+      "time_ns": 161405574242047
+    },
+    {
+      "revision": 12,
+      "name": "ashen",
+      "time_ns": 161405618029890
+    },
+    {
+      "revision": 13,
+      "name": "github_light",
+      "time_ns": 161405661720602
+    },
+    {
+      "revision": 14,
+      "name": "ashen",
+      "time_ns": 161405705833794
+    },
+    {
+      "revision": 15,
+      "name": "github_light",
+      "time_ns": 161405749468069
+    },
+    {
+      "revision": 16,
+      "name": "ashen",
+      "time_ns": 161405794075829
+    },
+    {
+      "revision": 17,
+      "name": "github_light",
+      "time_ns": 161405838805697
+    },
+    {
+      "revision": 18,
+      "name": "github_light_high_contrast",
+      "time_ns": 161405882835654
+    },
+    {
+      "revision": 19,
+      "name": "ashen",
+      "time_ns": 161412371388735
+    },
+    {
+      "revision": 20,
+      "name": "github_light_high_contrast",
+      "time_ns": 161412740528865
+    }
+  ],
+  "commits": [
+    {
+      "actor": "picker",
+      "snapshot": 1,
+      "theme": 1,
+      "time_ns": 161401668964833,
+      "since_theme_publication_ms": 4677.541
+    },
+    {
+      "actor": "inbox",
+      "snapshot": 1,
+      "theme": 1,
+      "time_ns": 161401678991532,
+      "since_theme_publication_ms": 4687.568
+    },
+    {
+      "actor": "keybindings",
+      "snapshot": 1,
+      "theme": 1,
+      "time_ns": 161401694322190,
+      "since_theme_publication_ms": 4702.899
+    },
+    {
+      "actor": "status-bar",
+      "snapshot": 1,
+      "theme": 1,
+      "time_ns": 161401695529703,
+      "since_theme_publication_ms": 4704.106
+    },
+    {
+      "actor": "status-bar",
+      "snapshot": 1,
+      "theme": 1,
+      "time_ns": 161401707332831,
+      "since_theme_publication_ms": 4715.909
+    },
+    {
+      "actor": "session-switcher",
+      "snapshot": 1,
+      "theme": 1,
+      "time_ns": 161401798961395,
+      "since_theme_publication_ms": 4807.538
+    },
+    {
+      "actor": "session-switcher",
+      "snapshot": 2,
+      "theme": 1,
+      "time_ns": 161401933448442,
+      "since_theme_publication_ms": 4942.025
+    },
+    {
+      "actor": "session-switcher",
+      "snapshot": 2,
+      "theme": 1,
+      "time_ns": 161402064404413,
+      "since_theme_publication_ms": 5072.981
+    },
+    {
+      "actor": "status-bar",
+      "snapshot": 1,
+      "theme": 2,
+      "time_ns": 161402594467632,
+      "since_theme_publication_ms": 19.671
+    },
+    {
+      "actor": "session-switcher",
+      "snapshot": 2,
+      "theme": 2,
+      "time_ns": 161402709161998,
+      "since_theme_publication_ms": 134.365
+    },
+    {
+      "actor": "status-bar",
+      "snapshot": 1,
+      "theme": 2,
+      "time_ns": 161402918881192,
+      "since_theme_publication_ms": 344.084
+    },
+    {
+      "actor": "status-bar",
+      "snapshot": 1,
+      "theme": 2,
+      "time_ns": 161403060899541,
+      "since_theme_publication_ms": 486.103
+    },
+    {
+      "actor": "picker",
+      "snapshot": 2,
+      "theme": 2,
+      "time_ns": 161403060944796,
+      "since_theme_publication_ms": 486.148
+    },
+    {
+      "actor": "session-switcher",
+      "snapshot": 3,
+      "theme": 2,
+      "time_ns": 161403060975984,
+      "since_theme_publication_ms": 486.179
+    },
+    {
+      "actor": "picker",
+      "snapshot": 2,
+      "theme": 2,
+      "time_ns": 161403072863290,
+      "since_theme_publication_ms": 498.066
+    },
+    {
+      "actor": "status-bar",
+      "snapshot": 1,
+      "theme": 2,
+      "time_ns": 161403073400356,
+      "since_theme_publication_ms": 498.604
+    },
+    {
+      "actor": "session-switcher",
+      "snapshot": 3,
+      "theme": 2,
+      "time_ns": 161403195792497,
+      "since_theme_publication_ms": 620.996
+    },
+    {
+      "actor": "picker",
+      "snapshot": 4,
+      "theme": 2,
+      "time_ns": 161403478664520,
+      "since_theme_publication_ms": 903.868
+    },
+    {
+      "actor": "picker",
+      "snapshot": 11,
+      "theme": 2,
+      "time_ns": 161403501855938,
+      "since_theme_publication_ms": 927.059
+    },
+    {
+      "actor": "picker",
+      "snapshot": 12,
+      "theme": 2,
+      "time_ns": 161403526642365,
+      "since_theme_publication_ms": 951.846
+    },
+    {
+      "actor": "picker",
+      "snapshot": 16,
+      "theme": 2,
+      "time_ns": 161403645089784,
+      "since_theme_publication_ms": 1070.293
+    },
+    {
+      "actor": "picker",
+      "snapshot": 16,
+      "theme": 2,
+      "time_ns": 161403963851159,
+      "since_theme_publication_ms": 1389.054
+    },
+    {
+      "actor": "picker",
+      "snapshot": 16,
+      "theme": 2,
+      "time_ns": 161403991788090,
+      "since_theme_publication_ms": 1416.991
+    },
+    {
+      "actor": "status-bar",
+      "snapshot": 1,
+      "theme": 3,
+      "time_ns": 161404038729664,
+      "since_theme_publication_ms": 27.905
+    },
+    {
+      "actor": "picker",
+      "snapshot": 16,
+      "theme": 3,
+      "time_ns": 161404061385388,
+      "since_theme_publication_ms": 50.56
+    },
+    {
+      "actor": "session-switcher",
+      "snapshot": 3,
+      "theme": 3,
+      "time_ns": 161404151162371,
+      "since_theme_publication_ms": 140.337
+    },
+    {
+      "actor": "picker",
+      "snapshot": 16,
+      "theme": 3,
+      "time_ns": 161404384349217,
+      "since_theme_publication_ms": 373.524
+    },
+    {
+      "actor": "picker",
+      "snapshot": 17,
+      "theme": 3,
+      "time_ns": 161404405606541,
+      "since_theme_publication_ms": 394.781
+    },
+    {
+      "actor": "picker",
+      "snapshot": 17,
+      "theme": 4,
+      "time_ns": 161404512613069,
+      "since_theme_publication_ms": 21.933
+    },
+    {
+      "actor": "status-bar",
+      "snapshot": 1,
+      "theme": 4,
+      "time_ns": 161404632041995,
+      "since_theme_publication_ms": 141.362
+    },
+    {
+      "actor": "status-bar",
+      "snapshot": 1,
+      "theme": 4,
+      "time_ns": 161404649084992,
+      "since_theme_publication_ms": 158.405
+    },
+    {
+      "actor": "session-switcher",
+      "snapshot": 5,
+      "theme": 4,
+      "time_ns": 161404784172851,
+      "since_theme_publication_ms": 293.493
+    },
+    {
+      "actor": "status-bar",
+      "snapshot": 1,
+      "theme": 5,
+      "time_ns": 161405073683812,
+      "since_theme_publication_ms": 29.283
+    },
+    {
+      "actor": "session-switcher",
+      "snapshot": 5,
+      "theme": 5,
+      "time_ns": 161405197475904,
+      "since_theme_publication_ms": 153.075
+    },
+    {
+      "actor": "status-bar",
+      "snapshot": 1,
+      "theme": 6,
+      "time_ns": 161405368899801,
+      "since_theme_publication_ms": 17.706
+    },
+    {
+      "actor": "status-bar",
+      "snapshot": 1,
+      "theme": 7,
+      "time_ns": 161405413098875,
+      "since_theme_publication_ms": 17.745
+    },
+    {
+      "actor": "status-bar",
+      "snapshot": 1,
+      "theme": 8,
+      "time_ns": 161405455176012,
+      "since_theme_publication_ms": 15.756
+    },
+    {
+      "actor": "status-bar",
+      "snapshot": 1,
+      "theme": 9,
+      "time_ns": 161405510377703,
+      "since_theme_publication_ms": 26.177
+    },
+    {
+      "actor": "status-bar",
+      "snapshot": 1,
+      "theme": 10,
+      "time_ns": 161405546646667,
+      "since_theme_publication_ms": 17.651
+    },
+    {
+      "actor": "status-bar",
+      "snapshot": 1,
+      "theme": 11,
+      "time_ns": 161405592520108,
+      "since_theme_publication_ms": 18.278
+    },
+    {
+      "actor": "status-bar",
+      "snapshot": 1,
+      "theme": 12,
+      "time_ns": 161405633800232,
+      "since_theme_publication_ms": 15.77
+    },
+    {
+      "actor": "status-bar",
+      "snapshot": 1,
+      "theme": 13,
+      "time_ns": 161405677832864,
+      "since_theme_publication_ms": 16.112
+    },
+    {
+      "actor": "status-bar",
+      "snapshot": 1,
+      "theme": 14,
+      "time_ns": 161405723150223,
+      "since_theme_publication_ms": 17.316
+    },
+    {
+      "actor": "status-bar",
+      "snapshot": 1,
+      "theme": 15,
+      "time_ns": 161405770683445,
+      "since_theme_publication_ms": 21.215
+    },
+    {
+      "actor": "status-bar",
+      "snapshot": 1,
+      "theme": 16,
+      "time_ns": 161405808423845,
+      "since_theme_publication_ms": 14.348
+    },
+    {
+      "actor": "status-bar",
+      "snapshot": 1,
+      "theme": 17,
+      "time_ns": 161405852549672,
+      "since_theme_publication_ms": 13.744
+    },
+    {
+      "actor": "status-bar",
+      "snapshot": 1,
+      "theme": 18,
+      "time_ns": 161405896800913,
+      "since_theme_publication_ms": 13.965
+    },
+    {
+      "actor": "session-switcher",
+      "snapshot": 5,
+      "theme": 18,
+      "time_ns": 161406026230548,
+      "since_theme_publication_ms": 143.395
+    },
+    {
+      "actor": "status-bar",
+      "snapshot": 1,
+      "theme": 18,
+      "time_ns": 161406741470095,
+      "since_theme_publication_ms": 858.634
+    },
+    {
+      "actor": "status-bar",
+      "snapshot": 1,
+      "theme": 18,
+      "time_ns": 161406884454809,
+      "since_theme_publication_ms": 1001.619
+    },
+    {
+      "actor": "picker",
+      "snapshot": 18,
+      "theme": 18,
+      "time_ns": 161406884509221,
+      "since_theme_publication_ms": 1001.674
+    },
+    {
+      "actor": "session-switcher",
+      "snapshot": 6,
+      "theme": 18,
+      "time_ns": 161406884543275,
+      "since_theme_publication_ms": 1001.708
+    },
+    {
+      "actor": "status-bar",
+      "snapshot": 1,
+      "theme": 18,
+      "time_ns": 161406902509882,
+      "since_theme_publication_ms": 1019.674
+    },
+    {
+      "actor": "picker",
+      "snapshot": 18,
+      "theme": 18,
+      "time_ns": 161406912057363,
+      "since_theme_publication_ms": 1029.222
+    },
+    {
+      "actor": "session-switcher",
+      "snapshot": 6,
+      "theme": 18,
+      "time_ns": 161407016779117,
+      "since_theme_publication_ms": 1133.943
+    },
+    {
+      "actor": "picker",
+      "snapshot": 19,
+      "theme": 18,
+      "time_ns": 161407284858903,
+      "since_theme_publication_ms": 1402.023
+    },
+    {
+      "actor": "picker",
+      "snapshot": 20,
+      "theme": 18,
+      "time_ns": 161407338967535,
+      "since_theme_publication_ms": 1456.132
+    },
+    {
+      "actor": "picker",
+      "snapshot": 20,
+      "theme": 18,
+      "time_ns": 161407349118777,
+      "since_theme_publication_ms": 1466.283
+    },
+    {
+      "actor": "picker",
+      "snapshot": 20,
+      "theme": 18,
+      "time_ns": 161407382118904,
+      "since_theme_publication_ms": 1499.283
+    },
+    {
+      "actor": "picker",
+      "snapshot": 20,
+      "theme": 18,
+      "time_ns": 161407467546454,
+      "since_theme_publication_ms": 1584.711
+    },
+    {
+      "actor": "picker",
+      "snapshot": 20,
+      "theme": 18,
+      "time_ns": 161407706913153,
+      "since_theme_publication_ms": 1824.077
+    },
+    {
+      "actor": "picker",
+      "snapshot": 21,
+      "theme": 18,
+      "time_ns": 161407728932795,
+      "since_theme_publication_ms": 1846.097
+    },
+    {
+      "actor": "status-bar",
+      "snapshot": 1,
+      "theme": 18,
+      "time_ns": 161407849218102,
+      "since_theme_publication_ms": 1966.382
+    },
+    {
+      "actor": "session-switcher",
+      "snapshot": 7,
+      "theme": 18,
+      "time_ns": 161407849328469,
+      "since_theme_publication_ms": 1966.493
+    },
+    {
+      "actor": "status-bar",
+      "snapshot": 2,
+      "theme": 18,
+      "time_ns": 161407901097387,
+      "since_theme_publication_ms": 2018.262
+    },
+    {
+      "actor": "session-switcher",
+      "snapshot": 9,
+      "theme": 18,
+      "time_ns": 161408022405291,
+      "since_theme_publication_ms": 2139.57
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 1,
+      "theme": 18,
+      "time_ns": 161410806289394,
+      "since_theme_publication_ms": 4923.454
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 5,
+      "theme": 18,
+      "time_ns": 161411286694882,
+      "since_theme_publication_ms": 5403.859
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 6,
+      "theme": 18,
+      "time_ns": 161411293712241,
+      "since_theme_publication_ms": 5410.877
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 6,
+      "theme": 18,
+      "time_ns": 161411355561496,
+      "since_theme_publication_ms": 5472.726
+    },
+    {
+      "actor": "status-bar",
+      "snapshot": 2,
+      "theme": 18,
+      "time_ns": 161411464969938,
+      "since_theme_publication_ms": 5582.134
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 8,
+      "theme": 18,
+      "time_ns": 161411472037952,
+      "since_theme_publication_ms": 5589.202
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 12,
+      "theme": 18,
+      "time_ns": 161411486485394,
+      "since_theme_publication_ms": 5603.65
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 16,
+      "theme": 18,
+      "time_ns": 161411505381983,
+      "since_theme_publication_ms": 5622.546
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 20,
+      "theme": 18,
+      "time_ns": 161411624335060,
+      "since_theme_publication_ms": 5741.499
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 25,
+      "theme": 18,
+      "time_ns": 161411645936788,
+      "since_theme_publication_ms": 5763.101
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 29,
+      "theme": 18,
+      "time_ns": 161411661904378,
+      "since_theme_publication_ms": 5779.069
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 33,
+      "theme": 18,
+      "time_ns": 161411677840149,
+      "since_theme_publication_ms": 5795.004
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 37,
+      "theme": 18,
+      "time_ns": 161411695103828,
+      "since_theme_publication_ms": 5812.268
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 41,
+      "theme": 18,
+      "time_ns": 161411710095850,
+      "since_theme_publication_ms": 5827.26
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 44,
+      "theme": 18,
+      "time_ns": 161411727841202,
+      "since_theme_publication_ms": 5845.006
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 48,
+      "theme": 18,
+      "time_ns": 161411742706186,
+      "since_theme_publication_ms": 5859.871
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 52,
+      "theme": 18,
+      "time_ns": 161411759041406,
+      "since_theme_publication_ms": 5876.206
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 56,
+      "theme": 18,
+      "time_ns": 161411774074465,
+      "since_theme_publication_ms": 5891.239
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 60,
+      "theme": 18,
+      "time_ns": 161411790138035,
+      "since_theme_publication_ms": 5907.302
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 64,
+      "theme": 18,
+      "time_ns": 161411806268922,
+      "since_theme_publication_ms": 5923.433
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 68,
+      "theme": 18,
+      "time_ns": 161411822762348,
+      "since_theme_publication_ms": 5939.927
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 72,
+      "theme": 18,
+      "time_ns": 161411839755520,
+      "since_theme_publication_ms": 5956.92
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 76,
+      "theme": 18,
+      "time_ns": 161411857486765,
+      "since_theme_publication_ms": 5974.651
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 80,
+      "theme": 18,
+      "time_ns": 161411874202127,
+      "since_theme_publication_ms": 5991.366
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 84,
+      "theme": 18,
+      "time_ns": 161411889911443,
+      "since_theme_publication_ms": 6007.076
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 88,
+      "theme": 18,
+      "time_ns": 161411906749735,
+      "since_theme_publication_ms": 6023.914
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 92,
+      "theme": 18,
+      "time_ns": 161411922926057,
+      "since_theme_publication_ms": 6040.09
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 96,
+      "theme": 18,
+      "time_ns": 161411940332213,
+      "since_theme_publication_ms": 6057.497
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 100,
+      "theme": 18,
+      "time_ns": 161411956535234,
+      "since_theme_publication_ms": 6073.7
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 104,
+      "theme": 18,
+      "time_ns": 161411972871836,
+      "since_theme_publication_ms": 6090.036
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 107,
+      "theme": 18,
+      "time_ns": 161411989449901,
+      "since_theme_publication_ms": 6106.614
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 111,
+      "theme": 18,
+      "time_ns": 161412004754328,
+      "since_theme_publication_ms": 6121.919
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 115,
+      "theme": 18,
+      "time_ns": 161412021751638,
+      "since_theme_publication_ms": 6138.916
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 119,
+      "theme": 18,
+      "time_ns": 161412038627360,
+      "since_theme_publication_ms": 6155.792
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 123,
+      "theme": 18,
+      "time_ns": 161412053707358,
+      "since_theme_publication_ms": 6170.872
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 127,
+      "theme": 18,
+      "time_ns": 161412070165728,
+      "since_theme_publication_ms": 6187.33
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 131,
+      "theme": 18,
+      "time_ns": 161412085008721,
+      "since_theme_publication_ms": 6202.173
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 135,
+      "theme": 18,
+      "time_ns": 161412101658620,
+      "since_theme_publication_ms": 6218.823
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 138,
+      "theme": 18,
+      "time_ns": 161412118696015,
+      "since_theme_publication_ms": 6235.86
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 142,
+      "theme": 18,
+      "time_ns": 161412134971111,
+      "since_theme_publication_ms": 6252.135
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 146,
+      "theme": 18,
+      "time_ns": 161412152194415,
+      "since_theme_publication_ms": 6269.359
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 150,
+      "theme": 18,
+      "time_ns": 161412167835223,
+      "since_theme_publication_ms": 6285.0
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 154,
+      "theme": 18,
+      "time_ns": 161412181572895,
+      "since_theme_publication_ms": 6298.737
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 155,
+      "theme": 18,
+      "time_ns": 161412200089311,
+      "since_theme_publication_ms": 6317.254
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 156,
+      "theme": 18,
+      "time_ns": 161412247556536,
+      "since_theme_publication_ms": 6364.721
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 157,
+      "theme": 18,
+      "time_ns": 161412306781763,
+      "since_theme_publication_ms": 6423.946
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 158,
+      "theme": 18,
+      "time_ns": 161412367292108,
+      "since_theme_publication_ms": 6484.456
+    },
+    {
+      "actor": "status-bar",
+      "snapshot": 2,
+      "theme": 19,
+      "time_ns": 161412389444027,
+      "since_theme_publication_ms": 18.055
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 158,
+      "theme": 19,
+      "time_ns": 161412393190377,
+      "since_theme_publication_ms": 21.802
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 159,
+      "theme": 19,
+      "time_ns": 161412405148574,
+      "since_theme_publication_ms": 33.76
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 159,
+      "theme": 19,
+      "time_ns": 161412420776618,
+      "since_theme_publication_ms": 49.388
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 160,
+      "theme": 19,
+      "time_ns": 161412471197267,
+      "since_theme_publication_ms": 99.809
+    },
+    {
+      "actor": "session-switcher",
+      "snapshot": 9,
+      "theme": 19,
+      "time_ns": 161412514826120,
+      "since_theme_publication_ms": 143.437
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 161,
+      "theme": 19,
+      "time_ns": 161412516820316,
+      "since_theme_publication_ms": 145.432
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 162,
+      "theme": 19,
+      "time_ns": 161412575074283,
+      "since_theme_publication_ms": 203.686
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 163,
+      "theme": 19,
+      "time_ns": 161412615393093,
+      "since_theme_publication_ms": 244.004
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 164,
+      "theme": 19,
+      "time_ns": 161412672290018,
+      "since_theme_publication_ms": 300.901
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 165,
+      "theme": 19,
+      "time_ns": 161412724569379,
+      "since_theme_publication_ms": 353.181
+    },
+    {
+      "actor": "status-bar",
+      "snapshot": 2,
+      "theme": 20,
+      "time_ns": 161412750798738,
+      "since_theme_publication_ms": 10.27
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 165,
+      "theme": 20,
+      "time_ns": 161412760686106,
+      "since_theme_publication_ms": 20.157
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 166,
+      "theme": 20,
+      "time_ns": 161412779325172,
+      "since_theme_publication_ms": 38.796
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 167,
+      "theme": 20,
+      "time_ns": 161412828887142,
+      "since_theme_publication_ms": 88.358
+    },
+    {
+      "actor": "session-switcher",
+      "snapshot": 9,
+      "theme": 20,
+      "time_ns": 161412876976181,
+      "since_theme_publication_ms": 136.447
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 168,
+      "theme": 20,
+      "time_ns": 161412883568715,
+      "since_theme_publication_ms": 143.04
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 169,
+      "theme": 20,
+      "time_ns": 161412933637915,
+      "since_theme_publication_ms": 193.109
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 169,
+      "theme": 20,
+      "time_ns": 161412940403683,
+      "since_theme_publication_ms": 199.875
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 170,
+      "theme": 20,
+      "time_ns": 161412988155601,
+      "since_theme_publication_ms": 247.627
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 171,
+      "theme": 20,
+      "time_ns": 161413043857937,
+      "since_theme_publication_ms": 303.329
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 172,
+      "theme": 20,
+      "time_ns": 161413087889263,
+      "since_theme_publication_ms": 347.36
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 173,
+      "theme": 20,
+      "time_ns": 161413148818153,
+      "since_theme_publication_ms": 408.289
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 174,
+      "theme": 20,
+      "time_ns": 161413195373929,
+      "since_theme_publication_ms": 454.845
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 175,
+      "theme": 20,
+      "time_ns": 161413239880266,
+      "since_theme_publication_ms": 499.351
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 176,
+      "theme": 20,
+      "time_ns": 161413303536876,
+      "since_theme_publication_ms": 563.008
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 177,
+      "theme": 20,
+      "time_ns": 161413341764788,
+      "since_theme_publication_ms": 601.236
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 178,
+      "theme": 20,
+      "time_ns": 161413411869460,
+      "since_theme_publication_ms": 671.341
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 179,
+      "theme": 20,
+      "time_ns": 161413444906856,
+      "since_theme_publication_ms": 704.378
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 179,
+      "theme": 20,
+      "time_ns": 161413464950073,
+      "since_theme_publication_ms": 724.421
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 179,
+      "theme": 20,
+      "time_ns": 161413479166842,
+      "since_theme_publication_ms": 738.638
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 180,
+      "theme": 20,
+      "time_ns": 161413507965655,
+      "since_theme_publication_ms": 767.437
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 180,
+      "theme": 20,
+      "time_ns": 161413522816002,
+      "since_theme_publication_ms": 782.287
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 180,
+      "theme": 20,
+      "time_ns": 161413537737141,
+      "since_theme_publication_ms": 797.208
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 181,
+      "theme": 20,
+      "time_ns": 161413554946999,
+      "since_theme_publication_ms": 814.418
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 181,
+      "theme": 20,
+      "time_ns": 161413570742517,
+      "since_theme_publication_ms": 830.214
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 181,
+      "theme": 20,
+      "time_ns": 161413586637561,
+      "since_theme_publication_ms": 846.109
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 182,
+      "theme": 20,
+      "time_ns": 161413602717682,
+      "since_theme_publication_ms": 862.189
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 182,
+      "theme": 20,
+      "time_ns": 161413618319748,
+      "since_theme_publication_ms": 877.791
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 182,
+      "theme": 20,
+      "time_ns": 161413636537214,
+      "since_theme_publication_ms": 896.008
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 183,
+      "theme": 20,
+      "time_ns": 161413669049976,
+      "since_theme_publication_ms": 928.521
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 184,
+      "theme": 20,
+      "time_ns": 161413718585857,
+      "since_theme_publication_ms": 978.057
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 185,
+      "theme": 20,
+      "time_ns": 161413763351649,
+      "since_theme_publication_ms": 1022.823
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 185,
+      "theme": 20,
+      "time_ns": 161413787339117,
+      "since_theme_publication_ms": 1046.81
+    },
+    {
+      "actor": "terminal-ui",
+      "snapshot": 186,
+      "theme": 20,
+      "time_ns": 161413816495671,
+      "since_theme_publication_ms": 1075.967
+    }
+  ],
+  "idle_status_application_revision": 1,
+  "light_dark_rmse": 0.919147,
+  "superseded_commits": 0,
+  "inflight_invalidations": 13
+}

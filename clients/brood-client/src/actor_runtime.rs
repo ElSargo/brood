@@ -56,6 +56,7 @@ struct PresentationActorSpec {
 }
 
 pub struct PresentationWasmRuntime {
+    theme: brood_graphics::theme::ThemeSnapshot,
     executor: tokio::runtime::Runtime,
     io_executor: tokio::runtime::Runtime,
     snapshot_reclaimer: Arc<BackgroundSnapshotReclaimer>,
@@ -374,6 +375,40 @@ enum StopDisposition {
 }
 
 impl PresentationWasmRuntime {
+    pub fn set_theme(&mut self, theme: brood_graphics::theme::ThemeSnapshot) -> Result<()> {
+        theme.validate().map_err(anyhow::Error::msg)?;
+        for actor in self.actors.values() {
+            if let Some(facets) = &actor.facets {
+                let mut facets = facets
+                    .lock()
+                    .map_err(|poison| anyhow::anyhow!("facet coordinator poisoned: {poison}"))?;
+                eprintln!(
+                    "THEME_RENDER_DEMAND revision={} actor_generation={} inflight={} pending_native={} time_ns={}",
+                    theme.revision,
+                    actor.actor.generation(),
+                    facets.coordinator.is_render_inflight(),
+                    facets.coordinator.awaits_native_commit(),
+                    brood_profiler::monotonic_ns()
+                );
+                facets.coordinator.discard_pending_render()?;
+                facets.prepared = None;
+                facets.retire_render_opportunity(actor.actor.generation());
+            }
+        }
+        eprintln!(
+            "THEME_PUBLISHED revision={} name={} actors={} time_ns={}",
+            theme.revision,
+            theme.name,
+            self.actors.len(),
+            brood_profiler::monotonic_ns()
+        );
+        self.theme = theme;
+        if let Some(proxy) = &self.event_proxy {
+            drop(proxy.send_event(ClientEvent::RenderSchedulingChanged));
+        }
+        Ok(())
+    }
+
     pub fn start(
         actor_specs: &[String],
         init_actor: Option<&Path>,
@@ -416,6 +451,7 @@ impl PresentationWasmRuntime {
             }
         });
         let mut runtime = Self {
+            theme: brood_theme::ThemeLoader::default().load("ashen", 1)?,
             executor,
             io_executor,
             snapshot_reclaimer: Arc::new(BackgroundSnapshotReclaimer::new(
@@ -2967,10 +3003,10 @@ impl PresentationWasmRuntime {
             candidate: hint.token.0,
             target_time_ns: hint.target_presentation_time_ns,
             cutoff_ns: hint.submission_deadline_ns,
-            configuration: Vec::new(),
+            configuration: self.theme.encode().map_err(anyhow::Error::msg)?,
             pane_membership_revision: 1,
             geometry_revision,
-            host_configuration_revision: 1,
+            host_configuration_revision: self.theme.revision,
             renderer_generation,
             interaction_revision: 1,
             test_delay_completion,

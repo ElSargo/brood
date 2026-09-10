@@ -1,6 +1,7 @@
+use brood_graphics::theme::ThemeSnapshot;
 use std::{collections::VecDeque, sync::Mutex};
 
-use brood_graphics::{Color, Command as DrawCommand, Packet, Rect, theme::ashen};
+use brood_graphics::{Color, Command as DrawCommand, Packet, Rect};
 #[cfg(not(feature = "pure-renderer"))]
 use brood_plugin_sdk::bindings;
 #[cfg(not(feature = "pure-renderer"))]
@@ -27,19 +28,6 @@ const MAX_DETAIL_CHARS: usize = 160;
 const CLOSE_TARGET: usize = usize::MAX;
 const SHOW_MESSAGE: &[u8] = br#"{"kind":"inbox-action","action":"show"}"#;
 const TOGGLE_MESSAGE: &[u8] = br#"{"kind":"inbox-action","action":"toggle"}"#;
-
-const BG: Color = ashen::BACKGROUND;
-const SURFACE: Color = ashen::SURFACE;
-const SURFACE_RAISED: Color = ashen::SURFACE_RAISED;
-const HOVER: Color = ashen::INTERACTIVE_HOVER;
-const PRESSED: Color = ashen::INTERACTIVE_PRESSED;
-const BORDER: Color = ashen::BORDER;
-const TEXT: Color = ashen::TEXT_STRONG;
-const FG: Color = ashen::TEXT;
-const MUTED: Color = ashen::MUTED;
-const ACCENT: Color = ashen::ACCENT;
-const INFO: Color = ashen::INFO;
-const ERROR: Color = ashen::ERROR;
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
@@ -630,25 +618,29 @@ fn redraw(state: &mut InboxState, resize_epoch: Option<u64>) -> Result<(), Strin
         return Ok(());
     }
     let mut frame = UiFrame::new(state.pane);
-    let packet = render_packet(state, &mut frame)?;
+    let packet = render_packet(&ThemeSnapshot::default(), state, &mut frame)?;
     frame.queue(resize_epoch, &packet, &mut state.text_resources)?;
     state.error.clear();
     Ok(())
 }
 
-fn render_packet(state: &InboxState, sink: &mut impl InboxTextSink) -> Result<Packet, String> {
+fn render_packet(
+    theme: &ThemeSnapshot,
+    state: &InboxState,
+    sink: &mut impl InboxTextSink,
+) -> Result<Packet, String> {
     let mut packet = Packet::new();
     packet.push(DrawCommand::FillRect {
         rect: Rect::new(0.0, 0.0, state.width, state.height),
-        color: BG,
+        color: theme.bg("ui.background"),
     });
     packet.push(DrawCommand::FillRect {
         rect: Rect::new(0.0, 0.0, state.width, HEADER_HEIGHT),
-        color: SURFACE,
+        color: theme.bg("ui.statusline"),
     });
     packet.push(DrawCommand::FillRect {
         rect: Rect::new(0.0, HEADER_HEIGHT - 1.0, state.width, 1.0),
-        color: BORDER,
+        color: theme.fg("ui.window"),
     });
     add_text(
         state.pane,
@@ -656,7 +648,7 @@ fn render_packet(state: &InboxState, sink: &mut impl InboxTextSink) -> Result<Pa
         sink,
         "Inbox",
         17.0,
-        TEXT,
+        theme.fg("ui.text"),
         14.0,
         12.0,
         state.width - 80.0,
@@ -667,7 +659,7 @@ fn render_packet(state: &InboxState, sink: &mut impl InboxTextSink) -> Result<Pa
         sink,
         &state.items.len().to_string(),
         12.0,
-        ACCENT,
+        theme.fg("ui.text.focus"),
         state.width - 70.0,
         15.0,
         28.0,
@@ -679,11 +671,11 @@ fn render_packet(state: &InboxState, sink: &mut impl InboxTextSink) -> Result<Pa
         "×",
         18.0,
         if state.pressed == Some(CLOSE_TARGET) {
-            TEXT
+            theme.fg("ui.text")
         } else if state.hovered == Some(CLOSE_TARGET) {
-            ACCENT
+            theme.fg("ui.text.focus")
         } else {
-            MUTED
+            theme.fg("ui.text.inactive")
         },
         state.width - 30.0,
         11.0,
@@ -697,7 +689,7 @@ fn render_packet(state: &InboxState, sink: &mut impl InboxTextSink) -> Result<Pa
             sink,
             "No notifications",
             14.0,
-            MUTED,
+            theme.fg("ui.text.inactive"),
             14.0,
             68.0,
             state.width - 28.0,
@@ -720,16 +712,20 @@ fn render_packet(state: &InboxState, sink: &mut impl InboxTextSink) -> Result<Pa
                 rect: Rect::new(8.0, y + 7.0, state.width - 16.0, ITEM_HEIGHT - 12.0),
                 radius: 5.0,
                 color: if pressed {
-                    PRESSED
+                    theme.bg("ui.selection")
                 } else if hovered || selected {
-                    HOVER
+                    theme.bg("ui.menu.selected")
                 } else {
-                    SURFACE_RAISED
+                    theme.bg("ui.menu")
                 },
             });
             packet.push(DrawCommand::FillRect {
                 rect: Rect::new(8.0, y + 7.0, 3.0, ITEM_HEIGHT - 12.0),
-                color: if item.failed { ERROR } else { INFO },
+                color: if item.failed {
+                    theme.fg("error")
+                } else {
+                    theme.fg("info")
+                },
             });
             let category = if item.category.is_empty() {
                 "update"
@@ -742,7 +738,11 @@ fn render_packet(state: &InboxState, sink: &mut impl InboxTextSink) -> Result<Pa
                 sink,
                 category,
                 10.0,
-                if item.failed { ERROR } else { ACCENT },
+                if item.failed {
+                    theme.fg("error")
+                } else {
+                    theme.fg("ui.text.focus")
+                },
                 18.0,
                 y + 11.0,
                 state.width - 36.0,
@@ -754,7 +754,7 @@ fn render_packet(state: &InboxState, sink: &mut impl InboxTextSink) -> Result<Pa
                     sink,
                     if pressed { "Opening…" } else { "Open  ›" },
                     10.0,
-                    ACCENT,
+                    theme.fg("ui.text.focus"),
                     (state.width - 74.0).max(18.0),
                     y + 11.0,
                     58.0,
@@ -766,7 +766,11 @@ fn render_packet(state: &InboxState, sink: &mut impl InboxTextSink) -> Result<Pa
                 sink,
                 &truncate(&item.title, state.width, 13.0),
                 13.0,
-                FG,
+                theme.fg(if hovered || selected {
+                    "ui.menu.selected"
+                } else {
+                    "ui.text"
+                }),
                 18.0,
                 y + 27.0,
                 state.width - 36.0,
@@ -777,7 +781,7 @@ fn render_packet(state: &InboxState, sink: &mut impl InboxTextSink) -> Result<Pa
                 sink,
                 &truncate(&item.detail, state.width, 11.0),
                 11.0,
-                MUTED,
+                theme.fg("ui.text.inactive"),
                 18.0,
                 y + 45.0,
                 state.width - 36.0,
@@ -791,7 +795,7 @@ fn render_packet(state: &InboxState, sink: &mut impl InboxTextSink) -> Result<Pa
             sink,
             &one_line(&state.error, 80),
             10.0,
-            ERROR,
+            theme.fg("error"),
             12.0,
             state.height - 20.0,
             state.width - 24.0,
@@ -958,6 +962,7 @@ impl Facets for InboxPlugin {
             },
         )
         .expect("valid inbox render request");
+        let theme = ThemeSnapshot::decode(&request.configuration).expect("valid theme snapshot");
         let view: InboxRenderView =
             serde_json::from_slice(&request.application_view).expect("valid inbox view");
         let sequence: InteractionState =
@@ -986,7 +991,8 @@ impl Facets for InboxPlugin {
                 });
                 let mut sink = brood_plugin_sdk::graphics::TextLayoutCache::new(pane.pane);
                 sink.begin_frame();
-                let packet = render_packet(&state, &mut sink).expect("bounded inbox render");
+                let packet =
+                    render_packet(&theme, &state, &mut sink).expect("bounded inbox render");
                 let mut regions = vec![InteractionRegion {
                     rect: [state.width - 42.0, 0.0, 42.0, HEADER_HEIGHT],
                     target: InboxTarget::Close,
