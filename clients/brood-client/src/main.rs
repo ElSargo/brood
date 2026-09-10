@@ -80,6 +80,7 @@ mod plugin_graphics;
 mod pointer_policy;
 mod remote;
 pub mod render_scheduler;
+mod themes;
 
 const COMPUTER_USE_OBSERVER_ACTOR: &str = "computer-use-observer";
 const COMPUTER_USE_SERVER_ACTOR: &str = "computer-use";
@@ -625,7 +626,7 @@ pub fn run_cli() -> Result<()> {
         None
     } else {
         let mut server = ServerLaunch::discover()?;
-        server.config = Some(config_path);
+        server.config = Some(config_path.clone());
         if let Some(executable) = args.server.clone() {
             server.executable = executable;
         }
@@ -1008,7 +1009,10 @@ pub fn run_cli() -> Result<()> {
     for backend in backend_registry.connected_backend_ids() {
         wasm_runtime.connect_backend(backend);
     }
+    let theme = themes::watch(config_path, event_proxy.clone())?;
+    wasm_runtime.set_theme(theme.clone())?;
     let mut application = Application {
+        theme,
         wasm_runtime: Some(wasm_runtime),
         key_policy: Some(key_policy),
         pointer_policy: Some(pointer_policy),
@@ -1275,6 +1279,7 @@ pub fn run_cli() -> Result<()> {
 
 #[derive(Debug)]
 enum ClientEvent {
+    ThemeChanged(brood_graphics::theme::ThemeSnapshot),
     SceneFrame {
         backend: BackendId,
         connection_generation: u64,
@@ -5206,6 +5211,7 @@ const fn client_event_callback_kind(event: &ClientEvent) -> &'static str {
         ClientEvent::PluginActorFrameChanged { .. } => "PluginActorFrameChanged",
         ClientEvent::PluginRendererReplayRequested { .. } => "PluginRendererReplayRequested",
         ClientEvent::PluginContentReused { .. } => "PluginContentReused",
+        ClientEvent::ThemeChanged(..) => "ThemeChanged",
         ClientEvent::RenderSchedulingChanged => "RenderSchedulingChanged",
         ClientEvent::EventLoopDeadlineReached { .. } => "EventLoopDeadlineReached",
         ClientEvent::GraphicsPreparationCapacityAvailable => "GraphicsPreparationCapacityAvailable",
@@ -5348,6 +5354,7 @@ const fn window_event_callback_kind(event: &WindowEvent) -> &'static str {
 
 #[derive(Default)]
 struct Application {
+    theme: brood_graphics::theme::ThemeSnapshot,
     renderer: Option<Renderer>,
     complaint_store: ComplaintStore,
     complaint_editor_open: bool,
@@ -6959,7 +6966,7 @@ impl Application {
                     "plugin renderer replay reached scene transport path"
                 ));
             }
-            ClientEvent::RenderSchedulingChanged => {
+            ClientEvent::ThemeChanged(..) | ClientEvent::RenderSchedulingChanged => {
                 return Err(anyhow!(
                     "render scheduling event reached scene transport path"
                 ));
@@ -11393,6 +11400,7 @@ impl Application {
                 .map_or(CursorRole::Default, |zone| zone.cursor);
             replacement.set_zone_pointer_state(None, Some(capture.zone), cursor);
         }
+        replacement.set_theme(&self.theme)?;
         self.renderer = Some(replacement);
         // Renderer-only recovery keeps the same Window and monitor cadence.
         // Preserve the trained predictor unless the monitor refresh changed;
@@ -11510,7 +11518,11 @@ impl ApplicationHandler<ClientEvent> for Application {
             });
 
         match result {
-            Ok(renderer) => {
+            Ok(mut renderer) => {
+                if let Err(error) = renderer.set_theme(&self.theme) {
+                    self.fail(event_loop, error);
+                    return;
+                }
                 match WaylandDropBridge::new(renderer.window.as_ref(), move |drop_event| {
                     drop(proxy.send_event(ClientEvent::WaylandDroppedFile(drop_event)));
                 }) {
@@ -12138,6 +12150,22 @@ impl ApplicationHandler<ClientEvent> for Application {
                         event_loop,
                         anyhow!("resume prepared plugin scene after event-loop close"),
                     );
+                }
+            }
+            ClientEvent::ThemeChanged(theme) => {
+                let result = (|| -> Result<()> {
+                    if let Some(runtime) = &mut self.wasm_runtime {
+                        runtime.set_theme(theme.clone())?;
+                    }
+                    if let Some(renderer) = &mut self.renderer {
+                        renderer.set_theme(&theme)?;
+                        renderer.window.request_redraw();
+                    }
+                    self.theme = theme;
+                    self.service_plugin_render_scheduler()
+                })();
+                if let Err(error) = result {
+                    self.fail(event_loop, error);
                 }
             }
             ClientEvent::RenderSchedulingChanged => {
@@ -14897,6 +14925,8 @@ fn take_for_renderer_recovery<T, S>(
 }
 
 struct Renderer {
+    theme_previous_visible: BTreeMap<u64, u64>,
+    theme: brood_graphics::theme::ThemeSnapshot,
     generation: u64,
     window: Arc<Window>,
     surface: wgpu::Surface<'static>,
@@ -17422,6 +17452,7 @@ fn create_automation_lock_overlay(
     queue: &wgpu::Queue,
     layout: &wgpu::BindGroupLayout,
     sampler: &wgpu::Sampler,
+    text_color: brood_graphics::Color,
 ) -> Result<AutomationLockOverlay> {
     const TEXT: &str = "press esc to unlock";
     const SCALE: u32 = 3;
@@ -17448,7 +17479,12 @@ fn create_automation_lock_overlay(
                         rgba.put_pixel(
                             origin_x + column * SCALE + dx,
                             origin_y + dy,
-                            image::Rgba([245, 245, 245, 245]),
+                            image::Rgba([
+                                (text_color.r * 255.0).round() as u8,
+                                (text_color.g * 255.0).round() as u8,
+                                (text_color.b * 255.0).round() as u8,
+                                255,
+                            ]),
                         );
                     }
                 }
@@ -17677,6 +17713,14 @@ fn create_placeholder_pipeline(
     })
 }
 
+fn theme_linear(value: f32) -> f32 {
+    if value <= 0.04045 {
+        value / 12.92
+    } else {
+        ((value + 0.055) / 1.055).powf(2.4)
+    }
+}
+
 fn create_solid_pipeline(
     device: &wgpu::Device,
     target_format: wgpu::TextureFormat,
@@ -17886,6 +17930,8 @@ impl Renderer {
             &mut self.pending_managed_resource_releases,
         );
         let Self {
+            theme_previous_visible: _,
+            theme: _,
             generation: _,
             window: _,
             surface: _,
@@ -18215,6 +18261,7 @@ impl Renderer {
             &queue,
             &frame_bind_group_layout,
             &frame_sampler,
+            brood_graphics::theme::ashen::TEXT,
         )?;
         let plugin_canvas =
             GpuCanvasRenderer::new(&device, &queue, &frame_bind_group_layout, &frame_sampler);
@@ -18231,6 +18278,8 @@ impl Renderer {
         );
         tracing::info!("configured divider resize mode={divider_resize_mode:?}");
         Ok(Self {
+            theme_previous_visible: BTreeMap::new(),
+            theme: brood_graphics::theme::ThemeSnapshot::default(),
             generation,
             window,
             surface,
@@ -19763,6 +19812,7 @@ impl Renderer {
                 && receipt
                     .with_graphics(|graphics| {
                         graphics.token().renderer_generation == self.generation
+                            && graphics.token().host_configuration_revision == self.theme.revision
                             && graphics.panes().count() == frame.scenes.len()
                             && graphics.panes().all(|(pane, pair)| {
                                 frame.scenes.get(pane).is_some_and(|scene| {
@@ -20355,6 +20405,7 @@ impl Renderer {
                 && receipt
                     .with_graphics(|graphics| {
                         graphics.token().renderer_generation == self.generation
+                            && graphics.token().host_configuration_revision == self.theme.revision
                             && graphics.panes().count() == changes.len()
                             && graphics.panes().all(|(pane, pair)| {
                                 changes
@@ -20923,7 +20974,91 @@ impl Renderer {
         self.window.request_redraw();
     }
 
+    fn set_theme(&mut self, theme: &brood_graphics::theme::ThemeSnapshot) -> Result<()> {
+        self.theme_previous_visible = self
+            .layout_paint_targets()
+            .into_iter()
+            .filter_map(|target| {
+                let LayoutPaintTarget::Pane(pane) = target else {
+                    return None;
+                };
+                self.plugin_panes
+                    .get(&pane)
+                    .map(|plugin| (pane, plugin.scene.sequence))
+            })
+            .collect();
+        let rgba = |color: brood_graphics::Color| {
+            [
+                theme_linear(color.r),
+                theme_linear(color.g),
+                theme_linear(color.b),
+                color.a,
+            ]
+        };
+        self.divider_pipeline = create_solid_pipeline(
+            &self.device,
+            self.config.format,
+            "native divider",
+            rgba(theme.fg("ui.window")),
+        );
+        self.divider_hover_pipeline = create_solid_pipeline(
+            &self.device,
+            self.config.format,
+            "hovered native divider",
+            rgba(theme.fg("ui.text.focus")),
+        );
+        self.divider_active_pipeline = create_solid_pipeline(
+            &self.device,
+            self.config.format,
+            "captured native divider",
+            rgba(theme.fg("ui.cursor")),
+        );
+        self.placeholder_pipeline = create_solid_pipeline(
+            &self.device,
+            self.config.format,
+            "theme placeholder",
+            rgba(theme.bg("ui.background")),
+        );
+        self.automation_border_pipeline = create_translucent_solid_pipeline(
+            &self.device,
+            self.config.format,
+            "computer-use border",
+            rgba(theme.fg("info").with_alpha(0.58)),
+        );
+        self.automation_scrim_pipeline = create_translucent_solid_pipeline(
+            &self.device,
+            self.config.format,
+            "computer-use lock scrim",
+            rgba(theme.bg("ui.background").with_alpha(0.80)),
+        );
+        self.automation_cursor_pipeline = create_translucent_solid_pipeline(
+            &self.device,
+            self.config.format,
+            "computer-use cursor",
+            rgba(theme.fg("ui.text.focus").with_alpha(0.95)),
+        );
+        self.automation_lock_overlay = create_automation_lock_overlay(
+            &self.device,
+            &self.queue,
+            &self.frame_bind_group_layout,
+            &self.frame_sampler,
+            theme.fg("ui.text"),
+        )?;
+        self.theme = theme.clone();
+        Ok(())
+    }
+
     fn render(&mut self, on_composed: impl FnOnce(Instant)) -> RenderOutcome {
+        let visible: BTreeSet<_> = self
+            .layout_paint_targets()
+            .into_iter()
+            .filter_map(|target| match target {
+                LayoutPaintTarget::Pane(pane) => Some(pane),
+                LayoutPaintTarget::Divider(_) => None,
+            })
+            .collect();
+        self.theme_previous_visible
+            .retain(|pane, _| visible.contains(pane));
         let _profile_span = brood_profiler::profile_span!("frame", "cpu_render_and_present");
         let started = Instant::now();
         let geometry_invariant = self.render_geometry_invariant();
@@ -20993,9 +21128,9 @@ impl Renderer {
                     depth_slice: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(Color {
-                            r: 0.04,
-                            g: 0.05,
-                            b: 0.07,
+                            r: f64::from(theme_linear(self.theme.bg("ui.background").r)),
+                            g: f64::from(theme_linear(self.theme.bg("ui.background").g)),
+                            b: f64::from(theme_linear(self.theme.bg("ui.background").b)),
                             a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
@@ -21042,6 +21177,20 @@ impl Renderer {
                         continue;
                     };
                     if let Some(plugin) = self.plugin_panes.get(&pane) {
+                        // Old output may remain displayed through a switch, but a
+                        // hidden pane must not expose an old theme for a frame.
+                        if plugin
+                            .scene
+                            .replay_snapshot()
+                            .and_then(|snapshot| snapshot.facet_frame_lease.as_ref())
+                            .is_some_and(|frame| {
+                                frame.token().host_configuration_revision != self.theme.revision
+                            })
+                            && self.theme_previous_visible.get(&pane)
+                                != Some(&plugin.scene.sequence)
+                        {
+                            continue;
+                        }
                         let Some(rect) = clip_rect_to_extent(plugin.rect, extent) else {
                             continue;
                         };

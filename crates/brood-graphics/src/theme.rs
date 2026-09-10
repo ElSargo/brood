@@ -82,3 +82,225 @@ pub mod ashen {
         )
     }
 }
+
+/// Resolved Helix style. `None` means inherit the corresponding base field.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RoleStyle {
+    pub fg: Option<u32>,
+    pub bg: Option<u32>,
+    pub modifiers: Option<u16>,
+    pub underline_color: Option<u32>,
+    pub underline_style: Option<UnderlineStyle>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum UnderlineStyle {
+    Line,
+    Curl,
+    Dashed,
+    Dotted,
+    DoubleLine,
+}
+
+impl RoleStyle {
+    #[must_use]
+    pub fn over(self, base: Self) -> Self {
+        Self {
+            fg: self.fg.or(base.fg),
+            bg: self.bg.or(base.bg),
+            modifiers: match (self.modifiers, base.modifiers) {
+                (Some(a), Some(b)) => Some(a | b),
+                (a, b) => a.or(b),
+            },
+            underline_color: self.underline_color.or(base.underline_color),
+            underline_style: self.underline_style.or(base.underline_style),
+        }
+    }
+}
+
+/// Explicit immutable render configuration, bounded independently of application data.
+/// Palette identifiers never cross this interface.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ThemeSnapshot {
+    pub revision: u64,
+    pub name: String,
+    pub roles: std::collections::BTreeMap<String, RoleStyle>,
+}
+
+pub const MAX_THEME_BYTES: usize = 256 * 1024;
+pub const MAX_THEME_ROLES: usize = 2048;
+pub const BOLD: u16 = 1;
+pub const DIM: u16 = 2;
+pub const ITALIC: u16 = 4;
+pub const SLOW_BLINK: u16 = 8;
+pub const RAPID_BLINK: u16 = 16;
+pub const REVERSED: u16 = 32;
+pub const HIDDEN: u16 = 64;
+pub const CROSSED_OUT: u16 = 128;
+
+impl Default for ThemeSnapshot {
+    fn default() -> Self {
+        Self {
+            revision: 1,
+            name: "default".into(),
+            roles: std::collections::BTreeMap::from([
+                (
+                    "ui.text".into(),
+                    RoleStyle {
+                        fg: Some(ashen::TEXT_RGB),
+                        ..RoleStyle::default()
+                    },
+                ),
+                (
+                    "ui.background".into(),
+                    RoleStyle {
+                        bg: Some(ashen::BACKGROUND_RGB),
+                        ..RoleStyle::default()
+                    },
+                ),
+            ]),
+        }
+    }
+}
+
+impl ThemeSnapshot {
+    /// Longest dot-delimited scope match; a present partial style is not filled
+    /// from its parent. Call `over` to compose it with an application base.
+    #[must_use]
+    pub fn style(&self, mut scope: &str) -> RoleStyle {
+        loop {
+            if let Some(style) = self.roles.get(scope) {
+                return *style;
+            }
+            let Some((parent, _)) = scope.rsplit_once('.') else {
+                return RoleStyle::default();
+            };
+            scope = parent;
+        }
+    }
+
+    #[must_use]
+    pub fn fg(&self, scope: &str) -> Color {
+        rgb_color(
+            self.style(scope)
+                .fg
+                .or_else(|| self.style("ui.text").fg)
+                .unwrap_or(ashen::TEXT_RGB),
+        )
+    }
+    #[must_use]
+    pub fn bg(&self, scope: &str) -> Color {
+        rgb_color(
+            self.style(scope)
+                .bg
+                .or_else(|| self.style("ui.background").bg)
+                .unwrap_or(ashen::BACKGROUND_RGB),
+        )
+    }
+    pub fn encode(&self) -> Result<Vec<u8>, String> {
+        self.validate()?;
+        let bytes = serde_json::to_vec(self).map_err(|e| e.to_string())?;
+        if bytes.len() > MAX_THEME_BYTES {
+            return Err("theme configuration exceeds byte limit".into());
+        }
+        Ok(bytes)
+    }
+    pub fn decode(bytes: &[u8]) -> Result<Self, String> {
+        // Empty configuration is the legacy facet caller's default.
+        if bytes.is_empty() {
+            return Ok(Self::default());
+        }
+        if bytes.len() > MAX_THEME_BYTES {
+            return Err("theme configuration exceeds byte limit".into());
+        }
+        let snapshot: Self = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+    pub fn validate(&self) -> Result<(), String> {
+        if self.revision == 0 || self.name.len() > 256 || self.roles.len() > MAX_THEME_ROLES {
+            return Err("invalid theme revision, name or role count".into());
+        }
+        for (scope, style) in &self.roles {
+            if scope.is_empty()
+                || scope.len() > 256
+                || [style.fg, style.bg, style.underline_color]
+                    .into_iter()
+                    .flatten()
+                    .any(|rgb| rgb > 0xff_ffff)
+                || style.modifiers.is_some_and(|bits| bits > 255)
+            {
+                return Err(format!("invalid theme role {scope:?}"));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[must_use]
+pub const fn rgb_color(rgb: u32) -> Color {
+    let [_, red, green, blue] = rgb.to_be_bytes();
+    Color::rgba(
+        red as f32 / 255.0,
+        green as f32 / 255.0,
+        blue as f32 / 255.0,
+        1.0,
+    )
+}
+
+/// Terminal snapshot colors reserve the high byte for semantic defaults.
+/// Indexed colors retain the terminal's explicit ANSI policy; RGB is unchanged.
+pub const TERMINAL_DEFAULT_FG: u32 = 0x0100_0000;
+pub const TERMINAL_DEFAULT_BG: u32 = 0x0200_0000;
+impl ThemeSnapshot {
+    #[must_use]
+    pub fn terminal_color(&self, value: u32) -> Color {
+        match value {
+            TERMINAL_DEFAULT_FG => self.fg("ui.text"),
+            TERMINAL_DEFAULT_BG => self.bg("ui.background"),
+            rgb => rgb_color(rgb),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_defaults_are_distinct_from_matching_truecolor() {
+        let mut light = ThemeSnapshot::default();
+        light.roles.insert(
+            "ui.text".into(),
+            RoleStyle {
+                fg: Some(0x0012_3456),
+                ..RoleStyle::default()
+            },
+        );
+        assert_eq!(
+            light.terminal_color(TERMINAL_DEFAULT_FG),
+            rgb_color(0x0012_3456)
+        );
+        assert_eq!(light.terminal_color(ashen::TEXT_RGB), ashen::TEXT);
+        assert_eq!(light.terminal_color(0x00fe_dcba), rgb_color(0x00fe_dcba));
+    }
+
+    #[test]
+    fn snapshot_bounds_and_omitted_fields_are_preserved() {
+        let mut theme = ThemeSnapshot::default();
+        theme.roles.insert(
+            "ui.text.focus".into(),
+            RoleStyle {
+                modifiers: Some(BOLD),
+                ..RoleStyle::default()
+            },
+        );
+        assert_eq!(theme.style("ui.text.focus.child").fg, None);
+        assert_eq!(theme.style("ui.text.other").fg, Some(ashen::TEXT_RGB));
+        let bytes = theme.encode().unwrap();
+        assert_eq!(ThemeSnapshot::decode(&bytes).unwrap(), theme);
+        theme.revision = 0;
+        assert!(theme.encode().is_err());
+        assert!(ThemeSnapshot::decode(&vec![0; MAX_THEME_BYTES + 1]).is_err());
+    }
+}

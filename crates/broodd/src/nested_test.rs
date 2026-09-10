@@ -8,6 +8,7 @@ pub fn run(args: TestArgs) -> Result<()> {
         .command
         .unwrap_or_else(|| TestCommand::Nested(NestedTestArgs::default()))
     {
+        TestCommand::Themes(args) => run_themes(args),
         TestCommand::Packages(args) => run_packages(args),
         TestCommand::Knowledge(args) => run_knowledge(args),
         TestCommand::ComputerUse(args) => run_computer_use(args),
@@ -226,6 +227,29 @@ fn run_packages(args: NestedTestArgs) -> Result<()> {
         .context("run package lifecycle proof")?;
     if !status.success() {
         bail!("package lifecycle proof exited with {status}");
+    }
+    Ok(())
+}
+
+fn run_themes(args: NestedTestArgs) -> Result<()> {
+    let root = find_checkout_root()?;
+    let mut command = Command::new("bash");
+    command
+        .arg(root.join("tools/test-session-switcher-plugin-nested.sh"))
+        .current_dir(&root)
+        .env("BROOD_THEMES_ONLY", "1")
+        .env("BROOD_EMPTY_STARTUP_ONLY", "1")
+        .env(
+            "BROOD_TEST_FACET_RENDER_COMPLETION_DELAY",
+            "session-switcher=120",
+        )
+        .env("BROOD_TEST_FACET_DELAY_ALL_RENDERS", "1");
+    if let Some(out) = args.out_dir {
+        command.env("BROOD_SESSION_SWITCHER_OUT", out);
+    }
+    let status = command.status().context("run offscreen theme proof")?;
+    if !status.success() {
+        bail!("theme proof exited with {status}");
     }
     Ok(())
 }

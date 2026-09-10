@@ -349,6 +349,7 @@ impl Drop for UiFrame {
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct TextLayoutKey {
+    modifiers: u16,
     text: String,
     font_size: u32,
     max_width: u32,
@@ -359,6 +360,7 @@ struct TextLayoutKey {
 impl TextLayoutKey {
     fn new(text: &str, font_size: f32, max_width: f32, line_height: f32, color: Color) -> Self {
         Self {
+            modifiers: 0,
             text: text.to_owned(),
             font_size: font_size.to_bits(),
             max_width: max_width.max(1.0).to_bits(),
@@ -387,6 +389,104 @@ pub struct TextLayoutCache {
 }
 
 impl TextLayoutCache {
+    /// Draw a composed Helix role style. Blink is static; curl/dash/dot
+    /// underlines use a single rule until the canvas has a native text decoration.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "a role label needs its full placement"
+    )]
+    pub fn draw_role_text_clipped(
+        &mut self,
+        packet: &mut Packet,
+        theme: &brood_graphics::theme::ThemeSnapshot,
+        scope: &str,
+        text: &str,
+        font_size: f32,
+        max_width: f32,
+        line_height: f32,
+        x: f32,
+        y: f32,
+    ) -> Result<host::TextLayoutResult, String> {
+        use brood_graphics::theme::{self, RoleStyle};
+        let style = theme
+            .style(scope)
+            .over(theme.style("ui.text"))
+            .over(RoleStyle {
+                fg: Some(theme::ashen::TEXT_RGB),
+                bg: Some(
+                    theme
+                        .style("ui.background")
+                        .bg
+                        .unwrap_or(theme::ashen::BACKGROUND_RGB),
+                ),
+                ..RoleStyle::default()
+            });
+        let modifiers = style.modifiers.unwrap_or(0);
+        let mut fg = theme::rgb_color(style.fg.unwrap_or(theme::ashen::TEXT_RGB));
+        let mut bg = theme::rgb_color(style.bg.unwrap_or(theme::ashen::BACKGROUND_RGB));
+        if modifiers & theme::REVERSED != 0 {
+            std::mem::swap(&mut fg, &mut bg);
+        }
+        if modifiers & theme::DIM != 0 {
+            fg.a = 0.6;
+        }
+        if modifiers & theme::HIDDEN != 0 {
+            fg.a = 0.0;
+        }
+        let mut key = TextLayoutKey::new(text, font_size, 4096.0, line_height, fg);
+        key.modifiers = modifiers & (theme::BOLD | theme::ITALIC);
+        self.used.insert(key.clone());
+        let layout = if let Some(layout) = self.layouts.get(&key) {
+            *layout
+        } else {
+            let mut options = ui_text_options(font_size, 4096.0, line_height, fg);
+            if modifiers & theme::BOLD != 0 {
+                options.font_weight = host::FontWeight::Bold;
+            }
+            if modifiers & theme::ITALIC != 0 {
+                options.font_style = host::FontStyle::Italic;
+            }
+            let layout = host::graphics_layout_text(self.pane, text, options)
+                .map_err(|error| format!("layout role text: {error:?}"))?;
+            self.layouts.insert(key.clone(), layout);
+            self.created.insert(key);
+            layout
+        };
+        if theme.style(scope).bg.is_some() || modifiers & theme::REVERSED != 0 {
+            packet.push(Command::FillRect {
+                rect: Rect::new(x, y, max_width, line_height),
+                color: bg,
+            });
+        }
+        draw_layout_clipped(packet, layout.handle, x, y, max_width, line_height);
+        let decoration = theme::rgb_color(
+            style
+                .underline_color
+                .or(style.fg)
+                .unwrap_or(theme::ashen::TEXT_RGB),
+        )
+        .with_alpha(fg.a);
+        if style.underline_style.is_some() {
+            packet.push(Command::FillRect {
+                rect: Rect::new(x, y + line_height - 2.0, max_width, 1.0),
+                color: decoration,
+            });
+            if style.underline_style == Some(theme::UnderlineStyle::DoubleLine) {
+                packet.push(Command::FillRect {
+                    rect: Rect::new(x, y + line_height - 4.0, max_width, 1.0),
+                    color: decoration,
+                });
+            }
+        }
+        if modifiers & theme::CROSSED_OUT != 0 {
+            packet.push(Command::FillRect {
+                rect: Rect::new(x, line_height.mul_add(0.5, y), max_width, 1.0),
+                color: fg,
+            });
+        }
+        Ok(layout)
+    }
+
     #[must_use]
     pub const fn new(pane: u64) -> Self {
         Self {

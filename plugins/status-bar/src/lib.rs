@@ -1,6 +1,8 @@
 use std::{collections::BTreeMap, sync::Mutex};
 
-use brood_graphics::{Color, Command, Packet, Rect, theme::ashen};
+#[cfg(not(feature = "pure-renderer"))]
+use brood_graphics::{Color, theme::ashen};
+use brood_graphics::{Command, Packet, Rect};
 #[cfg(not(feature = "pure-renderer"))]
 use brood_plugin_sdk::bindings;
 use brood_plugin_sdk::exports::brood::plugin::actor::{
@@ -16,8 +18,11 @@ use serde::{Deserialize, Serialize};
 const STATUS_BAR_ACTOR_ID: &str = "status-bar";
 const SHELL_ACTOR_ID: &str = "session-switcher";
 
+#[cfg(not(feature = "pure-renderer"))]
 const SURFACE: Color = ashen::SURFACE;
+#[cfg(not(feature = "pure-renderer"))]
 const BORDER: Color = ashen::BORDER;
+#[cfg(not(feature = "pure-renderer"))]
 const TEXT: Color = ashen::TEXT;
 
 #[derive(Clone, Default, Deserialize, Serialize)]
@@ -321,6 +326,8 @@ impl Facets for StatusBar {
             },
         )
         .expect("valid status render request");
+        let theme = brood_graphics::theme::ThemeSnapshot::decode(&request.configuration)
+            .expect("valid theme snapshot");
         let view: StatusRenderView =
             serde_json::from_slice(&request.application_view).expect("valid status render view");
         let panes = request
@@ -332,21 +339,22 @@ impl Facets for StatusBar {
                 let mut packet = Packet::new();
                 packet.push(Command::FillRect {
                     rect: Rect::new(0.0, 0.0, width, height),
-                    color: SURFACE,
+                    color: theme.bg("ui.statusline"),
                 });
                 packet.push(Command::FillRect {
                     rect: Rect::new(0.0, 0.0, width, 1.0),
-                    color: BORDER,
+                    color: theme.fg("ui.window"),
                 });
                 let mut text = brood_plugin_sdk::graphics::TextLayoutCache::new(pane.pane);
                 text.begin_frame();
-                text.draw_text_clipped(
+                text.draw_role_text_clipped(
                     &mut packet,
+                    &theme,
+                    "ui.statusline",
                     &status_bar_text_parts(&view.backends, &view.notice, width),
                     12.0,
                     width - 24.0,
                     16.0,
-                    TEXT,
                     12.0,
                     ((height - 16.0) * 0.5).max(3.0),
                 )

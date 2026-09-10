@@ -1,8 +1,9 @@
+use brood_graphics::theme::ThemeSnapshot;
 #[cfg(not(feature = "pure-renderer"))]
 use brood_plugin_sdk::graphics::reuse_pane_content;
 use std::sync::Mutex;
 
-use brood_graphics::{Color, Command, Packet, Rect, theme::ashen};
+use brood_graphics::{Color, Command, Packet, Rect};
 #[cfg(not(feature = "pure-renderer"))]
 use brood_plugin_sdk::bindings;
 #[cfg(feature = "pure-renderer")]
@@ -33,23 +34,6 @@ const SCROLLBAR_THUMB_WIDTH: f32 = 5.0;
 const REFRESH_BUTTON_WIDTH: f32 = 94.0;
 const MAX_DIFF_BYTES: usize = 900 * 1024;
 const MAX_UNTRACKED_FILES: usize = 128;
-
-const BG: Color = ashen::BACKGROUND;
-const SURFACE: Color = ashen::SURFACE;
-const HOVER: Color = ashen::INTERACTIVE_HOVER;
-const PRESSED: Color = ashen::INTERACTIVE_PRESSED;
-const ACTIVE: Color = ashen::CURSOR_LINE;
-const BORDER: Color = ashen::BORDER;
-const FG: Color = ashen::TEXT;
-const TEXT: Color = ashen::TEXT_STRONG;
-const MUTED: Color = ashen::MUTED;
-const LINE_NUMBER: Color = ashen::SUBTLE;
-const ADDED: Color = ashen::DIFF_ADDED;
-const DELETED: Color = ashen::DIFF_DELETED;
-const MODIFIED: Color = ashen::DIFF_MODIFIED;
-const ADDED_BG: Color = ashen::DIFF_ADDED_BG;
-const DELETED_BG: Color = ashen::DIFF_DELETED_BG;
-const EMPTY_BG: Color = ashen::DIFF_EMPTY_BG;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 enum ChangeKind {
@@ -543,10 +527,18 @@ fn build_packet(
     text_cache: &mut TextLayoutCache,
 ) -> Result<Packet, String> {
     let content_height = view.document.rows.iter().map(DisplayRow::height).sum();
-    build_packet_window(view, geometry, text_cache, content_height, 0.0)
+    build_packet_window(
+        &ThemeSnapshot::default(),
+        view,
+        geometry,
+        text_cache,
+        content_height,
+        0.0,
+    )
 }
 
 fn build_packet_window(
+    theme: &ThemeSnapshot,
     view: &RenderView,
     geometry: (f32, f32),
     text_cache: &mut TextLayoutCache,
@@ -574,22 +566,22 @@ fn build_packet_window(
     text_cache.begin_frame();
     packet.push(Command::FillRect {
         rect: Rect::new(0.0, 0.0, state.width, state.height),
-        color: BG,
+        color: theme.bg("ui.background"),
     });
     packet.push(Command::FillRect {
         rect: Rect::new(0.0, 0.0, state.width, HEADER_HEIGHT),
-        color: SURFACE,
+        color: theme.bg("ui.statusline"),
     });
     packet.push(Command::FillRect {
         rect: Rect::new(0.0, HEADER_HEIGHT - 1.0, state.width, 1.0),
-        color: BORDER,
+        color: theme.fg("ui.window"),
     });
     add_text(
         &mut packet,
         text_cache,
         "Project Diff",
         17.0,
-        TEXT,
+        theme.fg("ui.text"),
         16.0,
         14.0,
         180.0,
@@ -609,7 +601,11 @@ fn build_packet_window(
             text_cache,
             &summary,
             13.0,
-            if state.loading { MODIFIED } else { MUTED },
+            if state.loading {
+                theme.fg("diff.delta")
+            } else {
+                theme.fg("ui.text.inactive")
+            },
             142.0,
             17.0,
             refresh_rect.x - 154.0,
@@ -619,13 +615,13 @@ fn build_packet_window(
         rect: refresh_rect,
         radius: 5.0,
         color: if state.loading {
-            ACTIVE
+            theme.bg("ui.cursorline.primary")
         } else if state.refresh_pressed {
-            PRESSED
+            theme.bg("ui.selection")
         } else if state.refresh_hovered {
-            HOVER
+            theme.bg("ui.menu.selected")
         } else {
-            ashen::SURFACE_RAISED
+            theme.bg("ui.menu.selected")
         },
     });
     add_text(
@@ -637,7 +633,11 @@ fn build_packet_window(
             "↻  Refresh"
         },
         12.0,
-        if state.loading { MUTED } else { FG },
+        if state.loading {
+            theme.fg("ui.text.inactive")
+        } else {
+            theme.fg("ui.text")
+        },
         refresh_rect.x + 10.0,
         refresh_rect.y + if state.refresh_pressed { 8.0 } else { 7.0 },
         refresh_rect.width - 20.0,
@@ -660,14 +660,23 @@ fn build_packet_window(
             1.0,
             content_bottom - content_top,
         ),
-        color: BORDER,
+        color: theme.fg("ui.window"),
     });
 
     let mut y = content_top + row_origin - state.scroll;
     for row in &state.document.rows {
         let height = row.height();
         if y + height >= content_top && y <= content_bottom {
-            draw_row(&state, &mut packet, text_cache, row, y, height, split_x)?;
+            draw_row(
+                theme,
+                &state,
+                &mut packet,
+                text_cache,
+                row,
+                y,
+                height,
+                split_x,
+            )?;
         }
         y += height;
         if y > content_bottom {
@@ -686,7 +695,11 @@ fn build_packet_window(
                 "Working tree clean"
             },
             19.0,
-            if state.loading { MUTED } else { ADDED },
+            if state.loading {
+                theme.fg("ui.text.inactive")
+            } else {
+                theme.fg("diff.plus")
+            },
             24.0,
             HEADER_HEIGHT + 26.0,
             state.width - 48.0,
@@ -700,7 +713,7 @@ fn build_packet_window(
                 "No tracked or untracked changes to show."
             },
             13.0,
-            MUTED,
+            theme.fg("ui.text.inactive"),
             24.0,
             HEADER_HEIGHT + 58.0,
             state.width - 48.0,
@@ -710,14 +723,14 @@ fn build_packet_window(
         packet.push(Command::FillRoundedRect {
             rect: Rect::new(18.0, HEADER_HEIGHT + 18.0, state.width - 36.0, 92.0),
             radius: 7.0,
-            color: DELETED_BG,
+            color: theme.fg("diff.minus").with_alpha(0.16),
         });
         add_text(
             &mut packet,
             text_cache,
             "Could not load project diff",
             17.0,
-            DELETED,
+            theme.fg("diff.minus"),
             30.0,
             HEADER_HEIGHT + 30.0,
             state.width - 60.0,
@@ -727,14 +740,14 @@ fn build_packet_window(
             text_cache,
             &one_line(error, 180),
             13.0,
-            FG,
+            theme.fg("ui.text"),
             30.0,
             HEADER_HEIGHT + 61.0,
             state.width - 60.0,
         )?;
     }
 
-    draw_scrollbar_for_content(&state, content_height, &mut packet);
+    draw_scrollbar_for_content(theme, &state, content_height, &mut packet);
     packet.push(Command::FillRect {
         rect: Rect::new(
             0.0,
@@ -742,7 +755,7 @@ fn build_packet_window(
             state.width,
             FOOTER_HEIGHT,
         ),
-        color: SURFACE,
+        color: theme.bg("ui.statusline"),
     });
     let footer = if state.document.truncated && state.width < 480.0 {
         "Diff capped at 900 KiB"
@@ -758,7 +771,7 @@ fn build_packet_window(
         text_cache,
         footer,
         11.0,
-        MUTED,
+        theme.fg("ui.text.inactive"),
         14.0,
         state.height - 21.0,
         state.width - 28.0,
@@ -768,6 +781,7 @@ fn build_packet_window(
 }
 
 fn draw_row(
+    theme: &ThemeSnapshot,
     state: &ViewerState,
     packet: &mut Packet,
     text_cache: &mut TextLayoutCache,
@@ -784,18 +798,18 @@ fn draw_row(
         } => {
             packet.push(Command::FillRect {
                 rect: Rect::new(0.0, y, state.width, height),
-                color: SURFACE,
+                color: theme.bg("ui.statusline"),
             });
             packet.push(Command::FillRect {
                 rect: Rect::new(0.0, y + height - 1.0, state.width, 1.0),
-                color: BORDER,
+                color: theme.fg("ui.window"),
             });
             add_text(
                 packet,
                 text_cache,
                 &one_line(path, 160),
                 14.0,
-                TEXT,
+                theme.fg("ui.text"),
                 14.0,
                 y + 8.0,
                 state.width - 160.0,
@@ -805,7 +819,7 @@ fn draw_row(
                 text_cache,
                 &format!("+{additions}  −{deletions}"),
                 12.0,
-                MUTED,
+                theme.fg("ui.text.inactive"),
                 (state.width - 118.0).max(180.0),
                 y + 9.0,
                 104.0,
@@ -814,14 +828,19 @@ fn draw_row(
         DisplayRow::Hunk(header) => {
             packet.push(Command::FillRect {
                 rect: Rect::new(0.0, y, state.width, height),
-                color: Color::rgba(ACTIVE.r, ACTIVE.g, ACTIVE.b, 0.58),
+                color: Color::rgba(
+                    theme.bg("ui.cursorline.primary").r,
+                    theme.bg("ui.cursorline.primary").g,
+                    theme.bg("ui.cursorline.primary").b,
+                    0.58,
+                ),
             });
             add_text(
                 packet,
                 text_cache,
                 &one_line(header, 180),
                 12.0,
-                MUTED,
+                theme.fg("ui.text.inactive"),
                 14.0,
                 y + 7.0,
                 state.width - 28.0,
@@ -839,32 +858,50 @@ fn draw_row(
             if *kind == ChangeKind::Changed {
                 packet.push(Command::FillRect {
                     rect: Rect::new(0.0, y, left_width, height),
-                    color: if left.is_some() { DELETED_BG } else { EMPTY_BG },
+                    color: if left.is_some() {
+                        theme.fg("diff.minus").with_alpha(0.16)
+                    } else {
+                        theme.bg("ui.background")
+                    },
                 });
                 packet.push(Command::FillRect {
                     rect: Rect::new(split_x, y, right_width, height),
-                    color: if right.is_some() { ADDED_BG } else { EMPTY_BG },
+                    color: if right.is_some() {
+                        theme.fg("diff.plus").with_alpha(0.16)
+                    } else {
+                        theme.bg("ui.background")
+                    },
                 });
                 if left.is_some() {
                     packet.push(Command::FillRect {
                         rect: Rect::new(0.0, y, 3.0, height),
-                        color: DELETED,
+                        color: theme.fg("diff.minus"),
                     });
                 }
                 if right.is_some() {
                     packet.push(Command::FillRect {
                         rect: Rect::new(split_x, y, 3.0, height),
-                        color: ADDED,
+                        color: theme.fg("diff.plus"),
                     });
                 }
             }
             packet.push(Command::FillRect {
                 rect: Rect::new(GUTTER_WIDTH - 1.0, y, 1.0, height),
-                color: Color::rgba(BORDER.r, BORDER.g, BORDER.b, 0.38),
+                color: Color::rgba(
+                    theme.fg("ui.window").r,
+                    theme.fg("ui.window").g,
+                    theme.fg("ui.window").b,
+                    0.38,
+                ),
             });
             packet.push(Command::FillRect {
                 rect: Rect::new(split_x + GUTTER_WIDTH - 1.0, y, 1.0, height),
-                color: Color::rgba(BORDER.r, BORDER.g, BORDER.b, 0.38),
+                color: Color::rgba(
+                    theme.fg("ui.window").r,
+                    theme.fg("ui.window").g,
+                    theme.fg("ui.window").b,
+                    0.38,
+                ),
             });
             if let Some(line) = old_line {
                 add_text(
@@ -872,7 +909,7 @@ fn draw_row(
                     text_cache,
                     &line.to_string(),
                     11.0,
-                    LINE_NUMBER,
+                    theme.fg("ui.linenr"),
                     8.0,
                     y + 5.0,
                     GUTTER_WIDTH - 14.0,
@@ -884,7 +921,7 @@ fn draw_row(
                     text_cache,
                     &line.to_string(),
                     11.0,
-                    LINE_NUMBER,
+                    theme.fg("ui.linenr"),
                     split_x + 8.0,
                     y + 5.0,
                     GUTTER_WIDTH - 14.0,
@@ -898,7 +935,7 @@ fn draw_row(
                     text_cache,
                     &one_line(&expand_tabs(text), left_chars),
                     12.0,
-                    FG,
+                    theme.fg("ui.text"),
                     GUTTER_WIDTH + 7.0,
                     y + 4.0,
                     left_width - GUTTER_WIDTH - 12.0,
@@ -910,7 +947,7 @@ fn draw_row(
                     text_cache,
                     &one_line(&expand_tabs(text), right_chars),
                     12.0,
-                    FG,
+                    theme.fg("ui.text"),
                     split_x + GUTTER_WIDTH + 7.0,
                     y + 4.0,
                     right_width - GUTTER_WIDTH - 12.0,
@@ -923,11 +960,16 @@ fn draw_row(
 }
 
 #[cfg_attr(feature = "pure-renderer", allow(dead_code))]
-fn draw_scrollbar(state: &ViewerState, packet: &mut Packet) {
-    draw_scrollbar_for_content(state, state.content_height(), packet);
+fn draw_scrollbar(theme: &ThemeSnapshot, state: &ViewerState, packet: &mut Packet) {
+    draw_scrollbar_for_content(theme, state, state.content_height(), packet);
 }
 
-fn draw_scrollbar_for_content(state: &ViewerState, content_height: f32, packet: &mut Packet) {
+fn draw_scrollbar_for_content(
+    theme: &ThemeSnapshot,
+    state: &ViewerState,
+    content_height: f32,
+    packet: &mut Packet,
+) {
     let Some(geometry) = scrollbar_geometry_for_content(state, content_height) else {
         return;
     };
@@ -941,9 +983,9 @@ fn draw_scrollbar_for_content(state: &ViewerState, content_height: f32, packet: 
         ),
         radius: SCROLLBAR_THUMB_WIDTH * 0.5,
         color: Color::rgba(
-            FG.r,
-            FG.g,
-            FG.b,
+            theme.fg("ui.text").r,
+            theme.fg("ui.text").g,
+            theme.fg("ui.text").b,
             if dragging {
                 0.82
             } else if state.scrollbar_hovered {

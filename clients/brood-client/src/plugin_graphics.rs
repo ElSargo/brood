@@ -716,6 +716,7 @@ fn promote_actor_frame_in_state(
                 (
                     graphics.token().candidate,
                     graphics.token().snapshot_revision,
+                    graphics.token().host_configuration_revision,
                 )
             })
             .ok();
@@ -729,13 +730,15 @@ fn promote_actor_frame_in_state(
         };
         replace_facet_target(state, &frame.actor, next_frame_ns);
         tracing::info!(
-            "facet native pair committed route=ordinary actor={} generation={} native_revision={} candidate={} snapshot={} pane_count={} panes={promoted_panes:?}",
+            "facet native pair committed route=ordinary actor={} generation={} native_revision={} candidate={} snapshot={} theme_revision={} pane_count={} panes={promoted_panes:?} time_ns={}",
             frame.actor.name,
             frame.actor.generation,
             revision,
             candidate.map_or(0, |identity| identity.0),
             candidate.map_or(0, |identity| identity.1),
+            candidate.map_or(0, |identity| identity.2),
             promoted_panes.len(),
+            brood_profiler::monotonic_ns(),
         );
     }
     let actor = frame.actor.clone();
@@ -1026,6 +1029,7 @@ fn deferred_actor_frame_resolution_plan_in_state(
                     (
                         graphics.token().candidate,
                         graphics.token().snapshot_revision,
+                        graphics.token().host_configuration_revision,
                     )
                 })
                 .ok();
@@ -1038,14 +1042,16 @@ fn deferred_actor_frame_resolution_plan_in_state(
             replace_facet_target(state, &frame.actor, next_frame_ns);
             let panes = frame.scenes.keys().copied().collect::<BTreeSet<_>>();
             tracing::info!(
-                "facet native pair committed route=synchronized actor={} generation={} native_revision={} candidate={} snapshot={} resize_epoch={} pane_count={} panes={panes:?}",
+                "facet native pair committed route=synchronized actor={} generation={} native_revision={} candidate={} snapshot={} theme_revision={} resize_epoch={} pane_count={} panes={panes:?} time_ns={}",
                 frame.actor.name,
                 frame.actor.generation,
                 revision,
                 candidate.map_or(0, |identity| identity.0),
                 candidate.map_or(0, |identity| identity.1),
+                candidate.map_or(0, |identity| identity.2),
                 resize_epoch,
                 panes.len(),
+                brood_profiler::monotonic_ns(),
             );
         }
         let mut members = BTreeMap::new();

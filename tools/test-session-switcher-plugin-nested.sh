@@ -505,6 +505,11 @@ capture() {
   [[ -s "$target" ]]
 }
 
+if [[ "${BROOD_THEMES_ONLY:-0}" == 1 ]]; then
+  source "$ROOT/tools/test-themes-live.sh"
+  exit 0
+fi
+
 # The drag matrix reuses the production shell setup and offscreen compositor,
 # but supplies continuous pointer gestures instead of the sequential smoke flow.
 if [[ "${BROOD_PLUGIN_DRAG_TEST:-0}" == 1 ]]; then

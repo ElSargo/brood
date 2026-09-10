@@ -240,6 +240,7 @@ impl Facets for CodingAgentPlugin {
     fn render(input: Vec<u8>) -> Vec<u8> {
         let request = facet_codec::decode_render_request(&input, decode_limits(input.len()))
             .expect("coding-agent render request");
+        let theme = ThemeSnapshot::decode(&request.configuration).expect("valid theme snapshot");
         let view: View =
             serde_json::from_slice(&request.application_view).expect("coding-agent view");
         let sequence: Sequence =
@@ -281,7 +282,7 @@ impl Facets for CodingAgentPlugin {
                 }
                 let mut cache = TextLayoutCache::new(pane.pane);
                 cache.begin_frame();
-                let packet = build_ui_packet(&mut ui, &mut cache);
+                let packet = build_ui_packet(&theme, &mut ui, &mut cache);
                 if let Some(error) = ui.draw_error.take() {
                     panic!("coding-agent rendering: {error}");
                 }

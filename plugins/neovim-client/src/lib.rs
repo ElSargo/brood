@@ -1,3 +1,4 @@
+use brood_graphics::theme::ThemeSnapshot;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     sync::Mutex,
@@ -1538,7 +1539,7 @@ fn redraw_with_layouts(
         status: &state.status,
         runner_ready: state.runner_ready,
     };
-    let (packet, used) = build_screen_packet(&render, layouts)?;
+    let (packet, used) = build_screen_packet(&ThemeSnapshot::default(), &render, layouts)?;
     queue_packet_for_resize(state.pane, resize_epoch, &packet)
         .map_err(|error| format!("submit Neovim screen: {error}"))?;
     let stale = layouts
@@ -1560,6 +1561,7 @@ fn redraw_with_layouts(
 }
 
 fn build_screen_packet(
+    theme: &ThemeSnapshot,
     state: &RenderState<'_>,
     layouts: &mut BTreeMap<LayoutKey, u64>,
 ) -> Result<(Packet, BTreeSet<u64>), String> {
@@ -1567,7 +1569,7 @@ fn build_screen_packet(
     let mut used = BTreeSet::new();
     packet.push(DrawCommand::FillRect {
         rect: Rect::new(0.0, 0.0, state.width, state.height),
-        color: ashen::BACKGROUND,
+        color: theme.bg("ui.background"),
     });
     packet.push(DrawCommand::Save);
     packet.push(DrawCommand::ClipRect(Rect::new(
@@ -1587,7 +1589,7 @@ fn build_screen_packet(
         if !overlay.is_empty() {
             packet.push(DrawCommand::FillRect {
                 rect: Rect::new(0.0, overlay_y, state.width, state.line_height),
-                color: ashen::SURFACE,
+                color: theme.bg("ui.statusline"),
             });
         }
         if screen.cursor_visible {
@@ -1596,9 +1598,14 @@ fn build_screen_packet(
             packet.push(DrawCommand::FillRect {
                 rect: Rect::new(x, y, state.cell_width.max(1.0), state.line_height.max(1.0)),
                 color: if state.focused {
-                    Color::rgba(ashen::ACCENT.r, ashen::ACCENT.g, ashen::ACCENT.b, 0.58)
+                    Color::rgba(
+                        theme.fg("ui.text.focus").r,
+                        theme.fg("ui.text.focus").g,
+                        theme.fg("ui.text.focus").b,
+                        0.58,
+                    )
                 } else {
-                    ashen::BORDER
+                    theme.fg("ui.window")
                 },
             });
         }
@@ -1615,7 +1622,7 @@ fn build_screen_packet(
                 layouts,
                 &mut used,
                 text,
-                ashen::TEXT_RGB,
+                theme.style("ui.text").fg.unwrap_or(ashen::TEXT_RGB),
                 PADDING,
                 PADDING + row as f32 * state.line_height,
                 (state.width - PADDING * 2.0).max(state.cell_width),
@@ -1647,9 +1654,9 @@ fn build_screen_packet(
             &mut used,
             heading,
             if state.error.is_some() {
-                ashen::ERROR_RGB
+                theme.style("error").fg.unwrap_or(ashen::ERROR_RGB)
             } else {
-                ashen::TEXT_RGB
+                theme.style("ui.text").fg.unwrap_or(ashen::TEXT_RGB)
             },
             20.0,
             20.0,
@@ -1676,7 +1683,7 @@ fn build_screen_packet(
         let height = state.line_height + 8.0;
         packet.push(DrawCommand::FillRect {
             rect: Rect::new(0.0, (state.height - height).max(0.0), state.width, height),
-            color: ashen::DANGER,
+            color: theme.fg("error"),
         });
         add_text(
             state.pane,

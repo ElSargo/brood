@@ -46,10 +46,10 @@ const MAX_SCROLLBACK: usize = 2_000;
 const MAX_SNAPSHOT_BODY: usize = 12 * 1024;
 const BULK_OUTPUT_CHUNK_BYTES: usize = 4 * 1024;
 const SNAPSHOT_MAGIC: &[u8; 4] = b"BTRM";
-const SNAPSHOT_VERSION: u8 = 4;
+const SNAPSHOT_VERSION: u8 = 5;
 const SNAPSHOT_FULL: u8 = 1;
-const DEFAULT_FG: u32 = ashen::TEXT_RGB;
-const DEFAULT_BG: u32 = ashen::BACKGROUND_RGB;
+const DEFAULT_FG: u32 = brood_graphics::theme::TERMINAL_DEFAULT_FG;
+const DEFAULT_BG: u32 = brood_graphics::theme::TERMINAL_DEFAULT_BG;
 const SHELL_INTEGRATION: &str =
     r#"PS1='$(code=$?; printf "\033]777;brood-inbox;%s\007" "$code")$ '; export PS1; exec sh -i"#;
 

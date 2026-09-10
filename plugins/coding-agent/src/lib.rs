@@ -1,9 +1,10 @@
+use brood_graphics::theme::ThemeSnapshot;
 use std::{
     collections::{BTreeMap, VecDeque},
     sync::Mutex,
 };
 
-use brood_graphics::{Color, Command, Packet, Rect, theme::ashen};
+use brood_graphics::{Color, Command, Packet, Rect};
 use brood_plugin_sdk::{
     actor::{send_local, send_presentation, send_session, start_global_actor, start_session_actor},
     brood::plugin::host,
@@ -45,22 +46,6 @@ const IMAGE_TRAY_GAP: f32 = 8.0;
 const MOD_CTRL: u32 = 1;
 const MOD_SHIFT: u32 = 4;
 const FOCUS_MESSAGE: &[u8] = br#"{"kind":"focus"}"#;
-
-const BG: Color = ashen::BACKGROUND;
-const PANEL: Color = ashen::SURFACE;
-const PANEL_LIGHT: Color = ashen::SURFACE_RAISED;
-const HOVER: Color = ashen::INTERACTIVE_HOVER;
-const PRESSED: Color = ashen::INTERACTIVE_PRESSED;
-const FG: Color = ashen::TEXT;
-const MUTED: Color = ashen::MUTED;
-const YELLOW: Color = ashen::WARNING;
-const BLUE: Color = ashen::ACCENT;
-const GREEN: Color = ashen::INFO;
-const RED: Color = ashen::ERROR;
-const STRONG: Color = ashen::TEXT_STRONG;
-const BRIGHT: Color = ashen::TEXT_BRIGHT;
-const SUNKEN: Color = ashen::SURFACE_SUNKEN;
-const ACCENT_MUTED: Color = ashen::ACCENT_MUTED;
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
@@ -2415,7 +2400,7 @@ fn redraw_ui_for_resize(ui: &mut UiState, resize_epoch: Option<u64>) {
         .unwrap_or_else(|| TextLayoutCache::new(ui.pane));
     text_cache.set_pane(ui.pane);
     text_cache.begin_frame();
-    let packet = build_ui_packet(ui, &mut text_cache);
+    let packet = build_ui_packet(&ThemeSnapshot::default(), ui, &mut text_cache);
     let submitted = if let Some(error) = ui.draw_error.take() {
         text_cache.abort_frame();
         Err(error)
@@ -2434,25 +2419,34 @@ fn redraw_ui_for_resize(ui: &mut UiState, resize_epoch: Option<u64>) {
     ui.text_cache = Some(text_cache);
 }
 
-fn build_ui_packet(ui: &mut UiState, text_cache: &mut TextLayoutCache) -> Packet {
+fn build_ui_packet(
+    theme: &ThemeSnapshot,
+    ui: &mut UiState,
+    text_cache: &mut TextLayoutCache,
+) -> Packet {
     ui.draw_error = None;
     let mut packet = Packet::new();
     packet.push(Command::FillRect {
         rect: Rect::new(0.0, 0.0, ui.width, ui.height),
-        color: BG,
+        color: theme.bg("ui.background"),
     });
-    draw_agent_tabs(ui, text_cache, &mut packet);
-    draw_toolbar(ui, text_cache, &mut packet);
-    draw_search(ui, text_cache, &mut packet);
-    draw_transcript(ui, text_cache, &mut packet);
-    draw_prompt(ui, text_cache, &mut packet);
+    draw_agent_tabs(theme, ui, text_cache, &mut packet);
+    draw_toolbar(theme, ui, text_cache, &mut packet);
+    draw_search(theme, ui, text_cache, &mut packet);
+    draw_transcript(theme, ui, text_cache, &mut packet);
+    draw_prompt(theme, ui, text_cache, &mut packet);
     packet
 }
 
-fn draw_agent_tabs(ui: &mut UiState, text_cache: &mut TextLayoutCache, packet: &mut Packet) {
+fn draw_agent_tabs(
+    theme: &ThemeSnapshot,
+    ui: &mut UiState,
+    text_cache: &mut TextLayoutCache,
+    packet: &mut Packet,
+) {
     packet.push(Command::FillRect {
         rect: Rect::new(0.0, 0.0, ui.width, 40.0),
-        color: SUNKEN,
+        color: theme.bg("ui.background"),
     });
     let agents = ui.agents.clone();
     for (index, agent) in agents.iter().enumerate() {
@@ -2464,13 +2458,13 @@ fn draw_agent_tabs(ui: &mut UiState, text_cache: &mut TextLayoutCache, packet: &
             rect,
             radius: 4.0,
             color: if pressed {
-                PRESSED
+                theme.bg("ui.selection")
             } else if hovered {
-                HOVER
+                theme.bg("ui.menu.selected")
             } else if index == ui.selected {
-                PANEL_LIGHT
+                theme.bg("ui.menu.selected")
             } else {
-                SUNKEN
+                theme.bg("ui.background")
             },
         });
         if index == ui.selected {
@@ -2482,7 +2476,7 @@ fn draw_agent_tabs(ui: &mut UiState, text_cache: &mut TextLayoutCache, packet: &
                     3.0,
                 ),
                 radius: 1.5,
-                color: BLUE,
+                color: theme.fg("ui.text.focus"),
             });
         }
         draw_text(
@@ -2494,10 +2488,15 @@ fn draw_agent_tabs(ui: &mut UiState, text_cache: &mut TextLayoutCache, packet: &
             if pressed { 12.0 } else { 11.0 },
             13.0,
             (rect.width - 14.0).max(24.0),
-            if index == ui.selected { BRIGHT } else { FG },
+            if index == ui.selected {
+                theme.fg("ui.text.focus")
+            } else {
+                theme.fg("ui.text")
+            },
         );
     }
     draw_header_icon_button(
+        theme,
         ui,
         text_cache,
         packet,
@@ -2506,6 +2505,7 @@ fn draw_agent_tabs(ui: &mut UiState, text_cache: &mut TextLayoutCache, packet: &
         "⌕",
     );
     draw_header_icon_button(
+        theme,
         ui,
         text_cache,
         packet,
@@ -2516,6 +2516,7 @@ fn draw_agent_tabs(ui: &mut UiState, text_cache: &mut TextLayoutCache, packet: &
 }
 
 fn draw_header_icon_button(
+    theme: &ThemeSnapshot,
     ui: &mut UiState,
     text_cache: &mut TextLayoutCache,
     packet: &mut Packet,
@@ -2530,11 +2531,11 @@ fn draw_header_icon_button(
         rect,
         radius: 4.0,
         color: if pressed {
-            PRESSED
+            theme.bg("ui.selection")
         } else if hovered || active {
-            HOVER
+            theme.bg("ui.menu.selected")
         } else {
-            SUNKEN
+            theme.bg("ui.background")
         },
     });
     draw_text(
@@ -2546,11 +2547,20 @@ fn draw_header_icon_button(
         rect.y + 5.0,
         16.0,
         18.0,
-        if active { BLUE } else { FG },
+        if active {
+            theme.fg("ui.text.focus")
+        } else {
+            theme.fg("ui.text")
+        },
     );
 }
 
-fn draw_toolbar(ui: &mut UiState, text_cache: &mut TextLayoutCache, packet: &mut Packet) {
+fn draw_toolbar(
+    theme: &ThemeSnapshot,
+    ui: &mut UiState,
+    text_cache: &mut TextLayoutCache,
+    packet: &mut Packet,
+) {
     let (status, model, reasoning) = ui
         .selected_agent()
         .and_then(|agent| ui.views.get(agent))
@@ -2572,11 +2582,11 @@ fn draw_toolbar(ui: &mut UiState, text_cache: &mut TextLayoutCache, packet: &mut
         );
     packet.push(Command::FillRect {
         rect: Rect::new(0.0, 40.0, ui.width, 36.0),
-        color: PANEL,
+        color: theme.bg("ui.menu"),
     });
     packet.push(Command::FillRect {
         rect: Rect::new(0.0, HEADER_HEIGHT - 1.0, ui.width, 1.0),
-        color: ashen::SUBTLE,
+        color: theme.fg("ui.window"),
     });
     let (model_rect, reasoning_rect) = toolbar_control_rects(ui.width);
     draw_text(
@@ -2589,34 +2599,37 @@ fn draw_toolbar(ui: &mut UiState, text_cache: &mut TextLayoutCache, packet: &mut
         12.0,
         (model_rect.x - 22.0).max(70.0),
         if status == "running" {
-            GREEN
+            theme.fg("info")
         } else if status.starts_with("failed") {
-            RED
+            theme.fg("error")
         } else {
-            MUTED
+            theme.fg("ui.text.inactive")
         },
     );
     draw_toolbar_button(
+        theme,
         ui,
         text_cache,
         packet,
         UiTarget::Model,
         model_rect,
         &format!("{model}  ·  model"),
-        BLUE,
+        theme.fg("ui.text.focus"),
     );
     draw_toolbar_button(
+        theme,
         ui,
         text_cache,
         packet,
         UiTarget::Reasoning,
         reasoning_rect,
         &format!("{reasoning}  ·  effort"),
-        YELLOW,
+        theme.fg("ui.text.focus"),
     );
 }
 
 fn draw_toolbar_button(
+    theme: &ThemeSnapshot,
     ui: &mut UiState,
     text_cache: &mut TextLayoutCache,
     packet: &mut Packet,
@@ -2631,11 +2644,11 @@ fn draw_toolbar_button(
         rect,
         radius: 4.0,
         color: if pressed {
-            PRESSED
+            theme.bg("ui.selection")
         } else if hovered {
-            HOVER
+            theme.bg("ui.menu.selected")
         } else {
-            PANEL
+            theme.bg("ui.menu")
         },
     });
     draw_text(
@@ -2650,7 +2663,7 @@ fn draw_toolbar_button(
         if ui.selected_agent().is_some() {
             label_color
         } else {
-            MUTED
+            theme.fg("ui.text.inactive")
         },
     );
 }
@@ -2689,7 +2702,12 @@ struct PreparedCard {
     matched: bool,
 }
 
-fn draw_search(ui: &mut UiState, text_cache: &mut TextLayoutCache, packet: &mut Packet) {
+fn draw_search(
+    theme: &ThemeSnapshot,
+    ui: &mut UiState,
+    text_cache: &mut TextLayoutCache,
+    packet: &mut Packet,
+) {
     if !ui.search_active {
         return;
     }
@@ -2702,12 +2720,12 @@ fn draw_search(ui: &mut UiState, text_cache: &mut TextLayoutCache, packet: &mut 
     packet.push(Command::FillRoundedRect {
         rect,
         radius: 6.0,
-        color: PANEL,
+        color: theme.bg("ui.menu"),
     });
     packet.push(Command::StrokeRoundedRect {
         rect,
         radius: 6.0,
-        color: ACCENT_MUTED,
+        color: theme.fg("ui.text.inactive"),
         width: 1.0,
     });
     let matches = search_matches(ui);
@@ -2726,7 +2744,11 @@ fn draw_search(ui: &mut UiState, text_cache: &mut TextLayoutCache, packet: &mut 
         rect.y + 8.0,
         13.0,
         rect.width - 116.0,
-        if query_empty { MUTED } else { FG },
+        if query_empty {
+            theme.fg("ui.text.inactive")
+        } else {
+            theme.fg("ui.text")
+        },
     );
     draw_text(
         ui,
@@ -2737,7 +2759,7 @@ fn draw_search(ui: &mut UiState, text_cache: &mut TextLayoutCache, packet: &mut 
         rect.y + 7.0,
         15.0,
         16.0,
-        BLUE,
+        theme.fg("ui.text.focus"),
     );
     let counter = if matches.is_empty() {
         "0 results".to_string()
@@ -2757,7 +2779,7 @@ fn draw_search(ui: &mut UiState, text_cache: &mut TextLayoutCache, packet: &mut 
         rect.y + 9.0,
         11.0,
         66.0,
-        MUTED,
+        theme.fg("ui.text.inactive"),
     );
     if ui.pane_focused {
         let prefix = ui.search_query[..ui.search_cursor.min(ui.search_query.len())]
@@ -2766,12 +2788,17 @@ fn draw_search(ui: &mut UiState, text_cache: &mut TextLayoutCache, packet: &mut 
         let cursor_x = (rect.x + 30.0 + prefix * 7.0).min(rect.x + rect.width - 92.0);
         packet.push(Command::FillRect {
             rect: Rect::new(cursor_x, rect.y + 8.0, 1.5, 17.0),
-            color: BLUE,
+            color: theme.fg("ui.text.focus"),
         });
     }
 }
 
-fn draw_transcript(ui: &mut UiState, text_cache: &mut TextLayoutCache, packet: &mut Packet) {
+fn draw_transcript(
+    theme: &ThemeSnapshot,
+    ui: &mut UiState,
+    text_cache: &mut TextLayoutCache,
+    packet: &mut Packet,
+) {
     let lines = ui
         .selected_agent()
         .and_then(|agent| ui.views.get(agent))
@@ -2787,7 +2814,7 @@ fn draw_transcript(ui: &mut UiState, text_cache: &mut TextLayoutCache, packet: &
     let content_width = (viewport.width - 28.0).max(120.0);
     let mut cards = Vec::new();
     for (log_index, line) in lines.iter().enumerate() {
-        let blocks = prepare_markdown_blocks(ui, text_cache, line, content_width - 24.0);
+        let blocks = prepare_markdown_blocks(theme, ui, text_cache, line, content_width - 24.0);
         let height = if line.kind == "status" {
             30.0
         } else {
@@ -2832,6 +2859,7 @@ fn draw_transcript(ui: &mut UiState, text_cache: &mut TextLayoutCache, packet: &
         let y = viewport.y + content_y - ui.transcript_scroll;
         if y + card.height >= viewport.y && y <= viewport.y + viewport.height {
             draw_transcript_card(
+                theme,
                 ui,
                 text_cache,
                 packet,
@@ -2844,13 +2872,14 @@ fn draw_transcript(ui: &mut UiState, text_cache: &mut TextLayoutCache, packet: &
         content_y += card.height + 10.0;
     }
     if cards.is_empty() {
-        draw_empty_transcript(ui, text_cache, packet, viewport);
+        draw_empty_transcript(theme, ui, text_cache, packet, viewport);
     }
     packet.push(Command::Restore);
-    draw_transcript_scrollbar(ui, packet);
+    draw_transcript_scrollbar(theme, ui, packet);
 }
 
 fn prepare_markdown_blocks(
+    theme: &ThemeSnapshot,
     ui: &mut UiState,
     text_cache: &mut TextLayoutCache,
     line: &LogLine,
@@ -2868,16 +2897,16 @@ fn prepare_markdown_blocks(
         .into_iter()
         .map(|block| {
             let (size, color) = match block.kind {
-                MarkdownKind::Heading => (16.0, BRIGHT),
-                MarkdownKind::Code => (12.0, ashen::WARNING),
-                MarkdownKind::Quote => (13.0, MUTED),
-                MarkdownKind::Rule => (10.0, ashen::SUBTLE),
+                MarkdownKind::Heading => (16.0, theme.fg("ui.text.focus")),
+                MarkdownKind::Code => (12.0, theme.fg("warning")),
+                MarkdownKind::Quote => (13.0, theme.fg("ui.text.inactive")),
+                MarkdownKind::Rule => (10.0, theme.fg("ui.window")),
                 _ => (
                     13.5,
                     if line.kind == "error" {
-                        ashen::ERROR_BRIGHT
+                        theme.fg("error")
                     } else {
-                        FG
+                        theme.fg("ui.text")
                     },
                 ),
             };
@@ -2912,6 +2941,7 @@ fn prepare_markdown_blocks(
 }
 
 fn draw_transcript_card(
+    theme: &ThemeSnapshot,
     ui: &mut UiState,
     text_cache: &mut TextLayoutCache,
     packet: &mut Packet,
@@ -2936,15 +2966,23 @@ fn draw_transcript_card(
             y + 6.0,
             11.5,
             width - 20.0,
-            MUTED,
+            theme.fg("ui.text.inactive"),
         );
         return;
     }
     let (background, accent, label) = match card.kind.as_str() {
-        "user" => (PANEL_LIGHT, YELLOW, "YOU"),
-        "tool" => (SUNKEN, BLUE, "TOOL CALL"),
-        "error" => (Color::rgba(0.25, 0.07, 0.07, 0.64), RED, "ERROR"),
-        _ => (PANEL, MUTED, "AGENT"),
+        "user" => (theme.bg("ui.popup"), theme.fg("ui.text.focus"), "YOU"),
+        "tool" => (
+            theme.bg("ui.background"),
+            theme.fg("ui.text.focus"),
+            "TOOL CALL",
+        ),
+        "error" => (
+            theme.fg("error").with_alpha(0.16),
+            theme.fg("error"),
+            "ERROR",
+        ),
+        _ => (theme.bg("ui.menu"), theme.fg("ui.text.inactive"), "AGENT"),
     };
     let rect = Rect::new(x, y, width, card.height);
     packet.push(Command::FillRoundedRect {
@@ -2961,7 +2999,7 @@ fn draw_transcript_card(
         packet.push(Command::StrokeRoundedRect {
             rect,
             radius: 7.0,
-            color: YELLOW,
+            color: theme.fg("ui.text.focus"),
             width: 1.5,
         });
     }
@@ -2987,12 +3025,12 @@ fn draw_transcript_card(
             packet.push(Command::FillRoundedRect {
                 rect: Rect::new(x + 12.0, block_y - 3.0, width - 24.0, block.height + 7.0),
                 radius: 4.0,
-                color: BG,
+                color: theme.bg("ui.background"),
             });
         } else if block.kind == MarkdownKind::Quote {
             packet.push(Command::FillRect {
                 rect: Rect::new(x + 14.0, block_y, 2.0, block.height),
-                color: ACCENT_MUTED,
+                color: theme.fg("ui.text.inactive"),
             });
         }
         draw_text(
@@ -3011,6 +3049,7 @@ fn draw_transcript_card(
 }
 
 fn draw_empty_transcript(
+    theme: &ThemeSnapshot,
     ui: &mut UiState,
     text_cache: &mut TextLayoutCache,
     packet: &mut Packet,
@@ -3025,7 +3064,7 @@ fn draw_empty_transcript(
         viewport.y + viewport.height * 0.38,
         18.0,
         viewport.width - 36.0,
-        STRONG,
+        theme.fg("ui.text"),
     );
     draw_text(
         ui,
@@ -3036,11 +3075,11 @@ fn draw_empty_transcript(
         viewport.y + viewport.height * 0.38 + 30.0,
         13.0,
         viewport.width - 36.0,
-        MUTED,
+        theme.fg("ui.text.inactive"),
     );
 }
 
-fn draw_transcript_scrollbar(ui: &UiState, packet: &mut Packet) {
+fn draw_transcript_scrollbar(theme: &ThemeSnapshot, ui: &UiState, packet: &mut Packet) {
     let Some((_, _, thumb_y, thumb_height)) = scrollbar_geometry(ui) else {
         return;
     };
@@ -3048,9 +3087,9 @@ fn draw_transcript_scrollbar(ui: &UiState, packet: &mut Packet) {
         rect: Rect::new(ui.width - 10.0, thumb_y, SCROLLBAR_WIDTH, thumb_height),
         radius: SCROLLBAR_WIDTH * 0.5,
         color: Color::rgba(
-            FG.r,
-            FG.g,
-            FG.b,
+            theme.fg("ui.text").r,
+            theme.fg("ui.text").g,
+            theme.fg("ui.text").b,
             if ui.scrollbar_drag.is_some() {
                 0.82
             } else if ui.scrollbar_hovered {
@@ -3172,11 +3211,17 @@ fn clean_inline_markdown(text: &str) -> String {
     output
 }
 
-fn draw_prompt(ui: &mut UiState, text_cache: &mut TextLayoutCache, packet: &mut Packet) {
+fn draw_prompt(
+    theme: &ThemeSnapshot,
+    ui: &mut UiState,
+    text_cache: &mut TextLayoutCache,
+    packet: &mut Packet,
+) {
     let rect = prompt_rect(ui);
     let y = rect.y;
     if !ui.images.is_empty() {
         draw_image_tray(
+            theme,
             ui,
             text_cache,
             packet,
@@ -3186,15 +3231,15 @@ fn draw_prompt(ui: &mut UiState, text_cache: &mut TextLayoutCache, packet: &mut 
     packet.push(Command::FillRoundedRect {
         rect,
         radius: 9.0,
-        color: PANEL,
+        color: theme.bg("ui.menu"),
     });
     packet.push(Command::StrokeRoundedRect {
         rect,
         radius: 9.0,
         color: if ui.pane_focused && !ui.search_active {
-            ACCENT_MUTED
+            theme.fg("ui.text.inactive")
         } else {
-            ashen::SUBTLE
+            theme.fg("ui.window")
         },
         width: 1.0,
     });
@@ -3207,7 +3252,7 @@ fn draw_prompt(ui: &mut UiState, text_cache: &mut TextLayoutCache, packet: &mut 
         y + 8.0,
         9.5,
         80.0,
-        MUTED,
+        theme.fg("ui.text.inactive"),
     );
     let editor_width = (rect.width - 122.0).max(120.0);
     let columns = (editor_width / 7.4).max(16.0) as usize;
@@ -3232,7 +3277,7 @@ fn draw_prompt(ui: &mut UiState, text_cache: &mut TextLayoutCache, packet: &mut 
                     19.0,
                 ),
                 radius: 3.0,
-                color: ashen::SELECTION,
+                color: theme.bg("ui.selection"),
             });
         }
         draw_text(
@@ -3244,7 +3289,11 @@ fn draw_prompt(ui: &mut UiState, text_cache: &mut TextLayoutCache, packet: &mut 
             y + 27.0 + row as f32 * 20.0,
             14.0,
             editor_width,
-            if ui.prompt.is_empty() { MUTED } else { FG },
+            if ui.prompt.is_empty() {
+                theme.fg("ui.text.inactive")
+            } else {
+                theme.fg("ui.text")
+            },
         );
     }
     if ui.pane_focused
@@ -3257,7 +3306,7 @@ fn draw_prompt(ui: &mut UiState, text_cache: &mut TextLayoutCache, packet: &mut 
         let cursor_x = (rect.x + 13.0 + column * 7.4).min(rect.x + 13.0 + editor_width);
         packet.push(Command::FillRect {
             rect: Rect::new(cursor_x, y + 26.0 + visible_row * 20.0, 2.0, 19.0),
-            color: YELLOW,
+            color: theme.fg("ui.text.focus"),
         });
     }
     draw_text(
@@ -3269,7 +3318,7 @@ fn draw_prompt(ui: &mut UiState, text_cache: &mut TextLayoutCache, packet: &mut 
         y + rect.height - 17.0,
         9.5,
         (rect.width - 112.0).max(80.0),
-        MUTED,
+        theme.fg("ui.text.inactive"),
     );
     let send_rect = send_button_rect(ui);
     let send_pressed = ui.pressed.as_ref() == Some(&UiTarget::Send);
@@ -3279,13 +3328,13 @@ fn draw_prompt(ui: &mut UiState, text_cache: &mut TextLayoutCache, packet: &mut 
         rect: send_rect,
         radius: 6.0,
         color: if !send_enabled {
-            PANEL_LIGHT
+            theme.fg("ui.window")
         } else if send_pressed {
-            PRESSED
+            theme.bg("ui.selection")
         } else if send_hovered {
-            ashen::ACCENT_GLOW
+            theme.fg("ui.text.focus")
         } else {
-            GREEN
+            theme.fg("info")
         },
     });
     draw_text(
@@ -3297,7 +3346,11 @@ fn draw_prompt(ui: &mut UiState, text_cache: &mut TextLayoutCache, packet: &mut 
         send_rect.y + if send_pressed { 7.0 } else { 6.0 },
         11.5,
         54.0,
-        if send_enabled { PANEL } else { MUTED },
+        if send_enabled {
+            theme.bg("ui.menu")
+        } else {
+            theme.fg("ui.text.inactive")
+        },
     );
     if !ui.error.is_empty() {
         let error_y = if ui.images.is_empty() {
@@ -3314,7 +3367,7 @@ fn draw_prompt(ui: &mut UiState, text_cache: &mut TextLayoutCache, packet: &mut 
             error_y.max(92.0),
             12.0,
             (ui.width - 36.0).max(100.0),
-            RED,
+            theme.fg("error"),
         );
     }
 }
@@ -3367,6 +3420,7 @@ fn wrap_editor_text(text: &str, columns: usize) -> Vec<EditorLine> {
 }
 
 fn draw_image_tray(
+    theme: &ThemeSnapshot,
     ui: &mut UiState,
     text_cache: &mut TextLayoutCache,
     packet: &mut Packet,
@@ -3375,7 +3429,7 @@ fn draw_image_tray(
     packet.push(Command::FillRoundedRect {
         rect: Rect::new(12.0, y, ui.width - 24.0, IMAGE_TRAY_HEIGHT),
         radius: 8.0,
-        color: PANEL,
+        color: theme.bg("ui.menu"),
     });
     let images = ui
         .images
@@ -3392,12 +3446,12 @@ fn draw_image_tray(
         packet.push(Command::FillRoundedRect {
             rect: card,
             radius: 6.0,
-            color: PANEL_LIGHT,
+            color: theme.fg("ui.window"),
         });
         packet.push(Command::StrokeRoundedRect {
             rect: card,
             radius: 6.0,
-            color: HOVER,
+            color: theme.bg("ui.menu.selected"),
             width: 1.0,
         });
         if let Some((handle, width, height)) = ui
@@ -3429,7 +3483,7 @@ fn draw_image_tray(
             card.y + card.height - 18.0,
             11.0,
             (card.width - 12.0).max(1.0),
-            MUTED,
+            theme.fg("ui.text.inactive"),
         );
     }
 }
@@ -4051,6 +4105,7 @@ mod tests {
     #[test]
     fn markdown_parser_builds_semantic_blocks_without_raw_markers() {
         let blocks = parse_markdown(
+            &ThemeSnapshot::default(),
             "# Result\n\n- **first** item\n\n> note\n\n```rust\nlet value = 4;\n```",
         );
         assert_eq!(blocks[0].kind, MarkdownKind::Heading);

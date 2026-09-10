@@ -318,3 +318,36 @@ fn byte_exhaustion_preserves_prior_commit_and_invalidation_refuses_input() -> Re
     ensure!(prior.packet().is_err());
     Ok(())
 }
+
+#[test]
+fn theme_switch_keeps_displayed_input_and_supersedes_idle_application_work() -> Result<()> {
+    let mut h = harness(512)?;
+    commit_draw(&mut h, 1, b"dark", b"dark-input")?;
+    let lease = h.snapshots.acquire_latest()?.context("application view")?;
+    let pending = h.frames.issue(token(1), vec![target(1)], lease.clone())?;
+    let prepared = h
+        .frames
+        .prepare(&draw(pending, 1, b"old-work", b"old-hit"))?;
+    h.frames.discard_pending();
+    ensure!(h.frames.commit(prepared).is_err());
+    ensure!(h.frames.pin_input(1)?.interaction()? == b"dark-input");
+    for revision in 2..8 {
+        let mut next = token(1); // Same application publication throughout.
+        next.host_configuration_revision = revision;
+        let issued = h.frames.issue(next, vec![target(1)], lease.clone())?;
+        let prepared = h
+            .frames
+            .prepare(&draw(issued, 1, b"light", b"light-input"))?;
+        if revision < 7 {
+            h.frames.discard_pending();
+            ensure!(h.frames.commit(prepared).is_err());
+        } else {
+            h.frames.commit(prepared)?;
+        }
+    }
+    let visible = h.frames.pin_input(1)?;
+    ensure!(visible.token().host_configuration_revision == 7);
+    ensure!(visible.token().snapshot_revision == 1);
+    ensure!(visible.interaction()? == b"light-input");
+    Ok(())
+}

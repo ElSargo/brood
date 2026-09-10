@@ -453,6 +453,7 @@ dependencies = [
  "brood-layout",
  "brood-profiler",
  "brood-protocol",
+ "brood-theme",
  "brood-transport",
  "brood-wasm",
  "brood-wayland-drop",
@@ -463,6 +464,7 @@ dependencies = [
  "cosmic-text",
  "image",
  "lyon_tessellation",
+ "notify",
  "num-traits",
  "pollster",
  "quinn",
@@ -472,6 +474,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
  "wayland-client",
@@ -503,6 +506,10 @@ dependencies = [
 [[package]]
 name = "brood-graphics"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "brood-ipc"
@@ -610,6 +617,16 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "brood-theme"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "brood-graphics",
+ "tempfile",
+ "toml",
 ]
 
 [[package]]
