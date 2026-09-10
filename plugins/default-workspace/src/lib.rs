@@ -599,6 +599,7 @@ fn messages_for_action<'a>(
 ) -> &'a [Message<'static>] {
     match action.id {
         "shortcuts.passthrough" => &[Message::ToggleShortcutPassthrough],
+        "theme.picker" => &[Message::ThemePicker],
         "agent.picker" => &[Message::CodingAgentAction("picker")],
         "pane.close" => &[Message::LayoutAction("close-active-pane")],
         "terminal.new" => &[Message::TerminalAction("new")],
@@ -847,6 +848,7 @@ enum Message<'a> {
     SwitchActiveSessionNext,
     CreateAndAttachSession,
     ToggleShortcutPassthrough,
+    ThemePicker,
     SessionSwitcherAction(&'a str),
     CodingAgentAction(&'a str),
     DiffViewerAction(&'a str),
@@ -2368,6 +2370,7 @@ fn write_consume_payload(output: &mut [u8], messages: &[Message<'_>]) -> i32 {
         let actor = match messages[index] {
             Message::LayoutAction("close-active-pane") => "host",
             Message::LayoutAction(_) => "workspace",
+            Message::ThemePicker => "theme-switcher",
             Message::SessionSwitcherAction(_) => "session-switcher",
             Message::InboxAction(_) => "inbox",
             Message::CodingAgentAction(_)
@@ -2381,6 +2384,7 @@ fn write_consume_payload(output: &mut [u8], messages: &[Message<'_>]) -> i32 {
         writer.bytes(br#"","payload":["#);
         let mut payload = PayloadWriter::new(&mut writer);
         match messages[index] {
+            Message::ThemePicker => payload.bytes(br#"{"type":"theme-switcher-open"}"#),
             Message::Noop => {}
             Message::LayoutAction(action) => {
                 payload.bytes(br#"{"type":"layout-action","action":"#);

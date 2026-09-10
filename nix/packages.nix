@@ -152,6 +152,7 @@ let
         "${guestSrc}/plugins/resize-proof/Cargo.lock"
         "${guestSrc}/plugins/session-switcher/Cargo.lock"
         "${guestSrc}/plugins/status-bar/Cargo.lock"
+        "${guestSrc}/plugins/theme-switcher/Cargo.lock"
         "${guestSrc}/plugins/worktree-manager/Cargo.lock"
         "${guestSrc}/plugins/terminal-session/Cargo.lock"
         "${guestSrc}/plugins/terminal-ui/Cargo.lock"
@@ -533,6 +534,9 @@ let
           continue
         fi
         if [[ "$wasm" == "plugins/inbox/target/wasm32-unknown-unknown/release/brood_inbox_plugin.wasm" ]]; then
+          continue
+        fi
+        if [[ "$wasm" == "plugins/theme-switcher/target/wasm32-unknown-unknown/release/brood_theme_switcher_plugin.wasm" ]]; then
           continue
         fi
         if [[ "$wasm" == "plugins/status-bar/target/wasm32-unknown-unknown/release/brood_status_bar_plugin.wasm" ]]; then

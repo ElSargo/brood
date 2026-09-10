@@ -1,3 +1,4 @@
+theme = "ashen"
 [init]
 backend = "plugins/worktree-manager/target/wasm32-unknown-unknown/release/brood_worktree_manager_plugin.component.wasm"
 session = "examples/wasm-init-actor/target/wasm32-unknown-unknown/release/brood_wasm_init_actor_example.component.wasm"

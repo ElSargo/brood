@@ -1,0 +1,18 @@
+[package]
+name = "brood-theme-switcher-plugin"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+brood-plugin-sdk = { path = "../../crates/brood-plugin-sdk" }
+serde_json = "1.0"
+
+[profile.release]
+panic = "abort"
+lto = true
+
+[workspace]

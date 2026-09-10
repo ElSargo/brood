@@ -109,7 +109,7 @@ CLIENT_INIT="$(find_component brood_session_switcher_plugin.component.wasm)"
 # before starting the workload, including when a caller supplies the package.
 for shell_component in brood_picker_plugin.component.wasm \
   brood_keybindings_plugin.component.wasm brood_inbox_plugin.component.wasm \
-  brood_status_bar_plugin.component.wasm; do
+  brood_status_bar_plugin.component.wasm brood_theme_switcher_plugin.component.wasm; do
   find_component "$shell_component" >/dev/null
 done
 

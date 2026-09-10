@@ -303,6 +303,7 @@ struct SwitcherState {
     sidebar_width: f64,
     inbox_width: f64,
     status_bar_pane: Option<u64>,
+    theme_switcher_pane: Option<u64>,
     next_layout_request: u64,
     native_resize_revision: Option<u64>,
     durable_shell_layout: Option<ShellLayoutState>,
@@ -790,6 +791,7 @@ impl SwitcherState {
             sidebar_width: SIDEBAR_WIDTH,
             inbox_width: INBOX_WIDTH,
             status_bar_pane: None,
+            theme_switcher_pane: None,
             next_layout_request: 0,
             native_resize_revision: None,
             durable_shell_layout: None,
@@ -1021,6 +1023,11 @@ impl Guest for SessionSwitcher {
                         start_global_actor(CHILD_ACTOR_ID, COMPONENT_FILE, Vec::new()),
                         start_global_actor(PICKER_ACTOR_ID, PICKER_COMPONENT_FILE, Vec::new()),
                         start_global_actor(
+                            "theme-switcher",
+                            "brood_theme_switcher_plugin.component.wasm",
+                            Vec::new(),
+                        ),
+                        start_global_actor(
                             KEYBINDINGS_ACTOR_ID,
                             KEYBINDINGS_COMPONENT_FILE,
                             Vec::new(),
@@ -1098,6 +1105,23 @@ impl Guest for SessionSwitcher {
                     session,
                     target.as_deref(),
                 )]
+            }
+            Event::Child(ChildEvent::Stopped(id)) if id == "theme-switcher" => {
+                vec![reset_theme_preview()]
+            }
+            Event::Child(ChildEvent::Failed(failed)) if failed.id == "theme-switcher" => {
+                let mut commands = vec![reset_theme_preview()];
+                commands.extend(status_bar_notice(&format!(
+                    "Theme switcher failed: {}",
+                    failed.message
+                )));
+                commands
+            }
+            Event::Child(ChildEvent::Stopped(id)) if id == PICKER_ACTOR_ID => {
+                vec![reset_theme_picker()]
+            }
+            Event::Child(ChildEvent::Failed(failed)) if failed.id == PICKER_ACTOR_ID => {
+                vec![reset_theme_picker()]
             }
             Event::Child(ChildEvent::Stopped(id)) => {
                 let Ok(mut state) = STATE.lock() else {
@@ -1220,6 +1244,9 @@ impl Guest for SessionSwitcher {
             Event::Mailbox(message) if message.sender == INBOX_ACTOR_ID => {
                 handle_inbox_message(&message.body)
             }
+            Event::Mailbox(message) if message.sender == "theme-switcher" => {
+                handle_theme_switcher_ready(&message.body)
+            }
             Event::Mailbox(message) if message.sender == STATUS_BAR_ACTOR_ID => {
                 handle_status_bar_message(&message.body)
             }
@@ -1241,6 +1268,19 @@ impl Guest for SessionSwitcher {
     async fn worker_run(_worker: u64, _payload: Vec<u8>) -> Result<Vec<u8>, String> {
         Ok(Vec::new())
     }
+}
+
+fn reset_theme_preview() -> ActorCommand {
+    ActorCommand::SendHostMessage(
+        br#"{"type":"theme","request":0,"operation":"cancel","name":null}"#.to_vec(),
+    )
+}
+
+fn reset_theme_picker() -> ActorCommand {
+    ActorCommand::SendLocalMessage(LocalActorMessage {
+        actor: "theme-switcher".to_string(),
+        body: br#"{"type":"theme-switcher-reset"}"#.to_vec(),
+    })
 }
 
 fn status_bar_notice(message: &str) -> Option<ActorCommand> {
@@ -1294,6 +1334,23 @@ fn handle_inbox_message(bytes: &[u8]) -> Vec<ActorCommand> {
         }
         _ => Vec::new(),
     }
+}
+
+fn handle_theme_switcher_ready(bytes: &[u8]) -> Vec<ActorCommand> {
+    let Ok((message, consumed)) = serde_json_core::from_slice::<InboxReadyMessage>(bytes) else {
+        return Vec::new();
+    };
+    if consumed != bytes.len()
+        || message.kind.as_str() != "theme-switcher-ready"
+        || message.pane == 0
+    {
+        return Vec::new();
+    }
+    let Ok(mut state) = STATE.lock() else {
+        return Vec::new();
+    };
+    state.theme_switcher_pane = Some(message.pane);
+    publish_layout(&state, true, state.workspace_focus)
 }
 
 fn handle_status_bar_message(bytes: &[u8]) -> Vec<ActorCommand> {
@@ -3794,6 +3851,7 @@ fn resolve_shell_layout(
         || state.keybindings_pane.is_none()
         || state.inbox_pane.is_none()
         || state.status_bar_pane.is_none()
+        || state.theme_switcher_pane.is_none()
     {
         return None;
     }
@@ -3812,6 +3870,7 @@ fn resolve_shell_layout(
                 && Some(*visible) != keybindings_pane
                 && Some(*visible) != inbox_pane
                 && Some(*visible) != status_bar_pane
+                && Some(*visible) != state.theme_switcher_pane
         })
         .fold(Vec::new(), |mut panes, candidate| {
             if !panes.contains(&candidate) {
@@ -4125,6 +4184,7 @@ fn publish_synchronized_layout_attempt(
         state.keybindings_pane,
         state.inbox_pane,
         state.status_bar_pane,
+        state.theme_switcher_pane,
     ]
     .into_iter()
     .flatten()
@@ -5610,12 +5670,13 @@ mod tests {
     fn empty_startup_layout_shows_switcher_and_status_but_hides_inbox() {
         let mut state = SwitcherState::new();
         state.pane = 1;
+        state.theme_switcher_pane = Some(1000);
         state.status_bar_pane = Some(2);
         state.inbox_pane = Some(3);
         state.picker_pane = Some(4);
         state.keybindings_pane = Some(5);
         let mut visible_panes = serde_json_core::heapless::Vec::<u64, 64>::new();
-        assert!(visible_panes.extend_from_slice(&[1, 2, 3]).is_ok());
+        assert!(visible_panes.extend_from_slice(&[1, 2, 3, 1000]).is_ok());
         state.layout = Some(LayoutContext {
             revision: 9,
             presented_layout_revision: 3,
@@ -5666,6 +5727,7 @@ mod tests {
         state.pane = u64::MAX;
         state.keybindings_pane = Some(u64::MAX - 2);
         state.inbox_pane = Some(u64::MAX - 3);
+        state.theme_switcher_pane = Some(1000);
         state.status_bar_pane = Some(u64::MAX - 4);
         state.picker_pane = Some(u64::MAX - 1);
         state.inbox_visible = true;
@@ -5762,6 +5824,7 @@ mod tests {
         state.picker_pane = Some(2);
         state.keybindings_pane = Some(3);
         state.inbox_pane = Some(4);
+        state.theme_switcher_pane = Some(1000);
         state.status_bar_pane = Some(5);
         let workspace = 6;
         let mut panes = serde_json_core::heapless::Vec::<u64, 64>::new();
@@ -5833,6 +5896,7 @@ mod tests {
         state.picker_pane = Some(2);
         state.keybindings_pane = Some(3);
         state.inbox_pane = Some(4);
+        state.theme_switcher_pane = Some(1000);
         state.status_bar_pane = Some(5);
         let workspace = 6;
         let mut panes = serde_json_core::heapless::Vec::<u64, 64>::new();
@@ -5912,6 +5976,7 @@ mod tests {
     fn region_resize_returns_one_exact_epoch_fragment_and_restores_durable_size() {
         let mut state = SwitcherState::new();
         state.pane = 1;
+        state.theme_switcher_pane = Some(1000);
         state.status_bar_pane = Some(2);
         state.inbox_pane = Some(3);
         state.picker_pane = Some(4);
@@ -5961,6 +6026,7 @@ mod tests {
     fn picker_and_keybinding_surfaces_are_explicit_overlay_panes() {
         let mut state = SwitcherState::new();
         state.pane = 1;
+        state.theme_switcher_pane = Some(1000);
         state.status_bar_pane = Some(2);
         state.inbox_pane = Some(3);
         state.picker_pane = Some(4);
@@ -6031,6 +6097,7 @@ mod tests {
         state.inbox_pane = Some(4);
         assert!(publish_layout(&state, true, Some(6)).is_empty());
 
+        state.theme_switcher_pane = Some(1000);
         state.status_bar_pane = Some(5);
         let commands = publish_layout(&state, true, Some(6));
         assert_eq!(commands.len(), 3);
@@ -6054,6 +6121,7 @@ mod tests {
         state.picker_pane = Some(2);
         state.keybindings_pane = Some(3);
         state.inbox_pane = Some(4);
+        state.theme_switcher_pane = Some(1000);
         state.status_bar_pane = Some(5);
         state.inbox_visible = true;
         let mut visible_panes = serde_json_core::heapless::Vec::<u64, 64>::new();
@@ -6138,6 +6206,7 @@ mod tests {
         state.picker_pane = Some(2);
         state.keybindings_pane = Some(3);
         state.inbox_pane = Some(4);
+        state.theme_switcher_pane = Some(1000);
         state.status_bar_pane = Some(5);
         state.inbox_visible = true;
         let mut visible_panes = serde_json_core::heapless::Vec::<u64, 64>::new();
@@ -6388,6 +6457,7 @@ mod tests {
         state.picker_pane = Some(2);
         state.keybindings_pane = Some(3);
         state.inbox_pane = Some(4);
+        state.theme_switcher_pane = Some(1000);
         state.status_bar_pane = Some(5);
         let mut visible_panes = serde_json_core::heapless::Vec::<u64, 64>::new();
         assert!(visible_panes.extend_from_slice(&[1, 2, 3, 4, 5, 6]).is_ok());

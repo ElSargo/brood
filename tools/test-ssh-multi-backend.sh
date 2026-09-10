@@ -242,6 +242,17 @@ wasm-tools component new \
 cargo build \
   --release \
   --target wasm32-unknown-unknown \
+  --manifest-path plugins/theme-switcher/Cargo.toml \
+  --locked
+[[ ! -e plugins/session-switcher/target/wasm32-unknown-unknown/release/brood_theme_switcher_plugin.component.wasm ]] \
+  || chmod u+w plugins/session-switcher/target/wasm32-unknown-unknown/release/brood_theme_switcher_plugin.component.wasm
+wasm-tools component new \
+  plugins/theme-switcher/target/wasm32-unknown-unknown/release/brood_theme_switcher_plugin.wasm \
+  --output \
+  plugins/session-switcher/target/wasm32-unknown-unknown/release/brood_theme_switcher_plugin.component.wasm
+cargo build \
+  --release \
+  --target wasm32-unknown-unknown \
   --manifest-path plugins/status-bar/Cargo.toml \
   --locked
 [[ ! -e plugins/session-switcher/target/wasm32-unknown-unknown/release/brood_status_bar_plugin.component.wasm ]] \

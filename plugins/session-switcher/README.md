@@ -3,7 +3,7 @@
 This is the default presentation-local Brood shell plugin. The same
 Component Model artifact runs first as the blessed client init actor and starts
 the child actor which owns the native session-switcher pane, the reusable
-`picker` actor, global inbox, keybinding editor, and compact status bar. A fresh
+`picker` actor, global inbox, keybinding editor, theme switcher, and compact status bar. A fresh
 presentation creates no surface session or terminal UI; creating or selecting
 a session starts session-scoped workloads. The init actor also starts and
 supervises diff, terminal, and coding-agent UI children, so adding those
@@ -34,6 +34,9 @@ by publishing another fragment for its existing root lease.
 request on the reusable picker actor and activates the session returned in the
 selection reply. The picker pane is a centered overlay in this actor's root
 layout and is never delegated into the workspace subtree.
+
+`Ctrl+Alt+H` opens the theme switcher in the shared picker. Focus previews a
+theme, selection saves it, and cancellation restores the saved theme.
 
 `Ctrl+Alt+A` sends the init actor an agent-picker action. The picker enumerates
 the current session's registry, and selecting an entry starts a coding-agent

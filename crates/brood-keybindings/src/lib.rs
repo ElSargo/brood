@@ -122,6 +122,13 @@ pub const ACTIONS: &[Action] = &[
         default_binding: Binding::new(KEY_B, CTRL),
     },
     Action {
+        id: "theme.picker",
+        title: "Choose theme",
+        category: "Brood",
+        scope: Scope::Always,
+        default_binding: Binding::new(KEY_H, CTRL_ALT),
+    },
+    Action {
         id: "agent.picker",
         title: "Open agent picker",
         category: "Applications",

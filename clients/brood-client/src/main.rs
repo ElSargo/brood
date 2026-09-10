@@ -1009,10 +1009,11 @@ pub fn run_cli() -> Result<()> {
     for backend in backend_registry.connected_backend_ids() {
         wasm_runtime.connect_backend(backend);
     }
-    let theme = themes::watch(config_path, event_proxy.clone())?;
+    let (theme, theme_controller) = themes::watch(config_path, event_proxy.clone())?;
     wasm_runtime.set_theme(theme.clone())?;
     let mut application = Application {
         theme,
+        theme_controller: Some(theme_controller),
         wasm_runtime: Some(wasm_runtime),
         key_policy: Some(key_policy),
         pointer_policy: Some(pointer_policy),
@@ -1280,6 +1281,7 @@ pub fn run_cli() -> Result<()> {
 #[derive(Debug)]
 enum ClientEvent {
     ThemeChanged(brood_graphics::theme::ThemeSnapshot),
+    ThemeReply(Vec<u8>),
     SceneFrame {
         backend: BackendId,
         connection_generation: u64,
@@ -5212,6 +5214,7 @@ const fn client_event_callback_kind(event: &ClientEvent) -> &'static str {
         ClientEvent::PluginRendererReplayRequested { .. } => "PluginRendererReplayRequested",
         ClientEvent::PluginContentReused { .. } => "PluginContentReused",
         ClientEvent::ThemeChanged(..) => "ThemeChanged",
+        ClientEvent::ThemeReply(..) => "ThemeReply",
         ClientEvent::RenderSchedulingChanged => "RenderSchedulingChanged",
         ClientEvent::EventLoopDeadlineReached { .. } => "EventLoopDeadlineReached",
         ClientEvent::GraphicsPreparationCapacityAvailable => "GraphicsPreparationCapacityAvailable",
@@ -5354,6 +5357,7 @@ const fn window_event_callback_kind(event: &WindowEvent) -> &'static str {
 
 #[derive(Default)]
 struct Application {
+    theme_controller: Option<themes::Controller>,
     theme: brood_graphics::theme::ThemeSnapshot,
     renderer: Option<Renderer>,
     complaint_store: ComplaintStore,
@@ -6966,7 +6970,9 @@ impl Application {
                     "plugin renderer replay reached scene transport path"
                 ));
             }
-            ClientEvent::ThemeChanged(..) | ClientEvent::RenderSchedulingChanged => {
+            ClientEvent::ThemeChanged(..)
+            | ClientEvent::ThemeReply(..)
+            | ClientEvent::RenderSchedulingChanged => {
                 return Err(anyhow!(
                     "render scheduling event reached scene transport path"
                 ));
@@ -10786,6 +10792,27 @@ impl Application {
                     }
                     None
                 }
+                HostMessage::Theme {
+                    request,
+                    operation,
+                    name,
+                } => {
+                    if !actor_message.sender.as_ref().is_some_and(|sender| {
+                        sender.name == "theme-switcher"
+                            || (sender.name == "brood.client-init" && operation == "cancel")
+                    }) {
+                        eprintln!("ignored theme request without authorized actor identity");
+                        continue;
+                    }
+                    if let Some(controller) = &self.theme_controller {
+                        controller.request(themes::ThemeCommand {
+                            request,
+                            operation,
+                            name,
+                        })?;
+                    }
+                    None
+                }
                 HostMessage::SetKeybinding {
                     action,
                     key_code,
@@ -12150,6 +12177,13 @@ impl ApplicationHandler<ClientEvent> for Application {
                         event_loop,
                         anyhow!("resume prepared plugin scene after event-loop close"),
                     );
+                }
+            }
+            ClientEvent::ThemeReply(body) => {
+                if let Some(runtime) = &self.wasm_runtime
+                    && let Err(error) = runtime.send_key_policy_message("theme-switcher", body)
+                {
+                    eprintln!("could not reply to theme switcher: {error:#}");
                 }
             }
             ClientEvent::ThemeChanged(theme) => {
@@ -16101,6 +16135,7 @@ fn apply_key_policy_host_message(
         }
         HostMessage::ToggleShortcutPassthrough
         | HostMessage::SetShortcutPassthrough { .. }
+        | HostMessage::Theme { .. }
         | HostMessage::SetKeybinding { .. }
         | HostMessage::BackendSession { .. }
         | HostMessage::ConnectRemoteBackend { .. }

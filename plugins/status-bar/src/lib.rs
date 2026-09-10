@@ -172,7 +172,9 @@ impl Guest for StatusBar {
                 redraw_or_record_error(&mut state);
                 Vec::new()
             }
-            Event::Mailbox(message) if message.sender == SHELL_ACTOR_ID => {
+            Event::Mailbox(message)
+                if message.sender == SHELL_ACTOR_ID || message.sender == "theme-switcher" =>
+            {
                 let Ok(notice) = serde_json::from_slice::<StatusBarNotice>(&message.body) else {
                     return Vec::new();
                 };

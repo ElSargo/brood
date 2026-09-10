@@ -12,7 +12,7 @@ abi = "brood-component-v1"
 source = "plugins/session-switcher/target/wasm32-unknown-unknown/release/brood_session_switcher_plugin.component.wasm"
 placement = "brood_session_switcher_plugin.component.wasm"
 capabilities = ["actor:mailbox", "presentation:layout"]
-dependencies = ["picker", "keybindings", "diff-viewer", "inbox", "status-bar", "neovim-client", "terminal-ui", "coding-agent"]
+dependencies = ["theme-switcher", "picker", "keybindings", "diff-viewer", "inbox", "status-bar", "neovim-client", "terminal-ui", "coding-agent"]
 
 [[artifacts]]
 id = "picker"
@@ -78,3 +78,12 @@ abi = "brood-component-v1"
 source = "plugins/coding-agent/target/wasm32-unknown-unknown/release/brood_coding_agent_plugin.component.wasm"
 placement = "brood_coding_agent_plugin.component.wasm"
 capabilities = ["actor:mailbox", "process:spawn"]
+
+[[artifacts]]
+id = "theme-switcher"
+kind = "wasm-component"
+abi = "brood-component-v1"
+source = "plugins/theme-switcher/target/wasm32-unknown-unknown/release/brood_theme_switcher_plugin.component.wasm"
+placement = "brood_theme_switcher_plugin.component.wasm"
+capabilities = ["actor:mailbox"]
+dependencies = ["picker"]

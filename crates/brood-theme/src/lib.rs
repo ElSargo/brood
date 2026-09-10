@@ -8,14 +8,7 @@ use std::{
 };
 use toml::{Table, Value};
 
-pub const BUNDLED: &[(&str, &str)] = &[
-    ("ashen", include_str!("../themes/ashen.toml")),
-    ("github_light", include_str!("../themes/github_light.toml")),
-    (
-        "github_light_high_contrast",
-        include_str!("../themes/github_light_high_contrast.toml"),
-    ),
-];
+include!(concat!(env!("OUT_DIR"), "/bundled.rs"));
 
 /// Search roots ordered highest priority first. Bundled files are the final root.
 #[derive(Clone, Debug, Default)]

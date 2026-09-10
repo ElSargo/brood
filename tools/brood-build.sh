@@ -216,6 +216,9 @@ build_wasm_one() {
     plugins/session-switcher)
       core="$release_dir/brood_session_switcher_plugin.wasm"
       ;;
+    plugins/theme-switcher)
+      core="$release_dir/brood_theme_switcher_plugin.wasm"
+      ;;
     plugins/status-bar)
       core="$release_dir/brood_status_bar_plugin.wasm"
       ;;

@@ -200,6 +200,15 @@ wasm-tools component new \
   --output "$PACKAGE/brood_session_switcher_plugin.component.wasm"
 wasm-tools validate "$PACKAGE/brood_session_switcher_plugin.component.wasm"
 cargo build \
+  --manifest-path plugins/theme-switcher/Cargo.toml \
+  --target wasm32-unknown-unknown \
+  --release \
+  --locked
+wasm-tools component new \
+  plugins/theme-switcher/target/wasm32-unknown-unknown/release/brood_theme_switcher_plugin.wasm \
+  --output "$PACKAGE/brood_theme_switcher_plugin.component.wasm"
+wasm-tools validate "$PACKAGE/brood_theme_switcher_plugin.component.wasm"
+cargo build \
   --manifest-path plugins/status-bar/Cargo.toml \
   "${PURE_RENDERER_ARGS[@]}" \
   --target wasm32-unknown-unknown \

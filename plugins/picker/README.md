@@ -33,6 +33,11 @@ Backspace, and Delete. Matched label characters are highlighted, hovering a row
 moves keyboard selection to it, and click release activates only the row where
 the primary-button press began.
 
+Callers can opt into `notify_focus` to receive `picker-focused` messages as
+the current item changes, including an initial notification on activation and
+null item fields when no result is focused. Queued requests notify only after
+promotion. The theme switcher uses these messages for temporary previews.
+
 The protocol and ownership rules are documented in
 [`docs/systems/picker-actor.md`](../../docs/systems/picker-actor.md). The default
 session-switcher actor is the first real caller: `Ctrl+Alt+P` opens a fuzzy

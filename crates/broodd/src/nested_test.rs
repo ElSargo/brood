@@ -249,6 +249,10 @@ fn run_themes(args: NestedTestArgs) -> Result<()> {
         .arg(root.join("tools/test-session-switcher-plugin-nested.sh"))
         .current_dir(&root)
         .env("BROOD_THEMES_ONLY", "1")
+        .env(
+            "RUST_LOG",
+            "broodd=info,brood_client=info,smithay=warn,wgpu_core=warn,wgpu_hal=warn",
+        )
         .env("BROOD_EMPTY_STARTUP_ONLY", "1")
         .env(
             "BROOD_TEST_FACET_RENDER_COMPLETION_DELAY",

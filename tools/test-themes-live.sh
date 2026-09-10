@@ -26,6 +26,7 @@ select_theme() {
 wait_theme ashen
 sleep 0.5
 capture "$OUT/theme-ashen.png"
+source "$ROOT/tools/test-theme-switcher-live.sh"
 STATUS_BEFORE="$(sed -n 's/.*facet native pair committed .*actor=status-bar .*snapshot=\([0-9]*\) .*/\1/p' "$CLIENT_LOG" | tail -1)"
 STARTS_BEFORE="$(rg -c 'started presentation WASM actor' "$CLIENT_LOG")"
 select_theme github_light

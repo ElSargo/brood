@@ -1,0 +1,32 @@
+{
+  "workload": "nix develop --command cargo run -- test themes",
+  "bundled_themes": 174,
+  "picker_messages": {
+    "picker-created": 6,
+    "picker-focused": 51,
+    "picker-cancelled": 3,
+    "picker-selected": 3
+  },
+  "queued_requests": 1,
+  "theme_publications": 69,
+  "native_commits": 225,
+  "inflight_invalidations": 82,
+  "superseded_commits": 0,
+  "light_dark_rmse": 0.919048,
+  "verified": [
+    "keyboard focus advances one row",
+    "pointer hover previews",
+    "filter previews",
+    "empty results restore saved theme",
+    "focus never writes config",
+    "Escape restores saved theme",
+    "queued picker previews only after promotion",
+    "Enter saves without changing unrelated settings",
+    "click saves",
+    "failed save preserves invalid file and restores saved appearance",
+    "saved choice survives picker reopen and host state restart",
+    "invalid reload preserves last valid theme",
+    "user inheritance and theme edits reload",
+    "rapid changes and real terminal output retain current revision"
+  ]
+}

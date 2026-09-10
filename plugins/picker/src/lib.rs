@@ -53,6 +53,8 @@ enum PickerMessage {
         loading: bool,
         #[serde(default)]
         loading_label: String,
+        #[serde(default)]
+        notify_focus: bool,
     },
     #[serde(rename = "picker-add")]
     Add {
@@ -138,6 +140,10 @@ struct PickerRequest {
     id: u64,
     #[serde(skip)]
     owner: String,
+    #[serde(skip)]
+    notify_focus: bool,
+    #[serde(skip)]
+    notified_focus: Option<Value>,
     title: String,
     placeholder: String,
     items: Vec<PickerEntry>,
@@ -164,6 +170,8 @@ impl PickerRequest {
         Ok(Self {
             id,
             owner,
+            notify_focus: false,
+            notified_focus: None,
             title,
             placeholder,
             items: entries,
@@ -497,7 +505,7 @@ struct PickerActor;
 
 impl Guest for PickerActor {
     fn dispatch(event: Event) -> Vec<ActorCommand> {
-        let commands = match event {
+        let mut commands = match event {
             Event::Lifecycle(LifecycleEvent::Start(_)) => {
                 vec![ActorCommand::LifecycleComplete(Ok(()))]
             }
@@ -511,6 +519,9 @@ impl Guest for PickerActor {
             Event::Worker(event) => handle_worker(event),
             _ => Vec::new(),
         };
+        if let Ok(mut state) = STATE.lock() {
+            commands.extend(notify_active_focus(&mut state));
+        }
         #[cfg(feature = "pure-renderer")]
         publish_render_view();
         commands
@@ -544,6 +555,7 @@ fn handle_message(sender: &str, bytes: &[u8]) -> Vec<ActorCommand> {
             items,
             loading,
             loading_label,
+            notify_focus,
         } => create_picker(
             sender,
             request,
@@ -552,6 +564,7 @@ fn handle_message(sender: &str, bytes: &[u8]) -> Vec<ActorCommand> {
             items,
             loading,
             loading_label,
+            notify_focus,
         ),
         PickerMessage::Add { picker, items } => add_items(sender, picker, items),
         PickerMessage::Update {
@@ -579,6 +592,7 @@ fn create_picker(
     items: Vec<Value>,
     loading: bool,
     loading_label: String,
+    notify_focus: bool,
 ) -> Vec<ActorCommand> {
     let Ok(mut state) = STATE.lock() else {
         return Vec::new();
@@ -600,7 +614,7 @@ fn create_picker(
             )];
         }
     };
-    let picker = match PickerRequest::new(
+    let mut picker = match PickerRequest::new(
         id,
         sender.to_string(),
         title,
@@ -621,6 +635,7 @@ fn create_picker(
             )];
         }
     };
+    picker.notify_focus = notify_focus;
     let queued = queue_position.is_some();
     if queued {
         state.queued.push_back(picker);
@@ -1060,6 +1075,31 @@ fn select_active(state: &mut PickerState) -> Vec<ActorCommand> {
     let mut commands = vec![selected_reply];
     commands.extend(finish_active(state, true));
     commands
+}
+
+// Only the active request can preview. The cached payload also detects an
+// update to the value behind a stable ID, and distinguishes initial no-focus.
+fn notify_active_focus(state: &mut PickerState) -> Option<ActorCommand> {
+    let active = state.active.as_mut()?;
+    if !active.notify_focus {
+        return None;
+    }
+    let entry = active
+        .selected
+        .as_ref()
+        .and_then(|id| active.items.iter().find(|entry| entry.id == *id));
+    let body = serde_json::json!({
+        "type": "picker-focused",
+        "picker": active.id,
+        "item_id": entry.map(|entry| &entry.id),
+        "result": entry.map(|entry| &entry.result),
+        "index": entry.map(|entry| entry.index),
+    });
+    if active.notified_focus.as_ref() == Some(&body) {
+        return None;
+    }
+    active.notified_focus = Some(body.clone());
+    Some(reply(&active.owner, &body))
 }
 
 fn finish_active(state: &mut PickerState, selected: bool) -> Vec<ActorCommand> {
@@ -1773,7 +1813,15 @@ fn handle_facet_input(events: Vec<Vec<u8>>) -> Vec<ActorCommand> {
                 logical_key,
                 pressed: true,
                 ..
-            } => commands.extend(handle_key(&mut state, &logical_key)),
+            } => {
+                // The facet already chose navigation from the displayed order.
+                // Applying the actor's Arrow key handler too would skip a row.
+                if matches!(logical_key.as_str(), "ArrowUp" | "ArrowDown") {
+                    ensure_active_selection_visible(&mut state);
+                } else {
+                    commands.extend(handle_key(&mut state, &logical_key));
+                }
+            }
             facets::InputEvent::Text { text }
             | facets::InputEvent::Paste { text }
             | facets::InputEvent::Composition {
@@ -1800,6 +1848,7 @@ fn handle_facet_input(events: Vec<Vec<u8>>) -> Vec<ActorCommand> {
             }
             _ => {}
         }
+        commands.extend(notify_active_focus(&mut state));
     }
     commands
 }
@@ -2115,6 +2164,56 @@ mod tests {
                 .collect::<Vec<_>>(),
             [0, 1, 2]
         );
+    }
+
+    fn focus_body(state: &mut PickerState) -> Value {
+        let Some(ActorCommand::SendLocalMessage(message)) = notify_active_focus(state) else {
+            panic!("expected focus notification");
+        };
+        serde_json::from_slice(&message.body).unwrap()
+    }
+
+    #[test]
+    fn focus_notifications_are_opt_in_and_follow_identity_value_and_empty_results() {
+        let mut state = PickerState::new();
+        state.active = Some(request(1, "caller", &["alpha", "beta"]));
+        assert!(notify_active_focus(&mut state).is_none());
+        state.active.as_mut().unwrap().notify_focus = true;
+        assert_eq!(focus_body(&mut state)["item_id"], "item-0");
+        assert!(notify_active_focus(&mut state).is_none());
+        move_selection(&mut state, 1);
+        assert_eq!(focus_body(&mut state)["result"], "beta");
+        set_hovered_target(&mut state, Some("item-0".into()));
+        assert_eq!(focus_body(&mut state)["result"], "alpha");
+        let active = state.active.as_mut().unwrap();
+        active
+            .update(
+                vec![json!({"id":"item-0", "value":"changed"})],
+                false,
+                String::new(),
+            )
+            .unwrap();
+        assert_eq!(focus_body(&mut state)["result"], "changed");
+        state.active.as_mut().unwrap().insert_query_text("no match");
+        let empty = focus_body(&mut state);
+        assert!(
+            empty["item_id"].is_null() && empty["result"].is_null() && empty["index"].is_null()
+        );
+        assert!(notify_active_focus(&mut state).is_none());
+    }
+
+    #[test]
+    fn queued_focus_waits_for_promotion_and_finishing_never_previews_finished_work() {
+        let mut state = PickerState::new();
+        state.active = Some(request(1, "first", &["one"]));
+        let mut queued = request(2, "second", &["two"]);
+        queued.notify_focus = true;
+        state.queued.push_back(queued);
+        assert!(notify_active_focus(&mut state).is_none());
+        finish_active(&mut state, false);
+        assert_eq!(focus_body(&mut state)["picker"], 2);
+        select_active(&mut state);
+        assert!(notify_active_focus(&mut state).is_none());
     }
 
     #[test]

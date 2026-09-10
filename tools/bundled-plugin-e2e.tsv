@@ -28,3 +28,4 @@ resize-proof	divider-drags	continuous real pointer drags in pane or window resiz
 session-switcher	divider-drags	continuous real pointer drags in pane or window resize handles	intermediate composed PNGs; per-actor extent changes; capture lifetime; presentation progress; exact final geometry; backend metrics
 status-bar	divider-drags	continuous real pointer drags in pane or window resize handles	intermediate composed PNGs; per-actor extent changes; capture lifetime; presentation progress; exact final geometry; backend metrics
 terminal-ui	divider-drags	continuous real pointer drags in pane or window resize handles	intermediate composed PNGs; per-actor extent changes; capture lifetime; presentation progress; exact final geometry; backend metrics
+theme-switcher	themes	Ctrl+Alt+H; arrows; hover; filter; empty results; queue; Enter; Escape	preview PNGs; unchanged config during focus; persistent choice on selection; cancel restores; client and broodd metrics

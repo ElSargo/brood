@@ -11,6 +11,7 @@ Root-level target-shape Brood plugins live here.
 - `session-switcher/` is the default client-realm shell plugin: its init actor starts a native plugin pane which renders the live session catalogue and performs typed create, switch, rename, and close operations.
 - `status-bar/` is persistent presentation-global shell chrome with session
   context and the essential shortcut-discovery hints.
+- `theme-switcher/` opens the shared picker with all bundled and user Helix themes, previews focus, and saves selection (Ctrl+Alt+H).
 - `picker/` is the reusable client-realm fuzzy picker actor. It serializes concurrent requests, accepts streamed items through stable IDs, and returns the original selected result and index.
 - `inbox/` is the presentation-global completion queue revealed on demand. It
   activates the source presentation actor when a notification is clicked.

@@ -123,6 +123,19 @@ order, independent of the current fuzzy ranking:
 zero-based append order for diagnostics and compatibility; callers use
 `item_id` and validate the returned value against current domain state.
 
+A create request can set `"notify_focus": true`. The owner then receives
+`picker-focused` with the same `picker`, `item_id`, `result`, and `index` fields
+as selection whenever the active focused item or its payload changes. The first
+notification follows `picker-created` for immediately active work; queued work
+first notifies on promotion. Keyboard navigation, pointer hover, filtering,
+appending, and replacing results all use the same focused identity. Unchanged
+focus does not emit duplicate messages. When there are no matching items,
+`item_id`, `result`, and `index` are all null. Completion sends the normal
+selected/cancelled reply; finished work emits no later focus notifications.
+Notifications are ordinary actor messages, not rendering side effects.
+
+The theme switcher opts in to preview focus and saves only on selection.
+
 An owner may cancel active or queued work with `picker-cancel`. Escape produces
 the same `picker-cancelled` reply. Invalid messages, unknown IDs, malformed
 items, and ownership violations return `picker-error`.

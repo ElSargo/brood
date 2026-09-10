@@ -27,6 +27,7 @@ declare -A LANE_COMMANDS=(
   [resize]='cargo run --quiet -- test resize --out-dir "$LANE_OUT"'
   [session-shell]='BROOD_SESSION_SWITCHER_PACKAGE="$SUITE_PACKAGE" BROOD_SESSION_SWITCHER_OUT="$LANE_OUT" bash tools/test-session-switcher-plugin-nested.sh'
   [startup-empty]='BROOD_EMPTY_STARTUP_ONLY=1 BROOD_SESSION_SWITCHER_PACKAGE="$SUITE_PACKAGE" BROOD_SESSION_SWITCHER_OUT="$LANE_OUT" bash tools/test-session-switcher-plugin-nested.sh'
+  [themes]='BROOD_SESSION_SWITCHER_PACKAGE="$SUITE_PACKAGE" cargo run --quiet -- test themes --out-dir "$LANE_OUT"'
   [terminal]='BROOD_TERMINAL_PACKAGE="$SUITE_PACKAGE" cargo run --quiet -- test nested --out-dir "$LANE_OUT"'
   [workspace-watch]='BROOD_TERMINAL_PACKAGE="$SUITE_PACKAGE" BROOD_RUNTIME_PLUGIN_ONLY=1 BROOD_RUNTIME_PLUGIN_WATCH_ONLY=1 BROOD_RUNTIME_PLUGIN_OUT="$LANE_OUT" cargo run --quiet -- test nested'
   [worktree]='BROOD_WORKTREE_MANAGER_OUT="$LANE_OUT" bash tools/test-worktree-manager.sh'
@@ -56,14 +57,14 @@ audit_matrix() {
         # The build assembles the manifest's complete artifact plan; it does
         # not spell out each output filename in shell code.
         if [[ "$script" == "$ROOT/tools/brood-build.sh" ]]; then
-          for sidecar in picker keybindings inbox status_bar; do
+          for sidecar in picker keybindings inbox status_bar theme_switcher; do
             rg -q "^placement = \"brood_${sidecar}_plugin\\.component\\.wasm\"$" \
               "$ROOT/packages/default-client.brood-package.toml" \
               || printf '%s missing=%s\n' "packages/default-client.brood-package.toml" "$sidecar"
           done
           continue
         fi
-        for sidecar in picker keybindings inbox status_bar; do
+        for sidecar in picker keybindings inbox status_bar theme_switcher; do
           # Manual assemblers also pass a stem to componentize_plugin,
           # which appends .component.wasm itself.
           rg -q "brood_${sidecar}_plugin\\.component\\.wasm|^[[:space:]]*componentize_plugin[[:space:]]+${sidecar//_/-}[[:space:]]+brood_${sidecar}_plugin[[:space:]]*$" "$script" \

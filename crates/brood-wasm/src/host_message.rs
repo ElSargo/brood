@@ -51,6 +51,11 @@ pub enum HostMessage {
     SetShortcutPassthrough {
         enabled: bool,
     },
+    Theme {
+        request: u64,
+        operation: String,
+        name: Option<String>,
+    },
     SetKeybinding {
         action: String,
         key_code: i32,

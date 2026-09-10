@@ -148,6 +148,7 @@ componentize_plugin() {
 }
 
 componentize_plugin session-switcher brood_session_switcher_plugin
+componentize_plugin theme-switcher brood_theme_switcher_plugin
 componentize_plugin status-bar brood_status_bar_plugin
 componentize_plugin inbox brood_inbox_plugin
 componentize_plugin picker brood_picker_plugin

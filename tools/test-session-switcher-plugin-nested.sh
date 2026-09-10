@@ -244,6 +244,10 @@ else
 cargo run --quiet -p brood-wasm --example componentize -- \
   plugins/session-switcher/target/wasm32-unknown-unknown/release/brood_session_switcher_plugin.wasm \
   "$PACKAGE/brood_session_switcher_plugin.component.wasm"
+cargo build --manifest-path plugins/theme-switcher/Cargo.toml --target wasm32-unknown-unknown --release --locked
+cargo run --quiet -p brood-wasm --example componentize -- \
+  plugins/theme-switcher/target/wasm32-unknown-unknown/release/brood_theme_switcher_plugin.wasm \
+  "$PACKAGE/brood_theme_switcher_plugin.component.wasm"
 cargo build \
   --manifest-path plugins/status-bar/Cargo.toml \
   --target wasm32-unknown-unknown \

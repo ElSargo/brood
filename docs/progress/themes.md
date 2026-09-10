@@ -1,13 +1,14 @@
 # Helix theme implementation
 
-The implementation follows `docs/targets/systems/themes.md` from local `main`
-(the target is not yet present in this worktree). The target has not been edited.
+The implementation follows `docs/targets/systems/themes.md`. The target has not
+been edited.
 
 ## Operator workflow
 
 Set the top-level `theme` string in the Brood configuration passed to the client.
-Available bundled names are `ashen`, `github_light`, and
-`github_light_high_contrast`. Place additional `<name>.toml` files in the `themes/`
+The complete Helix 25.07.1 collection is bundled: 172 runtime themes plus
+Helix's `default` and `base16_default` themes. Ctrl+Alt+H opens the theme switcher;
+focus previews, Enter/click saves, and Escape restores the saved theme. Place additional `<name>.toml` files in the `themes/`
 directory beside that configuration. User files take precedence over bundled
 files. `brood_theme::ThemeLoader::names` provides sorted discovery from these
 same roots.
@@ -134,3 +135,53 @@ now starts from the existing empty-workspace harness, then creates its own
 terminal after the idle-theme checks. A broad SDK test invocation also tried to
 link its WASM export example as a native executable; SDK library tests were run
 with `--lib`, while the actual WASM artifacts were verified by the nested build.
+
+## 2026-09-10 complete collection and picker previews
+
+Imported all 172 Helix 25.07.1 runtime themes, both root default themes, the
+upstream attribution README, and the full theme license directory. The build
+script embeds every `.toml` file. All 174 bundled names resolve and round-trip
+through the theme snapshot codec, including inherited themes.
+
+The default presentation starts `theme-switcher`. Ctrl+Alt+H requests the host's
+current catalogue and opens the shared picker with focus notifications. The
+saved name appears first. Focus sends a preview request; selection sends a
+commit request; cancellation or an empty match set restores the saved theme.
+Repeated open actions are ignored while a request is pending or queued. Stable
+IDs and result values are validated against the catalogue, and replies for
+finished picker IDs cannot reverse a selection.
+
+One host worker serializes filesystem reloads and theme commands, preserving a
+single monotonic display revision. The committed snapshot and temporary preview
+are separate. External valid config edits update the cancellation destination
+without replacing an active preview. Saving reparses the latest config with
+`toml_edit`, preserves unrelated settings and comments, and atomically replaces
+the file. Failed saves preserve the file, restore the committed snapshot, and
+report an error through the status bar. The init supervisor clears previews if
+the picker or theme actor fails/stops. The host currently reserves a pane for
+every presentation child; the shell waits for the theme actor's ready message
+and keeps its reserved pane outside layout and workspace delegation.
+
+The default package manifest, local component build/assembly, Nix guest lock
+inventory, manual shell assemblies, and bundled-plugin coverage audit include
+the new component. No target documents were changed.
+
+Focused tests passed for the theme loader, host preview/persistence state,
+picker (both renderer variants), theme switcher, session shell, and shared key
+policy. The bundled-plugin audit and changed shell-script syntax checks passed.
+Client Clippy still reports nine existing diagnostics in `complaint_capture.rs`;
+none remain in the modified theme code. An initial offscreen proof inherited
+`RUST_LOG=warn`, suppressing the commit evidence the harness waits for. The
+built-in theme lane now explicitly enables its required metrics logging.
+
+The final offscreen `test themes` run passed, including keyboard and pointer
+previews, filtered and empty results, queued promotion, Enter and click saves,
+cancellation after saving, and recovery from an intentionally malformed config
+at commit time. Screenshots were inspected in dark Ashen, light Acme, and
+inherited GitHub Light High Contrast. The run recorded 69 theme publications,
+225 native commits, 82 in-flight invalidations, and zero superseded commits.
+Client metrics, broodd metrics, and screenshots are in
+[theme-switcher-evidence](theme-switcher-evidence/summary.json). The expanded
+workload now waits for a committed, focused picker frame before subsequent
+input; a fixed startup delay previously dropped a test shortcut during a
+layout transition. The standard local package was also rebuilt and assembled.
