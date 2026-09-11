@@ -1,0 +1,220 @@
+{
+  "package": "/nix/store/p98875wz58jm0rf4hx1iigv04y114l3k-brood",
+  "raw_artifacts": "/tmp/brood-layout-e2e11",
+  "cases": [
+    {
+      "case": "two-terminals-narrow",
+      "expected_actors": [
+        "terminal-ui",
+        "terminal-ui-b1-s1-2"
+      ],
+      "start": 480,
+      "target": 300,
+      "final": 300,
+      "post_gesture_convergence_seconds": 0.005424847011454403,
+      "visible_positions": [
+        300,
+        310,
+        320,
+        330,
+        340,
+        350,
+        360,
+        370,
+        380,
+        390,
+        400,
+        410,
+        418,
+        428,
+        440,
+        450,
+        460,
+        470,
+        480
+      ],
+      "synchronized_submissions": 180,
+      "synchronized_completions": 90,
+      "capture_cancellations": [],
+      "layout_rejections": [],
+      "errors": []
+    },
+    {
+      "case": "two-terminals-wide",
+      "expected_actors": [
+        "terminal-ui",
+        "terminal-ui-b1-s1-2"
+      ],
+      "start": 300,
+      "target": 480,
+      "final": 480,
+      "post_gesture_convergence_seconds": 0.011026330990716815,
+      "visible_positions": [
+        300,
+        302,
+        312,
+        322,
+        332,
+        342,
+        352,
+        362,
+        372,
+        382,
+        390,
+        400,
+        410,
+        420,
+        430,
+        440,
+        450,
+        460,
+        470,
+        480
+      ],
+      "synchronized_submissions": 182,
+      "synchronized_completions": 91,
+      "capture_cancellations": [],
+      "layout_rejections": [],
+      "errors": []
+    },
+    {
+      "case": "master-stack-divider-narrow",
+      "expected_actors": [
+        "terminal-ui",
+        "terminal-ui-b1-s1-2",
+        "terminal-ui-b1-s1-3",
+        "terminal-ui-b1-s1-4",
+        "terminal-ui-b1-s1-5",
+        "terminal-ui-b1-s1-6"
+      ],
+      "start": 528,
+      "target": 428,
+      "final": 428,
+      "post_gesture_convergence_seconds": 0.016446379013359547,
+      "visible_positions": [
+        428,
+        430,
+        435,
+        441,
+        446,
+        451,
+        456,
+        462,
+        467,
+        473,
+        478,
+        484,
+        490,
+        495,
+        501,
+        506,
+        512,
+        517,
+        524,
+        528
+      ],
+      "synchronized_submissions": 144,
+      "synchronized_completions": 72,
+      "capture_cancellations": [],
+      "layout_rejections": [],
+      "errors": []
+    },
+    {
+      "case": "master-stack-divider-wide",
+      "expected_actors": [
+        "terminal-ui",
+        "terminal-ui-b1-s1-2",
+        "terminal-ui-b1-s1-3",
+        "terminal-ui-b1-s1-4",
+        "terminal-ui-b1-s1-5",
+        "terminal-ui-b1-s1-6"
+      ],
+      "start": 428,
+      "target": 528,
+      "final": 528,
+      "post_gesture_convergence_seconds": 0.02323758401325904,
+      "visible_positions": [
+        428,
+        434,
+        439,
+        444,
+        450,
+        455,
+        461,
+        466,
+        472,
+        478,
+        483,
+        489,
+        494,
+        500,
+        504,
+        510,
+        515,
+        521,
+        526,
+        528
+      ],
+      "synchronized_submissions": 151,
+      "synchronized_completions": 75,
+      "capture_cancellations": [],
+      "layout_rejections": [
+        "rejected synchronized layout actor=workspace request=256 reason=InvalidRequest: resolved layout item 18446744073709551608 is outside normalized presentation bounds"
+      ],
+      "errors": []
+    },
+    {
+      "case": "workspace-layouts",
+      "focus_cycle": [
+        "terminal-ui",
+        "terminal-ui-b1-s1-2",
+        "terminal-ui-b1-s1-3",
+        "terminal-ui-b1-s1-4",
+        "terminal-ui-b1-s1-5",
+        "terminal-ui-b1-s1-6"
+      ],
+      "overflow_focus_cycle": [
+        "terminal-ui-b1-s1-7",
+        "terminal-ui",
+        "terminal-ui-b1-s1-2",
+        "terminal-ui-b1-s1-3",
+        "terminal-ui-b1-s1-4",
+        "terminal-ui-b1-s1-5",
+        "terminal-ui-b1-s1-6"
+      ],
+      "scroll_before": [
+        "18446744073709551603",
+        "18446744073709551604",
+        "18446744073709551605",
+        "18446744073709551606",
+        "18446744073709551607",
+        "18446744073709551610"
+      ],
+      "scroll_after": [
+        "18446744073709551604",
+        "18446744073709551605",
+        "18446744073709551606",
+        "18446744073709551607",
+        "18446744073709551608",
+        "18446744073709551610"
+      ],
+      "master_pane": "18446744073709551610",
+      "resource_pressure_retries": 0,
+      "errors": []
+    }
+  ],
+  "backend_before": {
+    "smithay_callback_count": 67,
+    "terminal_sessions": 1
+  },
+  "backend_after": {
+    "smithay_callback_count": 6285,
+    "terminal_sessions": 6
+  },
+  "pressure_run": {
+    "raw_artifacts": "/tmp/brood-layout-e2e10",
+    "deferred_frames": 5,
+    "visual_facet_failures": 0,
+    "note": "All four divider drags passed with five native allocation retries; this earlier run exposed the subsequently fixed overflow focus bug."
+  }
+}

@@ -50,6 +50,7 @@ const fn query() -> PointerPolicyQuery {
         button: Some(0x110),
         modifiers: 0,
         captured: false,
+        scroll: None,
     }
 }
 
@@ -106,4 +107,37 @@ fn aggregate_table_elements_cannot_exceed_the_store_limit() {
 fn one_oversized_table_is_refused_by_the_per_table_limit() {
     let (_directory, path) = write_provider("i32.const 0", 4, "(table 4097 funcref)");
     assert!(WasmPointerPolicy::load(&path, "test").is_err());
+}
+
+#[test]
+fn wheel_queries_accept_finite_deltas_only_on_the_axis_phase() {
+    let (_directory, path) = write_provider("i32.const 0", 4, "");
+    let mut policy = load(&path);
+    let mut wheel = query();
+    wheel.phase = PointerPhase::Axis;
+    wheel.button = None;
+    wheel.scroll = Some(LocalPoint { u: 0.0, v: -40.0 });
+    assert!(
+        policy
+            .handle_pointer(PointerPolicyInvocation::new(wheel.clone(), None))
+            .is_ok()
+    );
+
+    wheel.scroll = Some(LocalPoint {
+        u: 0.0,
+        v: f64::INFINITY,
+    });
+    assert!(
+        policy
+            .handle_pointer(PointerPolicyInvocation::new(wheel.clone(), None))
+            .is_err()
+    );
+
+    wheel.scroll = Some(LocalPoint { u: 0.0, v: -40.0 });
+    wheel.phase = PointerPhase::Motion;
+    assert!(
+        policy
+            .handle_pointer(PointerPolicyInvocation::new(wheel, None))
+            .is_err()
+    );
 }

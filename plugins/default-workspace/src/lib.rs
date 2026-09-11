@@ -11,6 +11,9 @@ use serde::Deserialize;
 use serde_json_core::heapless::{String as FixedString, Vec as FixedVec};
 
 mod backend_layout;
+mod master_stack;
+
+use master_stack::MasterStack;
 
 use backend_layout::pane_placement;
 
@@ -38,6 +41,7 @@ const PRIMARY_BUTTON: u32 = 0x110;
 // pane IDs grow down from `u64::MAX`, so chrome must use neither allocator end.
 const DIVIDER_ZONE_ID: u64 = 0x8000_4252_4f4f_4401;
 const DIVIDER_ITEM_ID: u64 = 0x8000_4252_4f4f_4501;
+const STACK_SCROLL_ZONE_ID: u64 = 0x8000_4252_4f4f_4601;
 const DIVIDER_EVENT_MASK: u8 = 0b1111;
 const MIN_PANE_SIZE_PIXELS: f32 = 96.0;
 const MAX_LAYOUT_BOUNDARIES: usize = MAX_PANES * 2;
@@ -55,6 +59,8 @@ static mut LAYOUT_PANE_COUNT: usize = 0;
 static mut LAYOUT_FOCUS: u64 = 0;
 static mut LAYOUT_HAS_FOCUS: bool = false;
 static mut LAYOUT_FULLSCREEN: bool = false;
+static mut LAYOUT_MASTER_STACK: bool = false;
+static mut LAYOUT_STACKS: MasterStack = MasterStack::EMPTY;
 static mut LAYOUT_LEASE_ID: u64 = 0;
 static mut LAYOUT_LEASE_GENERATION: u64 = 0;
 static mut LAYOUT_REVISION: u64 = 0;
@@ -120,10 +126,6 @@ type LayoutActorState = (
 struct PolicyState {
     #[serde(default)]
     focused_pane: Option<u64>,
-    #[serde(default)]
-    panes: PaneList,
-    #[serde(default)]
-    managed_panes: PaneList,
     #[serde(default)]
     app_panes: AppPaneList,
     #[serde(default)]
@@ -191,6 +193,8 @@ struct WorkspaceMessage {
     position: Option<LayoutPoint>,
     #[serde(default)]
     button: Option<u32>,
+    #[serde(default)]
+    scroll: Option<LayoutPoint>,
     #[serde(default, rename = "modifiers")]
     _modifiers: u32,
 }
@@ -425,6 +429,7 @@ pub extern "C" fn brood_policy_provider_pointer_workspace(
 
 fn pointer_capture_decision(query: &PointerPolicyQuery) -> Option<&'static str> {
     let capture = match query.phase.as_str() {
+        "axis" if !query.captured => "unchanged",
         "button-press" if !query.captured && query.button == Some(PRIMARY_BUTTON) => "acquire",
         "motion" if query.captured => "unchanged",
         "button-release" if query.captured && query.button == Some(PRIMARY_BUTTON) => "release",
@@ -609,8 +614,9 @@ fn messages_for_action<'a>(
         "sessions.picker" => &[Message::SessionSwitcherAction("picker")],
         "diff.toggle" => &[Message::DiffViewerAction("toggle")],
         "sessions.next" => &[Message::SwitchActiveSessionNext],
-        "focus.next" => focus_cycle_managed_pane(state, true, buffer),
-        "focus.previous" => focus_cycle_managed_pane(state, false, buffer),
+        "focus.next" => &[Message::LayoutAction("focus-next")],
+        "focus.previous" => &[Message::LayoutAction("focus-previous")],
+        "layout.next" => &[Message::LayoutAction("cycle-layout")],
         "terminal.spawn" => &[Message::SpawnApp(&["foot"])],
         "split.down" => &[Message::LayoutAction("split-active-down")],
         "split.right" => &[Message::LayoutAction("split-active-right")],
@@ -737,33 +743,6 @@ fn focus_cycle_terminal<'a>(
     };
     buffer[0] = Message::FocusPane(panes[target]);
     Some(&buffer[..1])
-}
-
-fn focus_cycle_managed_pane<'a>(
-    state: &PolicyState,
-    next: bool,
-    buffer: &'a mut [Message<'static>; 2],
-) -> &'a [Message<'static>] {
-    let panes = if state.managed_panes.is_empty() {
-        &state.panes
-    } else {
-        &state.managed_panes
-    };
-    if panes.is_empty() {
-        return &[];
-    }
-    let current = state
-        .focused_pane
-        .and_then(|focused| panes.iter().position(|pane| *pane == focused));
-    let target = match (current, next) {
-        (Some(index), true) => (index + 1) % panes.len(),
-        (Some(0), false) => panes.len() - 1,
-        (Some(index), false) => index - 1,
-        (None, true) => 0,
-        (None, false) => panes.len() - 1,
-    };
-    buffer[0] = Message::FocusPane(panes[target]);
-    &buffer[..1]
 }
 
 fn matching_action(
@@ -992,6 +971,14 @@ fn store_layout_actor_state(
     waitable_panes: &[u64],
     size: LayoutStateSize,
 ) {
+    let mut ordered = PaneList::new();
+    for pane in layout_actor_state().0.iter().chain(panes.iter()) {
+        if panes.contains(pane) && !ordered.contains(pane) {
+            let _ = ordered.push(*pane);
+        }
+    }
+    let panes = ordered.as_slice();
+    let previous_focus = layout_actor_state().2;
     let pane_count = panes.len().min(64);
     let width = size.w.max(1);
     let height = size.h.max(1);
@@ -1048,6 +1035,16 @@ fn store_layout_actor_state(
             waitable_count += 1;
         }
         LAYOUT_WAITABLE_PANE_COUNT = waitable_count;
+    }
+    let mut stacks = unsafe { LAYOUT_STACKS };
+    stacks.sync(
+        &panes[..pane_count],
+        &pane_backends,
+        focus,
+        topology_changed || focus != previous_focus,
+    );
+    unsafe {
+        LAYOUT_STACKS = stacks;
     }
     let preserve_custom_geometry = unsafe { LAYOUT_GEOMETRY_CUSTOMIZED } && !topology_changed;
     if topology_changed || (viewport_changed && !preserve_custom_geometry) {
@@ -1206,7 +1203,14 @@ fn layout_transform(
             } else {
                 ptr::addr_of!(DURABLE_LAYOUT).cast::<LayoutTransform>()
             };
-            return source.add(index).read();
+            let mut transform = source.add(index).read();
+            if LAYOUT_MASTER_STACK {
+                let stacks = LAYOUT_STACKS;
+                let placement = stacks.placement(index, panes, pane_backends, height);
+                transform.offset_v = placement.offset_v;
+                transform.size_v = placement.size_v;
+            }
+            return transform;
         }
     }
     initial_layout_transform(index, panes, pane_backends, width, height)
@@ -1219,11 +1223,11 @@ fn initial_layout_transform(
     width: i32,
     height: i32,
 ) -> LayoutTransform {
-    if panes.len() == 2
-        && panes
-            .iter()
-            .all(|pane| layout_waitable_panes().contains(pane))
-    {
+    if unsafe { LAYOUT_MASTER_STACK } {
+        let stacks = unsafe { LAYOUT_STACKS };
+        return stacks.placement(index, panes, pane_backends, height);
+    }
+    if panes.len() == 2 {
         return LayoutTransform {
             offset_u: index as f32 - 1.0,
             offset_v: -1.0,
@@ -1316,7 +1320,7 @@ fn collect_layout_boundaries(
             }
             let horizontal_start = a.offset_u.max(b.offset_u);
             let horizontal_end = (a.offset_u + a.size_u).min(b.offset_u + b.size_u);
-            if horizontal_end > horizontal_start + EPSILON {
+            if !unsafe { LAYOUT_MASTER_STACK } && horizontal_end > horizontal_start + EPSILON {
                 if (a.offset_v + a.size_v - b.offset_v).abs() <= EPSILON {
                     add_layout_boundary(
                         boundaries,
@@ -1364,13 +1368,6 @@ fn collect_layout_boundaries(
         boundaries[destination] = boundary;
     }
     count
-}
-
-fn boundary_is_waitable(boundary: LayoutBoundary, panes: &[u64]) -> bool {
-    let affected = boundary.negative_mask | boundary.positive_mask;
-    (0..panes.len()).all(|index| {
-        affected & (1_u64 << index) == 0 || layout_waitable_panes().contains(&panes[index])
-    })
 }
 
 const fn divider_zone_id(index: usize) -> u64 {
@@ -1707,6 +1704,9 @@ fn finish_pointer_resize_request(output: &mut [u8], request_id: Option<u64>) -> 
 }
 
 fn handle_layout_pointer(output: &mut [u8], message: &WorkspaceMessage) -> i32 {
+    if message.phase.as_deref() == Some("axis") {
+        return handle_stack_scroll(output, message);
+    }
     let Some(zone) = message.zone else { return 0 };
     let Some(interaction) = message.interaction.filter(|interaction| *interaction != 0) else {
         return 0;
@@ -1757,9 +1757,7 @@ fn handle_layout_pointer(output: &mut [u8], message: &WorkspaceMessage) -> i32 {
         else {
             return 0;
         };
-        if boundary_index >= boundary_count
-            || !boundary_is_waitable(boundaries[boundary_index], panes)
-        {
+        if boundary_index >= boundary_count {
             return 0;
         }
         let boundary = boundaries[boundary_index];
@@ -1886,6 +1884,78 @@ fn handle_layout_pointer(output: &mut [u8], message: &WorkspaceMessage) -> i32 {
     len
 }
 
+fn handle_stack_scroll(output: &mut [u8], message: &WorkspaceMessage) -> i32 {
+    let (panes, backends, focus, fullscreen, lease, revision) = layout_actor_state();
+    if !unsafe { LAYOUT_MASTER_STACK } || fullscreen || lease.is_none() || lease != message.lease {
+        return 0;
+    }
+    let Some(index) = message
+        .zone
+        .and_then(|zone| zone.checked_sub(STACK_SCROLL_ZONE_ID))
+        .and_then(|index| usize::try_from(index).ok())
+        .filter(|index| *index < panes.len())
+    else {
+        return 0;
+    };
+    let group = backend_layout::pane_group(index, panes.len(), backends);
+    let Some(scroll) = message
+        .scroll
+        .filter(|scroll| scroll.v.is_finite() && scroll.v.abs() > 0.0)
+    else {
+        return 0;
+    };
+    if group.index != 0 || group.count <= master_stack::STACK_LIMIT + 1 {
+        return 0;
+    }
+    let mut stacks = unsafe { LAYOUT_STACKS };
+    stacks.scroll(index, group.count, scroll.v);
+    let focus = focus.map(|pane| {
+        let focused = panes
+            .iter()
+            .position(|candidate| *candidate == pane)
+            .unwrap_or(0);
+        if stacks.visible(focused, panes, backends) {
+            pane
+        } else {
+            (0..panes.len())
+                .filter(|candidate| {
+                    backend_layout::pane_group(*candidate, panes.len(), backends).first == index
+                        && *candidate != index
+                        && stacks.visible(*candidate, panes, backends)
+                })
+                .min_by_key(|candidate| candidate.abs_diff(focused))
+                .map_or(pane, |candidate| panes[candidate])
+        }
+    });
+    stacks.sync(panes, backends, focus, false);
+    unsafe {
+        LAYOUT_STACKS = stacks;
+        LAYOUT_FOCUS = focus.unwrap_or(0);
+        LAYOUT_HAS_FOCUS = focus.is_some();
+    }
+    write_layout_actor_update_outbox(output, panes, backends, focus, fullscreen, lease, revision)
+}
+
+fn write_stack_scroll_zone(
+    payload: &mut PayloadWriter<'_, '_>,
+    index: usize,
+    transform: LayoutTransform,
+) {
+    let mut item = [0_u8; 512];
+    let mut writer = Writer::new(&mut item);
+    writer.bytes(br#"{"id":"#);
+    writer.u64(STACK_SCROLL_ZONE_ID + index as u64);
+    writer.bytes(br#", "transform":{"offset":{"u":"#);
+    writer.f32(transform.offset_u);
+    writer.bytes(br#", "v":-1},"size":{"u":"#);
+    writer.f32(transform.size_u);
+    writer.bytes(br#", "v":2}},"z":999,"event_mask":16,"cursor":"default","input":"hit"}"#);
+    let len = writer.finish();
+    if len > 0 {
+        payload.bytes(&item[..len as usize]);
+    }
+}
+
 fn next_layout_request_id() -> u64 {
     unsafe {
         let request_id = NEXT_LAYOUT_REQUEST_ID.max(1);
@@ -1970,6 +2040,15 @@ fn write_synchronized_layout_outbox(
     let mut first = true;
     for pane in panes {
         if !layout_waitable_panes().contains(pane)
+            || (!request.fullscreen
+                && !layout_pane_visible(
+                    panes
+                        .iter()
+                        .position(|candidate| candidate == pane)
+                        .unwrap(),
+                    panes,
+                    pane_backends,
+                ))
             || fullscreen_pane.is_some_and(|visible| visible != *pane)
         {
             continue;
@@ -2031,6 +2110,28 @@ fn write_layout_region_outbox(
 }
 
 fn apply_layout_actor_action(action: &str) {
+    if matches!(
+        action,
+        "cycle-layout" | "layout-grid" | "layout-master-stack-plus"
+    ) {
+        unsafe {
+            LAYOUT_MASTER_STACK = match action {
+                "layout-grid" => false,
+                "layout-master-stack-plus" => true,
+                _ => !LAYOUT_MASTER_STACK,
+            };
+        }
+        let (panes, backends, focus, _, _, _) = layout_actor_state();
+        let mut stacks = unsafe { LAYOUT_STACKS };
+        stacks.sync(panes, backends, focus, true);
+        unsafe {
+            LAYOUT_STACKS = stacks;
+        }
+        reset_layout_geometry(panes, backends, unsafe { LAYOUT_VIEWPORT_WIDTH }, unsafe {
+            LAYOUT_VIEWPORT_HEIGHT
+        });
+        return;
+    }
     let next = matches!(action, "focus-next" | "focus-next-split");
     let previous = matches!(action, "focus-previous" | "focus-previous-split");
     unsafe {
@@ -2062,7 +2163,15 @@ fn apply_layout_actor_action(action: &str) {
         };
         LAYOUT_FOCUS = panes[target];
         LAYOUT_HAS_FOCUS = true;
+        let (_, backends, _, _, _, _) = layout_actor_state();
+        let mut stacks = LAYOUT_STACKS;
+        stacks.sync(panes, backends, Some(LAYOUT_FOCUS), true);
+        LAYOUT_STACKS = stacks;
     }
+}
+
+fn layout_pane_visible(index: usize, panes: &[u64], backends: &[u64]) -> bool {
+    !unsafe { LAYOUT_MASTER_STACK } || unsafe { LAYOUT_STACKS }.visible(index, panes, backends)
 }
 
 fn write_app_pane(
@@ -2139,15 +2248,25 @@ fn write_resolved_layout_payload(
         write_pane_item_payload(payload, pane, 0.0, -1.0, -1.0, 2.0, 2.0);
     } else {
         let mut index = 0;
+        let mut first = true;
         while index < pane_count {
-            if index > 0 {
+            if !layout_pane_visible(index, panes, pane_backends) {
+                index += 1;
+                continue;
+            }
+            if !first {
                 payload.byte(b',');
             }
+            first = false;
             let placement = layout_transform(index, panes, pane_backends, use_requested_geometry);
             write_pane_item_payload(
                 payload,
                 panes[index],
-                index as f32,
+                if unsafe { LAYOUT_MASTER_STACK } {
+                    unsafe { LAYOUT_STACKS }.z(index, panes, pane_backends)
+                } else {
+                    index as f32
+                },
                 placement.offset_u,
                 placement.offset_v,
                 placement.size_u,
@@ -2168,21 +2287,38 @@ fn write_resolved_layout_payload(
         payload.bytes(br#", "zones":["#);
         let mut first = true;
         for (index, boundary) in boundaries[..boundary_count].iter().copied().enumerate() {
-            if !boundary_is_waitable(boundary, panes) {
-                continue;
-            }
             if !first {
                 payload.byte(b',');
             }
             first = false;
             write_interaction_zone_payload(payload, index, boundary);
         }
+        if unsafe { LAYOUT_MASTER_STACK } {
+            for index in 0..pane_count {
+                let group = backend_layout::pane_group(index, pane_count, pane_backends);
+                if group.index != 0 || group.count <= master_stack::STACK_LIMIT + 1 {
+                    continue;
+                }
+                let stack_index = (index + 1..pane_count)
+                    .find(|candidate| {
+                        backend_layout::pane_group(*candidate, pane_count, pane_backends).first
+                            == index
+                    })
+                    .unwrap();
+                let mut transform =
+                    layout_transform(stack_index, panes, pane_backends, use_requested_geometry);
+                transform.offset_v = -1.0;
+                transform.size_v = 2.0;
+                if !first {
+                    payload.byte(b',');
+                }
+                first = false;
+                write_stack_scroll_zone(payload, index, transform);
+            }
+        }
         payload.bytes(br#"],"dividers":["#);
         first = true;
         for (index, boundary) in boundaries[..boundary_count].iter().copied().enumerate() {
-            if !boundary_is_waitable(boundary, panes) {
-                continue;
-            }
             if !first {
                 payload.byte(b',');
             }
@@ -2669,7 +2805,9 @@ fn raw_control_plugin_should_abstain(
     input.modifiers & brood_keybindings::MOD_CTRL != 0
         && input.modifiers & brood_keybindings::MOD_ALT == 0
         && focused_raw_control_plugin(state)
-        && action.is_none_or(|action| action.category != "Brood")
+        && action.is_none_or(|action| {
+            action.category != "Brood" && !matches!(action.id, "focus.next" | "focus.previous")
+        })
 }
 
 fn focused_keybinding_editor(state: &PolicyState) -> bool {
@@ -2809,6 +2947,153 @@ mod tests {
                 matching_action(&state, &unbound, true)
             ));
         }
+    }
+
+    #[test]
+    fn focus_chords_reach_the_workspace_even_with_terminal_and_managed_panes() {
+        let state: PolicyState = decode_json(br#"{"focused_pane":7,"panes":[7,8,9],"managed_panes":[9],"app_panes":[{"pane":7,"app_id":"terminal-ui"}]}"#).unwrap();
+        for (key, id, command) in [
+            (brood_keybindings::KEY_J, "focus.next", "focus-next"),
+            (brood_keybindings::KEY_K, "focus.previous", "focus-previous"),
+        ] {
+            let input = KeyInput {
+                key_code: key,
+                key_state: KEY_PRESSED,
+                modifiers: brood_keybindings::MOD_CTRL,
+                repeat: false,
+            };
+            let action = matching_action(&state, &input, false).unwrap();
+            assert_eq!(action.id, id);
+            assert!(!raw_control_plugin_should_abstain(
+                &state,
+                &input,
+                Some(action)
+            ));
+            let mut buffer = [Message::Noop; 2];
+            assert!(
+                matches!(messages_for_action(action, &state, &mut buffer), [Message::LayoutAction(value)] if *value == command)
+            );
+        }
+    }
+
+    #[test]
+    fn two_pane_divider_survives_paint_readiness_changes() {
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        apply_layout_actor_action("layout-grid");
+        let panes = [101, 102];
+        let lease = Some(LayoutLeaseToken {
+            id: 5,
+            generation: 2,
+        });
+        for waitable in [&panes[..], &panes[..1], &panes[..0], &panes[..]] {
+            store_layout_actor_state(
+                &panes,
+                &[],
+                Some(101),
+                lease,
+                Some(7),
+                Some(3),
+                waitable,
+                LayoutStateSize { w: 400, h: 720 },
+            );
+            let mut output = [0; OUTBOX_BYTES];
+            let len = write_layout_actor_update_outbox(
+                &mut output,
+                &panes,
+                &[0, 0],
+                Some(101),
+                false,
+                lease,
+                Some(7),
+            );
+            let layout = host_payload(&output, len);
+            assert_eq!(layout["layout"]["zones"].as_array().unwrap().len(), 1);
+            assert_eq!(layout["layout"]["items"][0]["transform"]["size"]["v"], 2);
+            clear_resize_proposals();
+            clear_pointer_interaction();
+            handle_layout_pointer(
+                &mut output,
+                &pointer_message("button-press", 0.0, 1, Some(PRIMARY_BUTTON)),
+            );
+            let len = handle_layout_pointer(&mut output, &pointer_message("motion", 0.2, 2, None));
+            let request = host_payload(&output, len);
+            assert_eq!(request["wait_for_panes"], json!(waitable));
+            assert!(
+                request["fragment"]["layout"]["items"][0]["transform"]["size"]["u"]
+                    .as_f64()
+                    .unwrap()
+                    > 1.1
+            );
+        }
+        clear_resize_proposals();
+        clear_pointer_interaction();
+    }
+
+    #[test]
+    fn master_stack_keeps_master_and_cycles_through_overflow() {
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        apply_layout_actor_action("layout-grid");
+        store_layout_actor_state(
+            &[100],
+            &[],
+            Some(100),
+            Some(LayoutLeaseToken {
+                id: 5,
+                generation: 2,
+            }),
+            Some(7),
+            Some(3),
+            &[100],
+            LayoutStateSize { w: 960, h: 686 },
+        );
+        // Plugin IDs descend; adding a lower ID must not replace the master.
+        let panes = [94, 95, 96, 97, 98, 99, 100];
+        store_layout_actor_state(
+            &panes,
+            &[],
+            Some(100),
+            Some(LayoutLeaseToken {
+                id: 5,
+                generation: 2,
+            }),
+            Some(8),
+            Some(4),
+            &panes,
+            LayoutStateSize { w: 960, h: 686 },
+        );
+        apply_layout_actor_action("layout-master-stack-plus");
+        assert_eq!(layout_actor_state().0[0], 100);
+        let mut seen = Vec::new();
+        for _ in 0..panes.len() {
+            apply_layout_actor_action("focus-next");
+            let (ordered, backends, focus, fullscreen, lease, revision) = layout_actor_state();
+            seen.push(focus.unwrap());
+            let mut output = [0; OUTBOX_BYTES];
+            let len = write_layout_actor_update_outbox(
+                &mut output,
+                ordered,
+                backends,
+                focus,
+                fullscreen,
+                lease,
+                revision,
+            );
+            let result = host_payload(&output, len);
+            let items = result["layout"]["items"].as_array().unwrap();
+            assert_eq!(items.len(), 6);
+            assert!(items
+                .iter()
+                .any(|item| item["kind"]["pane"] == focus.unwrap()));
+            assert_eq!(items[0]["kind"]["pane"], 100);
+            assert_eq!(result["layout"]["zones"].as_array().unwrap().len(), 2);
+        }
+        seen.sort_unstable();
+        assert_eq!(seen, panes);
+        apply_layout_actor_action("layout-grid");
     }
 
     fn pointer_message(

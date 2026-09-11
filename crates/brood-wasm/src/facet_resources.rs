@@ -9,7 +9,7 @@ use std::{
     fmt,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{self, Receiver, SyncSender},
     },
     thread,
@@ -77,6 +77,7 @@ pub struct FacetResourceLease {
     panes: Vec<u64>,
     limits: InvocationLimits,
     state: Mutex<State>,
+    allocation_deferred: AtomicBool,
     backend: Arc<dyn FacetResourceBackend>,
     reservation: BudgetedValue<()>,
     _budget_owner: ByteBudget,
@@ -162,6 +163,7 @@ impl FacetResourceRegistry {
                 sealed: false,
                 resources: Vec::with_capacity(resource_count),
             }),
+            allocation_deferred: AtomicBool::new(false),
             backend: Arc::clone(&self.backend),
             reservation,
             _budget_owner: budget,
@@ -185,6 +187,11 @@ impl Drop for FacetResourceRegistry {
 }
 
 impl FacetResourceLease {
+    /// A native work queue rejected this invocation. Partial output must be
+    /// discarded and retried without replacing the last accepted frame.
+    pub fn allocation_deferred(&self) -> bool {
+        self.allocation_deferred.load(Ordering::Acquire)
+    }
     pub const fn token(&self) -> &RenderToken {
         &self.token
     }
@@ -252,7 +259,11 @@ impl FacetResourceLease {
         if minimum > remaining {
             return Err(PresentationError::LimitReached);
         }
-        let (handle, value, bytes) = allocate(remaining)?;
+        let (handle, value, bytes) = allocate(remaining).inspect_err(|error| {
+            if *error == PresentationError::AdmissionDeferred {
+                self.allocation_deferred.store(true, Ordering::Release);
+            }
+        })?;
         if state.resources.iter().any(|r| r.handle == handle) {
             state.sealed = true;
             return Err(PresentationError::HostFailure);

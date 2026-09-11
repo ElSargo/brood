@@ -498,6 +498,17 @@ impl LayoutLeaseTree {
         Ok(())
     }
 
+    /// Focus is a directive for a committed composition, not durable layout
+    /// geometry. Retaining an applied ancestor request would override every
+    /// later focus request from its descendants.
+    pub fn clear_focus_requests(&mut self) {
+        for node in self.nodes.values_mut() {
+            if let Some(accepted) = node.accepted.as_mut() {
+                accepted.focus = None;
+            }
+        }
+    }
+
     pub fn reuse_accepted_fragment_from(
         &mut self,
         source: &Self,
@@ -1107,8 +1118,9 @@ impl PointerEventMask {
     pub const MOTION: Self = Self(1 << 1);
     pub const RELEASE: Self = Self(1 << 2);
     pub const CANCEL: Self = Self(1 << 3);
+    pub const AXIS: Self = Self(1 << 4);
     pub const SUPPORTED: Self =
-        Self(Self::BUTTON.0 | Self::MOTION.0 | Self::RELEASE.0 | Self::CANCEL.0);
+        Self(Self::BUTTON.0 | Self::MOTION.0 | Self::RELEASE.0 | Self::CANCEL.0 | Self::AXIS.0);
 
     #[must_use]
     pub const fn empty() -> Self {
@@ -2318,6 +2330,28 @@ mod tests {
 
         assert_eq!(tree(false)?.compose()?.focus, Some(1));
         assert_eq!(tree(true)?.compose()?.focus, Some(1));
+        let mut committed = tree(false)?;
+        let geometry = committed.compose()?.layout;
+        committed.clear_focus_requests();
+        assert_eq!(committed.compose()?.focus, None);
+        assert_eq!(committed.compose()?.layout, geometry);
+        let child = committed
+            .rest_token(committed.root_token())
+            .ok_or_else(|| test_error("missing workspace lease"))?;
+        committed.submit(
+            child,
+            1,
+            LayoutFragment {
+                layout: ResolvedLayout {
+                    items: vec![pane_item(2, 2, 0.0)],
+                },
+                zones: Vec::new(),
+                dividers: Vec::new(),
+                rest: None,
+            },
+            Some(2),
+        )?;
+        assert_eq!(committed.compose()?.focus, Some(2));
         Ok(())
     }
 

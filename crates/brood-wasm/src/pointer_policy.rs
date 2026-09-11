@@ -60,6 +60,9 @@ pub struct PointerPolicyQuery {
     pub button: Option<u32>,
     pub modifiers: u32,
     pub captured: bool,
+    /// Scroll displacement in logical pixels; positive values point up/right.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scroll: Option<LocalPoint>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -414,6 +417,14 @@ fn validate_pointer_query(query: &PointerPolicyQuery) -> Result<()> {
     ensure!(
         expects_button == query.button.is_some(),
         "pointer query phase and button disagree"
+    );
+    ensure!(
+        query
+            .scroll
+            .is_none_or(|scroll| query.phase == PointerPhase::Axis
+                && scroll.u.is_finite()
+                && scroll.v.is_finite()),
+        "pointer query has invalid scroll displacement"
     );
     Ok(())
 }

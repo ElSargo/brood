@@ -2,7 +2,7 @@
 status: target
 type: system
 authority: product
-last-reviewed: 2026-09-05
+last-reviewed: 2026-09-10
 ---
 
 # Input And Keyboard Shortcuts
@@ -218,9 +218,10 @@ catalogue and client-published overrides; the editor consumes the same
 catalogue for labels and search. Plugin UI code does not maintain a second
 hardcoded binding table.
 
-When a terminal or Neovim pane is focused, ordinary Ctrl chords remain pane
-input so shell and Vim bindings retain their normal meaning. Ctrl+Alt product
-actions remain available through the global policy.
+When a terminal or Neovim pane is focused, Ctrl+J and Ctrl+K remain workspace
+focus actions. Other ordinary Ctrl chords remain pane input so shell and Vim
+bindings retain their normal meaning. Ctrl+Alt product actions, including
+layout selection, remain available through the global policy.
 
 ## Action Registry
 

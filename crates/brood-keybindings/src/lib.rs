@@ -193,17 +193,24 @@ pub const ACTIONS: &[Action] = &[
     },
     Action {
         id: "focus.next",
-        title: "Focus next managed pane",
+        title: "Focus next workspace pane",
         category: "Focus",
         scope: Scope::Always,
         default_binding: Binding::new(KEY_J, CTRL),
     },
     Action {
         id: "focus.previous",
-        title: "Focus previous managed pane",
+        title: "Focus previous workspace pane",
         category: "Focus",
         scope: Scope::Always,
         default_binding: Binding::new(KEY_K, CTRL),
+    },
+    Action {
+        id: "layout.next",
+        title: "Switch layout (grid / master stack+)",
+        category: "Layout",
+        scope: Scope::Always,
+        default_binding: Binding::new(KEY_L, CTRL_ALT),
     },
     Action {
         id: "terminal.spawn",

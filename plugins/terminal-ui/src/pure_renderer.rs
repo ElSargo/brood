@@ -1319,9 +1319,8 @@ fn layout_terminal_text(
     run: &Run,
     text: &str,
     cells: u16,
-    cell_width: f32,
-    line_height: f32,
-) -> u64 {
+    grid_metrics: GridMetrics,
+) -> Result<u64, host::GraphicsError> {
     let key = RunKey {
         cells,
         fg: run.fg,
@@ -1331,7 +1330,7 @@ fn layout_terminal_text(
         text: text.to_owned(),
     };
     if let Some(handle) = cache.get(&key) {
-        return *handle;
+        return Ok(*handle);
     }
     let resolved = theme.terminal_color(run.fg);
     let color = [resolved.r, resolved.g, resolved.b];
@@ -1351,18 +1350,17 @@ fn layout_terminal_text(
                 host::FontStyle::Normal
             },
             font_size: FONT_SIZE,
-            max_width: (f32::from(cells) * cell_width).max(cell_width),
-            line_height,
+            max_width: (f32::from(cells) * grid_metrics.cell_width).max(grid_metrics.cell_width),
+            line_height: grid_metrics.line_height,
             red: color[0],
             green: color[1],
             blue: color[2],
             alpha: if run.faint { 0.6 } else { 1.0 },
         },
-    )
-    .expect("lease terminal text layout")
+    )?
     .handle;
     cache.insert(key, handle);
-    handle
+    Ok(handle)
 }
 
 fn pane_packet(
@@ -1372,7 +1370,7 @@ fn pane_packet(
     sequence: &Sequence,
     target_time_ns: u64,
     grid_metrics: GridMetrics,
-) -> (Vec<u8>, Interaction, Option<u64>) {
+) -> Result<(Vec<u8>, Interaction, Option<u64>), host::GraphicsError> {
     let width = pane.logical_width as f32;
     let height = pane.logical_height as f32;
     let cell_width = grid_metrics.cell_width;
@@ -1432,9 +1430,8 @@ fn pane_packet(
                                 run,
                                 &cluster,
                                 cells,
-                                cell_width,
-                                line_height,
-                            ),
+                                grid_metrics,
+                            )?,
                             x: x + f32::from(offset) * cell_width,
                             y,
                         });
@@ -1455,9 +1452,8 @@ fn pane_packet(
                         run,
                         text,
                         cells,
-                        cell_width,
-                        line_height,
-                    ),
+                        grid_metrics,
+                    )?,
                     x,
                     y,
                 });
@@ -1540,11 +1536,11 @@ fn pane_packet(
         max_viewport_offset: snapshot.max_viewport_offset,
         rows_data: snapshot.rows_data.clone(),
     };
-    (
+    Ok((
         packet.encode().expect("encode terminal facet packet"),
         interaction,
         snapshot.cursor_visible.then_some(next_frame_ns).flatten(),
-    )
+    ))
 }
 
 fn placeholder_content(
@@ -1611,7 +1607,7 @@ impl Facets for TerminalUi {
                     placeholder_content(&theme, pane, true, view.grid_metrics)
                 } else {
                     view.snapshot.as_ref().map_or_else(
-                        || placeholder_content(&theme, pane, false, view.grid_metrics),
+                        || Ok(placeholder_content(&theme, pane, false, view.grid_metrics)),
                         |snapshot| {
                             let (packet, interaction, next) = pane_packet(
                                 &theme,
@@ -1620,7 +1616,7 @@ impl Facets for TerminalUi {
                                 &sequence,
                                 request.target_time_ns,
                                 view.grid_metrics,
-                            );
+                            )?;
                             next_frame_ns = match (next_frame_ns, next) {
                                 (Some(current), Some(next)) => Some(current.min(next)),
                                 (None, next) => next,
@@ -1635,22 +1631,28 @@ impl Facets for TerminalUi {
                                     Err(()) => true,
                                 }
                             {
-                                placeholder_content(&theme, pane, true, view.grid_metrics)
+                                Ok(placeholder_content(&theme, pane, true, view.grid_metrics))
                             } else {
-                                facets::PaneContent::Draw {
+                                Ok(facets::PaneContent::Draw {
                                     packet,
                                     interaction: interaction.unwrap_or_default(),
-                                }
+                                })
                             }
                         },
-                    )
+                    )?
                 };
-                facets::PaneOutput {
+                Ok(facets::PaneOutput {
                     pane: pane.pane,
                     content,
-                }
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, host::GraphicsError>>();
+        let Ok(panes) = panes else {
+            // The host records temporary allocation pressure on the resource
+            // lease and retries this opportunity without committing its output.
+            // Returning lets that happen without poisoning the facet worker.
+            return Vec::new();
+        };
         let response = facets::RenderResponse {
             token: request.token,
             panes,
