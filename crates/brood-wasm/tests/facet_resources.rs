@@ -19,6 +19,7 @@ struct FakeBackend {
     next: Mutex<u64>,
     blocked: Mutex<bool>,
     allocation_deferred: Mutex<bool>,
+    limit_reached: Mutex<bool>,
     released: Mutex<usize>,
     release_calls: Mutex<usize>,
     release_threads: Mutex<Vec<thread::ThreadId>>,
@@ -90,6 +91,13 @@ impl FacetResourceBackend for FakeBackend {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
         {
             return Err(PresentationError::AdmissionDeferred);
+        }
+        if *self
+            .limit_reached
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            return Err(PresentationError::LimitReached);
         }
         if text.len() > max_bytes {
             return Err(PresentationError::LimitReached);
@@ -284,6 +292,32 @@ fn temporary_text_pressure_discards_partial_resources_and_allows_a_new_invocatio
     ensure!(!retry.allocation_deferred());
     retry.seal()?;
     retry.validate_handle(7, text.handle)?;
+    Ok(())
+}
+
+#[test]
+fn backend_limit_reached_does_not_set_allocation_deferred() -> Result<()> {
+    let backend = Arc::new(FakeBackend::default());
+    let registry = registry(Arc::clone(&backend), 1)?;
+    let lease = registry.begin(token(), &[7], limits(), budget())?;
+    *backend
+        .limit_reached
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+    let options = TextLayoutOptions {
+        font_intent: brood_wasm::presentation::FontIntent::Monospace,
+        font_weight: brood_wasm::presentation::FontWeight::Normal,
+        font_style: brood_wasm::presentation::FontStyle::Normal,
+        font_size: 12.0,
+        max_width: 20.0,
+        line_height: 14.0,
+        color: [1.0; 4],
+    };
+    ensure!(lease.create_text(7, "x", options) == Err(PresentationError::LimitReached));
+    ensure!(
+        !lease.allocation_deferred(),
+        "permanent backend limit must not mark lease deferred"
+    );
     Ok(())
 }
 

@@ -505,6 +505,10 @@ impl PluginFacetCoordinator {
                     return Ok(FacetPoll::DiscardedRender);
                 }
                 let output = result?;
+                anyhow::ensure!(
+                    !output.is_empty(),
+                    "facet render produced empty response without transient resource pressure"
+                );
                 let decoded =
                     facet_wire::render_response(&output, &self.budget, self.config.decode)?;
                 let frames = self.frames.lock().map_err(|poison| {

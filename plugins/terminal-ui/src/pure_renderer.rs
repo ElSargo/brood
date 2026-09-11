@@ -1536,8 +1536,11 @@ fn pane_packet(
         max_viewport_offset: snapshot.max_viewport_offset,
         rows_data: snapshot.rows_data.clone(),
     };
+    let encoded_packet = packet
+        .encode()
+        .map_err(|_| host::GraphicsError::LimitReached)?;
     Ok((
-        packet.encode().expect("encode terminal facet packet"),
+        encoded_packet,
         interaction,
         snapshot.cursor_visible.then_some(next_frame_ns).flatten(),
     ))
@@ -1590,7 +1593,7 @@ impl Facets for TerminalUi {
         else {
             return Vec::new();
         };
-        let theme = ThemeSnapshot::decode(&request.configuration).expect("valid theme snapshot");
+        let theme = ThemeSnapshot::decode(&request.configuration).unwrap_or_default();
         let view = decode_view(&request.application_view).unwrap_or(View {
             snapshot: None,
             oversized: true,
@@ -1603,44 +1606,64 @@ impl Facets for TerminalUi {
             .panes
             .iter()
             .map(|pane| {
-                let content = if view.oversized {
-                    placeholder_content(&theme, pane, true, view.grid_metrics)
+                let (content, next) = if view.oversized {
+                    (
+                        placeholder_content(&theme, pane, true, view.grid_metrics),
+                        None,
+                    )
                 } else {
-                    view.snapshot.as_ref().map_or_else(
-                        || Ok(placeholder_content(&theme, pane, false, view.grid_metrics)),
-                        |snapshot| {
-                            let (packet, interaction, next) = pane_packet(
-                                &theme,
-                                pane,
-                                snapshot,
-                                &sequence,
-                                request.target_time_ns,
-                                view.grid_metrics,
-                            )?;
-                            next_frame_ns = match (next_frame_ns, next) {
-                                (Some(current), Some(next)) => Some(current.min(next)),
-                                (None, next) => next,
-                                (current, None) => current,
-                            };
-                            let interaction = encode_interaction(&interaction);
-                            if packet.len() > request.limits.max_packet_bytes as usize
-                                || match interaction.as_ref() {
-                                    Ok(bytes) => {
-                                        bytes.len() > request.limits.max_interaction_bytes as usize
+                    match view.snapshot.as_ref() {
+                        None => (
+                            placeholder_content(&theme, pane, false, view.grid_metrics),
+                            None,
+                        ),
+                        Some(snapshot) => match pane_packet(
+                            &theme,
+                            pane,
+                            snapshot,
+                            &sequence,
+                            request.target_time_ns,
+                            view.grid_metrics,
+                        ) {
+                            Ok((packet, interaction, next)) => {
+                                let interaction = encode_interaction(&interaction);
+                                if packet.len() > request.limits.max_packet_bytes as usize
+                                    || match interaction.as_ref() {
+                                        Ok(bytes) => {
+                                            bytes.len()
+                                                > request.limits.max_interaction_bytes as usize
+                                        }
+                                        Err(()) => true,
                                     }
-                                    Err(()) => true,
+                                {
+                                    (
+                                        placeholder_content(&theme, pane, true, view.grid_metrics),
+                                        None,
+                                    )
+                                } else {
+                                    (
+                                        facets::PaneContent::Draw {
+                                            packet,
+                                            interaction: interaction.unwrap_or_default(),
+                                        },
+                                        next,
+                                    )
                                 }
-                            {
-                                Ok(placeholder_content(&theme, pane, true, view.grid_metrics))
-                            } else {
-                                Ok(facets::PaneContent::Draw {
-                                    packet,
-                                    interaction: interaction.unwrap_or_default(),
-                                })
                             }
+                            Err(host::GraphicsError::LimitReached) => (
+                                placeholder_content(&theme, pane, true, view.grid_metrics),
+                                None,
+                            ),
+                            Err(error) => return Err(error),
                         },
-                    )?
+                    }
                 };
+                if let Some(next) = next {
+                    next_frame_ns = match next_frame_ns {
+                        Some(current) => Some(current.min(next)),
+                        None => Some(next),
+                    };
+                }
                 Ok(facets::PaneOutput {
                     pane: pane.pane,
                     content,
@@ -1648,18 +1671,34 @@ impl Facets for TerminalUi {
             })
             .collect::<Result<Vec<_>, host::GraphicsError>>();
         let Ok(panes) = panes else {
-            // The host records temporary allocation pressure on the resource
-            // lease and retries this opportunity without committing its output.
-            // Returning lets that happen without poisoning the facet worker.
             return Vec::new();
         };
         let response = facets::RenderResponse {
-            token: request.token,
+            token: request.token.clone(),
             panes,
             next_frame_ns,
         };
-        facet_codec::encode_render_response_owned(
+        if let Ok(encoded) = facet_codec::encode_render_response_owned(
             &response,
+            request.limits.max_output_bytes as usize,
+        ) {
+            return encoded;
+        }
+        let fallback_panes = request
+            .panes
+            .iter()
+            .map(|pane| facets::PaneOutput {
+                pane: pane.pane,
+                content: placeholder_content(&theme, pane, true, view.grid_metrics),
+            })
+            .collect();
+        let fallback_response = facets::RenderResponse {
+            token: request.token,
+            panes: fallback_panes,
+            next_frame_ns: None,
+        };
+        facet_codec::encode_render_response_owned(
+            &fallback_response,
             request.limits.max_output_bytes as usize,
         )
         .unwrap_or_default()
@@ -1687,7 +1726,7 @@ impl Facets for TerminalUi {
         .unwrap_or_default();
         let response = facets::InputResponse {
             token: request.token,
-            next_sequence_state: serde_json::to_vec(&sequence).expect("terminal input sequence"),
+            next_sequence_state: serde_json::to_vec(&sequence).unwrap_or_default(),
             events,
             requests,
         };
@@ -2107,6 +2146,112 @@ mod tests {
         snapshot.rows_data[0][0].text = "界界".into();
         assert_eq!(layout_unit_count(&snapshot), Some(2));
         assert_eq!(layout_key_count(&snapshot), Some(1));
+    }
+
+    #[test]
+    fn command_overflow_snapshot_falls_back_to_placeholder_instead_of_empty_output() {
+        let rows = 128_u16;
+        let cols = 128_u16; // 128 * 128 = 16_384 runs
+        let mut rows_data = Vec::with_capacity(rows as usize);
+        for _row in 0..rows {
+            let mut runs = Vec::with_capacity(cols as usize);
+            for col in 0..cols {
+                runs.push(Run {
+                    start: col,
+                    cells: 1,
+                    fg: DEFAULT_BG,
+                    bg: 0x00FF_0000,
+                    bold: false,
+                    faint: false,
+                    italic: false,
+                    underline: false,
+                    strikethrough: false,
+                    text: String::new(),
+                });
+            }
+            rows_data.push(runs);
+        }
+        let snapshot = Snapshot {
+            revision: 1,
+            input_sequence: 0,
+            rows,
+            cols,
+            cursor_row: 0,
+            cursor_col: 0,
+            cursor_visible: false,
+            application_cursor: false,
+            bracketed_paste: false,
+            mouse_tracking: 0,
+            mouse_sgr: false,
+            exited: false,
+            exit_code: None,
+            chunks_read: 0,
+            bytes_read: 0,
+            resizes: 0,
+            viewport_offset: 0,
+            max_viewport_offset: 0,
+            rows_data,
+        };
+        let view_bytes = encode_view_parts(Some(&snapshot), false, GridMetrics::default())
+            .expect("view parts encoded");
+        let pane = facets::PaneTarget {
+            pane: 9,
+            logical_width: 800.0,
+            logical_height: 600.0,
+            physical_width: 800,
+            physical_height: 600,
+            scale: 1.0,
+            clip: [0.0, 0.0, 800.0, 600.0],
+            visible: true,
+            focused: true,
+        };
+        let request = facets::RenderRequest {
+            token: facets::RenderToken {
+                scope: facets::Scope {
+                    client_generation: 1,
+                    actor_generation: 1,
+                    facet_generation: 1,
+                },
+                invocation: 1,
+                snapshot_revision: 1,
+                candidate: 1,
+                pane_membership_revision: 1,
+                geometry_revision: 1,
+                host_configuration_revision: 1,
+                renderer_generation: 1,
+                interaction_revision: 1,
+            },
+            panes: vec![pane],
+            target_time_ns: 0,
+            cutoff_ns: 1_000_000,
+            configuration: Vec::new(),
+            application_view: view_bytes,
+            sequence_state: Vec::new(),
+            limits: facets::InvocationLimits {
+                max_output_bytes: 65536,
+                max_packet_bytes: 65536,
+                max_interaction_bytes: 65536,
+                max_sequence_bytes: 65536,
+                max_events: 16,
+                max_event_bytes: 65536,
+                max_host_requests: 16,
+                max_resources: 16384,
+                max_resource_bytes: 65536,
+            },
+        };
+        let mut wire = vec![0u8; 512 * 1024];
+        let len = facet_codec::encode_render_request(&request, &mut wire).expect("encode request");
+        wire.truncate(len);
+        let output = TerminalUi::render(wire);
+        assert!(!output.is_empty(), "render output must not be empty on command overflow");
+        let response = facet_codec::decode_render_response(&output, decode_limits(output.len()))
+            .expect("decode response");
+        assert_eq!(response.panes.len(), 1);
+        let facets::PaneContent::Draw { packet, .. } = &response.panes[0].content else {
+            panic!("expected Draw content for fallback");
+        };
+        let decoded_packet = Packet::decode(packet).expect("valid fallback packet");
+        assert_eq!(decoded_packet.commands.len(), 2);
     }
 
     #[test]
