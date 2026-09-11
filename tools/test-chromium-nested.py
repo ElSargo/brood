@@ -33,6 +33,8 @@ processes = []
 files = []
 events = []
 size = os.environ.get("BROOD_CHROMIUM_SIZE", "1920x1080")
+# Keep the reconnect regression runnable independently of initial resize readiness.
+reconnect_only = os.environ.get("BROOD_CHROMIUM_RECONNECT_ONLY") == "1"
 width, height = map(int, size.split("x"))
 page = b"""<!doctype html><title>Brood Chromium proof</title>
 <style>html,body{margin:0;background:#123456;color:white;font:24px sans-serif}
@@ -141,6 +143,9 @@ try:
     start([binary, "run", "--no-session-runner", "--headless", "--config", config,
            "--dbus-destination", destination], "server.log")
     status = wait_for(lambda: json.loads(ctl("status-json")), "backend readiness")
+    # Leave a hole in the backend pane IDs. Reconnecting presentations allocate
+    # their own handles from one, so this catches repeated ID translation.
+    (out / "unused-pane.txt").write_text(ctl("spawn", "true"))
     (out / "sway.conf").write_text(
         f"xwayland disable\noutput * mode {size}\nseat seat0 fallback true\ndefault_border none\n")
     start(["sway", "--unsupported-gpu", "--config", out / "sway.conf"], "sway.log", {
@@ -149,9 +154,12 @@ try:
     socket = wait_for(lambda: next((p for p in present.glob("wayland-*") if p.is_socket()), None),
                       "offscreen socket")
     present_env = {"XDG_RUNTIME_DIR": str(present), "WAYLAND_DISPLAY": socket.name}
-    start([client, "--config", config, "--dbus-destination", destination], "client.log", {
-        **present_env, "BROOD_FRAME_TRANSPORT": "shared-memory", "WGPU_BACKEND": "vulkan",
-        "RUST_LOG": "brood_client=info,wgpu_core=warn,wgpu_hal=warn"})
+    def start_frontend(log):
+        return start([client, "--config", config, "--dbus-destination", destination], log, {
+            **present_env, "BROOD_FRAME_TRANSPORT": "shared-memory", "WGPU_BACKEND": "vulkan",
+            "RUST_LOG": "brood_client=info,wgpu_core=warn,wgpu_hal=warn"})
+
+    frontend = start_frontend("client.log")
     wait_for(lambda: "setup layout quiescent" in (out / "client.log").read_text(),
              "initial presentation layout", timeout=120)
     run(["grim", out / "before.png"], present_env)
@@ -161,7 +169,36 @@ try:
                      f"http://127.0.0.1:{http.server_port}/"],
                     "chromium.log", {"WAYLAND_DISPLAY": status["wayland_display"], "WAYLAND_DEBUG": "1"})
     wait_for(lambda: events, "Chromium page load")
-    bounds = wait_for(lambda: capture("presentation.png"), "visible Chromium content")
+    if not reconnect_only:
+        wait_for(lambda: capture("presentation.png"), "visible Chromium content")
+    windows_before_reconnect = wait_for(
+        lambda: json.loads(ctl("computer-use", "windows", "1"))["windows"],
+        "managed window identity before reconnect")
+    def window_identities(windows):
+        return sorted((window["pane"], window["session"], window["application_id"])
+                      for window in windows)
+
+    assert windows_before_reconnect and all(window["pane"] > 1 for window in windows_before_reconnect)
+    for reconnect in range(1, 3):
+        ctl("close-frontend")
+        assert frontend.wait(timeout=15) == 0, "presentation failed during disconnect"
+        processes.remove(frontend)
+        detached = json.loads(ctl("status-json"))
+        assert detached["presentation"] == "Detached"
+        assert browser.poll() is None, "managed browser died with the presentation"
+        (out / f"status-detached-{reconnect}.json").write_text(json.dumps(detached, indent=2))
+        log = f"client-reconnected-{reconnect}.log"
+        frontend = start_frontend(log)
+        bounds = wait_for(lambda: capture(f"reconnected-{reconnect}.png"),
+                          "managed content after presentation reconnect")
+        wait_for(lambda: "setup layout quiescent" in (out / log).read_text(),
+                 "reconnected presentation layout", timeout=120)
+        bounds = wait_for(lambda: capture(f"reconnected-{reconnect}.png"),
+                          "settled managed content after presentation reconnect")
+        windows_after_reconnect = json.loads(ctl("computer-use", "windows", "1"))["windows"]
+        assert window_identities(windows_after_reconnect) == window_identities(windows_before_reconnect), \
+            "reconnect changed managed windows"
+    # Exercise keyboard, click and scroll routing through the replacement client.
     before = json.loads(ctl("status-json"))
     (out / "status-before-input.json").write_text(json.dumps(before, indent=2))
     (out / "windows.json").write_text(ctl("computer-use", "windows", "1"))
@@ -193,7 +230,8 @@ try:
     deltas = {key: after[key] - before[key] for key in counters}
     assert all(delta > 0 for delta in deltas.values()), deltas
     assert after["dmabuf_rejected"] == 0 and after["wayland_dispatch_errors"] == 0
-    client_log = (out / "client.log").read_text()
+    client_log = "\n".join((out / log).read_text() for log in (
+        "client.log", "client-reconnected-1.log", "client-reconnected-2.log"))
     assert "completed synchronized layout" in client_log
     if width >= 1920:
         assert "managed resize snapshot queued" in (out / "server.log").read_text()
@@ -209,9 +247,11 @@ try:
         time.sleep(0.1)
     (out / "status-after-close.json").write_text(ctl("status-json"))
     report = {"size": size, "visible_browser_bounds": bounds, "input_deltas": deltas,
-              "page_events": len(events), "typed_text": typed, "passed": True}
+              "page_events": len(events), "typed_text": typed, "presentation_reconnects": 2,
+              "initial_launch_checked": not reconnect_only,
+              "passed": True}
     (out / "report.json").write_text(json.dumps(report, indent=2))
-    print(f"Chromium launch and input passed: {out}")
+    print(f"Chromium presentation reconnect and input passed: {out}")
 finally:
     for process in reversed(processes):
         # Each process owns a private test process group, including its helpers.

@@ -361,8 +361,6 @@ enum ActorLifecycleCompletion {
     },
     Stopped {
         id: String,
-        pane: Option<u64>,
-        panes: Vec<u64>,
         disposition: StopDisposition,
         result: std::result::Result<(), String>,
     },
@@ -2079,8 +2077,7 @@ impl PresentationWasmRuntime {
         mut actor: PresentationActor,
         disposition: StopDisposition,
     ) {
-        let pane = (actor.pane != 0).then_some(actor.pane);
-        let panes = actor.panes.iter().copied().collect::<Vec<_>>();
+        self.retire_actor_input_and_panes(&id, &actor.panes);
         let generation = actor.actor.generation();
         let send_stop_lifecycle = matches!(disposition, StopDisposition::Requested);
         self.starting_init_children.remove(&id);
@@ -2118,8 +2115,6 @@ impl PresentationWasmRuntime {
             if completion
                 .send(ActorLifecycleCompletion::Stopped {
                     id,
-                    pane,
-                    panes,
                     disposition,
                     result,
                 })
@@ -2133,6 +2128,27 @@ impl PresentationWasmRuntime {
             wake_lifecycle_completion(proxy.as_ref());
         });
         self.lifecycle_tasks.push(task);
+    }
+
+    fn retire_actor_input_and_panes(&mut self, id: &str, panes: &BTreeSet<u64>) {
+        // The actor has already left the routing table. Withdraw its panes and
+        // retained input now, without waiting for asynchronous guest shutdown.
+        let mut pending = self
+            .pending_actor_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        discard_pending_events_for_actor(&mut pending, id);
+        drop(pending);
+        if let Ok(mut cursor) = self.last_flushed_input_actor.lock()
+            && cursor.as_deref() == Some(id)
+        {
+            *cursor = None;
+        }
+        self.started_panes_awaiting_start_barrier
+            .retain(|pane| !panes.contains(pane));
+        self.pending_pane_creations
+            .retain(|pane| !panes.contains(pane));
+        self.pending_pane_removals.extend(panes.iter().copied());
     }
 
     fn drain_lifecycle_completions(&mut self) {
@@ -2262,17 +2278,10 @@ impl PresentationWasmRuntime {
                 }
                 ActorLifecycleCompletion::Stopped {
                     id,
-                    pane,
-                    panes,
                     disposition,
                     result,
                 } => {
                     self.stopping_init_children.remove(&id);
-                    if pane.is_some() {
-                        self.pending_pane_removals.extend(panes);
-                    } else {
-                        debug_assert!(panes.is_empty());
-                    }
                     match disposition {
                         StopDisposition::Requested => match result {
                             Ok(()) => {
@@ -2555,11 +2564,20 @@ impl PresentationWasmRuntime {
         let key_input = matches!(&event, PresentationEvent::Key { pressed: true, .. });
         let pane = presentation_event_pane(&event)
             .context("actor-scoped render hints require explicit actor routing")?;
-        let (actor_name, hosted) = self
+        let Some((actor_name, hosted)) = self
             .actors
             .iter()
             .find(|(_name, actor)| actor.panes.contains(&pane))
-            .with_context(|| format!("presentation pane {pane} has no actor"))?;
+        else {
+            // Input and layout teardown can still reference a withdrawn pane.
+            // Pane IDs are never reused, so these events cannot reach a later
+            // actor generation and must not terminate the presentation host.
+            tracing::debug!(
+                pane,
+                "discarded presentation event for unavailable actor pane"
+            );
+            return Ok(());
+        };
         let event = if let Some(facets) = &hosted.facets {
             let mut facets = facets
                 .lock()
@@ -4127,6 +4145,100 @@ fn started_hosted_actor_log(
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    #[test]
+    fn late_pane_events_after_actor_removal_are_harmless() -> Result<()> {
+        let runtime = PresentationWasmRuntime::start(&[], None, None, None, None)?;
+        let pane = u64::MAX;
+        crate::dispatch_focus_change(
+            Some(&runtime),
+            None,
+            crate::FocusChange {
+                plugin_blur: Some(pane),
+                plugin_focus: None,
+                managed_window: None,
+                reset_keyboard: true,
+            },
+            true,
+        )?;
+        for event in [
+            PresentationEvent::PointerLeft { pane },
+            PresentationEvent::PointerMoved {
+                pane,
+                x: 12.0,
+                y: 34.0,
+            },
+            PresentationEvent::Key {
+                pane,
+                physical_key: 30,
+                logical_key: "a".to_owned(),
+                pressed: false,
+                repeat: false,
+                modifiers: 0,
+            },
+            PresentationEvent::PaneCreated {
+                pane,
+                width: 800.0,
+                height: 600.0,
+                scale: 1.0,
+            },
+        ] {
+            runtime.send_presentation_event(event)?;
+        }
+        ensure!(runtime.pending_actor_input_messages() == 0);
+        runtime.shutdown()
+    }
+
+    #[test]
+    fn actor_stop_withdraws_panes_and_queued_input_before_shutdown_completes() -> Result<()> {
+        let mut runtime = PresentationWasmRuntime::start(&[], None, None, None, None)?;
+        runtime
+            .pending_actor_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend([
+                pending_key("closing", 1, 1),
+                pending_key("peer", 2, 2),
+                pending_hint("closing", 3),
+            ]);
+        *runtime
+            .last_flushed_input_actor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some("closing".to_owned());
+        runtime
+            .started_panes_awaiting_start_barrier
+            .extend([11, 22]);
+        runtime.pending_pane_creations.extend([11, 33]);
+
+        runtime.retire_actor_input_and_panes("closing", &BTreeSet::from([11]));
+
+        ensure!(runtime.drain_pending_pane_removals().collect::<Vec<_>>() == [11]);
+        ensure!(runtime.drain_pending_pane_creations().collect::<Vec<_>>() == [33]);
+        ensure!(runtime.started_panes_awaiting_start_barrier == VecDeque::from([22]));
+        ensure!(
+            runtime
+                .last_flushed_input_actor
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none()
+        );
+        let remaining = runtime
+            .pending_actor_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain(..)
+            .collect::<Vec<_>>();
+        ensure!(remaining.len() == 1);
+        ensure!(
+            remaining
+                .first()
+                .context("peer input was discarded")?
+                .actor()
+                == "peer"
+        );
+        runtime.flush_pending_actor_events()?;
+        runtime.shutdown()
+    }
 
     #[test]
     fn facet_input_correlation_requires_its_causal_snapshot_or_sequence_change() {

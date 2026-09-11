@@ -6922,6 +6922,23 @@ impl Application {
                     );
                     return Ok(());
                 }
+                if self.renderer.is_none() {
+                    // Replay goes through accept_frame again after renderer
+                    // startup. Retain backend-local IDs here so reconnects
+                    // with sparse pane IDs translate them exactly once.
+                    self.pending_frames.insert(
+                        backend,
+                        ClientEvent::SceneFrame {
+                            backend,
+                            connection_generation,
+                            sequence,
+                            width,
+                            height,
+                            windows,
+                        },
+                    );
+                    return Ok(());
+                }
                 let mut windows = windows;
                 for window in &mut windows {
                     window.window_id = self.backend_registry.view_pane(QualifiedPane {
@@ -7058,20 +7075,6 @@ impl Application {
                 ));
             }
         };
-        if self.renderer.is_none() {
-            self.pending_frames.insert(
-                backend,
-                ClientEvent::SceneFrame {
-                    backend,
-                    connection_generation,
-                    sequence,
-                    width,
-                    height,
-                    windows,
-                },
-            );
-            return Ok(());
-        }
         let (focus_change, released_resources, ready_managed) = self
             .renderer
             .as_mut()
@@ -27930,6 +27933,79 @@ mod tests {
         } else {
             assert!(false, "test lane stopped being multi-backend");
         }
+    }
+
+    #[test]
+    fn startup_frames_keep_backend_pane_ids_until_renderer_replay() -> Result<()> {
+        let mut application = Application::default();
+        for (backend, generation, panes) in
+            [(BackendId(1), 42, [7, 19]), (BackendId(2), 43, [7, 23])]
+        {
+            application
+                .backend_registry
+                .replace_panes(backend, Some(generation), panes);
+            // Reconnect catalogs contain existing, sparse backend IDs. Local
+            // handles need not match them, regardless of which lane wins startup.
+            if backend == BackendId(1) {
+                for pane in panes {
+                    application
+                        .backend_registry
+                        .view_pane(QualifiedPane { backend, pane });
+                }
+            }
+            application.accept_frame(ClientEvent::SceneFrame {
+                backend,
+                connection_generation: generation,
+                sequence: 11,
+                width: 800,
+                height: 600,
+                windows: panes
+                    .into_iter()
+                    .map(|pane| SceneWindowUpdate {
+                        backend,
+                        backend_window_id: pane,
+                        window_id: pane,
+                        resource_id: pane + 100,
+                        rect: [0, 0, 400, 600],
+                        active: pane == 7,
+                        resize_epoch: None,
+                        resource: None,
+                    })
+                    .collect(),
+            })?;
+        }
+        for (backend, panes) in [(BackendId(1), [7, 19]), (BackendId(2), [7, 23])] {
+            let frame = application.pending_frames.remove(&backend).unwrap();
+            let ClientEvent::SceneFrame { windows, .. } = &frame else {
+                anyhow::bail!("startup frame changed event kind");
+            };
+            assert_eq!(
+                windows
+                    .iter()
+                    .map(|window| window.window_id)
+                    .collect::<Vec<_>>(),
+                panes
+            );
+            assert!(
+                windows
+                    .iter()
+                    .all(|window| window.window_id == window.backend_window_id)
+            );
+            // Replaying while startup is still pending must also be idempotent.
+            application.accept_frame(frame)?;
+            let ClientEvent::SceneFrame { windows, .. } = &application.pending_frames[&backend]
+            else {
+                anyhow::bail!("replayed frame changed event kind");
+            };
+            assert_eq!(
+                windows
+                    .iter()
+                    .map(|window| window.window_id)
+                    .collect::<Vec<_>>(),
+                panes
+            );
+        }
+        Ok(())
     }
 
     #[test]

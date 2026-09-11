@@ -415,7 +415,10 @@ mod tests {
                     size: LocalPoint { u: 0.1, v: 2.0 },
                 },
                 z: 4.0,
-                event_mask: PointerEventMask::SUPPORTED,
+                event_mask: PointerEventMask::BUTTON
+                    | PointerEventMask::MOTION
+                    | PointerEventMask::RELEASE
+                    | PointerEventMask::CANCEL,
                 cursor: CursorRole::ColResize,
                 input: ZoneInputBehavior::Drag,
             }]
