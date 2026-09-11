@@ -24,39 +24,11 @@ pub fn pane_placement(
         };
     }
 
-    let backend_at = |index: usize| pane_backends.get(index).copied().unwrap_or(0);
-    let backend = backend_at(index);
-    let panes_in_group = (0..panes.len())
-        .filter(|candidate| backend_at(*candidate) == backend)
-        .count();
-    let pane_index = (0..index)
-        .filter(|candidate| backend_at(*candidate) == backend)
-        .count();
-    let group_weight = ceil_sqrt(panes_in_group);
-
-    let mut total_weight = 0;
-    let mut preceding_weight = 0;
-    let mut candidate = 0;
-    while candidate < panes.len() {
-        let candidate_backend = backend_at(candidate);
-        if !(0..candidate).any(|previous| backend_at(previous) == candidate_backend) {
-            let count = (candidate..panes.len())
-                .filter(|other| backend_at(*other) == candidate_backend)
-                .count();
-            let weight = ceil_sqrt(count);
-            total_weight += weight;
-            if candidate_backend != backend
-                && (0..candidate).all(|previous| backend_at(previous) != backend)
-            {
-                preceding_weight += weight;
-            }
-        }
-        candidate += 1;
-    }
-
-    let total_weight = total_weight.max(1) as f32;
-    let group_width = 2.0 * group_weight as f32 / total_weight;
-    let group_offset = -1.0 + 2.0 * preceding_weight as f32 / total_weight;
+    let group = pane_group(index, panes.len(), pane_backends);
+    let panes_in_group = group.count;
+    let pane_index = group.index;
+    let group_width = group.width;
+    let group_offset = group.offset;
     let viewport_aspect = viewport_width.max(1) as f32 / viewport_height.max(1) as f32;
     let group_aspect = viewport_aspect * group_width / 2.0;
     let columns = grid_columns(panes_in_group, group_aspect);
@@ -102,4 +74,62 @@ const fn ceil_sqrt(value: usize) -> usize {
         root += 1;
     }
     root
+}
+
+#[derive(Clone, Copy)]
+pub struct PaneGroup {
+    pub offset: f32,
+    pub width: f32,
+    pub index: usize,
+    pub count: usize,
+    #[allow(
+        dead_code,
+        reason = "the native grid consumer does not own per-backend stack state"
+    )]
+    pub first: usize,
+}
+
+pub fn pane_group(index: usize, pane_count: usize, pane_backends: &[u64]) -> PaneGroup {
+    let backend_at = |index: usize| pane_backends.get(index).copied().unwrap_or(0);
+    let backend = backend_at(index);
+    let panes_in_group = (0..pane_count)
+        .filter(|candidate| backend_at(*candidate) == backend)
+        .count();
+    let pane_index = (0..index)
+        .filter(|candidate| backend_at(*candidate) == backend)
+        .count();
+    let group_weight = ceil_sqrt(panes_in_group);
+
+    let mut total_weight = 0;
+    let mut preceding_weight = 0;
+    let mut candidate = 0;
+    while candidate < pane_count {
+        let candidate_backend = backend_at(candidate);
+        if !(0..candidate).any(|previous| backend_at(previous) == candidate_backend) {
+            let count = (candidate..pane_count)
+                .filter(|other| backend_at(*other) == candidate_backend)
+                .count();
+            let weight = ceil_sqrt(count);
+            total_weight += weight;
+            if candidate_backend != backend
+                && (0..candidate).all(|previous| backend_at(previous) != backend)
+            {
+                preceding_weight += weight;
+            }
+        }
+        candidate += 1;
+    }
+
+    let total_weight = total_weight.max(1) as f32;
+    let group_width = 2.0 * group_weight as f32 / total_weight;
+    let group_offset = -1.0 + 2.0 * preceding_weight as f32 / total_weight;
+    PaneGroup {
+        offset: group_offset,
+        width: group_width,
+        index: pane_index,
+        count: panes_in_group,
+        first: (0..=index)
+            .find(|candidate| backend_at(*candidate) == backend)
+            .unwrap_or(index),
+    }
 }

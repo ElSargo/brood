@@ -18,6 +18,7 @@ struct FakeBackend {
     resources: Mutex<BTreeMap<u64, usize>>,
     next: Mutex<u64>,
     blocked: Mutex<bool>,
+    allocation_deferred: Mutex<bool>,
     released: Mutex<usize>,
     release_calls: Mutex<usize>,
     release_threads: Mutex<Vec<thread::ThreadId>>,
@@ -83,6 +84,13 @@ impl FacetResourceBackend for FakeBackend {
         _options: TextLayoutOptions,
         max_bytes: usize,
     ) -> Result<(u64, TextLayoutResult, usize), PresentationError> {
+        if *self
+            .allocation_deferred
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            return Err(PresentationError::AdmissionDeferred);
+        }
         if text.len() > max_bytes {
             return Err(PresentationError::LimitReached);
         }
@@ -206,6 +214,10 @@ fn bounds_owner_validation_and_seal_are_enforced() -> Result<()> {
     let lease = registry.begin(token(), &[7], limits(), budget())?;
     let handle = lease.create_image(7, 1, 1, &[1, 2, 3, 4])?;
     ensure!(lease.create_image(7, 1, 1, &[1, 2, 3, 4]).is_err());
+    ensure!(
+        !lease.allocation_deferred(),
+        "hard limits must not retry forever"
+    );
     ensure!(lease.create_image(8, 1, 1, &[1, 2, 3, 4]).is_err());
     ensure!(lease.validate_handle(7, handle).is_err());
     lease.seal()?;
@@ -228,6 +240,50 @@ fn bounds_owner_validation_and_seal_are_enforced() -> Result<()> {
             )
             .is_err()
     );
+    Ok(())
+}
+
+#[test]
+fn temporary_text_pressure_discards_partial_resources_and_allows_a_new_invocation() -> Result<()> {
+    let backend = Arc::new(FakeBackend::default());
+    let registry = registry(Arc::clone(&backend), 2)?;
+    let lease = registry.begin(token(), &[7], limits(), budget())?;
+    lease.create_image(7, 1, 1, &[1])?;
+    *backend
+        .allocation_deferred
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+    let options = TextLayoutOptions {
+        font_intent: brood_wasm::presentation::FontIntent::Monospace,
+        font_weight: brood_wasm::presentation::FontWeight::Normal,
+        font_style: brood_wasm::presentation::FontStyle::Normal,
+        font_size: 12.0,
+        max_width: 20.0,
+        line_height: 14.0,
+        color: [1.0; 4],
+    };
+    ensure!(lease.create_text(7, "x", options) == Err(PresentationError::AdmissionDeferred));
+    ensure!(lease.allocation_deferred());
+    ensure!(lease.owned_count() == 1);
+    lease.seal()?;
+    drop(lease);
+    for _ in 0..100 {
+        if registry.active_invocations() == 0 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    ensure!(registry.active_invocations() == 0);
+    ensure!(backend.released() == 1);
+    *backend
+        .allocation_deferred
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = false;
+    let retry = registry.begin(token(), &[7], limits(), budget())?;
+    let text = retry.create_text(7, "x", options)?;
+    ensure!(!retry.allocation_deferred());
+    retry.seal()?;
+    retry.validate_handle(7, text.handle)?;
     Ok(())
 }
 

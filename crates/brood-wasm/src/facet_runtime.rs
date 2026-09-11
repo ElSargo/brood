@@ -307,7 +307,9 @@ const fn map_graphics_error(error: PresentationError) -> GraphicsError {
         PresentationError::DuplicatePane => GraphicsError::DuplicatePane,
         PresentationError::StaleResizeEpoch => GraphicsError::StaleResizeEpoch,
         PresentationError::InvalidArgument => GraphicsError::InvalidArgument,
-        PresentationError::LimitReached => GraphicsError::LimitReached,
+        PresentationError::LimitReached | PresentationError::AdmissionDeferred => {
+            GraphicsError::LimitReached
+        }
         PresentationError::InvalidPacket => GraphicsError::InvalidPacket,
         PresentationError::InvalidResource => GraphicsError::InvalidResource,
         PresentationError::ResourceInUse => GraphicsError::ResourceInUse,

@@ -13,6 +13,7 @@ import re
 import subprocess
 import time
 import threading
+import traceback
 
 parser = argparse.ArgumentParser(__doc__)
 parser.add_argument("--out", type=Path, required=True)
@@ -108,11 +109,15 @@ def wait_for(predicate, seconds=12):
 
 
 def key(code, modifiers=None):
+    offset = len(text())
     command = [str(out / "virtual-keyboard-key")]
     if modifiers:
         command.append(modifiers)
     subprocess.run(command + [str(code)], check=True)
     time.sleep(.5)
+    if os.environ.get("BROOD_LAYOUT_TEST") == "1" and modifiers == "--ctrl-only" and code in (36, 37):
+        physical = "KeyJ" if code == 36 else "KeyK"
+        assert re.search(rf"physical=Code\({physical}\) state=Pressed .*modifiers=ModifiersState\(CONTROL\)", text()[offset:]), f"virtual keyboard did not deliver Ctrl+{physical[-1]}"
 
 
 def actor_panes():
@@ -147,7 +152,9 @@ def divider(kind="tile"):
 
 def capture(name):
     path = frames / (name + ".png")
-    subprocess.run(["grim", "-l", "0", str(path)], check=True,
+    # Keep timed drag samples cheap; compress standalone evidence losslessly.
+    level = "0" if re.search(r"-\d{3}$", name) else "6"
+    subprocess.run(["grim", "-l", level, str(path)], check=True,
                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     return str(path)
 
@@ -280,6 +287,119 @@ def drag_case(name, expected, delta=-180, boundary="tile", fixed=()):
     (out / "drag-results.json").write_text(json.dumps(results, indent=2))
     print(f"drag_case={name} positions={len(unique)} final={final} errors={errors}", flush=True)
     return result
+
+
+def workspace_layout_mode():
+    (out / "workspace-status-before.json").write_text(json.dumps(ctl_status_json(), indent=2) + "\n")
+    def terminals():
+        return {name: pane for name, pane in actor_panes().items() if name.startswith("terminal-ui")}
+
+    def rects():
+        found = re.findall(r"(?:accepted leased actor layout .*?pane_rects|accepted synchronized layout .*?target_rects)=\[([^\]]*)\]", text())
+        return {item[0]: list(map(int, item[1:])) for record in found[-1:] for entry in record.split(",") if len(item := entry.split(":")) == 5}
+
+    def typed_target(value):
+        def settle_input():
+            # The diagnostic pending-input counter tracks optional latency
+            # correlations too. Instead wait for actual backend input delivery
+            # to stop changing before attributing the next command.
+            previous = None
+            stable_since = time.monotonic()
+            until = stable_since + 8
+            while time.monotonic() < until:
+                count = len(re.findall(r"sender=terminal-ui\S* recipient=terminal-session\S* body=J", text()))
+                if count != previous:
+                    previous = count
+                    stable_since = time.monotonic()
+                elif time.monotonic() - stable_since >= .3:
+                    return
+                time.sleep(.05)
+            raise RuntimeError("terminal input delivery did not settle")
+        settle_input()
+        offset = len(text())
+        type_text(value)
+        key(28, "--none")
+        wait_for(lambda: re.search(r"sender=(terminal-ui\S*) recipient=terminal-session\S* body=J", text()[offset:]) is not None)
+        settle_input()
+        targets = set(re.findall(r"sender=(terminal-ui\S*) recipient=terminal-session\S* body=J", text()[offset:]))
+        assert len(targets) == 1, f"typing crossed focus targets: {targets}"
+        return targets.pop()
+
+    def new_terminal(count):
+        key(20)
+        wait_for(lambda: len(terminals()) == count and sum(pane in projection() for pane in terminals().values()) == min(count, 6))
+        time.sleep(.3)
+        target = typed_target(f"printf '\\033[{30 + count}m\\033[2J\\033[HWindow {count}\\n'; seq 1 80")
+        assert target == list(terminals())[-1], f"new terminal did not receive focus: {target}"
+
+    subprocess.run([str(out / "virtual-pointer-input"), "click", "200", "330", "1280", "720"], check=True)
+    typed_target("printf '\\033[2J\\033[HMASTER\\n'; seq 1 80")
+    new_terminal(2)
+    # Both terminals must change through continuous drags.
+    drag_case("two-terminals-narrow", list(terminals()))
+    drag_case("two-terminals-wide", list(terminals()), 180)
+    current = typed_target("printf 'FOCUS BEFORE\\n'")
+    key(36, "--ctrl-only")
+    next_focus = typed_target("printf 'FOCUS NEXT\\n'")
+    assert next_focus != current, "Ctrl+J did not change focused terminal"
+    key(37, "--ctrl-only")
+    assert typed_target("printf 'FOCUS PREVIOUS\\n'") == current, "Ctrl+K did not restore focus"
+    key(38)  # Ctrl+Alt+L, cycle to master stack+.
+    time.sleep(.5)
+    first = terminals()["terminal-ui"]
+    assert rects()[first][0] == 0, "first terminal is not master"
+    master_before = rects()[first]
+    for count in range(3, 7):
+        new_terminal(count)
+        assert rects()[first] == master_before, "opening a terminal replaced/resized the master"
+    capture("master-stack-five")
+    # Cycle across all six windows, including master, and record actual PTY recipients.
+    forward = []
+    for _ in range(6):
+        key(36, "--ctrl-only")
+        forward.append(typed_target("printf 'CYCLE\\n'"))
+    assert len(set(forward)) == 6, f"focus cycle skipped windows: {forward}"
+    # Focus a middle strip via a real click, then retain the focused paint order.
+    visible = rects()
+    stack_panes = sorted((pane for pane in terminals().values() if pane != first), key=lambda pane: visible[pane][1])
+    middle = stack_panes[2]
+    x, y, width, height = visible[middle]
+    # Focus the first stack pane first, leaving all later bottom strips exposed.
+    for _ in range(6):
+        if typed_target("true") == next(name for name, pane in terminals().items() if pane == stack_panes[0]):
+            break
+        key(36, "--ctrl-only")
+    else:
+        raise AssertionError("could not focus first stack pane")
+    subprocess.run([str(out / "virtual-pointer-input"), "click", str(x + width // 2), str(y + height - 5), "1280", "720"], check=True)
+    assert terminals()[typed_target("printf 'CLICKED MIDDLE\\n'")] == middle, "exposed strip did not focus its window"
+    capture("master-stack-middle-focused")
+    drag_case("master-stack-divider-narrow", list(terminals()), -100)
+    drag_case("master-stack-divider-wide", list(terminals()), 100)
+    new_terminal(7)
+    capture("master-stack-overflow-last")
+    before = {pane for pane in terminals().values() if pane in projection()}
+    last_pane = list(terminals().values())[-1]
+    delta = "80" if last_pane not in before else "-80"
+    subprocess.run([str(out / "virtual-pointer-input"), "scroll", "800", "330", delta, "1", "1280", "720"], check=True)
+    wait_for(lambda: {pane for pane in terminals().values() if pane in projection()} != before)
+    after = {pane for pane in terminals().values() if pane in projection()}
+    assert len(after) == 6 and first in after, "scroll must retain master and five stack windows"
+    capture("master-stack-overflow-scrolled")
+    overflow_cycle = []
+    for _ in range(7):
+        key(36, "--ctrl-only")
+        overflow_cycle.append(typed_target("printf 'OVERFLOW CYCLE\\n'"))
+    assert len(set(overflow_cycle)) == 7, f"overflow focus skipped windows: {overflow_cycle}"
+    capture("master-stack-overflow-focus")
+    key(38)
+    wait_for(lambda: all(pane in projection() for pane in terminals().values()))
+    capture("grid-restored")
+    key(16)  # Close focused terminal.
+    wait_for(lambda: len(terminal_actor_ids(ctl_status_json())) == 6)
+    (out / "workspace-status-after.json").write_text(json.dumps(ctl_status_json(), indent=2) + "\n")
+    failures = re.findall(r"visual facet failed[^\n]*", text())
+    results.append({"case": "workspace-layouts", "focus_cycle": forward, "overflow_focus_cycle": overflow_cycle, "scroll_before": sorted(before), "scroll_after": sorted(after), "master_pane": first, "resource_pressure_retries": text().count("facet render deferred by native resource pressure"), "errors": failures})
 
 
 def many_actors_mode():
@@ -447,7 +567,14 @@ try:
                 and sizes.get(panes.get("status-bar"), [])[1:] == [width, 34, width, 34])
     wait_for(shell_ready)
     time.sleep(.5)
-    if os.environ.get("BROOD_PLUGIN_FONT_TEST") == "1":
+    if os.environ.get("BROOD_LAYOUT_TEST") == "baseline":
+        key(20)
+        wait_for(lambda: sum(name.startswith("terminal-ui") and pane in projection() for name, pane in actor_panes().items()) == 2)
+        drag_case("two-terminals-narrow", ["terminal-ui"])
+        drag_case("two-terminals-wide", ["terminal-ui"], 180)
+    elif os.environ.get("BROOD_LAYOUT_TEST") == "1":
+        workspace_layout_mode()
+    elif os.environ.get("BROOD_PLUGIN_FONT_TEST") == "1":
         font_test_mode()
     elif os.environ.get("BROOD_PLUGIN_DRAG_MANY_ACTORS") == "1":
         many_actors_mode()
@@ -497,7 +624,7 @@ try:
         drag_case("keybindings-window-narrow", ["keybindings"], -700, "window")
         drag_case("keybindings-window-wide", ["keybindings"], 700, "window")
 except Exception as error:
-    results.append({"case": "setup-or-runtime-failure", "errors": [str(error)]})
+    results.append({"case": "setup-or-runtime-failure", "errors": [str(error)], "traceback": traceback.format_exc()})
     try:
         results[-1]["failure_frame"] = capture("failure")
     except Exception as capture_error:

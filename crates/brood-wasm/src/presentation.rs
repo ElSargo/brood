@@ -12,6 +12,8 @@ pub enum PresentationError {
     StaleResizeEpoch,
     InvalidArgument,
     LimitReached,
+    /// Temporary native work-queue pressure; retry the render opportunity.
+    AdmissionDeferred,
     InvalidPacket,
     InvalidResource,
     ResourceInUse,
@@ -29,6 +31,7 @@ impl fmt::Display for PresentationError {
             Self::StaleResizeEpoch => "synchronized resize epoch is stale",
             Self::InvalidArgument => "presentation argument is invalid",
             Self::LimitReached => "presentation limit reached",
+            Self::AdmissionDeferred => "presentation allocation admission deferred",
             Self::InvalidPacket => "draw packet is invalid",
             Self::InvalidResource => "graphics resource is invalid",
             Self::ResourceInUse => "graphics resource is still retained by a pane",

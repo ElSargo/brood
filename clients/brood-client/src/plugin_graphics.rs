@@ -2564,17 +2564,19 @@ impl ActorPresentationHost {
             plan,
             raster_scale,
         };
-        if self
+        if let Err(error) = self
             .bridge
             .glyph_raster_tx
             .try_send(GlyphRasterWork::Layout(Box::new(request)))
-            .is_err()
         {
             if let Ok(mut state) = self.bridge.shared.lock() {
                 state.text_layouts.remove(&handle);
                 state.glyph_raster_backpressure = state.glyph_raster_backpressure.saturating_add(1);
             }
-            return Err(PresentationError::LimitReached);
+            return Err(match error {
+                mpsc::TrySendError::Full(_) => PresentationError::AdmissionDeferred,
+                mpsc::TrySendError::Disconnected(_) => PresentationError::HostFailure,
+            });
         }
         let elapsed = started.elapsed();
         if std::env::var_os("BROOD_TRACE_PLUGIN_TEXT").is_some()

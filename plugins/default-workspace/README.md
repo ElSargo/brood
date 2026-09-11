@@ -17,7 +17,7 @@ the normal actor inbox and outbox ABI.
 Build:
 
 ```sh
-cargo build --manifest-path plugins/default-workspace/Cargo.toml --target wasm32-unknown-unknown --release
+nix develop --command cargo build --manifest-path plugins/default-workspace/Cargo.toml --target wasm32-unknown-unknown --release
 ```
 
 Output:
@@ -42,7 +42,9 @@ picker, `Ctrl+Alt+A` for the current
 session's agent picker, `Ctrl+Alt+D` for that session's project diff,
 `Ctrl+Alt+T` for a fresh first-party terminal, `Ctrl+Alt+E` for the
 client-local Wasm Neovim editor, and `Ctrl+Alt+Q` to close the focused pane. `Ctrl+J` /
-`Ctrl+K` cycle managed-window focus, and `Ctrl+O` opens a new `foot` window.
+`Ctrl+K` cycle focus through all workspace windows, including first-party terminals.
+`Ctrl+Alt+L` switches between the grid and **master stack+**. `Ctrl+O` opens a new
+`foot` window.
 Product chords emit ordinary action messages to their owning actors; the policy
 does not spawn processes or toggle client-owned pane state. The repository
 acceptance proof uses this exact module with real terminal surfaces, injected
@@ -58,3 +60,16 @@ tiles every realm in a viewport-aspect-aware grid. It supports the full bounded
 pane inventory; a partial final row expands to the column width, and the
 existing focus-cycle and managed-fullscreen actions keep dense workspaces
 navigable.
+
+Master stack+ preserves the first window as master on the left and staggers up
+to five stack windows on the right. Focus raises a stack window while exposing
+the top or bottom of its neighbors. Additional windows scroll through the
+five-window view with the mouse wheel; keyboard focus reveals hidden windows.
+Click an exposed edge to raise its window. Drag the vertical divider to resize
+the master and stack together. Each backend retains its own stack.
+
+The focused real-terminal workload runs through the offscreen nested harness:
+
+```sh
+nix develop --command tools/test-workspace-layouts.sh
+```

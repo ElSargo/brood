@@ -372,7 +372,10 @@ int main(int argc, char **argv) {
     if (wl_display_roundtrip(display) < 0) {
         fail("the compositor rejected the virtual keyboard keymap");
     }
-    usleep(10000);
+    // A compositor roundtrip acknowledges our device, not delivery of its
+    // keymap/enter events to the nested client. Allow attachment to settle
+    // before sending a short chord, including under concurrent build load.
+    usleep(100000);
     uint32_t modifiers = 0;
     if (
         modifier_mode == MODIFIERS_CTRL_ALT ||
@@ -491,7 +494,8 @@ int main(int argc, char **argv) {
     if (wl_display_roundtrip(display) < 0) {
         fail("the virtual keyboard request failed");
     }
-    usleep(10000);
+    // Keep the device alive until the nested client has consumed the chord.
+    usleep(100000);
     wl_proxy_marshal_flags(
         (struct wl_proxy *)keyboard,
         3,

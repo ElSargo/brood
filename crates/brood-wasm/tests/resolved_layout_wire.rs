@@ -61,7 +61,8 @@ fn interaction_chrome_round_trips_with_all_initial_event_classes() {
             event_mask: PointerEventMask::BUTTON
                 | PointerEventMask::MOTION
                 | PointerEventMask::RELEASE
-                | PointerEventMask::CANCEL,
+                | PointerEventMask::CANCEL
+                | PointerEventMask::AXIS,
             cursor: CursorRole::ColResize,
             input: ZoneInputBehavior::Drag,
         }],

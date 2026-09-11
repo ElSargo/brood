@@ -458,14 +458,14 @@ pub fn run_cli() -> Result<()> {
             &snapshot,
         )?;
         if evaluation.decision != GlobalKeyDecision::Consume
-            || !evaluation
-                .host_messages
-                .iter()
-                .any(|message| matches!(message, HostMessage::FocusPane { pane: 2 }))
-            || !evaluation.actor_messages.is_empty()
+            || !evaluation.host_messages.is_empty()
+            || !evaluation.actor_messages.iter().any(|message| {
+                message.actor == "workspace"
+                    && message.payload == br#"{"type":"layout-action","action":"focus-next"}"#
+            })
         {
             return Err(anyhow!(
-                "presentation key policy did not resolve Ctrl+J to the next visible pane"
+                "presentation key policy did not route Ctrl+J to workspace focus cycling"
             ));
         }
         let terminal_snapshot = KeyPolicySnapshot {
@@ -4285,6 +4285,7 @@ struct ActiveSynchronizedResize {
     recovered_managed_panes: BTreeSet<u64>,
     recovered_managed_content: BTreeMap<u64, &'static str>,
     focus: Option<u64>,
+    focus_at_admission: Option<u64>,
     wait_panes: BTreeSet<u64>,
     ready_panes: BTreeSet<u64>,
     affected_panes: BTreeSet<u64>,
@@ -4372,7 +4373,8 @@ fn pending_focus_after_actor_layout(pending: Option<u64>, actor_focus: Option<u6
 
 fn promoted_synchronized_focus(
     host_owned: bool,
-    captured_focus: Option<u64>,
+    requested_focus: Option<u64>,
+    focus_at_admission: Option<u64>,
     current_focus: Option<u64>,
     pending_focus: Option<u64>,
     newly_admitted_active: Option<u64>,
@@ -4381,12 +4383,15 @@ fn promoted_synchronized_focus(
         return Some(pending);
     }
     if !host_owned {
-        return captured_focus;
+        return requested_focus;
     }
-    if current_focus != captured_focus {
+    if current_focus != focus_at_admission {
         return current_focus;
     }
-    newly_admitted_active.or(captured_focus)
+    if requested_focus.is_some() && requested_focus != focus_at_admission {
+        return requested_focus;
+    }
+    newly_admitted_active.or(requested_focus)
 }
 
 fn synchronized_resize_preview_timed_out(active: &ActiveSynchronizedResize, now: Instant) -> bool {
@@ -7468,8 +7473,12 @@ impl Application {
                 .layout_leases
                 .waitable_panes(lease)
                 .context("layout lease wait set is unavailable during state publication")?;
+            // Let the lease holder reveal a requested pane which its current
+            // layout omits (for example beyond the scrollable stack). Waiting
+            // for that pane to be presented first would deadlock focus.
             let focused_pane = renderer
-                .focused_pane_id()
+                .pending_focus_pane
+                .or_else(|| renderer.focused_pane_id())
                 .filter(|pane| self.layout_leases.subtree_contains(lease, *pane));
             let viewport = viewport.pixel_rect(renderer.layout_extent());
             let message = renderer.layout_state_message(
@@ -9024,6 +9033,7 @@ impl Application {
             recovered_managed_panes: BTreeSet::new(),
             recovered_managed_content: BTreeMap::new(),
             focus,
+            focus_at_admission: self.renderer.as_ref().and_then(Renderer::focused_pane_id),
             wait_panes: unique_wait,
             ready_panes: BTreeSet::new(),
             affected_panes,
@@ -9917,6 +9927,7 @@ impl Application {
             }
         }
         self.layout_leases = active.target_tree;
+        self.layout_leases.clear_focus_requests();
         self.presented_layout_revision = active.epoch.target_layout_revision;
         self.layout_publications.clear();
         if degraded {
@@ -10607,6 +10618,9 @@ impl Application {
                             }
                             Err(error) => renderer.reject_actor_layout(&error),
                         };
+                        if accepted {
+                            self.layout_leases.clear_focus_requests();
+                        }
                         if accepted && layout_changed {
                             let accepted_items = renderer.accepted_layout.items.len();
                             let accepted_panes = renderer.accepted_layout.pane_count();
@@ -13079,6 +13093,7 @@ impl ApplicationHandler<ClientEvent> for Application {
                     PointerEventMask::MOTION,
                     None,
                     modifier_bits(self.modifiers),
+                    None,
                 ) {
                     Ok(route) => route,
                     Err(error) => {
@@ -13208,6 +13223,7 @@ impl ApplicationHandler<ClientEvent> for Application {
                     },
                     Some(button_code),
                     modifier_bits(self.modifiers),
+                    None,
                 ) {
                     Ok(route) => route,
                     Err(error) => {
@@ -13306,11 +13322,59 @@ impl ApplicationHandler<ClientEvent> for Application {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                let Some(target) = pointer_target_for_cursor(
-                    renderer,
-                    self.cursor_position,
-                    self.pointer_grab.as_ref(),
-                ) else {
+                let scale = renderer.window.scale_factor().max(f64::EPSILON);
+                let scroll = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => brood_wasm::LocalPoint {
+                        u: f64::from(x) * 40.0,
+                        v: f64::from(y) * 40.0,
+                    },
+                    MouseScrollDelta::PixelDelta(position) => brood_wasm::LocalPoint {
+                        u: position.x / scale,
+                        v: position.y / scale,
+                    },
+                };
+                // A pane grab owns its input until release. Otherwise layout zones
+                // get the same bounded policy route as buttons and motion.
+                let (position, modifiers) = if self.pointer_grab.is_none() {
+                    match route_layout_zone_pointer(
+                        renderer,
+                        &mut self.pointer_policy,
+                        self.wasm_runtime.as_ref(),
+                        &self.layout_holders,
+                        &self.layout_leases,
+                        self.layout_revision,
+                        self.active_synchronized_resize
+                            .as_ref()
+                            .map_or(self.presented_layout_revision, |active| {
+                                active.epoch.target_layout_revision
+                            }),
+                        &mut self.policy_pointer_capture,
+                        &mut self.pointer_interactions,
+                        &mut self.next_pointer_interaction,
+                        &mut self.pointer_event_sequence,
+                        self.cursor_position,
+                        brood_wasm::PointerPhase::Axis,
+                        PointerEventMask::AXIS,
+                        None,
+                        modifier_bits(self.modifiers),
+                        Some(scroll),
+                    ) {
+                        Ok(PointerPolicyRoute::Consumed) => return,
+                        Ok(PointerPolicyRoute::Forward {
+                            position,
+                            modifiers,
+                        }) => (position, modifiers),
+                        Err(error) => {
+                            eprintln!("pointer-policy scroll failed: {error:#}");
+                            return;
+                        }
+                    }
+                } else {
+                    (self.cursor_position, modifier_bits(self.modifiers))
+                };
+                let Some(target) =
+                    pointer_target_for_cursor(renderer, position, self.pointer_grab.as_ref())
+                else {
                     return;
                 };
                 if matches!(target, PanePointerTarget::Managed { pane, .. } if renderer.automated_pane_is_locked(pane))
@@ -13350,7 +13414,7 @@ impl ApplicationHandler<ClientEvent> for Application {
                                 y,
                                 horizontal: horizontal / scale,
                                 vertical: vertical / scale,
-                                modifiers: modifier_bits(self.modifiers),
+                                modifiers,
                             },
                         ) {
                             eprintln!("dropped plugin pointer scroll: {error:#}");
@@ -13438,6 +13502,7 @@ impl ApplicationHandler<ClientEvent> for Application {
                             PointerEventMask::CANCEL,
                             None,
                             modifier_bits(self.modifiers),
+                            None,
                         )
                     {
                         eprintln!("pointer-policy cancel failed: {error:#}");
@@ -15921,6 +15986,7 @@ fn promote_ready_synchronized_resize(
     let change = renderer.promote_staged_layout(
         active.epoch.id,
         active.focus,
+        active.focus_at_admission,
         active.host_owned,
         degraded,
         &active.wait_panes,
@@ -16512,6 +16578,7 @@ fn encode_canonical_layout_pointer_message(
     inventory_revision: u64,
     base_layout_revision: u64,
     provider_payload: &[u8],
+    scroll: Option<brood_wasm::LocalPoint>,
 ) -> Result<Vec<u8>> {
     serde_json::to_vec(&serde_json::json!({
         "type": "layout-pointer",
@@ -16532,6 +16599,7 @@ fn encode_canonical_layout_pointer_message(
         "inventory_revision": inventory_revision,
         "base_layout_revision": base_layout_revision,
         "provider_payload": provider_payload,
+        "scroll": scroll,
     }))
     .context("encode canonical pointer-policy actor message")
 }
@@ -16590,6 +16658,7 @@ fn cancel_policy_pointer_capture(
             inventory_revision,
             base_layout_revision,
             &[],
+            None,
         )
         .and_then(|payload| {
             runtime.send_actor_message(&holder.name, "pointer-policy".to_string(), payload)
@@ -16646,6 +16715,7 @@ fn route_layout_zone_pointer(
     event_mask: PointerEventMask,
     button: Option<u32>,
     modifiers: u32,
+    scroll: Option<brood_wasm::LocalPoint>,
 ) -> Result<PointerPolicyRoute> {
     interactions.retain_current_authority(holders, leases);
     let position = cursor_position;
@@ -16812,6 +16882,7 @@ fn route_layout_zone_pointer(
             button,
             modifiers,
             captured: captured_before,
+            scroll,
         },
     ) {
         Ok(result) => result,
@@ -16975,6 +17046,7 @@ fn route_layout_zone_pointer(
                 inventory_revision,
                 base_layout_revision,
                 &message.payload,
+                scroll,
             )?;
             runtime
                 .context("pointer-policy actor runtime is unavailable")?
@@ -19153,6 +19225,7 @@ impl Renderer {
             pane,
             self.focus_target_for_pane(pane),
         ) else {
+            self.layout_state_dirty |= self.pending_focus_pane != Some(pane);
             self.pending_focus_pane = Some(pane);
             return None;
         };
@@ -19834,6 +19907,7 @@ impl Renderer {
         &mut self,
         resize_epoch: u64,
         focus: Option<u64>,
+        focus_at_admission: Option<u64>,
         host_owned: bool,
         degraded: bool,
         wait_panes: &BTreeSet<u64>,
@@ -20020,6 +20094,7 @@ impl Renderer {
         let focus = promoted_synchronized_focus(
             host_owned,
             focus,
+            focus_at_admission,
             self.focused_pane_id(),
             pending_focus,
             promoted_managed_focus,
@@ -24724,6 +24799,7 @@ mod tests {
             recovered_managed_panes: BTreeSet::new(),
             recovered_managed_content: BTreeMap::new(),
             focus: None,
+            focus_at_admission: None,
             wait_panes: BTreeSet::from([7, 8]),
             ready_panes: BTreeSet::new(),
             affected_panes: BTreeSet::from([7, 8]),
@@ -24912,6 +24988,7 @@ mod tests {
             recovered_managed_panes: BTreeSet::new(),
             recovered_managed_content: BTreeMap::new(),
             focus: Some(1),
+            focus_at_admission: Some(1),
             wait_panes: BTreeSet::from([1, 2, 3]),
             ready_panes: BTreeSet::new(),
             affected_panes: BTreeSet::from([1, 2, 3]),
@@ -26456,7 +26533,7 @@ mod tests {
     #[test]
     fn host_owned_promotion_focuses_a_newly_admitted_active_managed_pane() {
         assert_eq!(
-            promoted_synchronized_focus(true, Some(91), Some(91), None, Some(3)),
+            promoted_synchronized_focus(true, Some(91), Some(91), Some(91), None, Some(3)),
             Some(3)
         );
     }
@@ -26464,21 +26541,35 @@ mod tests {
     #[test]
     fn staged_active_focus_has_no_authority_outside_host_owned_promotion() {
         assert_eq!(
-            promoted_synchronized_focus(false, Some(91), Some(91), None, Some(3)),
+            promoted_synchronized_focus(false, Some(91), Some(91), Some(91), None, Some(3)),
             Some(91),
             "actor-owned layout focus remains authoritative"
         );
     }
 
     #[test]
+    fn revealing_a_hidden_pane_preserves_the_actor_focus_request() {
+        assert_eq!(
+            promoted_synchronized_focus(true, Some(8), Some(1), Some(1), None, None),
+            Some(8),
+            "unchanged current focus must not override the newly revealed pane"
+        );
+        assert_eq!(
+            promoted_synchronized_focus(true, Some(8), Some(1), Some(3), None, None),
+            Some(3),
+            "a real focus change during the transaction still wins"
+        );
+    }
+
+    #[test]
     fn explicit_newer_focus_overrides_newly_admitted_managed_focus() {
         assert_eq!(
-            promoted_synchronized_focus(true, Some(91), Some(91), Some(7), Some(3)),
+            promoted_synchronized_focus(true, Some(91), Some(91), Some(91), Some(7), Some(3)),
             Some(7),
             "a deferred explicit host request wins at the atomic boundary"
         );
         assert_eq!(
-            promoted_synchronized_focus(true, Some(91), Some(7), None, Some(3)),
+            promoted_synchronized_focus(true, Some(91), Some(91), Some(7), None, Some(3)),
             Some(7),
             "an already-applied focus change after cohort capture is retained"
         );
@@ -26720,6 +26811,7 @@ mod tests {
                 11,
                 13,
                 b"modified",
+                None,
             )
             .unwrap(),
         )

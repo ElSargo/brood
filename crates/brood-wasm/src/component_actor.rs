@@ -2012,7 +2012,9 @@ const fn map_component_presentation_error(
         PresentationError::DuplicatePane => AbiError::DuplicatePane,
         PresentationError::StaleResizeEpoch => AbiError::StaleResizeEpoch,
         PresentationError::InvalidArgument => AbiError::InvalidArgument,
-        PresentationError::LimitReached => AbiError::LimitReached,
+        PresentationError::LimitReached | PresentationError::AdmissionDeferred => {
+            AbiError::LimitReached
+        }
         PresentationError::InvalidPacket => AbiError::InvalidPacket,
         PresentationError::InvalidResource => AbiError::InvalidResource,
         PresentationError::ResourceInUse => AbiError::ResourceInUse,
@@ -2035,7 +2037,8 @@ const fn map_component_render_interest_error(
         | PresentationError::InvalidPacket
         | PresentationError::InvalidResource
         | PresentationError::ResourceInUse
-        | PresentationError::LimitReached => AbiError::InvalidArgument,
+        | PresentationError::LimitReached
+        | PresentationError::AdmissionDeferred => AbiError::InvalidArgument,
         PresentationError::HostFailure => AbiError::HostFailure,
     }
 }

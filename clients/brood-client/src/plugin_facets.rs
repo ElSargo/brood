@@ -492,6 +492,18 @@ impl PluginFacetCoordinator {
                     self.render_discarded = false;
                     return Ok(FacetPoll::DiscardedRender);
                 }
+                if result.is_ok() && lease.allocation_deferred() {
+                    tracing::info!(
+                        invocation = lease.token().invocation,
+                        "facet render deferred by native resource pressure"
+                    );
+                    self.discard_pending_render()?;
+                    self.render_wake.take();
+                    // The resource reclaimer retires partial allocations; the
+                    // actor retries on its next scheduled render opportunity.
+                    drop((lease, result));
+                    return Ok(FacetPoll::DiscardedRender);
+                }
                 let output = result?;
                 let decoded =
                     facet_wire::render_response(&output, &self.budget, self.config.decode)?;

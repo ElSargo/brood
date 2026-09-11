@@ -2,7 +2,7 @@
 status: target
 type: system
 authority: product
-last-reviewed: 2026-08-09
+last-reviewed: 2026-09-10
 ---
 
 # Client-Local Layout Actor
@@ -142,6 +142,39 @@ delegates the remaining pane set to the `workspace` actor. When the sidebar is
 hidden, the same root fragment expands `rest` to the full viewport, preserving
 the workspace actor and its layout state.
 
+## Workspace Layout Choices
+
+The default workspace offers the existing grid and **master stack+**. Layout
+selection belongs to the presentation actor and leaves pane identity and
+application processes intact. The grid remains the initial layout.
+
+Master stack+ keeps each backend in its own column. Within that column, the
+first window is the master on the left; new windows join the stack on the
+right. Opening a window or changing focus does not replace the master. A lone
+window fills its column. The master/stack divider is draggable.
+
+Stack windows have equal heights and stagger vertically. The focused stack
+window is painted last. Windows preceding it expose their top edges; windows
+following it expose their bottom edges, in window order. Focusing the master
+retains the last raised stack window. Clicking an exposed strip focuses and
+raises that window.
+
+At most five stack windows are staggered at once. Further windows extend the
+ordered stack; the mouse wheel moves the five-window view through it in window
+steps. Keyboard focus reveals the selected window, including windows currently
+outside the stack view. Each backend's scroll position is independent. Stack
+scrolling leaves the master fixed.
+
+Ctrl+J and Ctrl+K cycle forward and backward through every workspace window,
+including client-local terminals, wrapping at either end. Ctrl+Alt+L cycles
+layout choices. These are remappable actions in the shared shortcut catalogue.
+The focus actions remain available while a terminal or editor is focused.
+
+Divider interaction geometry follows layout topology, independently of which
+adjacent panes can currently participate in a synchronized paint barrier. The
+actor waits only for eligible panes; temporary ineligibility must not remove
+the divider or change the two-window split orientation.
+
 ## Recursive Composition
 
 Each fragment uses coordinates local to its lease viewport. The client
@@ -158,6 +191,8 @@ canonicalizes the flat result.
 The outermost valid focus request wins. If a wrapper does not request focus,
 the accepted request from its child remains eligible. The client still verifies
 that the resulting pane is visible and belongs to the submitting subtree.
+Focus requests are consumed when the composition commits. An already-applied
+parent request must not override a later child focus action.
 
 When a synchronized parent fragment changes its `rest` viewport, the host sends
 `layout-region-resized` with the same resize epoch to the exact child lease
