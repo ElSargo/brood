@@ -5387,6 +5387,9 @@ struct Application {
     local_backend: Option<BackendId>,
     pending_frames: BTreeMap<BackendId, ClientEvent>,
     pending_backend_snapshots: BTreeMap<BackendId, (u64, Vec<PresentationWindowSummary>)>,
+    /// A scene may arrive before the reliable catalog on a fresh connection.
+    /// Do not let that scene establish an empty managed-window inventory.
+    backend_catalogs_ready: BTreeSet<BackendId>,
     gpu_scene_completions: GpuSceneCompletionTracker,
     event_loop_deadline_waker: Option<EventLoopDeadlineWaker>,
     modifiers: ModifiersState,
@@ -6003,6 +6006,7 @@ impl Application {
         self.backend_sessions.remove(&backend);
         self.pending_frames.remove(&backend);
         self.pending_backend_snapshots.remove(&backend);
+        self.backend_catalogs_ready.remove(&backend);
         self.gpu_scene_completions.retire_backend(backend);
         self.computer_use_observer_updates.remove(&backend);
         self.computer_use_frame_assemblies.remove(&backend);
@@ -6919,6 +6923,24 @@ impl Application {
                     eprintln!(
                         "dropped scene from stale connection backend={} connection_generation={connection_generation}",
                         backend.0
+                    );
+                    return Ok(());
+                }
+                if !self.backend_catalogs_ready.contains(&backend) {
+                    // Catalog and scene workers are intentionally independent,
+                    // so a fresh connection can deliver its first frame first.
+                    // Keep the backend-local scene until the complete catalog
+                    // establishes the pane inventory and routes.
+                    self.pending_frames.insert(
+                        backend,
+                        ClientEvent::SceneFrame {
+                            backend,
+                            connection_generation,
+                            sequence,
+                            width,
+                            height,
+                            windows,
+                        },
                     );
                     return Ok(());
                 }
@@ -12450,6 +12472,7 @@ impl ApplicationHandler<ClientEvent> for Application {
                 {
                     return;
                 }
+                self.backend_catalogs_ready.insert(backend);
                 let windows = windows
                     .into_iter()
                     .map(|mut window| {
@@ -12527,6 +12550,12 @@ impl ApplicationHandler<ClientEvent> for Application {
                         }
                         runtime.stop_actors_for_closed_sessions(&snapshot);
                     }
+                }
+                if let Some(frame) = self.pending_frames.remove(&backend)
+                    && let Err(error) = self.accept_frame(frame)
+                {
+                    self.fail(event_loop, error);
+                    return;
                 }
                 if let Err(error) = self.publish_backend_sessions() {
                     eprintln!("could not publish backend session catalogue: {error:#}");
