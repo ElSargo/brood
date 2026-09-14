@@ -9,14 +9,13 @@ authority: implementation
 ## Reattachment ownership
 
 The PTY is owned by its session actor generation. Replacing that generation
-tears down the shell and streams. Shortcut-created terminal actors also survive
-a presentation disconnect without being replayed to replacement client init,
-which leaves them headless.
+tears down the shell and streams. Presentation replacement now replays the
+complete ready terminal inventory through the shared SDK helper; see
+[[../progress/terminal-reattachment]].
 
 The target requires reattachment without moving terminal emulation or process
 ownership into the presentation client. The open design questions are how
-session-resource promotion supervises the PTY across actor replacement and how
-the session terminal inventory is replayed to a replacement presentation.
+session-resource promotion supervises the PTY across actor replacement.
 
 ## Clipboard and IME
 

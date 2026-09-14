@@ -80,6 +80,10 @@ pub enum TestCommand {
     Nested(NestedTestArgs),
     /// Verify Chromium launch and input in an offscreen presentation.
     Chromium(NestedTestArgs),
+    /// Verify plugin clicks across session switches and presentation reconnects.
+    PointerReconnect(NestedTestArgs),
+    /// Verify complete terminal inventories across presentation replacement.
+    TerminalReconnect(NestedTestArgs),
     /// Run the external-client Neovim editor workload.
     Editor(NestedTestArgs),
     /// Capture and validate synchronized divider resizing frame by frame.

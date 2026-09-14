@@ -4,6 +4,7 @@
 )]
 // TODO(lint-structure): move CLI/default resolution into typed helpers instead of ad hoc options.
 
+mod actor_startup;
 mod application;
 mod browser;
 mod buffer_readback;

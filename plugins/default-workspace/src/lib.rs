@@ -1006,10 +1006,12 @@ fn store_layout_actor_state(
         }
         LAYOUT_PANE_COUNT = pane_count;
         let accepted_focus = focus.filter(|focus| panes[..pane_count].contains(focus));
-        LAYOUT_FOCUS = accepted_focus
-            .or_else(|| panes.first().copied())
-            .unwrap_or(0);
-        LAYOUT_HAS_FOCUS = pane_count > 0;
+        // An unfocused workspace can still contain panes. In particular, the
+        // host reports no subtree focus while the picker or sidebar owns it.
+        // Inventing a fallback here turns every layout reply into a request to
+        // blur that shell pane, potentially between pointer press and release.
+        LAYOUT_FOCUS = accepted_focus.unwrap_or(0);
+        LAYOUT_HAS_FOCUS = accepted_focus.is_some();
         if pane_count == 0 {
             LAYOUT_FULLSCREEN = false;
         }
@@ -2978,6 +2980,66 @@ mod tests {
                 matches!(messages_for_action(action, &state, &mut buffer), [Message::LayoutAction(value)] if *value == command)
             );
         }
+    }
+
+    #[test]
+    fn layout_updates_do_not_claim_focus_from_shell_panes() {
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        apply_layout_actor_action("layout-grid");
+        // A session switch replaces the workspace inventory; the shell can
+        // hold focus throughout, or acquire it after a workspace click.
+        for (panes, host_focus) in [
+            ([11, 22], Some(22)),
+            ([11, 22], None),
+            ([33, 44], None),
+            ([33, 44], Some(999)),
+            ([33, 44], Some(44)),
+        ] {
+            store_layout_actor_state(
+                &panes,
+                &[],
+                host_focus,
+                Some(LayoutLeaseToken {
+                    id: 5,
+                    generation: 2,
+                }),
+                Some(7),
+                Some(3),
+                &panes,
+                LayoutStateSize { w: 960, h: 686 },
+            );
+            let (ordered, backends, focus, fullscreen, lease, revision) = layout_actor_state();
+            let mut output = [0; OUTBOX_BYTES];
+            let len = write_layout_actor_update_outbox(
+                &mut output,
+                ordered,
+                backends,
+                focus,
+                fullscreen,
+                lease,
+                revision,
+            );
+            let response = host_payload(&output, len);
+            assert_eq!(
+                response["focus"],
+                json!(host_focus.filter(|pane| panes.contains(pane)))
+            );
+        }
+        // Explicit workspace navigation still acquires focus.
+        store_layout_actor_state(
+            &[33, 44],
+            &[],
+            None,
+            None,
+            None,
+            None,
+            &[],
+            LayoutStateSize { w: 960, h: 686 },
+        );
+        apply_layout_actor_action("focus-next");
+        assert_eq!(layout_actor_state().2, Some(33));
     }
 
     #[test]

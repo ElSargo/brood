@@ -362,8 +362,12 @@ flock -u 9
 exec 9>&-
 
 RUST_LOG="${RUST_LOG:-broodd=info,brood_client=info,smithay=warn,wgpu_core=warn,wgpu_hal=warn}"
+if [[ "${BROOD_POINTER_RECONNECT_ONLY:-0}" == 1 || "${BROOD_TERMINAL_RECONNECT_ONLY:-0}" == 1 ]]; then
+  # This proof asserts client input and focus traces even in a quiet host shell.
+  RUST_LOG="broodd=info,brood_client=info,smithay=warn,wgpu_core=warn,wgpu_hal=warn"
+fi
 SERVER_EXTRA_ARGS=()
-if [[ "$EMPTY_STARTUP_ONLY" == 1 ]]; then
+if [[ "$EMPTY_STARTUP_ONLY" == 1 || "${BROOD_TERMINAL_RECONNECT_ONLY:-0}" == 1 ]]; then
   SERVER_EXTRA_ARGS+=(--no-initial-surface-session)
 fi
 (
@@ -403,7 +407,7 @@ ctl status > /dev/null 2>&1 || {
   exit 1
 }
 
-if [[ "$EMPTY_STARTUP_ONLY" != 1 && "${BROOD_PLUGIN_DRAG_TEST:-0}" != 1 ]]; then
+if [[ "$EMPTY_STARTUP_ONLY" != 1 && "${BROOD_PLUGIN_DRAG_TEST:-0}" != 1 && "${BROOD_TERMINAL_RECONNECT_ONLY:-0}" != 1 ]]; then
   ctl surface-session new Beta > /dev/null
   ctl close-session 1 > /dev/null
   ctl spawn weston-simple-egl > /dev/null
@@ -485,7 +489,9 @@ env -u brood_session -u BROOD_SURFACE_SESSION_ID -u BROOD_PANE_ID \
   > "$CLIENT_LOG" 2>&1 &
 CLIENT_PID=$!
 
-for _ in $(seq 1 200); do
+# First-frame startup includes cold component compilation, independently of
+# the steady-state input deadlines exercised by the workload.
+for _ in $(seq 1 1200); do
   if rg -q "compiled plugin GPU scene|facet native pair committed" "$CLIENT_LOG" \
     && rg -q "granted claimed root layout lease actor=session-switcher" "$CLIENT_LOG" \
     && rg -q "loaded presentation key policy provider=workspace" "$CLIENT_LOG"; then
@@ -527,6 +533,19 @@ if [[ "${BROOD_PLUGIN_DRAG_TEST:-0}" == 1 ]]; then
       --out "$OUT" --client-pid "$CLIENT_PID" || drag_result=$?
   ctl status-json > "$OUT/drag-server-after.json"
   exit "$drag_result"
+fi
+
+if [[ "${BROOD_TERMINAL_RECONNECT_ONLY:-0}" == 1 ]]; then
+  capture "$OUT/sidebar-visible.png"
+  env XDG_RUNTIME_DIR="$RUNTIME_DIR" WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+    XDG_DATA_HOME="$DATA_HOME" BROOD_KEYBINDINGS_PATH="$OUT/keybindings.json" \
+    WGPU_BACKEND=vulkan BROOD_DMABUF_HAPPY_PATH=1 BROOD_TRACE_PLUGIN_INPUT=1 \
+    RUST_LOG="$RUST_LOG" \
+    python3 "$ROOT/tools/test-terminal-reconnect.py" \
+      --out "$OUT" --binary "$HOST_BIN_DIR/brood" \
+      --config "$CONFIG" --destination "$DBUS_DESTINATION" \
+      --dbus-address "$DBUS_SESSION_BUS_ADDRESS"
+  exit 0
 fi
 
 send_keybindings() {
@@ -1049,6 +1068,18 @@ submit_text() {
 }
 
 capture "$OUT/sidebar-visible.png"
+
+if [[ "${BROOD_POINTER_RECONNECT_ONLY:-0}" == 1 ]]; then
+  env XDG_RUNTIME_DIR="$RUNTIME_DIR" WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
+    XDG_DATA_HOME="$DATA_HOME" BROOD_KEYBINDINGS_PATH="$OUT/keybindings.json" \
+    WGPU_BACKEND=vulkan BROOD_DMABUF_HAPPY_PATH=1 BROOD_TRACE_PLUGIN_INPUT=1 \
+    RUST_LOG="$RUST_LOG" \
+    python3 "$ROOT/tools/test-pointer-reconnect.py" \
+      --out "$OUT" --binary "$HOST_BIN_DIR/brood" \
+      --config "$CONFIG" --destination "$DBUS_DESTINATION" \
+      --dbus-address "$DBUS_SESSION_BUS_ADDRESS"
+  exit 0
+fi
 
 KEYBINDINGS_LAYOUT_BEFORE="$(accepted_layout_count)"
 send_keybindings

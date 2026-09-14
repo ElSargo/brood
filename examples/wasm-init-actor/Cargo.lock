@@ -37,6 +37,7 @@ dependencies = [
  "brood-graphics",
  "brood-package-contract",
  "serde",
+ "serde_json",
  "wit-bindgen",
 ]
 

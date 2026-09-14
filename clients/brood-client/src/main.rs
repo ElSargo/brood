@@ -15349,6 +15349,8 @@ struct LayoutStateMessage {
     lease: brood_wasm::LayoutLeaseToken,
     waitable_panes: Vec<u64>,
     presented_panes: Vec<u64>,
+    /// Complete lease ownership, independent of visibility or frame readiness.
+    owned_panes: Vec<u64>,
     visible_panes: Vec<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     native_resize_revision: Option<u64>,
@@ -20292,6 +20294,7 @@ impl Renderer {
             },
             waitable_panes: waitable_panes.into_iter().collect(),
             presented_panes,
+            owned_panes: owned_panes.to_vec(),
             visible_panes,
             native_resize_revision,
             active_session: self.active_session,
@@ -27450,6 +27453,7 @@ mod tests {
             },
             waitable_panes: vec![3, 7, 9],
             presented_panes: vec![3, 7],
+            owned_panes: vec![3, 4, 5],
             visible_panes: vec![3],
             native_resize_revision: Some(11),
             active_session: 5,
@@ -27461,6 +27465,8 @@ mod tests {
             rest: true,
         };
         let encoded = serde_json::to_value(&message).expect("layout state must serialize");
+        assert_eq!(encoded["owned_panes"], serde_json::json!([3, 4, 5]));
+        assert_eq!(encoded["visible_panes"], serde_json::json!([3]));
         assert_eq!(encoded["presented_panes"], serde_json::json!([3, 7]));
         assert_eq!(encoded["native_resize_revision"], 11);
 

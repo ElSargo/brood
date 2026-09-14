@@ -25,6 +25,31 @@ It requires Chromium on the test environment's path. Workload setup and binary
 overrides are defined in `tools/test-chromium-nested.sh` and
 `tools/test-chromium-nested.py`.
 
+The plugin pointer proof holds clicks across asynchronous layout replies,
+switches sessions through both the sidebar and picker, and replaces the
+presentation twice:
+
+```sh
+nix develop --command cargo run -- test pointer-reconnect --out-dir /tmp/brood-pointer-proof
+```
+
+It retains presentation captures, client input counts, and daemon status
+snapshots. Workload setup lives in `tools/test-session-switcher-plugin-nested.sh`
+and `tools/test-pointer-reconnect.py`.
+
+The terminal reconnect proof starts with no sessions, creates two sessions after
+attachment, and verifies default terminals, shortcut creation, repeated
+presentation replacement, explicit pane close, and creation while detached:
+
+```sh
+nix develop --command env BROOD_TEST_HOST_PROFILE=release cargo run --release -- test terminal-reconnect --out-dir /tmp/brood-terminal-reconnect
+```
+
+It checks real keyboard input against retained shell variables and PIDs and
+captures screenshots and client/daemon metrics. The workload is defined in
+`tools/test-terminal-reconnect.py`. Use the release host for this workload so
+cold text shaping across the restored panes fits normal facet deadlines.
+
 Audit or run the complete bundled-plugin matrix with:
 
 ```sh

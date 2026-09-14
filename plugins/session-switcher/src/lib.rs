@@ -331,6 +331,8 @@ struct LayoutStateMessage {
     waitable_panes: serde_json_core::heapless::Vec<u64, 64>,
     #[serde(default)]
     presented_panes: serde_json_core::heapless::Vec<u64, 64>,
+    #[serde(default)]
+    owned_panes: Option<serde_json_core::heapless::Vec<u64, 64>>,
     visible_panes: serde_json_core::heapless::Vec<u64, 64>,
     #[serde(default)]
     available_windows: serde_json_core::heapless::Vec<AvailableWindow, 64>,
@@ -367,6 +369,7 @@ struct LayoutContext {
     lease: LayoutLeaseToken,
     waitable_panes: serde_json_core::heapless::Vec<u64, 64>,
     presented_panes: serde_json_core::heapless::Vec<u64, 64>,
+    owned_panes: Option<serde_json_core::heapless::Vec<u64, 64>>,
     visible_panes: serde_json_core::heapless::Vec<u64, 64>,
     focused_pane: Option<u64>,
     size: LayoutStateSize,
@@ -494,14 +497,6 @@ struct CodingAgentActionMessage {
 struct TerminalActionMessage {
     kind: serde_json_core::heapless::String<32>,
     action: serde_json_core::heapless::String<32>,
-}
-
-#[derive(Deserialize)]
-struct TerminalLifecycleMessage {
-    kind: serde_json_core::heapless::String<32>,
-    #[serde(default)]
-    session_id: u64,
-    terminal: Option<serde_json_core::heapless::String<64>>,
 }
 
 #[derive(Deserialize)]
@@ -1011,13 +1006,6 @@ impl Guest for SessionSwitcher {
                         state.is_root = true;
                         state.backend_id = context.backend_id.unwrap_or_default();
                         state.session_id = context.session_id.unwrap_or_default();
-                        if let (Some(backend_id), Some(session_id)) =
-                            (context.backend_id, context.session_id)
-                        {
-                            state
-                                .terminal_uis
-                                .insert(TERMINAL_UI_ID.to_string(), (backend_id, session_id));
-                        }
                     }
                     let mut commands = vec![
                         start_global_actor(CHILD_ACTOR_ID, COMPONENT_FILE, Vec::new()),
@@ -1042,13 +1030,7 @@ impl Guest for SessionSwitcher {
                     if let (Some(backend_id), Some(session_id)) =
                         (context.backend_id, context.session_id)
                     {
-                        commands.push(start_session_actor(
-                            TERMINAL_UI_ID,
-                            TERMINAL_UI_COMPONENT_FILE,
-                            Vec::new(),
-                            backend_id,
-                            session_id,
-                        ));
+                        commands.push(subscribe_terminal_inventory(backend_id, session_id));
                         commands.push(subscribe_agent_registry(backend_id, session_id));
                         commands.push(query_editor_status(backend_id, session_id));
                     }
@@ -1064,11 +1046,9 @@ impl Guest for SessionSwitcher {
             Event::Child(ChildEvent::Started(started))
                 if started.id == TERMINAL_UI_ID || started.id.starts_with("terminal-ui-b") =>
             {
-                if let Ok(mut state) = STATE.lock() {
-                    let realm =
-                        actor_realm(&started.id).unwrap_or((state.backend_id, state.session_id));
-                    state.terminal_uis.insert(started.id, realm);
-                }
+                // Reconciliation records the exact realm before admission.
+                // A delayed start acknowledgement must not rebind an unqualified
+                // UI ID to whichever session happens to be active now.
                 Vec::new()
             }
             Event::Child(ChildEvent::Started(started))
@@ -1209,20 +1189,13 @@ impl Guest for SessionSwitcher {
                             &failed.message,
                         )
                     });
-                let stop = state
-                    .terminal_uis
-                    .remove(&failed.id)
-                    .and_then(|(backend, session)| {
-                        stop_terminal_command(backend, session, &failed.id)
-                    });
+                // Losing a presentation does not mean the user closed its resource.
+                // A subsequent inventory subscription can retry the UI safely.
+                state.terminal_uis.remove(&failed.id);
                 state.error = true;
                 state.status = format!("Plugin pane failed: {}", failed.message);
                 let notice = status_bar_notice(&state.status);
-                editor_failure
-                    .into_iter()
-                    .chain(stop)
-                    .chain(notice)
-                    .collect()
+                editor_failure.into_iter().chain(notice).collect()
             }
             Event::Presentation(event) => handle_presentation(event),
             Event::Session(event) => handle_session_event(event),
@@ -1392,8 +1365,14 @@ fn handle_session_event(event: SessionEvent) -> Vec<ActorCommand> {
                 state.session_id = fallback.1;
             }
             let mut commands = if state.is_root {
-                ensure_default_terminal_ui(&mut state, backend, active)
-                    .into_iter()
+                // Subscribe to every session, including inactive ones. A new
+                // presentation must recover the whole inventory, and repeating
+                // a subscription repairs a notification missed while detached.
+                state
+                    .sessions
+                    .iter()
+                    .filter(|session| session.backend == backend)
+                    .map(|session| subscribe_terminal_inventory(backend, session.id))
                     .collect()
             } else {
                 Vec::new()
@@ -1850,6 +1829,7 @@ fn handle_layout_message(bytes: &[u8]) -> Vec<ActorCommand> {
         lease: message.lease,
         waitable_panes: message.waitable_panes,
         presented_panes: message.presented_panes,
+        owned_panes: message.owned_panes,
         visible_panes: message.visible_panes,
         focused_pane: requested_focus,
         size: message.size,
@@ -2522,43 +2502,88 @@ fn handle_session_message(sender: &str, bytes: &[u8]) -> Vec<ActorCommand> {
         }
         return Vec::new();
     }
-    handle_terminal_lifecycle(sender, bytes)
+    handle_terminal_inventory(sender, bytes)
 }
 
-fn handle_terminal_lifecycle(sender: &str, bytes: &[u8]) -> Vec<ActorCommand> {
-    let Ok((message, consumed)) = serde_json_core::from_slice::<TerminalLifecycleMessage>(bytes)
-    else {
-        return Vec::new();
-    };
-    if consumed != bytes.len() || message.kind.as_str() != "terminal-started" {
+fn subscribe_terminal_inventory(backend: u64, session: u64) -> ActorCommand {
+    brood_plugin_sdk::inventory::subscribe(backend, session, "init", "terminals")
+}
+
+fn handle_terminal_inventory(sender: &str, bytes: &[u8]) -> Vec<ActorCommand> {
+    if !sender_actor_is(sender, "init") {
         return Vec::new();
     }
-    let Some(terminal) = message.terminal else {
+    let Some(backend) = backend_from_sender(sender) else {
         return Vec::new();
     };
-    let Some(suffix) = terminal.as_str().strip_prefix("terminal-session-") else {
+    let Some(snapshot) = brood_plugin_sdk::inventory::Snapshot::decode(bytes, "terminals") else {
         return Vec::new();
     };
     let Ok(mut state) = STATE.lock() else {
         return Vec::new();
     };
-    let session_id = if message.session_id == 0 {
-        state.session_id
-    } else {
-        message.session_id
-    };
-    let backend_id = backend_from_sender(sender).unwrap_or(state.backend_id);
-    let id = format!("terminal-ui-b{backend_id}-s{session_id}-{suffix}");
-    state
+    if !state
+        .sessions
+        .iter()
+        .any(|session| session.backend == backend && session.id == snapshot.session_id)
+        && (state.backend_id, state.session_id) != (backend, snapshot.session_id)
+    {
+        return Vec::new();
+    }
+    reconcile_terminal_inventory(&mut state, backend, &snapshot)
+}
+
+fn reconcile_terminal_inventory(
+    state: &mut SwitcherState,
+    backend: u64,
+    snapshot: &brood_plugin_sdk::inventory::Snapshot,
+) -> Vec<ActorCommand> {
+    let session = snapshot.session_id;
+    let current = state
         .terminal_uis
-        .insert(id.clone(), (backend_id, session_id));
-    vec![start_session_actor(
-        id,
-        TERMINAL_UI_COMPONENT_FILE,
-        Vec::new(),
-        backend_id,
-        session_id,
-    )]
+        .iter()
+        .filter(|(_, realm)| **realm == (backend, session))
+        .filter_map(|(ui, _)| {
+            terminal_session_for_ui(backend, session, ui).map(|terminal| (terminal, ui.clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let changes = snapshot.changes(current.keys().map(String::as_str));
+    let mut commands = Vec::new();
+    for terminal in changes.removed {
+        if let Some(ui) = current.get(&terminal) {
+            // Remove ownership before stopping the UI: its Child::Stopped
+            // event must not become a new request to destroy a session actor.
+            state.terminal_uis.remove(ui);
+            commands.push(ActorCommand::StopActor(ui.clone()));
+        }
+    }
+    for terminal in changes.added {
+        let id = if terminal == "terminal-session" {
+            if state.terminal_uis.is_empty() {
+                TERMINAL_UI_ID.to_string()
+            } else {
+                format!("terminal-ui-b{backend}-s{session}")
+            }
+        } else if let Some(suffix) = terminal
+            .strip_prefix("terminal-session-")
+            .filter(|suffix| suffix.parse::<u64>().is_ok_and(|ordinal| ordinal >= 2))
+        {
+            format!("terminal-ui-b{backend}-s{session}-{suffix}")
+        } else {
+            continue;
+        };
+        // Count starts in flight as present; duplicate snapshots must never
+        // replace an already starting or live presentation actor.
+        state.terminal_uis.insert(id.clone(), (backend, session));
+        commands.push(start_session_actor(
+            id,
+            TERMINAL_UI_COMPONENT_FILE,
+            Vec::new(),
+            backend,
+            session,
+        ));
+    }
+    commands
 }
 
 fn backend_from_sender(sender: &str) -> Option<u64> {
@@ -3604,37 +3629,6 @@ fn subscribe_agent_registry(backend_id: u64, session_id: u64) -> ActorCommand {
     })
 }
 
-fn ensure_default_terminal_ui(
-    state: &mut SwitcherState,
-    backend_id: u64,
-    session_id: u64,
-) -> Option<ActorCommand> {
-    if backend_id == 0
-        || session_id == 0
-        || state
-            .terminal_uis
-            .values()
-            .any(|realm| *realm == (backend_id, session_id))
-    {
-        return None;
-    }
-    let id = if state.terminal_uis.is_empty() {
-        TERMINAL_UI_ID.to_string()
-    } else {
-        format!("terminal-ui-b{backend_id}-s{session_id}")
-    };
-    state
-        .terminal_uis
-        .insert(id.clone(), (backend_id, session_id));
-    Some(start_session_actor(
-        id,
-        TERMINAL_UI_COMPONENT_FILE,
-        Vec::new(),
-        backend_id,
-        session_id,
-    ))
-}
-
 fn actor_realm(actor: &str) -> Option<(u64, u64)> {
     let backend = actor.split("-b").nth(1)?.split('-').next()?.parse().ok()?;
     let session = actor.split("-s").nth(1)?.split('-').next()?.parse().ok()?;
@@ -3702,15 +3696,19 @@ fn editor_client_lifecycle(
     })
 }
 
-fn stop_terminal_command(backend_id: u64, session_id: u64, ui_actor: &str) -> Option<ActorCommand> {
-    let terminal = if ui_actor == TERMINAL_UI_ID
-        || ui_actor == format!("terminal-ui-b{backend_id}-s{session_id}")
+fn terminal_session_for_ui(backend_id: u64, session_id: u64, ui_actor: &str) -> Option<String> {
+    if ui_actor == TERMINAL_UI_ID || ui_actor == format!("terminal-ui-b{backend_id}-s{session_id}")
     {
-        "terminal-session".to_string()
+        Some("terminal-session".to_string())
     } else {
-        let suffix = ui_actor.splitn(5, '-').nth(4)?;
-        format!("terminal-session-{suffix}")
-    };
+        ui_actor
+            .strip_prefix(&format!("terminal-ui-b{backend_id}-s{session_id}-"))
+            .map(|suffix| format!("terminal-session-{suffix}"))
+    }
+}
+
+fn stop_terminal_command(backend_id: u64, session_id: u64, ui_actor: &str) -> Option<ActorCommand> {
+    let terminal = terminal_session_for_ui(backend_id, session_id, ui_actor)?;
     let body = serde_json::to_vec(&serde_json::json!({
         "kind": "stop-terminal",
         "terminal": terminal,
@@ -3860,8 +3858,13 @@ fn resolve_shell_layout(
     let keybindings_pane = state.keybindings_pane;
     let inbox_pane = state.inbox_pane;
     let status_bar_pane = state.status_bar_pane;
+    // Ownership must include inactive and not-yet-rendered panes. Using only
+    // visible panes strands early restored children at the root when `rest`
+    // is granted before their first frame or while another session is active.
     let delegated = message
-        .visible_panes
+        .owned_panes
+        .as_ref()
+        .unwrap_or(&message.visible_panes)
         .iter()
         .copied()
         .filter(|visible| {
@@ -5644,13 +5647,13 @@ mod tests {
         apply_backend_sessions, apply_layout_pointer_message,
         apply_layout_transaction_notification, apply_picker_selection, apply_worktree_completion,
         authenticated_neovim_client, backend_picker_reply_is_current, begin_worktree_for_source,
-        creation_backend_items, ensure_default_terminal_ui, header_geometry, neovim_client_realm,
-        neovim_ui_id, open_creation_backend_picker, publish_layout, publish_layout_region_response,
+        creation_backend_items, header_geometry, neovim_client_realm, neovim_ui_id,
+        open_creation_backend_picker, publish_layout, publish_layout_region_response,
         publish_synchronized_layout, publish_synchronized_layout_attempt,
-        remembered_workspace_focus, request_creation_backend_picker, request_editor,
-        resize_paint_plan, sender_actor_is, shell_layout_state, shell_requested_focus,
-        start_neovim_client, submit, terminal_ui_for_session_actor, toggle_diff, truncate_to_width,
-        update_creation_backend_picker, valid_editor_actor_target,
+        reconcile_terminal_inventory, remembered_workspace_focus, request_creation_backend_picker,
+        request_editor, resize_paint_plan, sender_actor_is, shell_layout_state,
+        shell_requested_focus, start_neovim_client, submit, terminal_ui_for_session_actor,
+        toggle_diff, truncate_to_width, update_creation_backend_picker, valid_editor_actor_target,
     };
 
     fn host_command<'a>(commands: &'a [ActorCommand], message_type: &str) -> &'a [u8] {
@@ -5678,6 +5681,7 @@ mod tests {
         let mut visible_panes = serde_json_core::heapless::Vec::<u64, 64>::new();
         assert!(visible_panes.extend_from_slice(&[1, 2, 3, 1000]).is_ok());
         state.layout = Some(LayoutContext {
+            owned_panes: None,
             revision: 9,
             presented_layout_revision: 3,
             lease: LayoutLeaseToken {
@@ -5746,6 +5750,7 @@ mod tests {
                 .is_ok()
         );
         state.layout = Some(LayoutContext {
+            owned_panes: None,
             revision: 23,
             presented_layout_revision: 22,
             lease: LayoutLeaseToken {
@@ -5830,6 +5835,7 @@ mod tests {
         let mut panes = serde_json_core::heapless::Vec::<u64, 64>::new();
         assert!(panes.extend_from_slice(&[1, 2, 3, 4, 5, workspace]).is_ok());
         state.layout = Some(LayoutContext {
+            owned_panes: None,
             revision: 9,
             presented_layout_revision: 17,
             lease: LayoutLeaseToken {
@@ -5902,6 +5908,7 @@ mod tests {
         let mut panes = serde_json_core::heapless::Vec::<u64, 64>::new();
         assert!(panes.extend_from_slice(&[1, 2, 3, 4, 5, workspace]).is_ok());
         state.layout = Some(LayoutContext {
+            owned_panes: None,
             revision: 9,
             presented_layout_revision: 17,
             lease: LayoutLeaseToken {
@@ -5984,6 +5991,7 @@ mod tests {
         let mut visible_panes = serde_json_core::heapless::Vec::<u64, 64>::new();
         assert!(visible_panes.extend_from_slice(&[1, 2, 3, 4, 5, 6]).is_ok());
         state.layout = Some(LayoutContext {
+            owned_panes: None,
             revision: 9,
             presented_layout_revision: 3,
             lease: LayoutLeaseToken {
@@ -6036,6 +6044,7 @@ mod tests {
         let mut visible_panes = serde_json_core::heapless::Vec::<u64, 64>::new();
         assert!(visible_panes.extend_from_slice(&[1, 2, 3, 4, 5]).is_ok());
         state.layout = Some(LayoutContext {
+            owned_panes: None,
             revision: 9,
             presented_layout_revision: 3,
             lease: LayoutLeaseToken {
@@ -6075,6 +6084,7 @@ mod tests {
         let mut visible_panes = serde_json_core::heapless::Vec::<u64, 64>::new();
         assert!(visible_panes.extend_from_slice(&[1, 2, 3, 4, 5, 6]).is_ok());
         state.layout = Some(LayoutContext {
+            owned_panes: None,
             revision: 9,
             presented_layout_revision: 3,
             lease: LayoutLeaseToken {
@@ -6115,6 +6125,47 @@ mod tests {
     }
 
     #[test]
+    fn rest_delegation_includes_unrendered_and_inactive_owned_panes() {
+        let mut state = SwitcherState::new();
+        state.pane = 1;
+        state.picker_pane = Some(2);
+        state.keybindings_pane = Some(3);
+        state.inbox_pane = Some(4);
+        state.status_bar_pane = Some(5);
+        state.theme_switcher_pane = Some(1000);
+        let mut owned = serde_json_core::heapless::Vec::new();
+        owned
+            .extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 1000])
+            .unwrap();
+        let mut visible = serde_json_core::heapless::Vec::new();
+        visible
+            .extend_from_slice(&[1, 2, 3, 4, 5, 6, 1000])
+            .unwrap();
+        state.layout = Some(LayoutContext {
+            owned_panes: Some(owned),
+            revision: 9,
+            presented_layout_revision: 7,
+            lease: LayoutLeaseToken {
+                id: 4,
+                generation: 2,
+            },
+            waitable_panes: serde_json_core::heapless::Vec::new(),
+            presented_panes: serde_json_core::heapless::Vec::new(),
+            visible_panes: visible,
+            focused_pane: Some(6),
+            size: LayoutStateSize {
+                w: 1280,
+                height: 720,
+            },
+            rest: false,
+        });
+        let commands = publish_layout(&state, true, Some(6));
+        let delegation: serde_json::Value =
+            serde_json::from_slice(host_command(&commands, "delegate-layout-rest")).unwrap();
+        assert_eq!(delegation["panes"], serde_json::json!([6, 7, 8]));
+    }
+
+    #[test]
     fn sidebar_transaction_carries_focus_native_revision_and_visible_subtree_wait_set() {
         let mut state = SwitcherState::new();
         state.pane = 1;
@@ -6135,6 +6186,7 @@ mod tests {
         let mut presented_panes = serde_json_core::heapless::Vec::<u64, 64>::new();
         assert!(presented_panes.extend_from_slice(&[1, 2, 5, 6]).is_ok());
         state.layout = Some(LayoutContext {
+            owned_panes: None,
             revision: 9,
             presented_layout_revision: 17,
             lease: LayoutLeaseToken {
@@ -6216,6 +6268,7 @@ mod tests {
         let mut presented_panes = serde_json_core::heapless::Vec::<u64, 64>::new();
         assert!(presented_panes.extend_from_slice(&[1, 4, 5, 6]).is_ok());
         state.layout = Some(LayoutContext {
+            owned_panes: None,
             revision: 9,
             presented_layout_revision: 17,
             lease: LayoutLeaseToken {
@@ -6470,6 +6523,7 @@ mod tests {
         let mut presented_panes = serde_json_core::heapless::Vec::<u64, 64>::new();
         assert!(presented_panes.extend_from_slice(&[1, 5, 6]).is_ok());
         state.layout = Some(LayoutContext {
+            owned_panes: None,
             revision: 9,
             presented_layout_revision: 17,
             lease: LayoutLeaseToken {
@@ -6541,6 +6595,7 @@ mod tests {
     fn layout_backlog_overflow_restores_the_latest_submitted_shell_proposal() {
         let mut state = SwitcherState::new();
         state.layout = Some(LayoutContext {
+            owned_panes: None,
             revision: 5,
             presented_layout_revision: 7,
             lease: LayoutLeaseToken {
@@ -6614,6 +6669,7 @@ mod tests {
         let mut state = SwitcherState::new();
         state.durable_shell_layout = Some(shell_layout_state(&state, Some(9)));
         state.layout = Some(LayoutContext {
+            owned_panes: None,
             revision: 5,
             presented_layout_revision: 7,
             lease: LayoutLeaseToken {
@@ -6715,6 +6771,7 @@ mod tests {
         state.picker_visible = true;
         state.durable_shell_layout = Some(shell_layout_state(&state, Some(2)));
         state.layout = Some(LayoutContext {
+            owned_panes: None,
             revision: 6,
             presented_layout_revision: 8,
             lease: LayoutLeaseToken {
@@ -6842,11 +6899,57 @@ mod tests {
         );
     }
 
+    fn terminal_inventory(session: u64, actors: &[&str]) -> brood_plugin_sdk::inventory::Snapshot {
+        brood_plugin_sdk::inventory::Snapshot::decode(&serde_json::to_vec(&serde_json::json!({
+            "kind": "brood.actor-inventory.v1", "inventory": "terminals", "session_id": session, "actors": actors,
+        })).unwrap(), "terminals").unwrap()
+    }
+
+    #[test]
+    fn complete_inventory_restores_dynamic_panes_and_removes_closed_resources() {
+        let mut state = SwitcherState::new();
+        let inventory = terminal_inventory(
+            7,
+            &[
+                "terminal-session",
+                "terminal-session-2",
+                "terminal-session-3",
+            ],
+        );
+        assert_eq!(
+            reconcile_terminal_inventory(&mut state, 2, &inventory).len(),
+            3
+        );
+        assert!(reconcile_terminal_inventory(&mut state, 2, &inventory).is_empty());
+        assert_eq!(state.terminal_uis.len(), 3);
+        assert_eq!(
+            reconcile_terminal_inventory(&mut state, 4, &inventory).len(),
+            3
+        );
+        let closed = terminal_inventory(7, &["terminal-session", "terminal-session-3"]);
+        let commands = reconcile_terminal_inventory(&mut state, 2, &closed);
+        assert!(
+            matches!(&commands[..], [ActorCommand::StopActor(id)] if id == "terminal-ui-b2-s7-2")
+        );
+        assert!(!state.terminal_uis.contains_key("terminal-ui-b2-s7-2"));
+        assert!(state.terminal_uis.contains_key("terminal-ui-b4-s7-2"));
+        assert_eq!(
+            reconcile_terminal_inventory(&mut state, 2, &terminal_inventory(7, &[])).len(),
+            2
+        );
+        assert_eq!(state.terminal_uis.len(), 3);
+    }
+
     #[test]
     fn each_backend_active_session_gets_one_default_terminal_frontend() {
         let mut state = SwitcherState::new();
-        let Some(ActorCommand::StartActor(first)) = ensure_default_terminal_ui(&mut state, 1, 7)
-        else {
+        let Some(ActorCommand::StartActor(first)) = reconcile_terminal_inventory(
+            &mut state,
+            1,
+            &terminal_inventory(7, &["terminal-session"]),
+        )
+        .into_iter()
+        .next() else {
             panic!("first backend did not start a terminal frontend");
         };
         assert_eq!(first.id, "terminal-ui");
@@ -6858,8 +6961,13 @@ mod tests {
             })
         ));
 
-        let Some(ActorCommand::StartActor(second)) = ensure_default_terminal_ui(&mut state, 2, 7)
-        else {
+        let Some(ActorCommand::StartActor(second)) = reconcile_terminal_inventory(
+            &mut state,
+            2,
+            &terminal_inventory(7, &["terminal-session"]),
+        )
+        .into_iter()
+        .next() else {
             panic!("second backend did not start a terminal frontend");
         };
         assert_eq!(second.id, "terminal-ui-b2-s7");
@@ -6870,7 +6978,16 @@ mod tests {
                 session_id: 7,
             })
         ));
-        assert!(ensure_default_terminal_ui(&mut state, 2, 7).is_none());
+        assert!(
+            reconcile_terminal_inventory(
+                &mut state,
+                2,
+                &terminal_inventory(7, &["terminal-session"])
+            )
+            .into_iter()
+            .next()
+            .is_none()
+        );
     }
 
     #[test]

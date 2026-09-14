@@ -1,4 +1,4 @@
-use brood_plugin_sdk::{bindings, exports};
+use brood_plugin_sdk::{bindings, exports, inventory::ActorInventory};
 
 use exports::brood::plugin::actor::{
     ActorStartRequest, AppStartRequest, ChildEvent, Command, Event, Guest, LifecycleEvent,
@@ -85,6 +85,7 @@ struct InitState {
     subscribers: Vec<Subscriber>,
     next_agent: u64,
     next_terminal: u64,
+    terminals: ActorInventory,
     pending_terminals: Vec<PendingTerminal>,
     editor_files_starting: bool,
     editor_files_ready: bool,
@@ -100,6 +101,7 @@ static STATE: Mutex<InitState> = Mutex::new(InitState {
     subscribers: Vec::new(),
     next_agent: 2,
     next_terminal: 2,
+    terminals: ActorInventory::new("terminals"),
     pending_terminals: Vec::new(),
     editor_files_starting: false,
     editor_files_ready: false,
@@ -113,7 +115,9 @@ struct ExampleInitActor;
 
 impl Guest for ExampleInitActor {
     fn dispatch(event: Event) -> Vec<Command> {
-        if let Some(commands) = brood_plugin_sdk::packages::dispatch(&event) { return commands; }
+        if let Some(commands) = brood_plugin_sdk::packages::dispatch(&event) {
+            return commands;
+        }
         match event {
             Event::Lifecycle(LifecycleEvent::Start(context))
                 if context
@@ -213,6 +217,33 @@ fn start_editor_files() -> Command {
 }
 
 fn handle_child(event: ChildEvent) -> Vec<Command> {
+    let id = match &event {
+        ChildEvent::Started(child) => &child.id,
+        ChildEvent::Stopped(id) => id,
+        ChildEvent::Failed(child) => &child.id,
+    };
+    let mut commands = if is_terminal(id) {
+        let Ok(mut state) = STATE.lock() else {
+            return Vec::new();
+        };
+        let session = state.session_id;
+        state.terminals.child(session, &event)
+    } else {
+        Vec::new()
+    };
+    commands.extend(handle_child_policy(event));
+    commands
+}
+
+fn is_terminal(id: &str) -> bool {
+    id == "terminal-session"
+        || id
+            .strip_prefix("terminal-session-")
+            .and_then(|suffix| suffix.parse::<u64>().ok())
+            .is_some_and(|ordinal| ordinal >= 2)
+}
+
+fn handle_child_policy(event: ChildEvent) -> Vec<Command> {
     let Ok(mut state) = STATE.lock() else {
         return Vec::new();
     };
@@ -309,6 +340,15 @@ fn handle_child(event: ChildEvent) -> Vec<Command> {
 }
 
 fn handle_mailbox(sender: &str, body: &[u8]) -> Vec<Command> {
+    if sender == "presentation:brood.client-init" {
+        let Ok(mut state) = STATE.lock() else {
+            return Vec::new();
+        };
+        let session = state.session_id;
+        if let Some(commands) = state.terminals.handle_subscription(session, sender, body) {
+            return commands;
+        }
+    }
     let Ok(message) = serde_json::from_slice::<WireMessage>(body) else {
         return Vec::new();
     };
@@ -414,7 +454,11 @@ fn handle_mailbox(sender: &str, body: &[u8]) -> Vec<Command> {
             vec![start_agent(&id)]
         }
         "create-terminal" => {
-            if message.command.len() > MAX_TERMINAL_COMMAND_BYTES || message.command.contains('\0')
+            if !state
+                .terminals
+                .has_capacity(state.pending_terminals.len() + 1)
+                || message.command.len() > MAX_TERMINAL_COMMAND_BYTES
+                || message.command.contains('\0')
             {
                 return Vec::new();
             }
@@ -429,9 +473,7 @@ fn handle_mailbox(sender: &str, body: &[u8]) -> Vec<Command> {
         }
         "stop-terminal" => message
             .terminal
-            .filter(|terminal| {
-                terminal == "terminal-session" || terminal.starts_with("terminal-session-")
-            })
+            .filter(|terminal| is_terminal(terminal))
             .map(Command::StopActor)
             .into_iter()
             .collect(),
@@ -779,8 +821,8 @@ fn editor_reply_with_message(
 #[cfg(test)]
 mod tests {
     use super::{
-        Command, EditorOpen, InitState, LocalActorMessage, MAX_PENDING_EDITORS, NEOVIM_FILES,
-        PendingEditor, STATE, WireAgent, WireMessage, handle_mailbox, start_agent,
+        ActorInventory, Command, EditorOpen, InitState, LocalActorMessage, MAX_PENDING_EDITORS,
+        NEOVIM_FILES, PendingEditor, STATE, WireAgent, WireMessage, handle_mailbox, start_agent,
         start_editor_files, terminal_command_body, valid_editor_client_actor, valid_editor_open,
     };
     use std::sync::Mutex;
@@ -794,6 +836,7 @@ mod tests {
             subscribers: Vec::new(),
             next_agent: 2,
             next_terminal: 2,
+            terminals: ActorInventory::new("terminals"),
             pending_terminals: Vec::new(),
             editor_files_starting: false,
             editor_files_ready: true,
@@ -811,6 +854,80 @@ mod tests {
 
     fn wire(message: WireMessage) -> Vec<u8> {
         serde_json::to_vec(&message).expect("wire message")
+    }
+
+    #[test]
+    fn terminal_inventory_replays_boot_and_shortcut_children_after_disconnect() {
+        use brood_plugin_sdk::{
+            exports::brood::plugin::actor::{ActorStarted, ChildEvent},
+            inventory,
+        };
+        let _serial = STATE_TEST_LOCK.lock().expect("state test lock");
+        reset_state(27);
+        let Command::SendSessionMessage(request) = inventory::subscribe(4, 27, "init", "terminals")
+        else {
+            panic!()
+        };
+        let decode = |commands: Vec<Command>| {
+            commands
+                .into_iter()
+                .find_map(|command| {
+                    let Command::SendPresentationMessage(message) = command else {
+                        return None;
+                    };
+                    inventory::Snapshot::decode(&message.body, "terminals")
+                })
+                .expect("complete inventory")
+        };
+        assert!(
+            decode(handle_mailbox(
+                "presentation:brood.client-init",
+                &request.body
+            ))
+            .actors
+            .is_empty()
+        );
+        for (ordinal, id) in [
+            (1, "terminal-session"),
+            (2, "terminal-session-2"),
+            (3, "terminal-session-3"),
+        ] {
+            if ordinal > 1 {
+                let commands = handle_mailbox(
+                    "presentation:brood.client-init",
+                    br#"{"kind":"create-terminal"}"#,
+                );
+                assert!(matches!(&commands[..], [Command::StartActor(start)] if start.id == id));
+            }
+            let snapshot = decode(super::handle_child(ChildEvent::Started(ActorStarted {
+                id: id.to_string(),
+                generation: ordinal,
+            })));
+            assert_eq!(snapshot.actors.len(), ordinal as usize);
+        }
+        assert_eq!(
+            decode(handle_mailbox(
+                "presentation:brood.client-init",
+                &request.body
+            ))
+            .actors
+            .len(),
+            3
+        );
+        let snapshot = decode(super::handle_child(ChildEvent::Stopped(
+            "terminal-session-2".to_string(),
+        )));
+        assert_eq!(snapshot.actors.len(), 2);
+        assert!(!snapshot.actors.contains("terminal-session-2"));
+        assert_eq!(
+            decode(handle_mailbox(
+                "presentation:brood.client-init",
+                &request.body
+            ))
+            .actors,
+            snapshot.actors
+        );
+        assert!(handle_mailbox("presentation:untrusted", &request.body).is_empty());
     }
 
     #[test]

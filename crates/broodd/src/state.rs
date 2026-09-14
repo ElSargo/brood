@@ -76,6 +76,7 @@ use tracing::{debug, info, warn};
 use crate::{
     BROOD_HOST_DBUS_ADDRESS_ENV, BROOD_PANE_ID_ENV, BROOD_SESSION_ENV, BROODD_DBUS_ADDRESS_ENV,
     BROODD_DBUS_DESTINATION_ENV,
+    actor_startup::StartupMessages,
     browser::{BrowserInstanceSummary, BrowserLaunchOptions, BrowserManager},
     clipboard::HostClipboardBridge,
     command::{SurfaceCommand, WorkspaceCommand},
@@ -889,7 +890,7 @@ pub struct Brood {
     event_loop_active: bool,
     next_hosted_replacement_request: u64,
     pending_hosted_replacements: BTreeMap<String, u64>,
-    pending_hosted_startup_messages: BTreeMap<String, Vec<(String, String)>>,
+    pending_hosted_startup_messages: StartupMessages,
     pending_legacy_replacement: Option<u64>,
     pending_legacy_actor_names: BTreeSet<String>,
     starting_realm_children: BTreeSet<(SurfaceSessionId, String)>,
@@ -1046,7 +1047,7 @@ impl Brood {
             event_loop_active: false,
             next_hosted_replacement_request: 1,
             pending_hosted_replacements: BTreeMap::new(),
-            pending_hosted_startup_messages: BTreeMap::new(),
+            pending_hosted_startup_messages: StartupMessages::default(),
             pending_legacy_replacement: None,
             pending_legacy_actor_names: BTreeSet::new(),
             starting_realm_children: BTreeSet::new(),
@@ -1125,8 +1126,10 @@ impl Brood {
         body: String,
     ) -> Result<()> {
         self.drain_hosted_actor_events();
-        if let Some(actor) = self.wasm_io_actors.get(actor_id) {
-            actor.try_send_message(sender, body.into_bytes())?;
+        if self.wasm_io_actors.contains_key(actor_id)
+            || self.pending_hosted_replacements.contains_key(actor_id)
+        {
+            self.try_route_wasm_actor_message(actor_id, sender, body.into_bytes())?;
             self.plugin_actor_messages += 1;
             self.plugin_actor_last_status = Some(format!("{actor_id}:message_queued"));
             return Ok(());
@@ -1276,10 +1279,13 @@ impl Brood {
         actor: &str,
         body: &[u8],
     ) -> Result<()> {
+        // A presentation owns session-scoped actors for inactive sessions too.
+        // Preserve the realm on the wire; the client checks the recipient's
+        // association. Visibility must not suppress inventory or state replies.
         if let BackendActorRealm::Session(session) = realm {
             ensure!(
-                SurfaceSessionId::from_raw(session) == self.sessions.active(),
-                "surface session {session} is not attached to the current presentation"
+                self.sessions.contains(SurfaceSessionId::from_raw(session)),
+                "unknown surface session {session}"
             );
         }
         let fast_path = self
@@ -1616,13 +1622,21 @@ impl Brood {
     /// namespace. Hosted Component/Preview actors carry sender metadata in
     /// their mailbox ABI; legacy actors retain their older byte-only mailbox.
     fn try_route_wasm_actor_message(
-        &self,
+        &mut self,
         actor_id: &str,
         sender: String,
         payload: Vec<u8>,
     ) -> Result<()> {
         if let Some(actor) = self.wasm_io_actors.get(actor_id) {
             return actor.try_send_message(sender, payload);
+        }
+        if self.pending_hosted_replacements.contains_key(actor_id) {
+            // Session catalogues can reach the presentation before their init
+            // actors finish loading. Accept ordinary messages for that admitted
+            // startup and preserve their authenticated sender until it is ready.
+            return self
+                .pending_hosted_startup_messages
+                .push(actor_id, sender, payload);
         }
         self.try_with_wasm_registry(|registry| {
             registry.try_post_named_message(actor_id, payload)
@@ -5917,6 +5931,7 @@ impl Brood {
                         continue;
                     }
                     self.pending_hosted_replacements.remove(&actor_id);
+                    let startup_messages = self.pending_hosted_startup_messages.take(&actor_id);
                     let actor = match result {
                         Ok(actor) => *actor,
                         Err(message) => {
@@ -6025,13 +6040,11 @@ impl Brood {
                             );
                         }
                     }
-                    if let Some(messages) = self.pending_hosted_startup_messages.remove(&actor_id) {
-                        for (sender, body) in messages {
-                            if let Err(error) =
-                                self.send_plugin_actor_message(&actor_id, sender, body)
-                            {
-                                warn!(actor = %actor_id, error = %error, "failed to deliver queued hosted actor startup message");
-                            }
+                    for (sender, body) in startup_messages {
+                        if let Err(error) =
+                            self.try_route_wasm_actor_message(&actor_id, sender, body)
+                        {
+                            warn!(actor = %actor_id, error = %error, "failed to deliver queued hosted actor startup message");
                         }
                     }
                     info!(actor = %actor_id, generation, path = %path.display(), "committed hosted actor replacement");
@@ -6477,10 +6490,11 @@ impl Brood {
         }
         if let Some(message) = startup_message {
             if self.pending_hosted_replacements.contains_key(module_id) {
-                self.pending_hosted_startup_messages
-                    .entry(module_id.to_string())
-                    .or_default()
-                    .push(("host".to_string(), message));
+                self.pending_hosted_startup_messages.push(
+                    module_id,
+                    "host".to_string(),
+                    message.into_bytes(),
+                )?;
             } else {
                 self.send_plugin_actor_message(module_id, "host".to_string(), message)?;
             }
@@ -6552,10 +6566,11 @@ impl Brood {
                 .and_then(|()| {
                     if let Some(message) = plugin.startup_message {
                         if self.pending_hosted_replacements.contains_key(&actor_name) {
-                            self.pending_hosted_startup_messages
-                                .entry(actor_name.clone())
-                                .or_default()
-                                .push(("host".to_string(), message));
+                            self.pending_hosted_startup_messages.push(
+                                &actor_name,
+                                "host".to_string(),
+                                message.into_bytes(),
+                            )?;
                         } else {
                             self.send_plugin_actor_message(
                                 &actor_name,
@@ -6812,6 +6827,7 @@ impl Brood {
         };
         if self.event_loop_active {
             let request = self.admit_backend_lifecycle_start_request()?;
+            self.pending_hosted_startup_messages.take(actor_name);
             self.pending_hosted_replacements
                 .insert(actor_name.to_string(), request);
             let actor_id = actor_name.to_string();
@@ -6991,6 +7007,7 @@ impl Brood {
         let watcher_service = self.filesystem_watcher_service.clone();
         if self.event_loop_active {
             let request = self.admit_backend_lifecycle_start_request()?;
+            self.pending_hosted_startup_messages.take(actor_name);
             self.pending_hosted_replacements
                 .insert(actor_name.to_string(), request);
             let actor_id = actor_name.to_string();

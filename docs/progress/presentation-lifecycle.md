@@ -62,3 +62,44 @@ Clippy remains blocked by existing findings in `complaint_capture.rs` and
 `themes.rs`; it reports no findings in the modified Rust files. Actor teardown
 is covered by the focused runtime regressions; the blocked terminal workload
 does not constitute a real terminal-close acceptance run.
+
+## Plugin clicks and workspace focus after reconnect
+
+The default workspace actor treated a nonempty pane inventory as permission to
+focus its first pane. The host deliberately reports no subtree focus while the
+session switcher or picker owns focus. Echoing an invented workspace focus in
+the next layout reply blurred the plugin, cancelling its press before release.
+Existing sessions at presentation startup and subsequent session changes expose
+this race through their layout publications.
+
+`store_layout_actor_state` now preserves absent focus and rejects focus outside
+its pane inventory. Explicit workspace navigation still acquires focus. The
+regression exercises focus moving out of the workspace, replacement session
+inventories, invalid focus, and explicit navigation. It failed before the fix
+(`focus: 11` instead of `null`) and passes with the fix.
+
+The new built-in pointer reconnect proof drives real virtual-pointer input
+through offscreen Sway. It checks the switcher's New button, sidebar session
+rows, and picker selections with a held button so asynchronous layout replies
+arrive between press and release. The unfixed actor reproducibly blurred the
+switcher during the first held click. Evidence is under
+`.codex-artifacts/pointer-reconnect/before/`.
+
+The proof waits for the shell's composition and the client-rendered session
+completion before clicking again: backend activation alone can precede the
+frame that re-enables New. Intentional frontend exit is checked separately
+from unexpected process failure during input. These readiness corrections
+avoid treating disabled controls or expected teardown as input failures.
+
+The fixed actor passed 18 held clicks across 12 session switches and two
+presentation reconnects. Each of the three client generations delivered six
+plugin button presses and six releases; the daemon recorded no input drops and
+retained both managed windows. Captures verify the picker and sidebar after
+reconnect. The report, client logs, daemon snapshots, and captures are retained
+under `.codex-artifacts/pointer-reconnect/accepted/`. This run used the rebuilt
+host and default-workspace WASM with the other packaged plugin components.
+
+Nix-backed checks passed all 12 default-workspace tests, 363 brood-client tests,
+and 19 brood-cli tests. The executable build and default-workspace release WASM
+Clippy check also passed. Check logs are in
+`.codex-artifacts/pointer-reconnect/`.

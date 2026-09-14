@@ -13,6 +13,7 @@ brood-package-contract.workspace = true
 brood-graphics.workspace = true
 brood-protocol = { workspace = true, optional = true }
 serde.workspace = true
+serde_json.workspace = true
 wit-bindgen = "0.57.1"
 
 [lints]

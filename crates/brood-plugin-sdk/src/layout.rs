@@ -3,6 +3,12 @@
 //! Plugins build these values in memory and serialize them only when emitting
 //! a host message. Keeping layout inspection typed avoids the fragile pattern
 //! of formatting JSON and immediately parsing that JSON back into a value.
+//!
+//! Incoming `layout-state` messages distinguish `owned_panes` (all lease
+//! members, including inactive sessions and panes without a first frame) from
+//! `visible_panes` (the current presentation candidates). Delegate ownership
+//! using `owned_panes`; selecting only visible panes can strand children when
+//! their rendering or session activation finishes after the delegation.
 
 use serde::Serialize;
 
