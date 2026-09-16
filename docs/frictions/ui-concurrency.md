@@ -40,13 +40,15 @@ completions. Unmatched or late replies are no-ops and leave a still-pending
 request in place for the real reply. Covered by unit tests in
 `plugins/session-switcher/src/lib.rs`.
 
-### Keybinding save replies survive cancellation
+### Keybinding save replies survive cancellation — remitted
 
-Closing the keybinding editor removes `pending_save`, but a later successful
-reply still hides the editor, clears capture, changes layout visibility, and
-opens the action picker because `handle_saved` does not require a matched save
-before its success path (`plugins/keybindings/src/lib.rs:329-362,455-469`). The
-reply names an action but no unique save attempt.
+Closing the keybinding editor removes `pending_save`. `handle_saved` now
+requires a matched pending action before either the success or failure path
+mutates UI state; mismatched or missing pending replies are no-ops and leave a
+still-pending save in place for the real reply. Covered by unit tests in
+`plugins/keybindings/src/lib.rs`. The reply still names an action rather than a
+unique save-attempt id; that stronger correlation remains future work if
+overlapping saves for the same action become possible.
 
 ### Repeated backend-picker creation reuses one correlation value
 
@@ -57,9 +59,10 @@ that constant becomes the current picker
 an earlier open can replace or update the newer picker. More generally, picker
 clients cannot cancel an in-flight creation before the service returns a
 picker identity, so a late create reply can resurrect a closed modal.
-The keybinding picker demonstrates this hole directly: close clears only the
-boolean when no picker identity exists, while any later `picker-created` reply
-is installed unconditionally (`plugins/keybindings/src/lib.rs:244-258,455-469`).
+The keybinding plugin now rejects a late `picker-created` when
+`picker_requested` is false (after close/cancel) and sends `picker-cancel` for
+the orphaned identity. Session-switcher discovery pickers still have the
+broader correlation hole.
 
 ### Agent-picker intent changes realm while it waits — remitted
 

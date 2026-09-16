@@ -322,7 +322,12 @@ fn handle_message(state: &mut KeybindingsState, sender: &str, bytes: &[u8]) -> V
                     state.bindings.insert(binding.action, candidate);
                 }
             }
-            if state.picker_requested || state.picker.is_some() || state.visible {
+            if state.picker_requested
+                || state.picker.is_some()
+                || state.visible
+                || state.pending_save.is_some()
+                || state.capture.is_some()
+            {
                 return Vec::new();
             }
             open_action_picker(state).into_iter().collect()
@@ -334,6 +339,9 @@ fn handle_message(state: &mut KeybindingsState, sender: &str, bytes: &[u8]) -> V
             message,
         } => handle_saved(state, &action, success, message),
         KeybindingsMessage::PickerCreated { picker } if sender == PICKER_ACTOR_ID => {
+            if !state.picker_requested {
+                return cancel_picker(picker).into_iter().collect();
+            }
             state.picker_requested = false;
             state.picker = Some(picker);
             Vec::new()
@@ -416,13 +424,21 @@ fn handle_saved(
     success: bool,
     message: String,
 ) -> Vec<ActorCommand> {
-    let saved = state.pending_save.take().filter(|index| {
-        ACTIONS
-            .get(*index)
-            .is_some_and(|candidate| candidate.id == action)
-    });
+    let Some(index) = state.pending_save else {
+        return Vec::new();
+    };
+    let Some(candidate) = ACTIONS.get(index) else {
+        state.pending_save = None;
+        return Vec::new();
+    };
+    // Leave a mismatched pending save in place so the real reply can still match.
+    if candidate.id != action {
+        return Vec::new();
+    }
+    state.pending_save = None;
+
     if !success {
-        state.capture = saved;
+        state.capture = Some(index);
         state.error = true;
         state.status = if message.is_empty() {
             "Could not save shortcut".to_string()
@@ -550,13 +566,8 @@ fn capture_key(
 
 fn close_editor(state: &mut KeybindingsState) -> Vec<ActorCommand> {
     let mut commands = Vec::new();
-    if let Some(picker) = state.picker.take()
-        && let Ok(body) = serde_json::to_vec(&PickerCancel {
-            message_type: "picker-cancel",
-            picker,
-        })
-    {
-        commands.push(send_local(PICKER_ACTOR_ID, body));
+    if let Some(picker) = state.picker.take() {
+        commands.extend(cancel_picker(picker));
     }
     state.picker_requested = false;
     state.visible = false;
@@ -569,6 +580,15 @@ fn close_editor(state: &mut KeybindingsState) -> Vec<ActorCommand> {
         commands.push(layout_visibility(state.pane, false));
     }
     commands
+}
+
+fn cancel_picker(picker: u64) -> Option<ActorCommand> {
+    let body = serde_json::to_vec(&PickerCancel {
+        message_type: "picker-cancel",
+        picker,
+    })
+    .ok()?;
+    Some(send_local(PICKER_ACTOR_ID, body))
 }
 
 impl KeybindingsState {
@@ -1243,6 +1263,169 @@ mod tests {
                 serde_json::from_slice(&response.next_sequence_state).unwrap();
             assert!(!state.backdrop_pressed);
         }
+    }
+
+    fn pending_index(action_id: &str) -> usize {
+        ACTIONS
+            .iter()
+            .position(|action| action.id == action_id)
+            .expect("known action")
+    }
+
+    fn saved_message(action: &str, success: bool, message: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "type": "keybinding-saved",
+            "action": action,
+            "success": success,
+            "message": message,
+        }))
+        .expect("serialize keybinding-saved")
+    }
+
+    #[test]
+    fn matched_save_success_closes_editor_and_reopens_picker() {
+        let mut state = KeybindingsState::new();
+        let index = pending_index("sessions.picker");
+        state.pane = 3;
+        state.visible = true;
+        state.pending_save = Some(index);
+        state.status = "Saving…".to_string();
+
+        let commands = handle_message(
+            &mut state,
+            "host",
+            &saved_message("sessions.picker", true, ""),
+        );
+
+        assert!(state.pending_save.is_none());
+        assert!(state.capture.is_none());
+        assert!(!state.visible);
+        assert!(!state.error);
+        assert!(state.status.is_empty());
+        assert!(state.picker_requested);
+        assert_eq!(commands.len(), 2);
+        assert!(matches!(
+            &commands[0],
+            ActorCommand::SendLocalMessage(message)
+                if message.actor == LAYOUT_ACTOR_ID
+        ));
+        assert!(matches!(
+            &commands[1],
+            ActorCommand::SendLocalMessage(message)
+                if message.actor == PICKER_ACTOR_ID
+        ));
+    }
+
+    #[test]
+    fn unmatched_or_stale_save_success_is_a_noop() {
+        let mut state = KeybindingsState::new();
+        state.pane = 3;
+        state.visible = true;
+        state.capture = Some(pending_index("sessions.picker"));
+        state.status = "Press the new shortcut · Esc cancels".to_string();
+
+        let without_pending = handle_message(
+            &mut state,
+            "host",
+            &saved_message("sessions.picker", true, ""),
+        );
+        assert!(without_pending.is_empty());
+        assert!(state.visible);
+        assert_eq!(state.capture, Some(pending_index("sessions.picker")));
+        assert!(!state.picker_requested);
+
+        let index = pending_index("sessions.picker");
+        state.pending_save = Some(index);
+        state.capture = None;
+        state.status = "Saving…".to_string();
+        let mismatched = handle_message(
+            &mut state,
+            "host",
+            &saved_message("inbox.show", true, ""),
+        );
+        assert!(mismatched.is_empty());
+        assert_eq!(state.pending_save, Some(index));
+        assert!(state.visible);
+        assert!(!state.picker_requested);
+        assert_eq!(state.status, "Saving…");
+    }
+
+    #[test]
+    fn cancelled_pending_save_ignores_late_success_and_failure() {
+        let mut state = KeybindingsState::new();
+        state.pane = 9;
+        state.visible = true;
+        state.pending_save = Some(pending_index("sessions.picker"));
+        let _ = close_editor(&mut state);
+        assert!(state.pending_save.is_none());
+        assert!(!state.visible);
+
+        let success = handle_message(
+            &mut state,
+            "host",
+            &saved_message("sessions.picker", true, ""),
+        );
+        assert!(success.is_empty());
+        assert!(!state.visible);
+        assert!(!state.picker_requested);
+        assert!(state.pending_save.is_none());
+
+        let failure = handle_message(
+            &mut state,
+            "host",
+            &saved_message("sessions.picker", false, "boom"),
+        );
+        assert!(failure.is_empty());
+        assert!(state.capture.is_none());
+        assert!(!state.error);
+        assert!(state.status.is_empty());
+    }
+
+    #[test]
+    fn matched_save_failure_restores_capture() {
+        let mut state = KeybindingsState::new();
+        let index = pending_index("sessions.picker");
+        state.visible = true;
+        state.pending_save = Some(index);
+        state.status = "Saving…".to_string();
+
+        let commands = handle_message(
+            &mut state,
+            "host",
+            &saved_message("sessions.picker", false, "binder rejected chord"),
+        );
+
+        assert!(commands.is_empty());
+        assert!(state.pending_save.is_none());
+        assert_eq!(state.capture, Some(index));
+        assert!(state.visible);
+        assert!(state.error);
+        assert_eq!(state.status, "binder rejected chord");
+        assert!(!state.picker_requested);
+    }
+
+    #[test]
+    fn late_picker_created_after_cancel_is_rejected() {
+        let mut state = KeybindingsState::new();
+        state.picker_requested = true;
+        let _ = close_editor(&mut state);
+        assert!(!state.picker_requested);
+
+        let commands = handle_message(
+            &mut state,
+            PICKER_ACTOR_ID,
+            br#"{"type":"picker-created","picker":42}"#,
+        );
+        assert!(state.picker.is_none());
+        assert!(!state.picker_requested);
+        assert_eq!(commands.len(), 1);
+        let ActorCommand::SendLocalMessage(message) = &commands[0] else {
+            panic!("expected picker-cancel");
+        };
+        assert_eq!(message.actor, PICKER_ACTOR_ID);
+        let value: serde_json::Value = serde_json::from_slice(&message.body).unwrap();
+        assert_eq!(value["type"], "picker-cancel");
+        assert_eq!(value["picker"], 42);
     }
 
     #[cfg(feature = "pure-renderer")]
