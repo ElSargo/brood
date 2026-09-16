@@ -362,6 +362,87 @@ let
     }
   );
 
+  # First-party WASM plugins are independent Cargo workspaces (each
+  # plugins/*/Cargo.toml declares an empty `[workspace]`), so root
+  # `cargo clippy --workspace` never sees them (audit H5). Gate their
+  # lib sources for wasm32. Do not pass `-D warnings` yet — fail on
+  # compiler/clippy errors only; gradual unwrap/deny tightening is a
+  # follow-up. Prefer `--lib` over `--all-targets`: several plugins'
+  # `#[cfg(test)]` / host-only paths (e.g. unix fs, std panic_impl)
+  # do not compile for wasm32.
+  pluginClippyPlugins = [
+    "coding-agent"
+    "component-runtime-io"
+    "component-workspace-watch"
+    "default-workspace"
+    "diff-viewer"
+    "inbox"
+    "keybindings"
+    "neovim-client"
+    "neovim-files"
+    "picker"
+    "resize-proof"
+    "session-switcher"
+    "status-bar"
+    "terminal-session"
+    "terminal-ui"
+    "theme-switcher"
+    "workspace-file-log"
+    "worktree-manager"
+  ];
+
+  pluginClippyPluginArgs = lib.concatStringsSep " " pluginClippyPlugins;
+
+  pluginClippyCheck = pkgs.stdenvNoCC.mkDerivation {
+    name = "brood-plugin-clippy";
+    src = guestSrc;
+    cargoVendorDir = wasmCargoVendorDir;
+    nativeBuildInputs = [
+      craneLib.configureCargoVendoredDepsHook
+      profiles.rustToolchainWithTools
+    ];
+
+    preConfigure = ''
+      export CARGO_HOME="$TMPDIR/cargo-home"
+      export HOME="$TMPDIR/home"
+      mkdir -p "$CARGO_HOME" "$HOME"
+    '';
+
+    buildPhase = ''
+      runHook preBuild
+
+      export CARGO_NET_OFFLINE=true
+
+      failed=0
+      for plugin in ${pluginClippyPluginArgs}; do
+        echo "lint=plugin-clippy plugin=$plugin target=wasm32-unknown-unknown"
+        if ! cargo clippy \
+          --manifest-path "plugins/$plugin/Cargo.toml" \
+          --target wasm32-unknown-unknown \
+          --locked \
+          --lib; then
+          echo "lint=plugin-clippy status=failed plugin=$plugin" >&2
+          failed=1
+        fi
+      done
+
+      if [[ "$failed" -ne 0 ]]; then
+        exit 1
+      fi
+
+      runHook postBuild
+    '';
+
+    installPhase = ''
+      runHook preInstall
+      mkdir -p "$out"
+      touch "$out/passed"
+      runHook postInstall
+    '';
+
+    dontFixup = true;
+  };
+
   softwareE2eCapture = pkgs.writeShellApplication {
     name = "brood-software-e2e-capture";
     runtimeInputs = [
@@ -1121,6 +1202,7 @@ let
         .#cargoArtifacts
         .#clippyCheck
         .#unitTestCheck
+        .#pluginClippyCheck
         .#shellCheck
         .#brooddArtifacts
       )
@@ -1282,6 +1364,16 @@ let
       echo "lint=rust command=cargo-clippy"
       cargo clippy --workspace --all-targets --locked
 
+      echo "lint=rust command=cargo-clippy-plugins plugins=all"
+      for plugin in ${pluginClippyPluginArgs}; do
+        echo "lint=plugin-clippy plugin=$plugin target=wasm32-unknown-unknown"
+        cargo clippy \
+          --manifest-path "plugins/$plugin/Cargo.toml" \
+          --target wasm32-unknown-unknown \
+          --locked \
+          --lib
+      done
+
       echo "lint=rust command=cargo-check"
       cargo check --workspace --all-targets --locked
 
@@ -1317,6 +1409,7 @@ let
   lintCheck = pkgs.runCommand "brood-lint-check" { } ''
     echo "lint=rust command=cargo-check artifacts=${cargoArtifacts}"
     echo "lint=rust command=cargo-clippy check=${clippyCheck}"
+    echo "lint=rust command=cargo-clippy-plugins check=${pluginClippyCheck}"
     echo "lint=shell check=${shellCheck}"
     echo "test=agent check=${agentCheck}"
     echo "test=cargo-unit check=${unitTestCheck}"
@@ -1412,6 +1505,7 @@ in
     cargoArtifacts
     clippyCheck
     unitTestCheck
+    pluginClippyCheck
     devEnv
     devEnvFull
     cacheCi
