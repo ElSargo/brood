@@ -313,6 +313,55 @@ let
     }
   );
 
+  # Focused Cargo unit/integration tests for the default PR gate (H4).
+  # Prefer packages that already pass cleanly under the same Nix native libs /
+  # mold linker as clippyCheck. Nested Wayland e2e under tools/test-*-nested.sh
+  # stays optional/nightly and is intentionally not referenced here.
+  #
+  # Expansion path (once CI-clean):
+  # - brood-capsuled: `cargo test -p brood-capsuled --lib` works, but the
+  #   host_smoke integration target currently fails to compile (missing
+  #   CARGO_BIN_EXE_brood-capsuled / no package binary).
+  # - brood-launch / brood-dmabuf: no meaningful tests yet.
+  unitTestPackages = [
+    "brood-protocol"
+    "brood-ipc"
+    "brood-transport"
+    "brood-wasm"
+    "brood-layout"
+    "brood-plugin-sdk"
+    "brood-keybindings"
+    "brood-theme"
+    "brood-package-contract"
+    "brood-graphics"
+    "brood-computer-use"
+    "brood-profiler"
+    "brood-wayland-drop"
+    "bmux"
+    "brood-cli"
+    "brood-remote"
+    "broodd"
+    "brood-client"
+  ];
+
+  unitTestPackageArgs = lib.concatMapStringsSep " " (name: "-p ${name}") unitTestPackages;
+
+  unitTestCheck = craneLib.cargoTest (
+    craneBaseArgs
+    // {
+      pname = "brood-unit-tests";
+      inherit cargoArtifacts;
+      # Match clippy/check: empty profile so cargoWithProfile omits --profile.
+      env.CARGO_PROFILE = "";
+      # --lib --tests skips doctests (fragile under parallel sandbox runs) while
+      # still covering in-crate unit tests and crates/*/tests integration suites.
+      cargoExtraArgs = "--locked ${unitTestPackageArgs} --lib --tests";
+      # Keep harness concurrency modest: brood-wasm facet_executor has shown
+      # intermittent "facet worker is unavailable" under high --test-threads.
+      cargoTestExtraArgs = "-- --test-threads=2";
+    }
+  );
+
   softwareE2eCapture = pkgs.writeShellApplication {
     name = "brood-software-e2e-capture";
     runtimeInputs = [
@@ -1071,6 +1120,7 @@ let
         ".#checks.$system.lint"
         .#cargoArtifacts
         .#clippyCheck
+        .#unitTestCheck
         .#shellCheck
         .#brooddArtifacts
       )
@@ -1235,6 +1285,9 @@ let
       echo "lint=rust command=cargo-check"
       cargo check --workspace --all-targets --locked
 
+      echo "test=rust command=cargo-test packages=focused"
+      cargo test --locked ${unitTestPackageArgs} --lib --tests -- --test-threads=2
+
       if ((''${#shell_files[@]} > 0)); then
         echo "lint=shell command=shellcheck files=''${#shell_files[@]}"
         shellcheck -e SC2016 -e SC2034 "''${shell_files[@]}"
@@ -1266,6 +1319,7 @@ let
     echo "lint=rust command=cargo-clippy check=${clippyCheck}"
     echo "lint=shell check=${shellCheck}"
     echo "test=agent check=${agentCheck}"
+    echo "test=cargo-unit check=${unitTestCheck}"
 
     mkdir -p "$out"
     touch "$out/passed"
@@ -1357,6 +1411,7 @@ in
   inherit
     cargoArtifacts
     clippyCheck
+    unitTestCheck
     devEnv
     devEnvFull
     cacheCi
