@@ -2519,8 +2519,20 @@ fn handle_session_message(sender: &str, bytes: &[u8]) -> Vec<ActorCommand> {
         && message.validate().is_ok()
     {
         match message {
-            BackendCatalogueMessage::ConnectionFailed { message, .. } => {
+            BackendCatalogueMessage::ConnectionFailed {
+                message,
+                request,
+                ..
+            } => {
                 if let Ok(mut state) = STATE.lock() {
+                    // Ignore unidentified or superseded deploy failures so a
+                    // late older attempt cannot overwrite a newer pending deploy.
+                    if state.pending.is_some() && state.pending != request {
+                        return Vec::new();
+                    }
+                    if request.is_some() {
+                        state.pending = None;
+                    }
                     state.mode = EditMode::Search;
                     state.pending_directory_backend = None;
                     state.error = true;
@@ -4585,10 +4597,18 @@ fn submit(state: &mut SwitcherState) -> Vec<ActorCommand> {
         }
         state.error = false;
         state.status = format!("Deploying {address} over SSH…");
-        state.next_request();
-        return vec![ActorCommand::SendHostMessage(
-            format!("{{\"type\":\"deploy-ssh-backend\",\"target\":{address:?}}}").into_bytes(),
-        )];
+        let request = state.next_request();
+        let body = serde_json::json!({
+            "type": "deploy-ssh-backend",
+            "target": address,
+            "request": request,
+        });
+        let Ok(body) = serde_json::to_vec(&body) else {
+            state.error = true;
+            state.status = "Could not encode the SSH deploy request".to_string();
+            return Vec::new();
+        };
+        return vec![ActorCommand::SendHostMessage(body)];
     }
     if matches!(
         state.mode,
@@ -4615,11 +4635,12 @@ fn submit(state: &mut SwitcherState) -> Vec<ActorCommand> {
         }
         state.error = false;
         state.status = format!("Creating container backend from {image}…");
-        state.next_request();
+        let request = state.next_request();
         let body = serde_json::json!({
             "type": "deploy-container-backend",
             "image": image,
             "connection": connection,
+            "request": request,
         });
         let Ok(body) = serde_json::to_vec(&body) else {
             state.error = true;
@@ -5754,14 +5775,15 @@ bindings::export!(SessionSwitcher with_types_in bindings);
 #[cfg(test)]
 mod tests {
     use brood_plugin_sdk::exports::brood::plugin::actor::{PresentationScope, PresentationSession};
-    use brood_protocol::backend_catalogue::{BackendCatalogueEntry, BackendSessionEntry};
+    use brood_protocol::backend_catalogue::{BackendCatalogueEntry, BackendCatalogueMessage, BackendSessionEntry};
 
     use super::{
         ActorCommand, EditMode, LayoutContext, LayoutLeaseToken, LayoutRegionResizeMessage,
         LayoutStateSize, ResizePaintPlan, SessionCommandCompleted, SessionOperation,
-        SessionSnapshot, ShellLayoutState, SwitcherState, ViewSession, WireAgent, actor_realm,
+        SessionSnapshot, ShellLayoutState, STATE, SwitcherState, ViewSession, WireAgent, actor_realm,
         apply_backend_sessions, apply_completion, apply_snapshot, apply_layout_pointer_message,
         apply_layout_transaction_notification, apply_picker_selection, apply_worktree_completion,
+        handle_session_message,
         authenticated_neovim_client, backend_picker_reply_is_current, begin_worktree_for_source,
         clear_agent_registry_for_realm_change, fulfill_pending_agent_picker,
         creation_backend_items, header_geometry, neovim_client_realm, neovim_ui_id,
@@ -7848,6 +7870,46 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![9]
         );
+    }
+
+    #[test]
+    fn stale_connection_failed_must_not_overwrite_newer_deploy_status() {
+        {
+            let mut state = SwitcherState::new();
+            state.mode = EditMode::ConnectRemote;
+            state.pending = Some(2);
+            state.error = false;
+            state.status = "Deploying newer@host…".to_string();
+            *STATE.lock().expect("state") = state;
+        }
+        let stale = serde_json::to_vec(&BackendCatalogueMessage::connection_failed(
+            "older deploy failed",
+        ))
+        .expect("encode stale failure");
+        assert!(handle_session_message("client", &stale).is_empty());
+        {
+            let state = STATE.lock().expect("state");
+            assert_eq!(state.pending, Some(2));
+            assert!(!state.error);
+            assert_eq!(state.status, "Deploying newer@host…");
+            assert!(matches!(state.mode, EditMode::ConnectRemote));
+        }
+
+        let matched = serde_json::to_vec(
+            &BackendCatalogueMessage::connection_failed_for_request(
+                Some(2),
+                "newer deploy failed",
+            ),
+        )
+        .expect("encode matched failure");
+        assert!(handle_session_message("client", &matched).is_empty());
+        {
+            let state = STATE.lock().expect("state");
+            assert_eq!(state.pending, None);
+            assert!(state.error);
+            assert_eq!(state.status, "newer deploy failed");
+            assert!(matches!(state.mode, EditMode::Search));
+        }
     }
 
     #[test]

@@ -110,17 +110,15 @@ catalogue containing that identity is guaranteed to be installed
 special-case workaround, showing that this ordering cannot be assumed. A
 commit revision would remove the need for per-operation workarounds.
 
-### Backend deployment results do not identify the initiating intent
+### Backend deployment results do not identify the initiating intent — remitted
 
-SSH and container ready/failed client events carry only a deployment or error
-string, and connection notifications sent to the switcher carry only backend
-state and a message (`clients/brood-client/src/main.rs:1123-1132,9216-9284`;
-`plugins/session-switcher/src/lib.rs:2057-2075`). A failure from an earlier
-deployment can replace the status for a later attempt. The switcher cannot
-settle the correct pending operation because the operation identity is lost
-across the host boundary.
-
-## Cross-lane ordering and pressure
+Remitted by threading an optional deploy `request` id from the session switcher
+through host deploy messages, deployer ready/failed client events, and
+`BackendCatalogueMessage::ConnectionFailed`. The switcher ignores failures that
+do not match the current `pending` id and clears `pending` only on a match.
+Residual risk: in-flight deployer threads are not cancelled when superseded; they
+are only ignored at notification time. Ready/success paths still do not clear
+`pending` by request id.
 
 ### Critical and latest-state input lack a shared source watermark
 

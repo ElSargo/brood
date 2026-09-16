@@ -34,13 +34,19 @@ pub enum HostMessage {
     },
     ConnectRemoteBackend {
         address: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request: Option<u64>,
     },
     DeploySshBackend {
         target: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request: Option<u64>,
     },
     DeployContainerBackend {
         image: String,
         connection: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request: Option<u64>,
     },
     RequestBackendCatalogue,
     CreateLocalBackend,

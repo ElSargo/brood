@@ -68,7 +68,13 @@ pub enum BackendCatalogueMessage {
     #[serde(rename = "backend-connected")]
     Connected { version: u32, backend: BackendId },
     #[serde(rename = "backend-connection-failed")]
-    ConnectionFailed { version: u32, message: String },
+    ConnectionFailed {
+        version: u32,
+        message: String,
+        /// Switcher deploy `pending` / host request id that initiated this attempt.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request: Option<u64>,
+    },
     #[serde(rename = "backend-sessions")]
     Sessions {
         version: u32,
@@ -91,9 +97,18 @@ impl BackendCatalogueMessage {
 
     #[must_use]
     pub fn connection_failed(message: impl Into<String>) -> Self {
+        Self::connection_failed_for_request(None, message)
+    }
+
+    #[must_use]
+    pub fn connection_failed_for_request(
+        request: Option<u64>,
+        message: impl Into<String>,
+    ) -> Self {
         Self::ConnectionFailed {
             version: BACKEND_CATALOGUE_PROTOCOL_VERSION,
             message: message.into(),
+            request,
         }
     }
 
@@ -335,6 +350,34 @@ mod tests {
             Ok(BackendSessionEntry { isolation, .. }) if isolation == SessionIsolationStatus::default()
         ));
     }
+
+    #[test]
+    fn connection_failed_omits_request_by_default_for_wire_compat() {
+        let notification = BackendCatalogueMessage::connection_failed("deploy A failed");
+        let value = serde_json::to_value(&notification).expect("encode");
+        assert!(value.get("request").is_none());
+        assert!(matches!(
+            notification,
+            BackendCatalogueMessage::ConnectionFailed { request: None, .. }
+        ));
+    }
+
+    #[test]
+    fn connection_failed_round_trips_optional_request() {
+        let notification =
+            BackendCatalogueMessage::connection_failed_for_request(Some(17), "deploy B failed");
+        let encoded = serde_json::to_vec(&notification).expect("encode");
+        let decoded: BackendCatalogueMessage =
+            serde_json::from_slice(&encoded).expect("decode");
+        assert!(matches!(
+            decoded,
+            BackendCatalogueMessage::ConnectionFailed {
+                request: Some(17),
+                ..
+            }
+        ));
+    }
+
 
     #[test]
     fn catalogue_validation_rejects_version_and_oversized_metadata() {
