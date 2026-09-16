@@ -8,13 +8,14 @@ use std::{
     thread,
 };
 
-use anyhow::{Context, Result, anyhow};
-use calloop::{EventLoop, LoopSignal, channel};
+use anyhow::{anyhow, Context, Result};
+use calloop::{channel, EventLoop, LoopSignal};
 use calloop_wayland_source::WaylandSource;
 use wayland_client::{
-    Connection, Dispatch, Proxy, QueueHandle, event_created_child,
-    globals::{GlobalListContents, registry_queue_init},
+    event_created_child,
+    globals::{registry_queue_init, GlobalListContents},
     protocol::{wl_registry, wl_seat},
+    Connection, Dispatch, Proxy, QueueHandle,
 };
 use wayland_protocols::ext::data_control::v1::client::{
     ext_data_control_device_v1::{self, ExtDataControlDeviceV1},
@@ -45,6 +46,86 @@ pub enum ClipboardContent {
     Image { mime_type: String, bytes: Vec<u8> },
 }
 
+#[derive(Debug, Default)]
+struct ClipboardSlot {
+    /// Monotonic offer/set generation. Readers commit only while this matches
+    /// the generation captured when their selection read began.
+    generation: u64,
+    content: Option<ClipboardContent>,
+}
+
+type SharedClipboardSlot = Arc<Mutex<ClipboardSlot>>;
+
+fn bump_generation(slot: &mut ClipboardSlot) -> u64 {
+    slot.generation = slot.generation.wrapping_add(1);
+    slot.generation
+}
+
+fn clear_clipboard_slot(slot: &SharedClipboardSlot) -> u64 {
+    match slot.lock() {
+        Ok(mut guard) => {
+            let generation = bump_generation(&mut guard);
+            guard.content = None;
+            generation
+        }
+        Err(poisoned) => {
+            let mut guard = poisoned.into_inner();
+            let generation = bump_generation(&mut guard);
+            guard.content = None;
+            generation
+        }
+    }
+}
+
+fn set_clipboard_slot(slot: &SharedClipboardSlot, content: ClipboardContent) -> u64 {
+    match slot.lock() {
+        Ok(mut guard) => {
+            let generation = bump_generation(&mut guard);
+            guard.content = Some(content);
+            generation
+        }
+        Err(poisoned) => {
+            let mut guard = poisoned.into_inner();
+            let generation = bump_generation(&mut guard);
+            guard.content = Some(content);
+            generation
+        }
+    }
+}
+
+/// Commit offer bytes only if `generation` is still the current selection epoch.
+/// Returns whether the commit applied.
+fn commit_clipboard_slot(
+    slot: &SharedClipboardSlot,
+    generation: u64,
+    content: ClipboardContent,
+) -> bool {
+    match slot.lock() {
+        Ok(mut guard) => {
+            if guard.generation != generation {
+                return false;
+            }
+            guard.content = Some(content);
+            true
+        }
+        Err(poisoned) => {
+            let mut guard = poisoned.into_inner();
+            if guard.generation != generation {
+                return false;
+            }
+            guard.content = Some(content);
+            true
+        }
+    }
+}
+
+fn clone_clipboard_content(slot: &SharedClipboardSlot) -> Option<ClipboardContent> {
+    match slot.lock() {
+        Ok(guard) => guard.content.clone(),
+        Err(poisoned) => poisoned.into_inner().content.clone(),
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ClipboardBridge {
     inner: Arc<ClipboardBridgeInner>,
@@ -53,13 +134,13 @@ pub struct ClipboardBridge {
 #[derive(Debug)]
 struct ClipboardBridgeInner {
     command_sender: channel::Sender<ClipboardCommand>,
-    latest_content: Arc<Mutex<Option<ClipboardContent>>>,
+    latest_content: SharedClipboardSlot,
 }
 
 impl ClipboardBridge {
     pub fn start() -> Option<Self> {
         env::var_os("WAYLAND_DISPLAY")?;
-        let latest_content = Arc::new(Mutex::new(None));
+        let latest_content = Arc::new(Mutex::new(ClipboardSlot::default()));
         let thread_latest_content = Arc::clone(&latest_content);
         let (command_sender, command_receiver) = channel::channel();
         let spawn = thread::Builder::new()
@@ -86,9 +167,12 @@ impl ClipboardBridge {
     }
 
     pub fn set_text(&self, text: String) {
-        if let Ok(mut latest) = self.inner.latest_content.lock() {
-            *latest = Some(ClipboardContent::Text(text.clone()));
-        }
+        // Bump the selection generation so in-flight offer readers cannot
+        // overwrite this explicit copy with a stale selection.
+        let _generation = set_clipboard_slot(
+            &self.inner.latest_content,
+            ClipboardContent::Text(text.clone()),
+        );
         if self
             .inner
             .command_sender
@@ -100,7 +184,7 @@ impl ClipboardBridge {
     }
 
     pub fn content(&self) -> Option<ClipboardContent> {
-        self.inner.latest_content.lock().ok()?.clone()
+        clone_clipboard_content(&self.inner.latest_content)
     }
 }
 
@@ -160,7 +244,7 @@ struct ClipboardState {
     protocol: ClipboardProtocol,
     offers: HashMap<wayland_client::backend::ObjectId, OfferData>,
     active_source: Option<ActiveSource>,
-    latest_content: Arc<Mutex<Option<ClipboardContent>>>,
+    latest_content: SharedClipboardSlot,
     loop_signal: LoopSignal,
 }
 
@@ -212,14 +296,20 @@ impl ClipboardState {
         let Some((mime_type, kind)) = choose_content_mime_type(&mime_types) else {
             return;
         };
-        self.clear_latest();
+        let generation = self.begin_offer_epoch();
         let Ok((read_fd, write_fd)) = rustix::pipe::pipe() else {
             return;
         };
         offer.receive(mime_type.clone(), write_fd.as_fd());
         drop(write_fd);
         if self.connection.flush().is_ok() {
-            spawn_offer_reader(Arc::clone(&self.latest_content), read_fd, mime_type, kind);
+            spawn_offer_reader(
+                Arc::clone(&self.latest_content),
+                generation,
+                read_fd,
+                mime_type,
+                kind,
+            );
         }
     }
 
@@ -232,14 +322,20 @@ impl ClipboardState {
         let Some((mime_type, kind)) = choose_content_mime_type(&mime_types) else {
             return;
         };
-        self.clear_latest();
+        let generation = self.begin_offer_epoch();
         let Ok((read_fd, write_fd)) = rustix::pipe::pipe() else {
             return;
         };
         offer.receive(mime_type.clone(), write_fd.as_fd());
         drop(write_fd);
         if self.connection.flush().is_ok() {
-            spawn_offer_reader(Arc::clone(&self.latest_content), read_fd, mime_type, kind);
+            spawn_offer_reader(
+                Arc::clone(&self.latest_content),
+                generation,
+                read_fd,
+                mime_type,
+                kind,
+            );
         }
     }
 
@@ -251,9 +347,12 @@ impl ClipboardState {
     }
 
     fn clear_latest(&self) {
-        if let Ok(mut latest) = self.latest_content.lock() {
-            *latest = None;
-        }
+        let _generation = clear_clipboard_slot(&self.latest_content);
+    }
+
+    /// Invalidate in-flight readers and start a new offer epoch for this selection.
+    fn begin_offer_epoch(&self) -> u64 {
+        clear_clipboard_slot(&self.latest_content)
     }
 
     fn source_cancelled(&mut self, id: &wayland_client::backend::ObjectId) {
@@ -268,7 +367,7 @@ impl ClipboardState {
 }
 
 fn run_clipboard_data_control(
-    latest_content: Arc<Mutex<Option<ClipboardContent>>>,
+    latest_content: SharedClipboardSlot,
     command_receiver: channel::Channel<ClipboardCommand>,
 ) -> Result<()> {
     let connection = Connection::connect_to_env().context("connect to Wayland compositor")?;
@@ -359,7 +458,8 @@ fn choose_content_mime_type(mime_types: &[String]) -> Option<(String, ClipboardC
 }
 
 fn spawn_offer_reader(
-    latest_content: Arc<Mutex<Option<ClipboardContent>>>,
+    latest_content: SharedClipboardSlot,
+    generation: u64,
     fd: OwnedFd,
     mime_type: String,
     kind: ClipboardContentKind,
@@ -378,9 +478,7 @@ fn spawn_offer_reader(
                     },
                     ClipboardContentKind::Image => ClipboardContent::Image { mime_type, bytes },
                 };
-                if let Ok(mut latest) = latest_content.lock() {
-                    *latest = Some(content);
-                }
+                let _applied = commit_clipboard_slot(&latest_content, generation, content);
             }
             Err(error) => eprintln!("failed to read clipboard content: {error}"),
         });
@@ -582,5 +680,90 @@ impl Dispatch<ZwlrDataControlSourceV1, SourceData> for ClipboardState {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn slot_with(generation: u64, content: Option<ClipboardContent>) -> SharedClipboardSlot {
+        Arc::new(Mutex::new(ClipboardSlot {
+            generation,
+            content,
+        }))
+    }
+
+    #[test]
+    fn stale_offer_commit_does_not_overwrite_newer_selection() {
+        let slot = slot_with(1, Some(ClipboardContent::Text("selection-a".into())));
+        // Selection B begins: bump + clear, then a newer value lands (set_text or fast B).
+        let gen_a = 1;
+        let gen_b = set_clipboard_slot(&slot, ClipboardContent::Text("selection-b".into()));
+        assert_eq!(gen_b, 2);
+        assert!(!commit_clipboard_slot(
+            &slot,
+            gen_a,
+            ClipboardContent::Text("stale-a".into()),
+        ));
+        assert_eq!(
+            clone_clipboard_content(&slot),
+            Some(ClipboardContent::Text("selection-b".into()))
+        );
+    }
+
+    #[test]
+    fn stale_offer_commit_does_not_overwrite_set_text() {
+        let slot = slot_with(0, None);
+        let offer_generation = clear_clipboard_slot(&slot);
+        assert_eq!(offer_generation, 1);
+        let _ = set_clipboard_slot(&slot, ClipboardContent::Text("user-copy".into()));
+        assert!(!commit_clipboard_slot(
+            &slot,
+            offer_generation,
+            ClipboardContent::Text("stale-offer".into()),
+        ));
+        assert_eq!(
+            clone_clipboard_content(&slot),
+            Some(ClipboardContent::Text("user-copy".into()))
+        );
+    }
+
+    #[test]
+    fn current_offer_commit_applies() {
+        let slot = slot_with(0, Some(ClipboardContent::Text("old".into())));
+        let generation = clear_clipboard_slot(&slot);
+        assert_eq!(clone_clipboard_content(&slot), None);
+        assert!(commit_clipboard_slot(
+            &slot,
+            generation,
+            ClipboardContent::Text("fresh".into()),
+        ));
+        assert_eq!(
+            clone_clipboard_content(&slot),
+            Some(ClipboardContent::Text("fresh".into()))
+        );
+    }
+
+    #[test]
+    fn superseded_offer_epoch_invalidates_prior_reader() {
+        let slot = slot_with(0, None);
+        let first = clear_clipboard_slot(&slot);
+        let second = clear_clipboard_slot(&slot);
+        assert_ne!(first, second);
+        assert!(commit_clipboard_slot(
+            &slot,
+            second,
+            ClipboardContent::Text("second".into()),
+        ));
+        assert!(!commit_clipboard_slot(
+            &slot,
+            first,
+            ClipboardContent::Text("first".into()),
+        ));
+        assert_eq!(
+            clone_clipboard_content(&slot),
+            Some(ClipboardContent::Text("second".into()))
+        );
     }
 }

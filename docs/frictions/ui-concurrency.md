@@ -22,14 +22,15 @@ catalogue, platform-service, and cross-lane transitions.
 
 ## Confirmed stale-result mutations
 
-### Clipboard selection readers can overwrite a newer selection
+### Clipboard selection readers can overwrite a newer selection — remitted
 
-Each Wayland selection starts an independent untracked reader thread. The
-thread unconditionally writes `latest_content` when it finishes
-(`clients/brood-client/src/clipboard.rs:206-243,361-386`). A slow read for
-selection A can therefore finish after selection B, or after `set_text`, and
-replace the newer clipboard value. There is no selection epoch or offer
-identity at commit time.
+Offer reads now stamp a selection generation via `begin_offer_epoch` /
+`clear_clipboard_slot` / `set_clipboard_slot`. `spawn_offer_reader` commits
+through `commit_clipboard_slot`, which ignores results whose generation is no
+longer current, so a slow read for selection A cannot replace selection B or an
+intervening `set_text` (`clients/brood-client/src/clipboard.rs`). Superseded
+reader threads may still finish their pipe I/O; they simply drop the result.
+Covered by unit tests in the same module.
 
 ### Session command completions mutate unrelated newer state — remitted
 
