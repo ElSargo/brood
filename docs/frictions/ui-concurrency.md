@@ -70,14 +70,15 @@ reply for the new session can fulfill a shortcut intent issued in the old
 session and open an unexpected agent (`plugins/session-switcher/src/lib.rs:
 2114-2137`).
 
-### Layout completions can move durable state backward
+### Layout completions can move durable state backward — remitted
 
-The shell permits several pending layout requests. Any completed or degraded
-request becomes `durable_shell_layout`, and its target revision becomes the
-presented revision, without checking for a later request or higher revision
-(`plugins/session-switcher/src/lib.rs:1843-1860,3593-3715`). If request 2
-completes before request 1, the late request-1 completion can restore older
-durable state and a lower presented revision.
+Completed and degraded layout notifications still always retire their pending
+entry, but they install `durable_shell_layout` and advance
+`presented_layout_revision` only when `request_id` is at least the last
+committed layout request. Presented revision is monotonic via `max`, so a late
+older completion cannot restore stale shell chrome or rewind the presented
+revision (`plugins/session-switcher/src/lib.rs`). Covered by
+`late_older_layout_completion_must_not_regress_durable_or_presented_revision`.
 
 ## Authority and publication races
 

@@ -307,6 +307,10 @@ struct SwitcherState {
     next_layout_request: u64,
     native_resize_revision: Option<u64>,
     durable_shell_layout: Option<ShellLayoutState>,
+    /// Highest layout request_id whose completed/degraded result was installed
+    /// as durable. Late older completions may retire their pending entry but
+    /// must not replace this authority.
+    committed_shell_layout_request: u64,
     pending_shell_layouts: BTreeMap<u64, PendingShellLayout>,
     deferred_shell_layout: Option<DeferredShellLayout>,
     deferred_pointer_layout: Option<DeferredPointerLayout>,
@@ -790,6 +794,7 @@ impl SwitcherState {
             next_layout_request: 0,
             native_resize_revision: None,
             durable_shell_layout: None,
+            committed_shell_layout_request: 0,
             pending_shell_layouts: BTreeMap::new(),
             deferred_shell_layout: None,
             deferred_pointer_layout: None,
@@ -2154,15 +2159,35 @@ fn apply_layout_transaction_notification(
 ) -> Vec<ActorCommand> {
     match notification.message_type.as_str() {
         "completed" | "degraded" => {
+            // Always retire the pending entry. Only install durable / advance
+            // presented when this request is at least as new as the last
+            // committed layout request; otherwise a late older completion can
+            // restore stale shell chrome and rewind presented_layout_revision.
             if let Some(completed) = state.pending_shell_layouts.remove(&notification.request_id) {
-                state.durable_shell_layout = Some(completed.state);
-            }
-            if let Some(target_layout_revision) = notification
-                .resize_epoch
-                .map(|epoch| epoch.target_layout_revision)
-                && let Some(layout) = state.layout.as_mut()
-            {
-                layout.presented_layout_revision = target_layout_revision;
+                if notification.request_id >= state.committed_shell_layout_request {
+                    state.committed_shell_layout_request = notification.request_id;
+                    state.durable_shell_layout = Some(completed.state);
+                    if let Some(target_layout_revision) = notification
+                        .resize_epoch
+                        .map(|epoch| epoch.target_layout_revision)
+                        && let Some(layout) = state.layout.as_mut()
+                    {
+                        layout.presented_layout_revision = layout
+                            .presented_layout_revision
+                            .max(target_layout_revision);
+                    }
+                }
+            } else if notification.request_id >= state.committed_shell_layout_request {
+                // Orphan completion (no pending entry): never lower presented.
+                if let Some(target_layout_revision) = notification
+                    .resize_epoch
+                    .map(|epoch| epoch.target_layout_revision)
+                    && let Some(layout) = state.layout.as_mut()
+                {
+                    layout.presented_layout_revision = layout
+                        .presented_layout_revision
+                        .max(target_layout_revision);
+                }
             }
             return publish_deferred_shell_layout(state);
         }
@@ -5644,10 +5669,10 @@ mod tests {
 
     use super::{
         ActorCommand, EditMode, LayoutContext, LayoutLeaseToken, LayoutRegionResizeMessage,
-        LayoutStateSize, ResizePaintPlan, SessionCommandCompleted, SessionOperation, SwitcherState,
-        ViewSession, actor_realm, apply_backend_sessions, apply_completion,
-        apply_layout_pointer_message, apply_layout_transaction_notification, apply_picker_selection,
-        apply_worktree_completion,
+        LayoutStateSize, ResizePaintPlan, SessionCommandCompleted, SessionOperation,
+        ShellLayoutState, SwitcherState, ViewSession, actor_realm, apply_backend_sessions,
+        apply_completion, apply_layout_pointer_message, apply_layout_transaction_notification,
+        apply_picker_selection, apply_worktree_completion,
         authenticated_neovim_client, backend_picker_reply_is_current, begin_worktree_for_source,
         creation_backend_items, header_geometry, neovim_client_realm, neovim_ui_id,
         open_creation_backend_picker, publish_layout, publish_layout_region_response,
@@ -6764,6 +6789,111 @@ mod tests {
                 .map(|layout| layout.presented_layout_revision),
             Some(8)
         );
+    }
+
+    #[test]
+    fn late_older_layout_completion_must_not_regress_durable_or_presented_revision() {
+        let mut state = SwitcherState::new();
+        state.layout = Some(LayoutContext {
+            owned_panes: None,
+            revision: 5,
+            presented_layout_revision: 7,
+            lease: LayoutLeaseToken {
+                id: 1,
+                generation: 1,
+            },
+            waitable_panes: serde_json_core::heapless::Vec::new(),
+            presented_panes: serde_json_core::heapless::Vec::new(),
+            visible_panes: serde_json_core::heapless::Vec::new(),
+            focused_pane: Some(1),
+            size: LayoutStateSize {
+                w: 1280,
+                height: 720,
+            },
+            rest: false,
+        });
+
+        let older = ShellLayoutState {
+            sidebar_visible: false,
+            picker_visible: false,
+            keybindings_visible: false,
+            inbox_visible: false,
+            sidebar_width: state.sidebar_width,
+            inbox_width: state.inbox_width,
+            focus: Some(1),
+        };
+        let newer = ShellLayoutState {
+            sidebar_visible: true,
+            picker_visible: false,
+            keybindings_visible: false,
+            inbox_visible: true,
+            sidebar_width: state.sidebar_width,
+            inbox_width: state.inbox_width,
+            focus: Some(2),
+        };
+
+        state.pending_shell_layouts.insert(
+            1,
+            super::PendingShellLayout {
+                state: older,
+                native_resize_revision: Some(11),
+                native_retry_count: 0,
+            },
+        );
+        state.pending_shell_layouts.insert(
+            2,
+            super::PendingShellLayout {
+                state: newer.clone(),
+                native_resize_revision: Some(12),
+                native_retry_count: 0,
+            },
+        );
+
+        assert!(
+            apply_layout_transaction_notification(
+                &mut state,
+                &super::decode_layout_transaction_notification(
+                    br#"{"type":"completed","request_id":2,"resize_epoch":{"id":52,"lease":1,"lease_generation":1,"base_layout_revision":7,"target_layout_revision":10}}"#,
+                )
+                .expect("newer completed notification"),
+            )
+            .is_empty()
+        );
+        assert_eq!(state.durable_shell_layout.as_ref(), Some(&newer));
+        assert_eq!(
+            state
+                .layout
+                .as_ref()
+                .map(|layout| layout.presented_layout_revision),
+            Some(10)
+        );
+        assert_eq!(state.pending_shell_layouts.len(), 1);
+
+        assert!(
+            apply_layout_transaction_notification(
+                &mut state,
+                &super::decode_layout_transaction_notification(
+                    br#"{"type":"completed","request_id":1,"resize_epoch":{"id":51,"lease":1,"lease_generation":1,"base_layout_revision":7,"target_layout_revision":8}}"#,
+                )
+                .expect("late older completed notification"),
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            state.durable_shell_layout.as_ref(),
+            Some(&newer),
+            "late older completion must not replace newer durable shell layout"
+        );
+        assert_eq!(
+            state
+                .layout
+                .as_ref()
+                .map(|layout| layout.presented_layout_revision),
+            Some(10),
+            "late older completion must not rewind presented_layout_revision"
+        );
+        assert!(state.pending_shell_layouts.is_empty());
+        assert_eq!(state.committed_shell_layout_request, 2);
     }
 
     #[test]
