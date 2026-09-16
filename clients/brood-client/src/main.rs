@@ -1357,9 +1357,9 @@ enum ClientEvent {
         completion: SessionCommandCompletion,
     },
     SshBackendReady(SshBackendDeployment),
-    SshBackendFailed(String),
+    SshBackendFailed { request: Option<u64>, message: String },
     ContainerBackendReady(ContainerBackendDeployment),
-    ContainerBackendFailed(String),
+    ContainerBackendFailed { request: Option<u64>, message: String },
     RemoteBackendReady(Box<RemoteBackendReady>),
     RemoteBackendFailed {
         backend: BackendId,
@@ -2094,6 +2094,7 @@ struct SshAttachReady {
 #[derive(Debug)]
 struct SshBackendDeployment {
     target: String,
+    request: Option<u64>,
     child: Child,
     stdin: Option<ChildStdin>,
     ready: SshAttachReady,
@@ -2103,6 +2104,7 @@ struct SshBackendDeployment {
 #[derive(Debug)]
 struct ContainerBackendDeployment {
     description: String,
+    request: Option<u64>,
     child: Child,
     stdin: Option<ChildStdin>,
     ready: SshAttachReady,
@@ -2196,6 +2198,7 @@ fn start_container_backend_deployment(
     deployer: &std::path::Path,
     image: &str,
     connection: Option<&str>,
+    request: Option<u64>,
     proxy: winit::event_loop::EventLoopProxy<ClientEvent>,
 ) -> Result<()> {
     let client = std::env::current_exe().context("resolve running brood-client executable")?;
@@ -2247,6 +2250,7 @@ fn start_container_backend_deployment(
                 Ok(ready) => {
                     let deployment = ContainerBackendDeployment {
                         description: description.clone(),
+                        request,
                         child,
                         stdin: stdin.take(),
                         ready,
@@ -2269,7 +2273,7 @@ fn start_container_backend_deployment(
                             format!("{error:#}; could not wait for deployer: {wait_error}")
                         }
                     };
-                    drop(proxy.send_event(ClientEvent::ContainerBackendFailed(message)));
+                    drop(proxy.send_event(ClientEvent::ContainerBackendFailed { request, message }));
                 }
             }
         })
@@ -2280,6 +2284,7 @@ fn start_container_backend_deployment(
 fn start_ssh_backend_deployment(
     deployer: &std::path::Path,
     target: String,
+    request: Option<u64>,
     proxy: winit::event_loop::EventLoopProxy<ClientEvent>,
 ) -> Result<()> {
     let client = std::env::current_exe().context("resolve running brood-client executable")?;
@@ -2329,6 +2334,7 @@ fn start_ssh_backend_deployment(
                 Ok(ready) => {
                     let deployment = SshBackendDeployment {
                         target: target.clone(),
+                        request,
                         child,
                         stdin: stdin.take(),
                         ready,
@@ -2351,7 +2357,7 @@ fn start_ssh_backend_deployment(
                             format!("{error:#}; could not wait for deployer: {wait_error}")
                         }
                     };
-                    drop(proxy.send_event(ClientEvent::SshBackendFailed(message)));
+                    drop(proxy.send_event(ClientEvent::SshBackendFailed { request, message }));
                 }
             }
         })
@@ -5234,9 +5240,9 @@ const fn client_event_callback_kind(event: &ClientEvent) -> &'static str {
         ClientEvent::BackendSnapshot { .. } => "BackendSnapshot",
         ClientEvent::SessionCommandCompleted { .. } => "SessionCommandCompleted",
         ClientEvent::SshBackendReady(..) => "SshBackendReady",
-        ClientEvent::SshBackendFailed(..) => "SshBackendFailed",
+        ClientEvent::SshBackendFailed { .. } => "SshBackendFailed",
         ClientEvent::ContainerBackendReady(..) => "ContainerBackendReady",
-        ClientEvent::ContainerBackendFailed(..) => "ContainerBackendFailed",
+        ClientEvent::ContainerBackendFailed { .. } => "ContainerBackendFailed",
         ClientEvent::RemoteBackendReady(..) => "RemoteBackendReady",
         ClientEvent::RemoteBackendFailed { .. } => "RemoteBackendFailed",
         ClientEvent::RemoteTerminalInputSent { .. } => "RemoteTerminalInputSent",
@@ -6054,7 +6060,7 @@ impl Application {
             .as_ref()
             .is_some_and(|lane| lane.backend_count() != 0);
         self.publish_backend_sessions()?;
-        self.notify_backend_connection_failed(message)?;
+        self.notify_backend_connection_failed(message, None)?;
         eprintln!("detached failed remote backend={backend:?}: {message}");
         Ok(focus_change)
     }
@@ -6394,7 +6400,7 @@ impl Application {
         }
     }
 
-    fn start_ssh_backend(&self, target: String) -> Result<()> {
+    fn start_ssh_backend(&self, target: String, request: Option<u64>) -> Result<()> {
         let deployer = self
             .ssh_deployer
             .as_deref()
@@ -6403,10 +6409,10 @@ impl Application {
             .event_proxy
             .clone()
             .context("presentation event loop proxy is unavailable")?;
-        start_ssh_backend_deployment(deployer, target, proxy)
+        start_ssh_backend_deployment(deployer, target, request, proxy)
     }
 
-    fn start_container_backend(&self, image: &str, connection: Option<&str>) -> Result<()> {
+    fn start_container_backend(&self, image: &str, connection: Option<&str>, request: Option<u64>) -> Result<()> {
         let deployer = self
             .container_deployer
             .as_deref()
@@ -6415,7 +6421,7 @@ impl Application {
             .event_proxy
             .clone()
             .context("presentation event loop proxy is unavailable")?;
-        start_container_backend_deployment(deployer, image, connection, proxy)
+        start_container_backend_deployment(deployer, image, connection, request, proxy)
     }
 
     fn notify_backend_connected(&self, backend: BackendId) -> Result<()> {
@@ -6434,14 +6440,19 @@ impl Application {
         )
     }
 
-    fn notify_backend_connection_failed(&self, message: &str) -> Result<()> {
+    fn notify_backend_connection_failed(
+        &self,
+        message: &str,
+        request: Option<u64>,
+    ) -> Result<()> {
         let Some(runtime) = self.wasm_runtime.as_ref() else {
             return Ok(());
         };
         if runtime.actor_identity(BACKEND_CATALOGUE_ACTOR_ID).is_none() {
             return Ok(());
         }
-        let notification = BackendCatalogueMessage::connection_failed(message);
+        let notification =
+            BackendCatalogueMessage::connection_failed_for_request(request, message);
         notification.validate()?;
         runtime.send_actor_message(
             BACKEND_CATALOGUE_ACTOR_ID,
@@ -7062,12 +7073,12 @@ impl Application {
             ClientEvent::BackendSnapshot { .. } | ClientEvent::SessionCommandCompleted { .. } => {
                 return Err(anyhow!("backend event reached scene transport path"));
             }
-            ClientEvent::SshBackendReady(_) | ClientEvent::SshBackendFailed(_) => {
+            ClientEvent::SshBackendReady(_) | ClientEvent::SshBackendFailed { .. } => {
                 return Err(anyhow!(
                     "SSH backend deployment event reached scene transport path"
                 ));
             }
-            ClientEvent::ContainerBackendReady(_) | ClientEvent::ContainerBackendFailed(_) => {
+            ClientEvent::ContainerBackendReady(_) | ClientEvent::ContainerBackendFailed { .. } => {
                 return Err(anyhow!(
                     "container backend deployment event reached scene transport path"
                 ));
@@ -10800,11 +10811,11 @@ impl Application {
                         .try_send_session_to(BackendId(backend), command)?;
                     None
                 }
-                HostMessage::ConnectRemoteBackend { address } => {
+                HostMessage::ConnectRemoteBackend { address, request } => {
                     if let Err(error) = self.connect_remote_backend(address) {
                         eprintln!("could not connect dynamic remote backend: {error:#}");
                         if let Err(notify_error) =
-                            self.notify_backend_connection_failed(&format!("{error:#}"))
+                            self.notify_backend_connection_failed(&format!("{error:#}"), request)
                         {
                             eprintln!(
                                 "could not notify session switcher about remote backend failure: \
@@ -10814,11 +10825,11 @@ impl Application {
                     }
                     None
                 }
-                HostMessage::DeploySshBackend { target } => {
-                    if let Err(error) = self.start_ssh_backend(target) {
+                HostMessage::DeploySshBackend { target, request } => {
+                    if let Err(error) = self.start_ssh_backend(target, request) {
                         eprintln!("could not start in-client SSH backend: {error:#}");
                         if let Err(notify_error) =
-                            self.notify_backend_connection_failed(&format!("{error:#}"))
+                            self.notify_backend_connection_failed(&format!("{error:#}"), request)
                         {
                             eprintln!(
                                 "could not notify session switcher about SSH backend failure: \
@@ -10828,12 +10839,17 @@ impl Application {
                     }
                     None
                 }
-                HostMessage::DeployContainerBackend { image, connection } => {
-                    if let Err(error) = self.start_container_backend(&image, connection.as_deref())
+                HostMessage::DeployContainerBackend {
+                    image,
+                    connection,
+                    request,
+                } => {
+                    if let Err(error) =
+                        self.start_container_backend(&image, connection.as_deref(), request)
                     {
                         eprintln!("could not start in-client container backend: {error:#}");
                         if let Err(notify_error) =
-                            self.notify_backend_connection_failed(&format!("{error:#}"))
+                            self.notify_backend_connection_failed(&format!("{error:#}"), request)
                         {
                             eprintln!(
                                 "could not notify session switcher about container backend \
@@ -10853,7 +10869,7 @@ impl Application {
                     if let Err(error) = self.connect_local_backend() {
                         eprintln!("could not start dynamic local backend: {error:#}");
                         if let Err(notify_error) =
-                            self.notify_backend_connection_failed(&format!("{error:#}"))
+                            self.notify_backend_connection_failed(&format!("{error:#}"), None)
                         {
                             eprintln!(
                                 "could not notify session switcher about local backend failure: \
@@ -11808,7 +11824,7 @@ impl ApplicationHandler<ClientEvent> for Application {
                 if let Err(error) = self.accept_remote_backend(connection, origin) {
                     eprintln!("could not attach remote backend: {error:#}");
                     if let Err(notify_error) =
-                        self.notify_backend_connection_failed(&format!("{error:#}"))
+                        self.notify_backend_connection_failed(&format!("{error:#}"), None)
                     {
                         eprintln!(
                             "could not notify session switcher about remote backend failure: \
@@ -11824,17 +11840,18 @@ impl ApplicationHandler<ClientEvent> for Application {
             } => {
                 let _retired = self.backend_registry.retire(backend);
                 eprintln!("{description} attachment failed: {message}");
-                if let Err(error) = self.notify_backend_connection_failed(&message) {
+                if let Err(error) = self.notify_backend_connection_failed(&message, None) {
                     eprintln!(
                         "could not notify session switcher about remote backend failure: {error:#}"
                     );
                 }
             }
             ClientEvent::SshBackendReady(deployment) => {
+                let request = deployment.request;
                 if let Err(error) = self.connect_ssh_backend(deployment) {
                     eprintln!("could not attach deployed SSH backend: {error:#}");
                     if let Err(notify_error) =
-                        self.notify_backend_connection_failed(&format!("{error:#}"))
+                        self.notify_backend_connection_failed(&format!("{error:#}"), request)
                     {
                         eprintln!(
                             "could not notify session switcher about SSH backend failure: \
@@ -11843,19 +11860,20 @@ impl ApplicationHandler<ClientEvent> for Application {
                     }
                 }
             }
-            ClientEvent::SshBackendFailed(message) => {
+            ClientEvent::SshBackendFailed { request, message } => {
                 eprintln!("in-client SSH backend deployment failed: {message}");
-                if let Err(error) = self.notify_backend_connection_failed(&message) {
+                if let Err(error) = self.notify_backend_connection_failed(&message, request) {
                     eprintln!(
                         "could not notify session switcher about SSH backend failure: {error:#}"
                     );
                 }
             }
             ClientEvent::ContainerBackendReady(deployment) => {
+                let request = deployment.request;
                 if let Err(error) = self.connect_container_backend(deployment) {
                     eprintln!("could not attach deployed container backend: {error:#}");
                     if let Err(notify_error) =
-                        self.notify_backend_connection_failed(&format!("{error:#}"))
+                        self.notify_backend_connection_failed(&format!("{error:#}"), request)
                     {
                         eprintln!(
                             "could not notify session switcher about container backend failure: \
@@ -11864,9 +11882,9 @@ impl ApplicationHandler<ClientEvent> for Application {
                     }
                 }
             }
-            ClientEvent::ContainerBackendFailed(message) => {
+            ClientEvent::ContainerBackendFailed { request, message } => {
                 eprintln!("in-client container backend deployment failed: {message}");
-                if let Err(error) = self.notify_backend_connection_failed(&message) {
+                if let Err(error) = self.notify_backend_connection_failed(&message, request) {
                     eprintln!(
                         "could not notify session switcher about container backend failure: \
                          {error:#}"
