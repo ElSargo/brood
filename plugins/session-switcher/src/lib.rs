@@ -1389,16 +1389,6 @@ fn handle_session_event(event: SessionEvent) -> Vec<ActorCommand> {
             commands
         }
         SessionEvent::CommandCompleted(completion) => {
-            if completion.success
-                && matches!(
-                    completion.operation,
-                    SessionOperation::Activate | SessionOperation::Create
-                )
-                && let Some(session) = completion.session
-            {
-                state.backend_id = completion.backend_id;
-                state.session_id = session;
-            }
             apply_completion(&mut state, completion);
             Vec::new()
         }
@@ -1512,11 +1502,22 @@ fn apply_backend_sessions(
 }
 
 fn apply_completion(state: &mut SwitcherState, completion: SessionCommandCompleted) {
-    if state.pending == Some(completion.request) {
-        state.pending = None;
+    // Same pending gate as directory-list / worktree completions: a late reply
+    // for an older request must not rewrite UI for a newer in-flight action.
+    if state.pending != Some(completion.request) {
+        return;
     }
+    state.pending = None;
     state.error = !completion.success;
     if completion.success {
+        if matches!(
+            completion.operation,
+            SessionOperation::Activate | SessionOperation::Create
+        ) && let Some(session) = completion.session
+        {
+            state.backend_id = completion.backend_id;
+            state.session_id = session;
+        }
         if matches!(
             completion.operation,
             SessionOperation::Activate | SessionOperation::Create | SessionOperation::Rename
@@ -5643,9 +5644,10 @@ mod tests {
 
     use super::{
         ActorCommand, EditMode, LayoutContext, LayoutLeaseToken, LayoutRegionResizeMessage,
-        LayoutStateSize, ResizePaintPlan, SwitcherState, ViewSession, actor_realm,
-        apply_backend_sessions, apply_layout_pointer_message,
-        apply_layout_transaction_notification, apply_picker_selection, apply_worktree_completion,
+        LayoutStateSize, ResizePaintPlan, SessionCommandCompleted, SessionOperation, SwitcherState,
+        ViewSession, actor_realm, apply_backend_sessions, apply_completion,
+        apply_layout_pointer_message, apply_layout_transaction_notification, apply_picker_selection,
+        apply_worktree_completion,
         authenticated_neovim_client, backend_picker_reply_is_current, begin_worktree_for_source,
         creation_backend_items, header_geometry, neovim_client_realm, neovim_ui_id,
         open_creation_backend_picker, publish_layout, publish_layout_region_response,
@@ -7342,6 +7344,175 @@ mod tests {
         );
         assert_eq!(state.sessions.len(), 1);
         assert_eq!(state.sessions[0].id, 8);
+    }
+
+    #[test]
+    fn session_completion_ignores_unmatched_pending_and_preserves_ui() {
+        let mut state = SwitcherState::new();
+        state.backend_id = 1;
+        state.session_id = 3;
+        state.pending = Some(42);
+        state.error = false;
+        state.status = "Waiting for rename".to_string();
+        state.mode = EditMode::Rename(1, 3);
+        state.query = "new-name".to_string();
+        state.selected = Some((1, 3));
+        state.sessions.push(ViewSession {
+            backend: 1,
+            id: 3,
+            name: "current".to_string(),
+            active: true,
+            windows: 0,
+            working_directory: Some("/work/current".to_string()),
+            project_id: "/work/current/.git".to_string(),
+            project_name: "current".to_string(),
+            branch: Some("main".to_string()),
+            worktree: false,
+            git: true,
+        });
+
+        apply_completion(
+            &mut state,
+            SessionCommandCompleted {
+                backend_id: 1,
+                request: 41,
+                operation: SessionOperation::Activate,
+                success: true,
+                session: Some(9),
+                message: String::new(),
+            },
+        );
+
+        assert_eq!(state.pending, Some(42));
+        assert!(!state.error);
+        assert_eq!(state.status, "Waiting for rename");
+        assert!(state.mode == EditMode::Rename(1, 3));
+        assert_eq!(state.query, "new-name");
+        assert_eq!(state.selected, Some((1, 3)));
+        assert_eq!(state.backend_id, 1);
+        assert_eq!(state.session_id, 3);
+    }
+
+    #[test]
+    fn session_completion_applies_only_when_pending_matches() {
+        let mut state = SwitcherState::new();
+        state.backend_id = 1;
+        state.session_id = 3;
+        state.pending = Some(42);
+        state.mode = EditMode::Rename(1, 3);
+        state.query = "renamed".to_string();
+        state.sessions.push(ViewSession {
+            backend: 1,
+            id: 3,
+            name: "renamed".to_string(),
+            active: true,
+            windows: 0,
+            working_directory: Some("/work/current".to_string()),
+            project_id: "/work/current/.git".to_string(),
+            project_name: "current".to_string(),
+            branch: Some("main".to_string()),
+            worktree: false,
+            git: true,
+        });
+
+        apply_completion(
+            &mut state,
+            SessionCommandCompleted {
+                backend_id: 1,
+                request: 42,
+                operation: SessionOperation::Rename,
+                success: true,
+                session: Some(3),
+                message: String::new(),
+            },
+        );
+
+        assert_eq!(state.pending, None);
+        assert!(!state.error);
+        assert_eq!(state.status, "Renamed session");
+        assert!(state.mode == EditMode::Search);
+        assert!(state.query.is_empty());
+        assert_eq!(state.selected, Some((1, 3)));
+        assert_eq!(state.backend_id, 1);
+        assert_eq!(state.session_id, 3);
+    }
+
+    #[test]
+    fn overlapping_session_completion_does_not_clobber_newer_pending() {
+        let mut state = SwitcherState::new();
+        state.backend_id = 1;
+        state.session_id = 3;
+        state.pending = Some(10);
+        state.status = "Creating…".to_string();
+        state.mode = EditMode::Search;
+        state.query.clear();
+        state.sessions.push(ViewSession {
+            backend: 1,
+            id: 3,
+            name: "current".to_string(),
+            active: true,
+            windows: 0,
+            working_directory: Some("/work/current".to_string()),
+            project_id: "/work/current/.git".to_string(),
+            project_name: "current".to_string(),
+            branch: Some("main".to_string()),
+            worktree: false,
+            git: true,
+        });
+        state.sessions.push(ViewSession {
+            backend: 1,
+            id: 9,
+            name: "other".to_string(),
+            active: false,
+            windows: 0,
+            working_directory: Some("/work/other".to_string()),
+            project_id: "/work/other/.git".to_string(),
+            project_name: "other".to_string(),
+            branch: Some("main".to_string()),
+            worktree: false,
+            git: true,
+        });
+
+        // Newer activate is in flight (request 11) when an older create (10) completes.
+        state.pending = Some(11);
+        state.status = "Switching…".to_string();
+
+        apply_completion(
+            &mut state,
+            SessionCommandCompleted {
+                backend_id: 1,
+                request: 10,
+                operation: SessionOperation::Create,
+                success: true,
+                session: Some(9),
+                message: String::new(),
+            },
+        );
+
+        assert_eq!(state.pending, Some(11));
+        assert_eq!(state.status, "Switching…");
+        assert_eq!(state.backend_id, 1);
+        assert_eq!(state.session_id, 3);
+        assert_ne!(state.status, "Created session");
+        assert_ne!(state.selected, Some((1, 9)));
+
+        apply_completion(
+            &mut state,
+            SessionCommandCompleted {
+                backend_id: 1,
+                request: 11,
+                operation: SessionOperation::Activate,
+                success: true,
+                session: Some(9),
+                message: String::new(),
+            },
+        );
+
+        assert_eq!(state.pending, None);
+        assert_eq!(state.status, "Switched session");
+        assert_eq!(state.backend_id, 1);
+        assert_eq!(state.session_id, 9);
+        assert_eq!(state.selected, Some((1, 9)));
     }
 
     #[test]

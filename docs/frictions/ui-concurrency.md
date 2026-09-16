@@ -31,13 +31,14 @@ selection A can therefore finish after selection B, or after `set_text`, and
 replace the newer clipboard value. There is no selection epoch or offer
 identity at commit time.
 
-### Session command completions mutate unrelated newer state
+### Session command completions mutate unrelated newer state — remitted
 
-The session switcher clears `pending` only when a completion request matches,
-but it changes error, status, selection, query, and edit mode for every
-completion (`plugins/session-switcher/src/lib.rs:1252-1287`). Keyboard paths
-can start another operation while one is pending. An older activate, create,
-rename, or failure can therefore rewrite the UI for a later action.
+`apply_completion` now requires `pending == Some(completion.request)` before
+clearing pending or mutating error, status, selection, query, edit mode, or
+activate/create realm identity—the same gate as directory-list and worktree
+completions. Unmatched or late replies are no-ops and leave a still-pending
+request in place for the real reply. Covered by unit tests in
+`plugins/session-switcher/src/lib.rs`.
 
 ### Keybinding save replies survive cancellation
 
