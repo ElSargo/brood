@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Sourced by the offscreen themes workload after its first Ashen capture.
 theme_key() {
   env XDG_RUNTIME_DIR="$RUNTIME_DIR" WAYLAND_DISPLAY="$WAYLAND_SOCKET" \
