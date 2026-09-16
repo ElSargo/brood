@@ -35,6 +35,13 @@ pub struct BackendCatalogueEntry {
     pub backend: BackendId,
     pub label: String,
     pub sessions: Vec<BackendSessionEntry>,
+    /// Presentation catalogue revision this entry was built from.
+    ///
+    /// `0` means the publisher did not stamp a revision (legacy hosts). Newer
+    /// clients fill this from `SessionSnapshot.revision` so consumers can reject
+    /// stale non-empty catalogues.
+    #[serde(default)]
+    pub snapshot_revision: u64,
 }
 
 /// Session metadata rendered by the bundled session switcher.
@@ -294,6 +301,21 @@ mod tests {
     }
 
     #[test]
+    fn older_catalogue_entries_default_snapshot_revision_to_zero() {
+        let json = format!(
+            "{{\"kind\":\"backend-sessions\",\"version\":{BACKEND_CATALOGUE_PROTOCOL_VERSION},\"can_create_local\":true,\"can_connect_remote\":false,\"backends\":[{{\"backend\":1,\"label\":\"Local\",\"sessions\":[]}}]}}"
+        );
+        let decoded = serde_json::from_str::<BackendCatalogueMessage>(&json);
+        assert!(matches!(
+            decoded,
+            Ok(BackendCatalogueMessage::Sessions {
+                backends,
+                ..
+            }) if backends.len() == 1 && backends[0].snapshot_revision == 0
+        ));
+    }
+
+    #[test]
     fn older_session_entries_default_to_direct_without_volume_or_capsule() {
         let json = r#"{
             "id":7,
@@ -337,6 +359,7 @@ mod tests {
                 backend: BackendId(1),
                 label: "Local".to_string(),
                 sessions: vec![oversized],
+                snapshot_revision: 0,
             }],
         );
         assert!(matches!(

@@ -265,6 +265,8 @@ struct SwitcherState {
     height: f32,
     resize_extent: (f32, f32, f32),
     sessions: Vec<ViewSession>,
+    /// Last applied `SessionSnapshot.revision` (or catalogue stamp) per backend.
+    backend_session_revisions: BTreeMap<u64, u64>,
     backends: Vec<(u64, String)>,
     collapsed_projects: BTreeSet<String>,
     selected: Option<(u64, u64)>,
@@ -755,6 +757,7 @@ impl SwitcherState {
             height: 720.0,
             resize_extent: (320.0, 720.0, 1.0),
             sessions: Vec::new(),
+            backend_session_revisions: BTreeMap::new(),
             backends: Vec::new(),
             collapsed_projects: BTreeSet::new(),
             selected: None,
@@ -1406,6 +1409,26 @@ fn handle_session_event(event: SessionEvent) -> Vec<ActorCommand> {
 }
 
 fn apply_snapshot(state: &mut SwitcherState, backend: u64, snapshot: SessionSnapshot) {
+    let last_revision = state.backend_session_revisions.get(&backend).copied();
+    if let Some(last) = last_revision {
+        // Ignore delayed older snapshots once a newer revision is installed.
+        if snapshot.revision != 0 && snapshot.revision < last {
+            return;
+        }
+    } else if snapshot.sessions.is_empty()
+        && state
+            .sessions
+            .iter()
+            .any(|session| session.backend == backend)
+    {
+        // Catalogue rows can arrive before any revisioned snapshot. An empty
+        // snapshot without a prior revision baseline cannot prove it is newer,
+        // so keep the live rows (disconnect still clears via catalogue drop).
+        return;
+    }
+
+    let revision = snapshot.revision;
+    let sessions_empty = snapshot.sessions.is_empty();
     state.sessions.retain(|session| session.backend != backend);
     state
         .sessions
@@ -1422,6 +1445,11 @@ fn apply_snapshot(state: &mut SwitcherState, backend: u64, snapshot: SessionSnap
             worktree: session.worktree,
             git: session.git,
         }));
+    if revision != 0 {
+        state.backend_session_revisions.insert(backend, revision);
+    } else if sessions_empty {
+        state.backend_session_revisions.remove(&backend);
+    }
     state.sessions.sort_by(|left, right| {
         left.project_name
             .to_lowercase()
@@ -1456,52 +1484,83 @@ fn apply_backend_sessions(
         .map(|backend| (backend.backend.0, backend.label.clone()))
         .collect();
     state.backends.sort_by_key(|(backend, _)| *backend);
-    let current_backend = state.backend_id;
-    let current_sessions = state
-        .sessions
+
+    let catalogue_backends = backends
         .iter()
-        .filter(|session| session.backend == current_backend)
-        .cloned()
-        .collect::<Vec<_>>();
-    let mut catalogue_sessions = backends
-        .into_iter()
-        .flat_map(|backend| {
-            backend
-                .sessions
-                .into_iter()
-                .map(move |session| ViewSession {
-                    backend: backend.backend.0,
-                    id: session.id,
-                    name: session.name,
-                    active: session.active,
-                    windows: session.windows,
-                    working_directory: session.working_directory,
-                    project_id: session.project_id,
-                    project_name: if backend.label.is_empty() {
-                        session.project_name
-                    } else {
-                        format!("{} · {}", backend.label, session.project_name)
-                    },
-                    branch: session.branch,
-                    worktree: session.worktree,
-                    git: session.git,
-                })
-        })
-        .collect::<Vec<_>>();
-    // The global catalogue is discovered asynchronously and can initially
-    // contain an empty row for the active backend even though that backend's
-    // live session snapshot has already arrived. Preserve that newer snapshot
-    // until the catalogue has real rows to replace it. A genuine empty state
-    // still arrives through `apply_snapshot`, which removes the sessions.
-    if current_backend != 0
-        && !current_sessions.is_empty()
-        && !catalogue_sessions
-            .iter()
-            .any(|session| session.backend == current_backend)
-    {
-        catalogue_sessions.extend(current_sessions);
+        .map(|backend| backend.backend.0)
+        .collect::<BTreeSet<_>>();
+    // Drop revision tracking for backends that left the connected set.
+    state
+        .backend_session_revisions
+        .retain(|backend, _| catalogue_backends.contains(backend));
+
+    let mut next_sessions = Vec::new();
+    for entry in &backends {
+        let backend = entry.backend.0;
+        let last = state.backend_session_revisions.get(&backend).copied();
+        let stamped = entry.snapshot_revision;
+        let stale = match last {
+            Some(last) if stamped != 0 && stamped < last => true,
+            // Unstamped catalogues cannot beat a revisioned live snapshot.
+            Some(_) if stamped == 0 => true,
+            _ => false,
+        };
+        if stale {
+            next_sessions.extend(
+                state
+                    .sessions
+                    .iter()
+                    .filter(|session| session.backend == backend)
+                    .cloned(),
+            );
+            continue;
+        }
+
+        if entry.sessions.is_empty() {
+            // Preserve live rows for the current backend when an initial empty
+            // catalogue arrives before the first stamped snapshot/catalogue.
+            if backend == state.backend_id
+                && backend != 0
+                && last.is_none()
+                && state
+                    .sessions
+                    .iter()
+                    .any(|session| session.backend == backend)
+            {
+                next_sessions.extend(
+                    state
+                        .sessions
+                        .iter()
+                        .filter(|session| session.backend == backend)
+                        .cloned(),
+                );
+                continue;
+            }
+        }
+
+        next_sessions.extend(entry.sessions.iter().map(|session| ViewSession {
+            backend,
+            id: session.id,
+            name: session.name.clone(),
+            active: session.active,
+            windows: session.windows,
+            working_directory: session.working_directory.clone(),
+            project_id: session.project_id.clone(),
+            project_name: if entry.label.is_empty() {
+                session.project_name.clone()
+            } else {
+                format!("{} · {}", entry.label, session.project_name)
+            },
+            branch: session.branch.clone(),
+            worktree: session.worktree,
+            git: session.git,
+        }));
+        if stamped != 0 {
+            state.backend_session_revisions.insert(backend, stamped);
+        }
     }
-    state.sessions = catalogue_sessions;
+
+    state.sessions = next_sessions;
     state
         .sessions
         .sort_by_key(|session| (session.backend, session.id));
@@ -5700,8 +5759,8 @@ mod tests {
     use super::{
         ActorCommand, EditMode, LayoutContext, LayoutLeaseToken, LayoutRegionResizeMessage,
         LayoutStateSize, ResizePaintPlan, SessionCommandCompleted, SessionOperation,
-        ShellLayoutState, SwitcherState, ViewSession, WireAgent, actor_realm,
-        apply_backend_sessions, apply_completion, apply_layout_pointer_message,
+        SessionSnapshot, ShellLayoutState, SwitcherState, ViewSession, WireAgent, actor_realm,
+        apply_backend_sessions, apply_completion, apply_snapshot, apply_layout_pointer_message,
         apply_layout_transaction_notification, apply_picker_selection, apply_worktree_completion,
         authenticated_neovim_client, backend_picker_reply_is_current, begin_worktree_for_source,
         clear_agent_registry_for_realm_change, fulfill_pending_agent_picker,
@@ -7342,6 +7401,7 @@ mod tests {
                 backend: brood_protocol::BackendId(7),
                 label: "Local".to_string(),
                 sessions: Vec::new(),
+                        snapshot_revision: 0,
             }],
         );
         let commands = open_creation_backend_picker(&mut state);
@@ -7469,6 +7529,7 @@ mod tests {
                 backend: brood_protocol::BackendId(7),
                 label: "Local".to_string(),
                 sessions: Vec::new(),
+                        snapshot_revision: 0,
             }],
         );
 
@@ -7501,6 +7562,7 @@ mod tests {
                     git: true,
                     isolation: brood_protocol::SessionIsolationStatus::default(),
                 }],
+                snapshot_revision: 0,
             }],
         );
         assert_eq!(state.sessions.len(), 1);
@@ -7674,6 +7736,118 @@ mod tests {
         assert_eq!(state.backend_id, 1);
         assert_eq!(state.session_id, 9);
         assert_eq!(state.selected, Some((1, 9)));
+    }
+
+    #[test]
+    fn stale_nonempty_catalogue_must_not_regress_live_snapshot_rows() {
+        let mut state = SwitcherState::new();
+        state.backend_id = 7;
+        state.session_id = 9;
+        state.sessions.push(ViewSession {
+            backend: 7,
+            id: 9,
+            name: "live".to_string(),
+            active: true,
+            windows: 1,
+            working_directory: Some("/work/live".to_string()),
+            project_id: "/work/live/.git".to_string(),
+            project_name: "live".to_string(),
+            branch: Some("main".to_string()),
+            worktree: false,
+            git: true,
+        });
+        state.backend_session_revisions.insert(7, 5);
+
+        apply_backend_sessions(
+            &mut state,
+            true,
+            false,
+            false,
+            vec![BackendCatalogueEntry {
+                backend: brood_protocol::BackendId(7),
+                label: "Local".to_string(),
+                sessions: vec![BackendSessionEntry {
+                    id: 3,
+                    name: "stale".to_string(),
+                    active: true,
+                    windows: 1,
+                    working_directory: Some("/work/stale".to_string()),
+                    project_id: "/work/stale/.git".to_string(),
+                    project_name: "stale".to_string(),
+                    branch: Some("main".to_string()),
+                    worktree: false,
+                    git: true,
+                    isolation: brood_protocol::SessionIsolationStatus::default(),
+                }],
+                snapshot_revision: 3,
+            }],
+        );
+        assert_eq!(
+            state
+                .sessions
+                .iter()
+                .map(|session| session.id)
+                .collect::<Vec<_>>(),
+            vec![9]
+        );
+    }
+
+    #[test]
+    fn late_older_snapshot_must_not_regress_after_newer_catalogue() {
+        let mut state = SwitcherState::new();
+        state.backend_id = 7;
+        state.session_id = 9;
+        apply_backend_sessions(
+            &mut state,
+            true,
+            false,
+            false,
+            vec![BackendCatalogueEntry {
+                backend: brood_protocol::BackendId(7),
+                label: "Local".to_string(),
+                sessions: vec![BackendSessionEntry {
+                    id: 9,
+                    name: "catalogue".to_string(),
+                    active: true,
+                    windows: 1,
+                    working_directory: Some("/work/catalogue".to_string()),
+                    project_id: "/work/catalogue/.git".to_string(),
+                    project_name: "catalogue".to_string(),
+                    branch: Some("main".to_string()),
+                    worktree: false,
+                    git: true,
+                    isolation: brood_protocol::SessionIsolationStatus::default(),
+                }],
+                snapshot_revision: 5,
+            }],
+        );
+        assert_eq!(
+            state
+                .sessions
+                .iter()
+                .map(|session| session.id)
+                .collect::<Vec<_>>(),
+            vec![9]
+        );
+
+        apply_snapshot(
+            &mut state,
+            7,
+            SessionSnapshot {
+                backend_id: 7,
+                revision: 1,
+                active: 0,
+                sessions: Vec::new(),
+            },
+        );
+        assert_eq!(
+            state
+                .sessions
+                .iter()
+                .map(|session| session.id)
+                .collect::<Vec<_>>(),
+            vec![9]
+        );
     }
 
     #[test]
@@ -7871,6 +8045,7 @@ mod tests {
                 backend: brood_protocol::BackendId(1),
                 label: "Backend 1".to_string(),
                 sessions: Vec::new(),
+                        snapshot_revision: 0,
             }],
         );
         let bytes = serde_json::to_vec(&message).expect("catalogue JSON");
