@@ -87,17 +87,16 @@ revision (`plugins/session-switcher/src/lib.rs`). Covered by
 
 ## Authority and publication races
 
-### Session and backend catalogues can regress each other
+### Session and backend catalogues can regress each other — remitted
 
-`SessionSnapshot.revision` is not checked when the switcher replaces all rows
-for a backend (`plugins/session-switcher/src/lib.rs:1148-1182`). A separate
-backend-catalogue path replaces the combined list and uses the absence of rows
-for the current backend as its freshness heuristic
-(`plugins/session-switcher/src/lib.rs:1184-1249`). The native client event that
-installs a backend snapshot also has no connection generation or catalogue
-revision and replaces routes, windows, sessions, and renderer state directly
-(`clients/brood-client/src/main.rs:1113-1118,9453-9547`). Delayed non-empty
-catalogue or snapshot events can therefore make a newer view older.
+Remitted by revision gates on snapshot apply and catalogue apply in the
+session switcher, plus optional `snapshot_revision` stamps on
+`BackendCatalogueEntry` and a client-map reject for older
+`SessionSnapshot.revision` values. Empty-row preservation remains only as a
+bootstrap aid when no revision has been observed yet. Residual risk: pane /
+route / renderer state from a delayed `BackendSnapshot` event is still applied
+before the session-map gate; only the session catalogue / actor broadcast path
+is revision-gated today.
 
 ### Command completion and catalogue publication are independent
 

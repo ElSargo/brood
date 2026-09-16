@@ -6463,32 +6463,34 @@ impl Application {
             self.container_deployer.is_some(),
             self.backend_registry
                 .connected_backend_ids()
-                .map(|backend| BackendCatalogueEntry {
-                    backend,
-                    label: if self.local_backend == Some(backend) {
-                        "Local".to_string()
-                    } else {
-                        format!("Backend {}", backend.0)
-                    },
-                    sessions: self
-                        .backend_sessions
-                        .get(&backend)
-                        .into_iter()
-                        .flat_map(|snapshot| &snapshot.sessions)
-                        .map(|session| BackendSessionEntry {
-                            id: session.id,
-                            name: session.name.clone(),
-                            active: session.active,
-                            windows: session.windows,
-                            working_directory: session.working_directory.clone(),
-                            project_id: session.project_id.clone(),
-                            project_name: session.project_name.clone(),
-                            branch: session.branch.clone(),
-                            worktree: session.worktree,
-                            git: session.git,
-                            isolation: session.isolation.clone(),
-                        })
-                        .collect(),
+                .map(|backend| {
+                    let snapshot = self.backend_sessions.get(&backend);
+                    BackendCatalogueEntry {
+                        backend,
+                        label: if self.local_backend == Some(backend) {
+                            "Local".to_string()
+                        } else {
+                            format!("Backend {}", backend.0)
+                        },
+                        sessions: snapshot
+                            .into_iter()
+                            .flat_map(|snapshot| &snapshot.sessions)
+                            .map(|session| BackendSessionEntry {
+                                id: session.id,
+                                name: session.name.clone(),
+                                active: session.active,
+                                windows: session.windows,
+                                working_directory: session.working_directory.clone(),
+                                project_id: session.project_id.clone(),
+                                project_name: session.project_name.clone(),
+                                branch: session.branch.clone(),
+                                worktree: session.worktree,
+                                git: session.git,
+                                isolation: session.isolation.clone(),
+                            })
+                            .collect(),
+                        snapshot_revision: snapshot.map(|snapshot| snapshot.revision).unwrap_or(0),
+                    }
                 })
                 .collect(),
         );
@@ -12539,16 +12541,23 @@ impl ApplicationHandler<ClientEvent> for Application {
                     return;
                 }
                 if let Some(snapshot) = session {
-                    self.backend_sessions.insert(backend, snapshot.clone());
-                    if let Some(runtime) = self.wasm_runtime.as_mut() {
-                        runtime.bind_session_snapshot(&snapshot);
-                        if let Err(error) = runtime
-                            .broadcast_session_event(&SessionEvent::Snapshot(snapshot.clone()))
-                        {
-                            self.fail(event_loop, error);
-                            return;
+                    let stale = self.backend_sessions.get(&backend).is_some_and(|current| {
+                        snapshot.revision != 0
+                            && current.revision != 0
+                            && snapshot.revision < current.revision
+                    });
+                    if !stale {
+                        self.backend_sessions.insert(backend, snapshot.clone());
+                        if let Some(runtime) = self.wasm_runtime.as_mut() {
+                            runtime.bind_session_snapshot(&snapshot);
+                            if let Err(error) = runtime
+                                .broadcast_session_event(&SessionEvent::Snapshot(snapshot.clone()))
+                            {
+                                self.fail(event_loop, error);
+                                return;
+                            }
+                            runtime.stop_actors_for_closed_sessions(&snapshot);
                         }
-                        runtime.stop_actors_for_closed_sessions(&snapshot);
                     }
                 }
                 if let Some(frame) = self.pending_frames.remove(&backend)
