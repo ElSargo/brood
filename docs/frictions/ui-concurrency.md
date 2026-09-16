@@ -152,18 +152,18 @@ the advertised bounded-flow-control contract.
 
 ## Native event-loop stalls
 
-### Backend teardown blocks the presentation loop
+### Backend teardown blocks the presentation loop — remitted
 
-Remote reaping polls and sleeps before joining a worker
-(`clients/brood-client/src/remote.rs:184-230`). SSH and container shutdown call
-blocking `Child::wait` with no timeout (`clients/brood-client/src/main.rs:
-1214-1240`). Remote disconnect invokes these operations directly while
-handling UI state (`clients/brood-client/src/main.rs:4079-4181`). During that
-interval focus, actor output, resize deadlines, catalogues, and renderer events
-accumulate. Even otherwise correct timeout and generation logic can then
-observe artificial expiry or a burst of late results.
+`disconnect_remote_backend` now signals cancel/disconnect on the presentation
+thread, then joins the remote worker and SSH/container children on background
+teardown threads. Child waits use `try_wait` with a timeout and kill
+escalation instead of unbounded `Child::wait`. Completion is delivered as
+generation-gated `BackendTeardownCompleted` so stale teardown results cannot
+mutate newer UI state (`clients/brood-client/src/remote.rs`,
+`clients/brood-client/src/main.rs`). Covered by `wait_child_with_timeout`
+unit tests.
 
-### File drop reads and decodes synchronously
+### File drop reads### File drop reads and decodes synchronously
 
 The dropped-image path performs metadata lookup, whole-file read, format
 detection, and preview decode on the presentation event path

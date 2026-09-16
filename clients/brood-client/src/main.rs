@@ -1302,6 +1302,12 @@ enum ClientEvent {
         backend: BackendId,
         message: String,
     },
+    BackendTeardownCompleted {
+        backend: Option<BackendId>,
+        teardown_generation: u64,
+        kind: BackendTeardownKind,
+        error: Option<String>,
+    },
     RemoteArtifactInstalled {
         manifest: ArtifactManifest,
         path: PathBuf,
@@ -2091,6 +2097,89 @@ struct SshAttachReady {
     session_root: PathBuf,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BackendTeardownKind {
+    RemoteConnection,
+    SshDeployment,
+    ContainerDeployment,
+}
+
+const CHILD_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn wait_child_with_timeout(
+    child: &mut std::process::Child,
+    timeout: Duration,
+    label: &str,
+) -> Result<std::process::ExitStatus> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .with_context(|| format!("poll {label}"))?
+        {
+            return Ok(status);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let status = child
+                .wait()
+                .with_context(|| format!("wait for killed {label}"))?;
+            anyhow::bail!("{label} did not exit within {timeout:?}; killed with {status}");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(test)]
+mod backend_teardown_tests {
+    use super::{wait_child_with_timeout, CHILD_SHUTDOWN_TIMEOUT};
+    use std::{
+        process::{Command, Stdio},
+        time::{Duration, Instant},
+    };
+
+    #[test]
+    fn wait_child_with_timeout_reaps_an_exited_process() {
+        let mut child = Command::new("true")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn true");
+        let status = wait_child_with_timeout(&mut child, Duration::from_secs(1), "true")
+            .expect("reap true");
+        assert!(status.success());
+    }
+
+    #[test]
+    fn wait_child_with_timeout_kills_a_hung_process() {
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let started = Instant::now();
+        let error = wait_child_with_timeout(&mut child, Duration::from_millis(100), "sleep")
+            .expect_err("hung child must time out");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "timeout path took too long: {:?}",
+            started.elapsed()
+        );
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("did not exit"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn child_shutdown_timeout_constant_is_finite() {
+        assert!(CHILD_SHUTDOWN_TIMEOUT > Duration::ZERO);
+        assert!(CHILD_SHUTDOWN_TIMEOUT <= Duration::from_secs(30));
+    }
+}
+
 #[derive(Debug)]
 struct SshBackendDeployment {
     target: String,
@@ -2147,10 +2236,11 @@ impl RemoteAttachOrigin {
 impl ContainerBackendDeployment {
     fn shutdown(&mut self) -> Result<()> {
         drop(self.stdin.take());
-        let status = self
-            .child
-            .wait()
-            .with_context(|| format!("wait for container backend {}", self.description))?;
+        let status = wait_child_with_timeout(
+            &mut self.child,
+            CHILD_SHUTDOWN_TIMEOUT,
+            &format!("container backend {}", self.description),
+        )?;
         anyhow::ensure!(
             status.success(),
             "container backend {} exited with {status}",
@@ -2158,21 +2248,30 @@ impl ContainerBackendDeployment {
         );
         Ok(())
     }
+
+    fn into_teardown_parts(self) -> (std::process::Child, Option<ChildStdin>, String) {
+        (self.child, self.stdin, self.description)
+    }
 }
 
 impl SshBackendDeployment {
     fn shutdown(&mut self) -> Result<()> {
         drop(self.stdin.take());
-        let status = self
-            .child
-            .wait()
-            .with_context(|| format!("wait for SSH backend deployment {}", self.target))?;
+        let status = wait_child_with_timeout(
+            &mut self.child,
+            CHILD_SHUTDOWN_TIMEOUT,
+            &format!("SSH backend deployment {}", self.target),
+        )?;
         anyhow::ensure!(
             status.success(),
             "SSH backend deployment {} exited with {status}",
             self.target
         );
         Ok(())
+    }
+
+    fn into_teardown_parts(self) -> (std::process::Child, Option<ChildStdin>, String) {
+        (self.child, self.stdin, self.target)
     }
 }
 
@@ -5222,6 +5321,7 @@ const fn client_event_callback_kind(event: &ClientEvent) -> &'static str {
         ClientEvent::ClosePresentation => "ClosePresentation",
         ClientEvent::TransportError(..) => "TransportError",
         ClientEvent::BackendDisconnected { .. } => "BackendDisconnected",
+        ClientEvent::BackendTeardownCompleted { .. } => "BackendTeardownCompleted",
         ClientEvent::RemoteArtifactInstalled { .. } => "RemoteArtifactInstalled",
         ClientEvent::PluginGraphicsChanged { .. } => "PluginGraphicsChanged",
         ClientEvent::PluginActorFrameChanged { .. } => "PluginActorFrameChanged",
@@ -5389,6 +5489,8 @@ struct Application {
     ssh_deployments: Vec<SshBackendDeployment>,
     container_deployer: Option<PathBuf>,
     container_deployments: Vec<ContainerBackendDeployment>,
+    pending_backend_teardowns: BTreeSet<(Option<BackendId>, u64)>,
+    next_backend_teardown_generation: u64,
     local_backend_template: Option<LocalBackendTemplate>,
     local_backend: Option<BackendId>,
     pending_frames: BTreeMap<BackendId, ClientEvent>,
@@ -5950,6 +6052,112 @@ impl Application {
         );
     }
 
+    fn allocate_backend_teardown_generation(
+        &mut self,
+        backend: Option<BackendId>,
+    ) -> Option<(winit::event_loop::EventLoopProxy<ClientEvent>, u64)> {
+        let proxy = self.event_proxy.clone()?;
+        let generation = self.next_backend_teardown_generation.wrapping_add(1).max(1);
+        self.next_backend_teardown_generation = generation;
+        self.pending_backend_teardowns.insert((backend, generation));
+        Some((proxy, generation))
+    }
+
+    fn spawn_remote_connection_teardown(
+        &mut self,
+        backend: Option<BackendId>,
+        connection: &mut remote::RemoteConnection,
+        graceful_timeout: Duration,
+        cancel_first: bool,
+    ) {
+        if cancel_first {
+            connection.signal_reap();
+        } else {
+            connection.signal_shutdown();
+        }
+        let Some(pending) = connection.take_worker_for_teardown() else {
+            return;
+        };
+        let Some((proxy, generation)) = self.allocate_backend_teardown_generation(backend) else {
+            // No event loop proxy (tests): join inline with the original deadlines.
+            if let Err(error) = pending.join(graceful_timeout) {
+                eprintln!("backend teardown without event proxy failed: {error:#}");
+            }
+            return;
+        };
+        let kind = BackendTeardownKind::RemoteConnection;
+        if let Err(error) = thread::Builder::new()
+            .name("brood-backend-teardown".to_string())
+            .spawn(move || {
+                let error = pending.join(graceful_timeout).err().map(|error| format!("{error:#}"));
+                let _ = proxy.send_event(ClientEvent::BackendTeardownCompleted {
+                    backend,
+                    teardown_generation: generation,
+                    kind,
+                    error,
+                });
+            })
+        {
+            eprintln!("could not spawn remote connection teardown: {error:#}");
+            let _ = self.pending_backend_teardowns.remove(&(backend, generation));
+        }
+    }
+
+    fn spawn_child_deployment_teardown(
+        &mut self,
+        backend: Option<BackendId>,
+        kind: BackendTeardownKind,
+        parts: (std::process::Child, Option<ChildStdin>, String),
+    ) {
+        let (mut child, stdin, label) = parts;
+        drop(stdin);
+        let Some((proxy, generation)) = self.allocate_backend_teardown_generation(backend) else {
+            if let Err(error) =
+                wait_child_with_timeout(&mut child, CHILD_SHUTDOWN_TIMEOUT, &label)
+            {
+                eprintln!("deployment teardown without event proxy failed: {error:#}");
+            }
+            return;
+        };
+        if let Err(error) = thread::Builder::new()
+            .name("brood-deployment-teardown".to_string())
+            .spawn(move || {
+                let error = wait_child_with_timeout(&mut child, CHILD_SHUTDOWN_TIMEOUT, &label)
+                    .err()
+                    .map(|error| format!("{error:#}"));
+                let _ = proxy.send_event(ClientEvent::BackendTeardownCompleted {
+                    backend,
+                    teardown_generation: generation,
+                    kind,
+                    error,
+                });
+            })
+        {
+            eprintln!("could not spawn deployment teardown: {error:#}");
+            let _ = self.pending_backend_teardowns.remove(&(backend, generation));
+        }
+    }
+
+    fn handle_backend_teardown_completed(
+        &mut self,
+        backend: Option<BackendId>,
+        teardown_generation: u64,
+        kind: BackendTeardownKind,
+        error: Option<String>,
+    ) {
+        if !self
+            .pending_backend_teardowns
+            .remove(&(backend, teardown_generation))
+        {
+            return;
+        }
+        if let Some(error) = error {
+            eprintln!(
+                "backend teardown completed with error backend={backend:?} kind={kind:?} generation={teardown_generation}: {error}"
+            );
+        }
+    }
+
     fn disconnect_remote_backend(
         &mut self,
         backend: BackendId,
@@ -6031,29 +6239,36 @@ impl Application {
             .position(|connection| connection.backend == backend)
         {
             let mut connection = self.remote_connections.remove(position);
-            if let Err(error) = connection.reap() {
-                eprintln!("remote backend {backend:?} stopped: {error:#}");
-            }
+            self.spawn_remote_connection_teardown(
+                Some(backend),
+                &mut connection,
+                remote::CONNECTION_CANCEL_TIMEOUT,
+                true,
+            );
         }
         if let Some(position) = self
             .ssh_deployments
             .iter()
             .position(|deployment| deployment.backend == Some(backend))
         {
-            let mut deployment = self.ssh_deployments.remove(position);
-            if let Err(error) = deployment.shutdown() {
-                eprintln!("SSH deployment for backend {backend:?} stopped: {error:#}");
-            }
+            let deployment = self.ssh_deployments.remove(position);
+            self.spawn_child_deployment_teardown(
+                Some(backend),
+                BackendTeardownKind::SshDeployment,
+                deployment.into_teardown_parts(),
+            );
         }
         if let Some(position) = self
             .container_deployments
             .iter()
             .position(|deployment| deployment.backend == Some(backend))
         {
-            let mut deployment = self.container_deployments.remove(position);
-            if let Err(error) = deployment.shutdown() {
-                eprintln!("container deployment for backend {backend:?} stopped: {error:#}");
-            }
+            let deployment = self.container_deployments.remove(position);
+            self.spawn_child_deployment_teardown(
+                Some(backend),
+                BackendTeardownKind::ContainerDeployment,
+                deployment.into_teardown_parts(),
+            );
         }
         self.backend_connected = self
             .input_sender
@@ -6293,8 +6508,25 @@ impl Application {
             if let Some(runtime) = self.wasm_runtime.as_mut() {
                 drop(runtime.disconnect_backend(backend));
             }
-            drop(connection.shutdown());
-            drop(origin.shutdown());
+            self.spawn_remote_connection_teardown(
+                Some(backend),
+                &mut connection,
+                remote::CONNECTION_SHUTDOWN_TIMEOUT,
+                false,
+            );
+            match origin {
+                RemoteAttachOrigin::Direct { .. } => {}
+                RemoteAttachOrigin::Ssh(deployment) => self.spawn_child_deployment_teardown(
+                    Some(backend),
+                    BackendTeardownKind::SshDeployment,
+                    deployment.into_teardown_parts(),
+                ),
+                RemoteAttachOrigin::Container(deployment) => self.spawn_child_deployment_teardown(
+                    Some(backend),
+                    BackendTeardownKind::ContainerDeployment,
+                    deployment.into_teardown_parts(),
+                ),
+            }
             return Err(error);
         }
         match &mut origin {
@@ -6327,7 +6559,7 @@ impl Application {
         Ok(())
     }
 
-    fn connect_ssh_backend(&mut self, mut deployment: SshBackendDeployment) -> Result<()> {
+    fn connect_ssh_backend(&mut self, deployment: SshBackendDeployment) -> Result<()> {
         let config = (|| -> Result<remote::RemoteConfig> {
             let offer = format!(
                 "{}={}",
@@ -6351,12 +6583,11 @@ impl Application {
                 .queue_remote_backend_config(config, RemoteAttachOrigin::Ssh(deployment))
                 .map(|_backend| ()),
             Err(error) => {
-                if let Err(shutdown_error) = deployment.shutdown() {
-                    eprintln!(
-                        "could not stop failed SSH deployment {}: {shutdown_error:#}",
-                        deployment.target
-                    );
-                }
+                self.spawn_child_deployment_teardown(
+                    None,
+                    BackendTeardownKind::SshDeployment,
+                    deployment.into_teardown_parts(),
+                );
                 Err(error)
             }
         }
@@ -6364,7 +6595,7 @@ impl Application {
 
     fn connect_container_backend(
         &mut self,
-        mut deployment: ContainerBackendDeployment,
+        deployment: ContainerBackendDeployment,
     ) -> Result<()> {
         let config = (|| -> Result<remote::RemoteConfig> {
             let offer = format!(
@@ -6389,12 +6620,11 @@ impl Application {
                 .queue_remote_backend_config(config, RemoteAttachOrigin::Container(deployment))
                 .map(|_backend| ()),
             Err(error) => {
-                if let Err(shutdown_error) = deployment.shutdown() {
-                    eprintln!(
-                        "could not stop failed container deployment {}: {shutdown_error:#}",
-                        deployment.description
-                    );
-                }
+                self.spawn_child_deployment_teardown(
+                    None,
+                    BackendTeardownKind::ContainerDeployment,
+                    deployment.into_teardown_parts(),
+                );
                 Err(error)
             }
         }
@@ -7001,6 +7231,9 @@ impl Application {
             }
             ClientEvent::BackendDisconnected { .. } => {
                 return Err(anyhow!("backend disconnect reached scene transport path"));
+            }
+            ClientEvent::BackendTeardownCompleted { .. } => {
+                return Err(anyhow!("backend teardown reached scene transport path"));
             }
             ClientEvent::RemoteArtifactInstalled { .. } => {
                 return Err(anyhow!(
@@ -11798,6 +12031,19 @@ impl ApplicationHandler<ClientEvent> for Application {
                 }
             }
             ClientEvent::ClosePresentation => event_loop.exit(),
+            ClientEvent::BackendTeardownCompleted {
+                backend,
+                teardown_generation,
+                kind,
+                error,
+            } => {
+                self.handle_backend_teardown_completed(
+                    backend,
+                    teardown_generation,
+                    kind,
+                    error,
+                );
+            }
             ClientEvent::BackendDisconnected { backend, message } => {
                 match self.disconnect_remote_backend(backend, &message) {
                     Ok(focus_change) => {

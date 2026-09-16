@@ -42,8 +42,8 @@ const MAX_PENDING_FRAME_PACKETS: usize = 256;
 const MAX_PENDING_DECODED_FRAME_BYTES: usize = 256 * 1024 * 1024;
 const SCENE_EVENT_CAPACITY: usize = 1;
 const CONNECTION_SETUP_TIMEOUT: Duration = Duration::from_secs(15);
-const CONNECTION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
-const CONNECTION_CANCEL_TIMEOUT: Duration = Duration::from_secs(1);
+pub const CONNECTION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+pub const CONNECTION_CANCEL_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 pub struct RemoteConfig {
@@ -187,6 +187,18 @@ impl RemoteConnection {
     }
 
     pub fn shutdown(&mut self) -> Result<()> {
+        self.signal_shutdown();
+        self.join_worker(CONNECTION_SHUTDOWN_TIMEOUT)
+    }
+
+    /// Close the disconnect gate and request worker cancellation without joining.
+    pub fn signal_reap(&mut self) {
+        let _gate_result = self.event_gate_sender.try_send(false);
+        let _send_result = self.cancel_sender.send(true);
+    }
+
+    /// Request a graceful disconnect without joining the transport worker.
+    pub fn signal_shutdown(&mut self) {
         let _gate_result = self.event_gate_sender.try_send(false);
         let watermark = next_source_watermark(&self.source_watermark);
         match self.shutdown_sender.try_send(StampedClientMessage::new(
@@ -198,12 +210,14 @@ impl RemoteConnection {
                 let _send_result = self.cancel_sender.send(true);
             }
         }
-        self.join_worker(CONNECTION_SHUTDOWN_TIMEOUT)
     }
 
-    pub fn reap(&mut self) -> Result<()> {
-        let _gate_result = self.event_gate_sender.try_send(false);
-        self.join_worker(CONNECTION_CANCEL_TIMEOUT)
+    /// Take the transport worker after signaling so a background thread can join it.
+    pub fn take_worker_for_teardown(&mut self) -> Option<PendingRemoteWorker> {
+        self.worker.take().map(|worker| PendingRemoteWorker {
+            worker,
+            cancel_sender: self.cancel_sender.clone(),
+        })
     }
 
     pub fn activate_disconnect_notifications(&self) -> Result<()> {
@@ -213,15 +227,32 @@ impl RemoteConnection {
     }
 
     fn join_worker(&mut self, graceful_timeout: Duration) -> Result<()> {
-        let Some(worker) = self.worker.take() else {
+        let Some(pending) = self.take_worker_for_teardown() else {
             return Ok(());
         };
+        pending.join(graceful_timeout)
+    }
+}
+
+/// Detached remote transport worker waiting to be joined off the presentation loop.
+pub struct PendingRemoteWorker {
+    worker: thread::JoinHandle<Result<()>>,
+    cancel_sender: tokio::sync::watch::Sender<bool>,
+}
+
+impl PendingRemoteWorker {
+    /// Poll/join with the same deadlines as the former on-loop reap path.
+    pub fn join(self, graceful_timeout: Duration) -> Result<()> {
+        let Self {
+            worker,
+            cancel_sender,
+        } = self;
         let graceful_deadline = Instant::now() + graceful_timeout;
         while !worker.is_finished() && Instant::now() < graceful_deadline {
             thread::sleep(Duration::from_millis(5));
         }
         if !worker.is_finished() {
-            let _send_result = self.cancel_sender.send(true);
+            let _send_result = cancel_sender.send(true);
             let cancel_deadline = Instant::now() + CONNECTION_CANCEL_TIMEOUT;
             while !worker.is_finished() && Instant::now() < cancel_deadline {
                 thread::sleep(Duration::from_millis(5));
