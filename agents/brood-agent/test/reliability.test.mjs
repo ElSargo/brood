@@ -65,6 +65,9 @@ test("provider profiles validate settings and never borrow credentials", () => {
   assert.equal(backend.headers["x-api-key"], "header");
   assert.throws(() => validateConfig({ max_step: 1 }), /Unknown/);
   assert.throws(() => validateConfig({ providers: { x: { base_url: "file:///etc", env_key: "KEY" } } }), /HTTP/);
+  assert.throws(() => validateConfig({ providers: { "opencode-go": { base_url: "https://opencode.ai/zen/go/v1", env_key: "KEY" } } }), /reserved/);
+  assert.equal(resolveSettings({}, { provider: "opencode-go" }).provider, "opencode-go");
+  assert.throws(() => resolveSettings({}, { provider: "opencode-zen" }), /Unknown agent provider/);
   assert.throws(() => resolveSettings({}, { profile: "missing" }), /Unknown agent profile/);
   assert.throws(() => resolveSettings({ context_window: 10000, compact_threshold: 10000 }), /below/);
 });

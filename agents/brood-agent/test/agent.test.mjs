@@ -17,6 +17,7 @@ import {
   nativeToolResult,
   requestNativeTool,
 } from "../src/computer-use.mjs";
+import { providerReadiness } from "../src/auth.mjs";
 
 function fakeJwt(accountId, expiresAtSeconds) {
   const encode = (value) => Buffer.from(JSON.stringify(value)).toString("base64url");
@@ -106,6 +107,68 @@ test("API key selects the public Responses backend", async () => {
   assert.equal(backend.kind, "openai-responses");
   assert.equal(backend.url, "https://api.openai.com/v1/responses");
   assert.equal(backend.headers.authorization, "Bearer test-key");
+});
+
+test("OpenCode Go key selects the Go Responses backend", async () => {
+  await assert.rejects(
+    resolveModelBackend({ OPENAI_API_KEY: "public" }, undefined, { provider: "opencode-go" }),
+    /OPENCODE_API_KEY/,
+  );
+  const backend = await resolveModelBackend(
+    { OPENAI_API_KEY: "public", OPENCODE_API_KEY: "go-key" },
+    undefined,
+    { provider: "opencode-go" },
+    undefined,
+    { session: "conversation-1" },
+  );
+  assert.equal(backend.kind, "opencode-go");
+  assert.equal(backend.url, "https://opencode.ai/zen/go/v1/responses");
+  assert.equal(backend.headers.authorization, "Bearer go-key");
+  assert.equal(backend.headers["user-agent"], "brood-agent/0.1.0");
+  assert.equal(backend.headers["x-opencode-session"], "conversation-1");
+});
+
+test("auto selects any available provider without a specific login", async (t) => {
+  const home = await temporaryAuthHome(t);
+  const env = { HOME: home, XDG_CONFIG_HOME: join(home, "config") };
+  const go = await resolveModelBackend({ ...env, OPENCODE_API_KEY: "go-key" });
+  assert.equal(go.kind, "opencode-go");
+  const openai = await resolveModelBackend({ ...env, OPENAI_API_KEY: "public", OPENCODE_API_KEY: "go-key" });
+  assert.equal(openai.kind, "openai-responses");
+  await assert.rejects(resolveModelBackend(env), /OPENCODE_API_KEY/);
+  const readiness = await providerReadiness({ ...env, OPENCODE_API_KEY: "go-key" });
+  assert.equal(readiness.auto, "");
+  assert.equal(readiness["opencode-go"], "");
+  assert.equal(readiness.openai, "OPENAI_API_KEY");
+  assert.equal(readiness["openai-codex"], "ChatGPT login");
+});
+
+test("commands work without any provider credential", async (t) => {
+  const home = await temporaryAuthHome(t);
+  const workspace = await mkdtemp(join(tmpdir(), "brood-agent-commands."));
+  t.after(() => rm(workspace, { recursive: true, force: true }));
+  const env = { HOME: home, XDG_CONFIG_HOME: join(home, "config"), BROOD_AGENT_STATE_DIR: join(home, "state") };
+  const events = [];
+  const run = prompt => runAgent({ conversation_id: "command-lifecycle", prompt }, {
+    env,
+    workspace,
+    computerUse: { tools: () => [] },
+    emit: (type, fields) => events.push({ type, ...fields }),
+  });
+  await run("/status");
+  const status = events.findLast(event => event.type === "assistant");
+  assert.match(status.text, /Providers: auto \(no credential\), openai \(no OPENAI_API_KEY\), openai-codex \(no ChatGPT login\), opencode-go \(no OPENCODE_API_KEY\)/);
+  await run("/provider opencode-go");
+  await run("/model grok-4.6");
+  await run("/reasoning low");
+  await run("/status");
+  const configuration = events.filter(event => event.type === "configuration").at(-1);
+  assert.equal(configuration.provider, "opencode-go");
+  assert.equal(configuration.model, "grok-4.6");
+  assert.equal(configuration.reasoning, "low");
+  assert(!events.some(event => event.type === "error"));
+  await assert.rejects(run("hello"), /Provider opencode-go requires OPENCODE_API_KEY/);
+  assert.match(events.findLast(event => event.type === "error").text, /OPENCODE_API_KEY/);
 });
 
 test("imports a valid Codex login once into a private Brood auth file", async (t) => {

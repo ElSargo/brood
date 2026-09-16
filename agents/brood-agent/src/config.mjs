@@ -2,6 +2,8 @@ import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+export const BUILTIN_PROVIDERS = Object.freeze(["auto", "openai", "openai-codex", "opencode-go"]);
+
 export const DEFAULTS = Object.freeze({
   model: "gpt-5.6-sol",
   reasoning: "medium",
@@ -55,7 +57,7 @@ export function validateConfig(config) {
   if (config.providers !== undefined) object(config.providers, "providers");
   for (const [id, provider] of Object.entries(config.providers ?? {})) {
     object(provider, `provider ${id}`);
-    if (["auto", "openai", "openai-codex"].includes(id)) throw new Error(`Provider id ${id} is reserved`);
+    if (BUILTIN_PROVIDERS.includes(id)) throw new Error(`Provider id ${id} is reserved`);
     const keys = new Set(["base_url", "env_key", "http_headers", "env_http_headers", "query_params", "wire_api", "supports_reasoning", "supports_verbosity", "compaction"]);
     for (const key of Object.keys(provider)) if (!keys.has(key)) throw new Error(`Unknown provider ${id} setting: ${key}`);
     let url;
@@ -99,7 +101,7 @@ export function resolveSettings(config, request = {}, env = process.env) {
   if (settings.provider === "default") settings.provider = config.provider || DEFAULTS.provider;
   validateSettings(settings, "resolved config");
   if (settings.compact_threshold >= settings.context_window) throw new Error("compact_threshold must be below context_window");
-  if (!["auto", "openai", "openai-codex"].includes(settings.provider) && !config.providers?.[settings.provider]) throw new Error(`Unknown agent provider: ${settings.provider}`);
+  if (!BUILTIN_PROVIDERS.includes(settings.provider) && !config.providers?.[settings.provider]) throw new Error(`Unknown agent provider: ${settings.provider}`);
   return settings;
 }
 

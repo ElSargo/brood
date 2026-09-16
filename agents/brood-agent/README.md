@@ -29,12 +29,27 @@ defaults. The schema and validation rules live in
 [`src/config.mjs`](src/config.mjs). `config check` validates configuration and
 profiles without contacting a provider or printing credentials.
 
-The built-in `auto` provider uses `OPENAI_API_KEY` when present, otherwise the
-Brood-owned ChatGPT login. Initial use can import `~/.codex/auth.json` into
-Brood's private auth file. Refresh is serialized across agents and a rejected
-access token gets one refresh attempt. An expired or revoked saved login can be
-replaced explicitly with `brood-agent auth import-codex`; this never writes
-Codex's file. `BROOD_AGENT_AUTH` selects the Brood-owned credential file.
+The built-in `auto` provider uses an explicitly configured API key first
+(`OPENAI_API_KEY`, then `OPENCODE_API_KEY`) and otherwise the Brood-owned
+ChatGPT login. Initial use can import `~/.codex/auth.json` into Brood's private
+auth file. Refresh is serialized across agents and a rejected access token gets
+one refresh attempt. An expired or revoked saved login can be replaced
+explicitly with `brood-agent auth import-codex`; this never writes Codex's file.
+`BROOD_AGENT_AUTH` selects the Brood-owned credential file.
+
+The built-in `opencode-go` provider selects OpenCode Go's Responses endpoint
+(`https://opencode.ai/zen/go/v1/responses`) with `OPENCODE_API_KEY` and sends
+the conversation ID as `x-opencode-session`. Because the runtime only speaks the
+Responses wire API, select Go models the catalog lists for `/responses`, such as
+`gpt-5.6-luna` or `grok-4.6`; Go models served through chat-completions or
+messages endpoints are not reachable.
+
+Provider credentials are resolved only when a model request is made. Agent
+creation, `/help`, `/status`, `/provider`, `/model`, `/reasoning`, `/profile`,
+`/new`, and `/resume` work with no provider authenticated; `/status` marks each
+provider as ready or names the missing credential. A failed credential lookup
+does not bind the conversation to an endpoint, so the provider can be changed
+without starting a new conversation.
 
 Use the pane's `/help` and `/status` commands to inspect available commands,
 providers, profiles, the conversation ID, and context usage. Model and provider

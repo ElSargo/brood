@@ -83,9 +83,10 @@ keeps only the small model, memory, tool, stop, and event seams. Brood supplies
 the session-scoped tool bridge, provider backend, credential migration, and
 actor event projection; see `agents/brood-agent/THIRD_PARTY_NOTICES.md`.
 
-For model authentication, `OPENAI_API_KEY` selects the public Responses API.
-Otherwise, the first agent turn may import the existing Codex ChatGPT login
-from `~/.codex/auth.json` into `$XDG_CONFIG_HOME/brood/agent-auth.json`, or
+For model authentication, `OPENAI_API_KEY` or `OPENCODE_API_KEY` selects the
+matching public Responses API. Otherwise, the first agent turn may import the
+existing Codex ChatGPT login from `~/.codex/auth.json` into
+`$XDG_CONFIG_HOME/brood/agent-auth.json`, or
 `~/.config/brood/agent-auth.json` when `XDG_CONFIG_HOME` is unset. The
 Brood-owned directory and file are forced to modes `0700` and `0600`;
 subsequent turns use and refresh that copy without modifying Codex's file. Both

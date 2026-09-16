@@ -10,6 +10,7 @@ const CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token";
 const CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses";
 const OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
+const OPENCODE_GO_RESPONSES_URL = "https://opencode.ai/zen/go/v1/responses";
 
 function decodeJwtPayload(token) {
   const payload = token.split(".")[1];
@@ -89,23 +90,33 @@ async function refreshCodexAuth(auth, path, fetchImpl, signal) {
   return refreshed;
 }
 
-export async function resolveModelBackend(env = process.env, fetchImpl = fetch, settings = { provider: "auto" }, signal) {
-  signal?.throwIfAborted();
-  const custom = customBackend(settings, env);
-  if (custom) return custom;
-  if (settings.provider === "openai" && !env.OPENAI_API_KEY) throw new Error("Provider openai requires OPENAI_API_KEY");
-  if (env.OPENAI_API_KEY && settings.provider !== "openai-codex") {
-    return {
-      kind: "openai-responses",
-      url: env.BROOD_AGENT_MODEL_URL || OPENAI_RESPONSES_URL,
-      headers: {
-        authorization: `Bearer ${env.OPENAI_API_KEY}`,
-        "content-type": "application/json",
-        accept: "text/event-stream",
-      },
-    };
-  }
+function openaiBackend(env) {
+  return {
+    kind: "openai-responses",
+    url: env.BROOD_AGENT_MODEL_URL || OPENAI_RESPONSES_URL,
+    headers: {
+      authorization: `Bearer ${env.OPENAI_API_KEY}`,
+      "content-type": "application/json",
+      accept: "text/event-stream",
+    },
+  };
+}
 
+function opencodeGoBackend(env, options = {}) {
+  return {
+    kind: "opencode-go",
+    url: env.BROOD_AGENT_MODEL_URL || OPENCODE_GO_RESPONSES_URL,
+    headers: {
+      authorization: `Bearer ${env.OPENCODE_API_KEY}`,
+      "content-type": "application/json",
+      accept: "text/event-stream",
+      "user-agent": "brood-agent/0.1.0",
+      ...(options.session ? { "x-opencode-session": options.session } : {}),
+    },
+  };
+}
+
+async function codexBackend(env, fetchImpl, signal) {
   let auth = await loadCodexAuth(env, fetchImpl, signal);
   const backend = {
     kind: "openai-codex",
@@ -126,6 +137,41 @@ export async function resolveModelBackend(env = process.env, fetchImpl = fetch, 
     },
   };
   return backend;
+}
+
+async function hasCodexLogin(env) {
+  const saved = await readJson(broodAuthPath(env));
+  if (saved?.access_token) return true;
+  const imported = await readJson(codexAuthPath(env));
+  return Boolean(imported?.tokens?.access_token && imported.tokens.refresh_token);
+}
+
+export async function providerReadiness(env = process.env) {
+  const codex = await hasCodexLogin(env);
+  return {
+    auto: env.OPENAI_API_KEY || env.OPENCODE_API_KEY || codex ? "" : "credential",
+    openai: env.OPENAI_API_KEY ? "" : "OPENAI_API_KEY",
+    "opencode-go": env.OPENCODE_API_KEY ? "" : "OPENCODE_API_KEY",
+    "openai-codex": codex ? "" : "ChatGPT login",
+  };
+}
+
+export async function resolveModelBackend(env = process.env, fetchImpl = fetch, settings = { provider: "auto" }, signal, options = {}) {
+  signal?.throwIfAborted();
+  const custom = customBackend(settings, env);
+  if (custom) return custom;
+  if (settings.provider === "openai") {
+    if (!env.OPENAI_API_KEY) throw new Error("Provider openai requires OPENAI_API_KEY");
+    return openaiBackend(env);
+  }
+  if (settings.provider === "opencode-go") {
+    if (!env.OPENCODE_API_KEY) throw new Error("Provider opencode-go requires OPENCODE_API_KEY");
+    return opencodeGoBackend(env, options);
+  }
+  if (settings.provider === "openai-codex") return codexBackend(env, fetchImpl, signal);
+  if (env.OPENAI_API_KEY) return openaiBackend(env);
+  if (env.OPENCODE_API_KEY) return opencodeGoBackend(env, options);
+  return codexBackend(env, fetchImpl, signal);
 }
 
 export async function importCodexLogin(env = process.env, fetchImpl = fetch, signal) {
@@ -158,7 +204,7 @@ async function loadCodexAuth(env, fetchImpl, parentSignal, rejectedToken, import
     }
     if (!auth?.access_token) {
       throw new Error(
-        "No Brood agent model login. Set OPENAI_API_KEY or provide Brood agent OAuth credentials.",
+        "No Brood agent model login. Set OPENAI_API_KEY or OPENCODE_API_KEY, or provide Brood agent OAuth credentials.",
       );
     }
     if (tokenExpiresSoon(auth.access_token) || auth.access_token === rejectedToken) {

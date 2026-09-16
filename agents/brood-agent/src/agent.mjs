@@ -2,8 +2,8 @@ import { readFile, realpath } from "node:fs/promises";
 import { join, dirname } from "node:path";
 import { randomUUID, createHash } from "node:crypto";
 import { NativeComputerUseClient } from "./computer-use.mjs";
-import { resolveModelBackend } from "./auth.mjs";
-import { loadConfig, resolveSettings } from "./config.mjs";
+import { providerReadiness, resolveModelBackend } from "./auth.mjs";
+import { BUILTIN_PROVIDERS, loadConfig, resolveSettings } from "./config.mjs";
 import { ConversationStore, stateDirectory, recoverInterruptedCalls } from "./storage.mjs";
 import { requestModel } from "./transport.mjs";
 import { CommandSessions } from "./commands.mjs";
@@ -125,6 +125,18 @@ function parseCommand(prompt) {
   return match ? { name: match[1], value: match[2]?.trim() ?? "" } : undefined;
 }
 
+async function providerSummary(config, env) {
+  const readiness = await providerReadiness(env);
+  const entries = BUILTIN_PROVIDERS.map(name => readiness[name] ? `${name} (no ${readiness[name]})` : `${name} (ready)`);
+  for (const [name, provider] of Object.entries(config.providers ?? {})) {
+    const missing = [];
+    if (provider.env_key && !env[provider.env_key]) missing.push(provider.env_key);
+    for (const variable of Object.values(provider.env_http_headers ?? {})) if (!env[variable]) missing.push(variable);
+    entries.push(missing.length ? `${name} (no ${missing.join(", ")})` : `${name} (ready)`);
+  }
+  return entries.join(", ");
+}
+
 export async function runAgent(request, options = {}) {
   if (!request || typeof request !== "object" || typeof request.prompt !== "string") throw new Error("Agent request requires a prompt string");
   const env = options.env ?? process.env;
@@ -182,12 +194,12 @@ export async function runAgent(request, options = {}) {
       const text = command.name === "help"
         ? "Commands: /status, /compact, /provider NAME, /model NAME, /reasoning LEVEL, /profile NAME, /new, /resume ID. Configure providers in the Brood agent.json file; credentials come from environment variables."
         : command.name === "status"
-          ? `Conversation ${id}\nProvider: ${settings.provider}\nModel: ${settings.model}\nReasoning: ${settings.reasoning}\nContext estimate: ${estimateTokens(state.input)} / ${settings.context_window} tokens\nCompactions: ${state.compactions}\nProviders: ${["auto", "openai", "openai-codex", ...Object.keys(config.providers ?? {})].join(", ")}\nProfiles: ${Object.keys(config.profiles ?? {}).join(", ") || "none"}`
+          ? `Conversation ${id}\nProvider: ${settings.provider}\nModel: ${settings.model}\nReasoning: ${settings.reasoning}\nContext estimate: ${estimateTokens(state.input)} / ${settings.context_window} tokens\nCompactions: ${state.compactions}\nProviders: ${await providerSummary(config, env)}\nProfiles: ${Object.keys(config.profiles ?? {}).join(", ") || "none"}`
           : command.name === "new" ? "New conversation started" : command.name === "resume" ? "Conversation resumed" : "Agent configuration updated";
       emit("assistant", { text });
       return result();
     }
-    const backend = options.backend ?? await resolveModelBackend(env, fetchImpl, settings, signal);
+    const backend = options.backend ?? await resolveModelBackend(env, fetchImpl, settings, signal, { session: id });
     const backendIdentity = createHash("sha256").update(`${backend.kind ?? settings.provider}\0${backend.url}`).digest("hex");
     if (state.backend && state.backend !== backendIdentity && state.input.length) throw new Error("This conversation contains state from a different provider endpoint. Start /new before switching providers to keep opaque reasoning and compaction state valid.");
     state.backend = backendIdentity;

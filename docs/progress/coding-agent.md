@@ -6,6 +6,49 @@ authority: implementation
 
 # Coding Agent
 
+## 2026-09-16 provider-independent lifecycle
+
+No provider is a prerequisite for the agent lifecycle. `auto` selects an
+explicitly configured API key first (`OPENAI_API_KEY`, then
+`OPENCODE_API_KEY`) and falls back to the Brood-owned ChatGPT login only when
+neither is set. Credentials are resolved only at model-request time: `/help`,
+`/status`, `/provider`, `/model`, `/reasoning`, `/profile`, `/new`, and
+`/resume` run with no provider authenticated, and a failed credential lookup
+does not write `state.backend`, so a provider can be selected without `/new`.
+`/status` marks built-in and custom providers as ready or names the missing
+credential using only local files and environment variables.
+
+Verification: 38 Node tests pass through the Nix toolchain. New coverage asserts
+auto fallback to OpenCode Go with no OpenAI credential, the provider-agnostic
+error, readiness output, command success with an empty credential environment,
+and that a prompt in that state fails only at the model request. A live check
+with a temporary home and only `OPENCODE_API_KEY` completed an auto-routed
+`gpt-5.6-luna` turn (`AUTO_GO_OK`). The remaining provider-specific default
+model tension is recorded in
+[agent continuity friction](../frictions/coding-agent-continuity.md).
+
+## 2026-09-16 OpenCode Go provider
+
+`opencode-go` is now a built-in agent provider alongside `auto`, `openai`, and
+`openai-codex`. It resolves `OPENCODE_API_KEY` against the Go Responses endpoint
+(`https://opencode.ai/zen/go/v1/responses`), identifies as `brood-agent/0.1.0`,
+and sends the conversation ID as `x-opencode-session` for routing and prompt
+caching. The provider ID is reserved from custom `providers` config, and
+`/status` lists it. The runtime guide documents the Responses-only model
+constraint.
+
+Only Go models exposed on `/responses` are reachable (`gpt-5.6-luna`,
+`grok-4.6`, Muse Spark Contributor); the catalog's chat-completions and messages
+models remain blocked by the Responses-only friction, which now records this
+evidence.
+
+Verification: 36 Node tests pass through the Nix toolchain, including new
+coverage for backend selection, `OPENCODE_API_KEY` enforcement, the session
+header, and reserved-provider validation. Live requests through the Go endpoint
+returned `LIVE_OPENCODE_GO_OK` (`gpt-5.6-luna`, 1873 input / 10 output tokens)
+and `GROK_OK` (`grok-4.6`, 2328 input / 27 output tokens, 128 cached). No
+credential was printed or stored.
+
 ## 2026-09-10 core agent reliability
 
 The requested implementation prioritizes durable conversation state, compaction,
