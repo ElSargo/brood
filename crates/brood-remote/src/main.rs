@@ -24,7 +24,8 @@ use brood_protocol::{
     ActorMessage, ArtifactDigest, ArtifactMessage, ArtifactRealm, BackendActorRealm,
     BackendOperation, BackendRequest, BackendResponse, BackendResponseValue, CatalogSession,
     CatalogSnapshot, CatalogWindow, ClientLifecycle, ClientMessage, EndpointCapabilities,
-    FrameResourceRef, FrameScene, FrameTransportKind, InputEvent, Lane, ServerMessage, WindowFrame,
+    FrameResourceRef, FrameScene, FrameTransportKind, InputEvent, Lane, ServerMessage,
+    StampedClientMessage, WindowFrame,
 };
 use brood_transport::{
     ArtifactExchange, ArtifactExchangeEvent, ArtifactOffer, ArtifactTransfer, NetworkFramePacket,
@@ -361,8 +362,13 @@ enum CriticalOutbound {
 }
 
 struct LocalCriticalInput {
+    source_watermark: u64,
     message: ClientMessage,
     published: Option<oneshot::Sender<()>>,
+}
+
+const fn retires_latest_state(message: &ClientMessage) -> bool {
+    matches!(message, ClientMessage::Input(input) if input.retires_latest_state())
 }
 
 #[derive(Deserialize)]
@@ -722,8 +728,9 @@ async fn relay(
     transport_tasks.spawn(async move {
         let result: Result<()> = async {
             loop {
-                let message = critical_receive.receive_client_message().await?;
-                let disconnect = message == ClientMessage::Lifecycle(ClientLifecycle::Disconnect);
+                let stamped = critical_receive.receive_stamped_client_message().await?;
+                let disconnect =
+                    stamped.message == ClientMessage::Lifecycle(ClientLifecycle::Disconnect);
                 let (published, publication) = if disconnect {
                     let (published, publication) = oneshot::channel();
                     (Some(published), Some(publication))
@@ -731,7 +738,11 @@ async fn relay(
                     (None, None)
                 };
                 critical_input_tx
-                    .send(LocalCriticalInput { message, published })
+                    .send(LocalCriticalInput {
+                        source_watermark: stamped.source_watermark,
+                        message: stamped.message,
+                        published,
+                    })
                     .await
                     .map_err(|_error| anyhow!("local input writer stopped"))?;
                 if disconnect {
@@ -1249,12 +1260,12 @@ async fn receive_client_artifact(lane: &mut NetworkReceiveLane) -> Result<Artifa
 
 async fn receive_latest_input(
     mut lane: brood_transport::NetworkReceiveLane,
-    sender: tokio::sync::watch::Sender<Option<ClientMessage>>,
+    sender: tokio::sync::watch::Sender<Option<StampedClientMessage>>,
 ) -> Result<()> {
     loop {
-        let message = lane.receive_client_message().await?;
+        let stamped = lane.receive_stamped_client_message().await?;
         sender
-            .send(Some(message))
+            .send(Some(stamped))
             .map_err(|_error| anyhow!("local input writer stopped"))?;
     }
 }
@@ -1559,10 +1570,11 @@ async fn write_local_input(
     notifications: brood_ipc::EventNotifier,
     generation: u64,
     mut critical: mpsc::Receiver<LocalCriticalInput>,
-    mut latest: tokio::sync::watch::Receiver<Option<ClientMessage>>,
+    mut latest: tokio::sync::watch::Receiver<Option<StampedClientMessage>>,
 ) -> Result<()> {
     let mut sequence = 0_u64;
     let mut critical_open = true;
+    let mut applied_barrier_watermark = 0_u64;
     loop {
         let (message, published) = tokio::select! {
             biased;
@@ -1571,32 +1583,215 @@ async fn write_local_input(
                     critical_open = false;
                     continue;
                 };
+                let pending_latest = latest.borrow().clone();
+                if let Some(pending) = pending_latest {
+                    if pending.source_watermark > applied_barrier_watermark
+                        && pending.source_watermark < input.source_watermark
+                    {
+                        let _ = latest.borrow_and_update();
+                        sequence = sequence.wrapping_add(1);
+                        publish_local_input(
+                            &mut producer,
+                            &notifications,
+                            generation,
+                            sequence,
+                            pending.message,
+                        )
+                        .await?;
+                    } else if pending.source_watermark < input.source_watermark {
+                        let _ = latest.borrow_and_update();
+                    }
+                }
+                if retires_latest_state(&input.message) {
+                    applied_barrier_watermark =
+                        applied_barrier_watermark.max(input.source_watermark);
+                    let pending_latest = latest.borrow().clone();
+                    if let Some(pending) = pending_latest
+                        && pending.source_watermark <= applied_barrier_watermark
+                    {
+                        let _ = latest.borrow_and_update();
+                    }
+                }
                 (input.message, input.published)
             }
             changed = latest.changed() => {
                 changed.context("latest-state input forwarder stopped")?;
-                let Some(message) = latest.borrow_and_update().clone() else {
+                let Some(pending) = latest.borrow_and_update().clone() else {
                     continue;
                 };
-                (message, None)
+                if pending.source_watermark <= applied_barrier_watermark {
+                    continue;
+                }
+                (pending.message, None)
             }
         };
         sequence = sequence.wrapping_add(1);
-        let mut record = brood_ipc::encode_client_record(message, generation, sequence)?;
-        let mut retry = IpcRetry::default();
-        loop {
-            match producer.try_send(record) {
-                Ok(()) => break,
-                Err(returned) => {
-                    record = returned;
-                    retry.wait().await;
-                }
-            }
-        }
-        notifications.notify()?;
+        publish_local_input(&mut producer, &notifications, generation, sequence, message).await?;
         if let Some(published) = published {
             let _send_result = published.send(());
         }
+    }
+}
+
+async fn publish_local_input(
+    producer: &mut brood_ipc::CriticalProducer,
+    notifications: &brood_ipc::EventNotifier,
+    generation: u64,
+    sequence: u64,
+    message: ClientMessage,
+) -> Result<()> {
+    let mut record = brood_ipc::encode_client_record(message, generation, sequence)?;
+    let mut retry = IpcRetry::default();
+    loop {
+        match producer.try_send(record) {
+            Ok(()) => break,
+            Err(returned) => {
+                record = returned;
+                retry.wait().await;
+            }
+        }
+    }
+    notifications.notify()?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod input_watermark_tests {
+    use super::*;
+    use brood_ipc::{CriticalConsumer, CriticalLaneFile, EventNotifier};
+    use brood_protocol::PanePosition;
+    use std::os::fd::AsFd;
+
+    #[tokio::test]
+    async fn source_earlier_motion_must_not_sequence_after_leave() -> Result<()> {
+        const GENERATION: u64 = 7;
+        let lane = CriticalLaneFile::create(GENERATION)?;
+        let notifications = EventNotifier::create()?;
+        let producer = brood_ipc::CriticalProducer::map(lane.as_fd(), GENERATION)?;
+        let mut consumer = CriticalConsumer::map(lane.as_fd(), GENERATION)?;
+        let (critical_tx, critical_rx) = mpsc::channel(8);
+        let (latest_tx, latest_rx) = tokio::sync::watch::channel(None);
+        latest_tx.send(Some(StampedClientMessage::new(
+            1,
+            ClientMessage::Input(InputEvent::PointerMotion {
+                position: PanePosition {
+                    pane: 3,
+                    x: 9.0,
+                    y: 1.0,
+                },
+            }),
+        )))?;
+        critical_tx
+            .send(LocalCriticalInput {
+                source_watermark: 2,
+                message: ClientMessage::Input(InputEvent::PointerLeave),
+                published: None,
+            })
+            .await?;
+        drop(critical_tx);
+        let writer = tokio::spawn(write_local_input(
+            producer,
+            notifications,
+            GENERATION,
+            critical_rx,
+            latest_rx,
+        ));
+        let mut ordered = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while ordered.len() < 2 && Instant::now() < deadline {
+            if let Some(record) = consumer.try_recv() {
+                let message = brood_ipc::decode_client_record(&record)?;
+                ordered.push((record.sequence, message));
+                drop(record);
+            } else {
+                tokio::task::yield_now().await;
+            }
+        }
+        writer.abort();
+        ensure!(
+            ordered.len() == 2,
+            "expected motion and leave, got {ordered:?}"
+        );
+        let motion_seq = ordered
+            .iter()
+            .find_map(|(sequence, message)| {
+                matches!(
+                    message,
+                    ClientMessage::Input(InputEvent::PointerMotion { .. })
+                )
+                .then_some(*sequence)
+            })
+            .context("motion missing from ordered IPC records")?;
+        let leave_seq = ordered
+            .iter()
+            .find_map(|(sequence, message)| {
+                matches!(message, ClientMessage::Input(InputEvent::PointerLeave))
+                    .then_some(*sequence)
+            })
+            .context("leave missing from ordered IPC records")?;
+        ensure!(
+            motion_seq < leave_seq,
+            "source-earlier motion sequenced after leave: motion_seq={motion_seq} leave_seq={leave_seq} ordered={ordered:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn leave_barrier_drops_source_earlier_pending_latest() -> Result<()> {
+        const GENERATION: u64 = 9;
+        let lane = CriticalLaneFile::create(GENERATION)?;
+        let notifications = EventNotifier::create()?;
+        let producer = brood_ipc::CriticalProducer::map(lane.as_fd(), GENERATION)?;
+        let mut consumer = CriticalConsumer::map(lane.as_fd(), GENERATION)?;
+        let (critical_tx, critical_rx) = mpsc::channel(8);
+        let (latest_tx, latest_rx) = tokio::sync::watch::channel(None);
+        critical_tx
+            .send(LocalCriticalInput {
+                source_watermark: 2,
+                message: ClientMessage::Input(InputEvent::PointerLeave),
+                published: None,
+            })
+            .await?;
+        let writer = tokio::spawn(write_local_input(
+            producer,
+            notifications,
+            GENERATION,
+            critical_rx,
+            latest_rx,
+        ));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut saw_leave = false;
+        while Instant::now() < deadline {
+            if let Some(record) = consumer.try_recv() {
+                let message = brood_ipc::decode_client_record(&record)?;
+                ensure!(
+                    matches!(message, ClientMessage::Input(InputEvent::PointerLeave)),
+                    "unexpected record before late motion: {message:?}"
+                );
+                saw_leave = true;
+                drop(record);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        ensure!(saw_leave, "leave was not published");
+        latest_tx.send(Some(StampedClientMessage::new(
+            1,
+            ClientMessage::Input(InputEvent::PointerMotion {
+                position: PanePosition {
+                    pane: 3,
+                    x: 4.0,
+                    y: 5.0,
+                },
+            }),
+        )))?;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        ensure!(
+            consumer.try_recv().is_none(),
+            "source-earlier motion leaked after leave barrier"
+        );
+        writer.abort();
+        Ok(())
     }
 }
 
@@ -2017,6 +2212,7 @@ async fn probe(
     let (_latest_send, mut latest_receive) = network.take_lane(Lane::LatestState)?.split();
     let (mut bulk_send, mut bulk_receive) = network.take_lane(Lane::Bulk)?.split();
     let (_frame_send, mut frame_receive) = network.take_lane(Lane::FrameResource)?.split();
+    let mut source_watermark = 0_u64;
 
     let (artifacts_sent, artifacts_received) = probe_artifacts(
         &mut bulk_send,
@@ -2027,13 +2223,17 @@ async fn probe(
     )
     .await?;
 
+    source_watermark = source_watermark.wrapping_add(1);
     critical_send
-        .send_client_message(&ClientMessage::Input(InputEvent::PresentationSize {
-            width: 1280,
-            height: 800,
-            refresh_millihz: 60_000,
-            scale_120: 120,
-        }))
+        .send_stamped_client_message(&StampedClientMessage::new(
+            source_watermark,
+            ClientMessage::Input(InputEvent::PresentationSize {
+                width: 1280,
+                height: 800,
+                refresh_millihz: 60_000,
+                scale_120: 120,
+            }),
+        ))
         .await?;
 
     let catalog = loop {
@@ -2079,7 +2279,7 @@ async fn probe(
             continue;
         };
         if scene.windows.is_empty() {
-            acknowledge_frame(&mut critical_send, scene.sequence).await?;
+            acknowledge_frame(&mut critical_send, &mut source_watermark, scene.sequence).await?;
             continue;
         }
         let mut packets = Vec::with_capacity(scene.windows.len());
@@ -2100,7 +2300,7 @@ async fn probe(
         }
         break (scene, packets);
     };
-    acknowledge_frame(&mut critical_send, scene.sequence).await?;
+    acknowledge_frame(&mut critical_send, &mut source_watermark, scene.sequence).await?;
     let (input_scene, input_frame_packets) = if let Some(keycode) = keycode {
         let pane = scene
             .windows
@@ -2112,15 +2312,20 @@ async fn probe(
             .find(|packet| packet.pane == pane)
             .context("initial scene did not include its focused pane")?
             .pixels()?;
+        source_watermark = source_watermark.wrapping_add(1);
         critical_send
-            .send_client_message(&ClientMessage::Input(InputEvent::WindowFocus { pane }))
+            .send_stamped_client_message(&StampedClientMessage::new(
+                source_watermark,
+                ClientMessage::Input(InputEvent::WindowFocus { pane }),
+            ))
             .await?;
         for pressed in [true, false] {
+            source_watermark = source_watermark.wrapping_add(1);
             critical_send
-                .send_client_message(&ClientMessage::Input(InputEvent::KeyboardKey {
-                    keycode,
-                    pressed,
-                }))
+                .send_stamped_client_message(&StampedClientMessage::new(
+                    source_watermark,
+                    ClientMessage::Input(InputEvent::KeyboardKey { keycode, pressed }),
+                ))
                 .await?;
         }
         let mut unchanged_scenes = 0_u8;
@@ -2130,7 +2335,7 @@ async fn probe(
                 continue;
             };
             if next_scene.sequence <= scene.sequence || next_scene.windows.is_empty() {
-                acknowledge_frame(&mut critical_send, next_scene.sequence).await?;
+                acknowledge_frame(&mut critical_send, &mut source_watermark, next_scene.sequence).await?;
                 continue;
             }
             let expected = next_scene
@@ -2161,18 +2366,22 @@ async fn probe(
                     unchanged_scenes <= 8,
                     "remote key transition did not change the focused pane"
                 );
-                acknowledge_frame(&mut critical_send, next_scene.sequence).await?;
+                acknowledge_frame(&mut critical_send, &mut source_watermark, next_scene.sequence).await?;
                 continue;
             }
             break (next_scene, next_packets);
         };
-        acknowledge_frame(&mut critical_send, input_scene.sequence).await?;
+        acknowledge_frame(&mut critical_send, &mut source_watermark, input_scene.sequence).await?;
         (input_scene.sequence, input_packets.len())
     } else {
         (scene.sequence, 0)
     };
+    source_watermark = source_watermark.wrapping_add(1);
     critical_send
-        .send_client_message(&ClientMessage::Lifecycle(ClientLifecycle::Disconnect))
+        .send_stamped_client_message(&StampedClientMessage::new(
+            source_watermark,
+            ClientMessage::Lifecycle(ClientLifecycle::Disconnect),
+        ))
         .await?;
     critical_send.finish().await?;
     ensure!(
@@ -2286,9 +2495,15 @@ async fn probe_artifacts(
     Ok((accepted.len(), installed.len()))
 }
 
-async fn acknowledge_frame(lane: &mut NetworkSendLane, sequence: u64) -> Result<()> {
-    lane.send_client_message(&ClientMessage::Lifecycle(ClientLifecycle::FramePresented {
-        sequence,
-    }))
+async fn acknowledge_frame(
+    lane: &mut NetworkSendLane,
+    source_watermark: &mut u64,
+    sequence: u64,
+) -> Result<()> {
+    *source_watermark = source_watermark.wrapping_add(1);
+    lane.send_stamped_client_message(&StampedClientMessage::new(
+        *source_watermark,
+        ClientMessage::Lifecycle(ClientLifecycle::FramePresented { sequence }),
+    ))
     .await
 }

@@ -9,7 +9,8 @@ use anyhow::{Context, Result, bail, ensure};
 use brood_protocol::{
     BackendActorRealm, CarrierKind, ClientMessage, EndpointCapabilities, FrameColorSpace,
     FramePixelFormat, Lane, MAX_ACTOR_ID_BYTES, MAX_ACTOR_MESSAGE_BYTES, MAX_NETWORK_FRAME_BYTES,
-    ServerMessage, TransportProfile, managed_resize_epoch_is_valid, negotiate_profile,
+    ServerMessage, StampedClientMessage, TransportProfile, managed_resize_epoch_is_valid,
+    negotiate_profile,
 };
 use quinn::{
     AckFrequencyConfig, Connection, Endpoint, Incoming, RecvStream, SendStream, VarInt,
@@ -226,6 +227,39 @@ impl NetworkLane {
     }
 
     /// Send a server message after validating its semantic lane.
+    /// Send a source-stamped client message after validating its semantic lane.
+    pub async fn send_stamped_client_message(
+        &mut self,
+        stamped: &StampedClientMessage,
+    ) -> Result<()> {
+        ensure!(
+            stamped.source_watermark != 0,
+            "stamped client message watermark must be non-zero"
+        );
+        ensure!(
+            client_message_lane(&stamped.message) == self.lane,
+            "client message belongs on a different semantic lane"
+        );
+        validate_client_message(&stamped.message)?;
+        self.send_value(stamped).await
+    }
+
+    /// Receive and validate a source-stamped client message.
+    pub async fn receive_stamped_client_message(&mut self) -> Result<StampedClientMessage> {
+        let stamped: StampedClientMessage = self.receive_value().await?;
+        ensure!(
+            stamped.source_watermark != 0,
+            "stamped client message watermark must be non-zero"
+        );
+        ensure!(
+            client_message_lane(&stamped.message) == self.lane,
+            "client message arrived on the wrong semantic lane"
+        );
+        validate_client_message(&stamped.message)?;
+        Ok(stamped)
+    }
+
+    /// Send a server message after validating its semantic lane.
     pub async fn send_server_message(&mut self, message: &ServerMessage) -> Result<()> {
         ensure!(
             server_message_lane(message) == self.lane,
@@ -298,6 +332,23 @@ impl NetworkSendLane {
         send_value(&mut self.send, &mut self.buffer, self.limit, message).await
     }
 
+    /// Send a source-stamped client message after validating its semantic lane.
+    pub async fn send_stamped_client_message(
+        &mut self,
+        stamped: &StampedClientMessage,
+    ) -> Result<()> {
+        ensure!(
+            stamped.source_watermark != 0,
+            "stamped client message watermark must be non-zero"
+        );
+        ensure!(
+            client_message_lane(&stamped.message) == self.lane,
+            "client message belongs on a different semantic lane"
+        );
+        validate_client_message(&stamped.message)?;
+        send_value(&mut self.send, &mut self.buffer, self.limit, stamped).await
+    }
+
     /// Send a server message after validating its semantic lane.
     pub async fn send_server_message(&mut self, message: &ServerMessage) -> Result<()> {
         ensure!(
@@ -341,6 +392,22 @@ impl NetworkReceiveLane {
         );
         validate_client_message(&message)?;
         Ok(message)
+    }
+
+    /// Receive and validate a source-stamped client message.
+    pub async fn receive_stamped_client_message(&mut self) -> Result<StampedClientMessage> {
+        let stamped: StampedClientMessage =
+            receive_value(&mut self.receive, &mut self.buffer, self.limit).await?;
+        ensure!(
+            stamped.source_watermark != 0,
+            "stamped client message watermark must be non-zero"
+        );
+        ensure!(
+            client_message_lane(&stamped.message) == self.lane,
+            "client message arrived on the wrong semantic lane"
+        );
+        validate_client_message(&stamped.message)?;
+        Ok(stamped)
     }
 
     /// Receive and validate a server message.
@@ -459,6 +526,19 @@ impl NetworkConnection {
         self.send(client_message_lane(message), message).await
     }
 
+    /// Send one source-stamped client message on its required logical lane.
+    pub async fn send_stamped_client_message(
+        &mut self,
+        stamped: &StampedClientMessage,
+    ) -> Result<()> {
+        ensure!(
+            stamped.source_watermark != 0,
+            "stamped client message watermark must be non-zero"
+        );
+        validate_client_message(&stamped.message)?;
+        self.send(client_message_lane(&stamped.message), stamped).await
+    }
+
     /// Receive one client message from a specified logical lane.
     pub async fn receive_client_message(&mut self, lane: Lane) -> Result<ClientMessage> {
         let message = self.receive(lane).await?;
@@ -468,6 +548,24 @@ impl NetworkConnection {
         );
         validate_client_message(&message)?;
         Ok(message)
+    }
+
+    /// Receive one source-stamped client message from a specified logical lane.
+    pub async fn receive_stamped_client_message(
+        &mut self,
+        lane: Lane,
+    ) -> Result<StampedClientMessage> {
+        let stamped: StampedClientMessage = self.receive(lane).await?;
+        ensure!(
+            stamped.source_watermark != 0,
+            "stamped client message watermark must be non-zero"
+        );
+        ensure!(
+            client_message_lane(&stamped.message) == lane,
+            "client message arrived on the wrong semantic lane"
+        );
+        validate_client_message(&stamped.message)?;
+        Ok(stamped)
     }
 
     /// Send one server message on its required logical lane.
@@ -1273,6 +1371,7 @@ mod tests {
     };
 
     use brood_protocol::{
+        StampedClientMessage,
         ARTIFACT_ABI_VERSION, ActorMessage, ArtifactKind, ArtifactManifest, ArtifactMessage,
         ArtifactRealm, BackendActorRealm, BackendId, BackendOperation, BackendRequest,
         BackendResponse, BackendResponseValue, CatalogSession, CatalogSnapshot, CatalogWindow,
@@ -1558,11 +1657,12 @@ mod tests {
                     .await
                     .unwrap_or_else(|error| unreachable!("{error}"));
             let input = connection
-                .receive_client_message(Lane::LatestState)
+                .receive_stamped_client_message(Lane::LatestState)
                 .await
                 .unwrap_or_else(|error| unreachable!("{error}"));
+            assert_eq!(input.source_watermark, 1);
             assert!(matches!(
-                input,
+                input.message,
                 ClientMessage::Input(InputEvent::PointerMotion {
                     position: PanePosition { pane: 7, .. }
                 })
@@ -1659,11 +1759,12 @@ mod tests {
                 .await
                 .unwrap_or_else(|error| unreachable!("{error}"));
             let resize = connection
-                .receive_client_message(Lane::Critical)
+                .receive_stamped_client_message(Lane::Critical)
                 .await
                 .unwrap_or_else(|error| unreachable!("{error}"));
+            assert_eq!(resize.source_watermark, 2);
             assert_eq!(
-                resize,
+                resize.message,
                 ClientMessage::Input(InputEvent::WindowResize {
                     pane: 7,
                     logical_width: 200,
@@ -1676,11 +1777,12 @@ mod tests {
                 })
             );
             let disconnect = connection
-                .receive_client_message(Lane::Critical)
+                .receive_stamped_client_message(Lane::Critical)
                 .await
                 .unwrap_or_else(|error| unreachable!("{error}"));
+            assert_eq!(disconnect.source_watermark, 3);
             assert_eq!(
-                disconnect,
+                disconnect.message,
                 ClientMessage::Lifecycle(brood_protocol::ClientLifecycle::Disconnect)
             );
         });
@@ -1696,13 +1798,16 @@ mod tests {
         .unwrap_or_else(|error| unreachable!("{error}"));
         assert_eq!(client.connection_generation, 42);
         client
-            .send_client_message(&ClientMessage::Input(InputEvent::PointerMotion {
-                position: PanePosition {
-                    pane: 7,
-                    x: 1.5,
-                    y: 2.5,
-                },
-            }))
+            .send_stamped_client_message(&StampedClientMessage::new(
+                1,
+                ClientMessage::Input(InputEvent::PointerMotion {
+                    position: PanePosition {
+                        pane: 7,
+                        x: 1.5,
+                        y: 2.5,
+                    },
+                }),
+            ))
             .await
             .unwrap_or_else(|error| unreachable!("{error}"));
         client
@@ -1805,21 +1910,25 @@ mod tests {
             })
         );
         client
-            .send_client_message(&ClientMessage::Input(InputEvent::WindowResize {
-                pane: 7,
-                logical_width: 200,
-                logical_height: 120,
-                pixel_width: 300,
-                pixel_height: 180,
-                scale_120: 180,
-                resize_epoch: Some(41),
-                recover_through_epoch: None,
-            }))
+            .send_stamped_client_message(&StampedClientMessage::new(
+                2,
+                ClientMessage::Input(InputEvent::WindowResize {
+                    pane: 7,
+                    logical_width: 200,
+                    logical_height: 120,
+                    pixel_width: 300,
+                    pixel_height: 180,
+                    scale_120: 180,
+                    resize_epoch: Some(41),
+                    recover_through_epoch: None,
+                }),
+            ))
             .await
             .unwrap_or_else(|error| unreachable!("{error}"));
         client
-            .send_client_message(&ClientMessage::Lifecycle(
-                brood_protocol::ClientLifecycle::Disconnect,
+            .send_stamped_client_message(&StampedClientMessage::new(
+                3,
+                ClientMessage::Lifecycle(brood_protocol::ClientLifecycle::Disconnect),
             ))
             .await
             .unwrap_or_else(|error| unreachable!("{error}"));
@@ -1850,11 +1959,12 @@ mod tests {
                 .split();
             tokio::time::timeout(
                 Duration::from_secs(2),
-                critical_receive.receive_client_message(),
+                critical_receive.receive_stamped_client_message(),
             )
             .await
             .unwrap_or_else(|error| unreachable!("critical lane timed out: {error}"))
             .unwrap_or_else(|error| unreachable!("{error}"))
+            .message
         });
 
         let mut client = connect_network(
@@ -1891,7 +2001,10 @@ mod tests {
         });
         tokio::task::yield_now().await;
         critical_send
-            .send_client_message(&ClientMessage::Input(InputEvent::KeyboardReset))
+            .send_stamped_client_message(&StampedClientMessage::new(
+                1,
+                ClientMessage::Input(InputEvent::KeyboardReset),
+            ))
             .await
             .unwrap_or_else(|error| unreachable!("{error}"));
         assert_eq!(

@@ -14,7 +14,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use thiserror::Error;
 
 /// Current semantic presentation protocol version.
-pub const PRESENTATION_PROTOCOL_VERSION: u32 = 24;
+pub const PRESENTATION_PROTOCOL_VERSION: u32 = 25;
 
 /// Number of fixed scale units in one logical output unit.
 pub const FRACTIONAL_SCALE_DENOMINATOR: u32 = 120;
@@ -868,6 +868,20 @@ impl InputEvent {
             | Self::PointerLeave => Lane::Critical,
         }
     }
+
+    /// Whether applying this event should retire pending latest-state samples.
+    ///
+    /// Leave and focus transitions are causal barriers for supersedable pointer
+    /// samples. Ordinary buttons/axes carry position and do not retire motion.
+    /// Focus-epoch fan-out across local input vs presentation paths is tracked
+    /// separately and is not covered here.
+    #[must_use]
+    pub const fn retires_latest_state(&self) -> bool {
+        matches!(
+            self,
+            Self::PointerLeave | Self::PresentationFocus { .. } | Self::WindowFocus { .. }
+        )
+    }
 }
 
 /// Explicit client-side lifecycle operations.
@@ -1050,6 +1064,28 @@ pub enum ArtifactValidationError {
     Chunk(usize),
     #[error("artifact rejection detail size {0} exceeds the supported bound")]
     Rejection(usize),
+}
+
+/// Client message stamped with source order before remote lane split.
+///
+/// Critical and latest-state input travel independent network tasks and are
+/// merged only later. The watermark is assigned at the presentation source
+/// before that split so the merge can preserve source order and refuse
+/// latest-state samples older than already-applied leave/focus barriers.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct StampedClientMessage {
+    pub source_watermark: u64,
+    pub message: ClientMessage,
+}
+
+impl StampedClientMessage {
+    #[must_use]
+    pub fn new(source_watermark: u64, message: ClientMessage) -> Self {
+        Self {
+            source_watermark,
+            message,
+        }
+    }
 }
 
 /// Message sent from a presentation client to its session server.
@@ -1269,7 +1305,7 @@ mod tests {
 
     #[test]
     fn version_mismatch_is_rejected() {
-        assert_eq!(PRESENTATION_PROTOCOL_VERSION, 24);
+        assert_eq!(PRESENTATION_PROTOCOL_VERSION, 25);
         let client = EndpointCapabilities::local_server(true);
         let mut server = client.clone();
         server.protocol_version = 23;
