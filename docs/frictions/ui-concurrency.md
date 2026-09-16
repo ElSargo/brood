@@ -118,16 +118,18 @@ Residual risk: in-flight deployer threads are not cancelled when superseded; the
 are only ignored at notification time. Ready/success paths still do not clear
 `pending` by request id.
 
-### Critical and latest-state input lack a shared source watermark
+### Critical and latest-state input lack a shared source watermark — remitted
 
-Remote critical input and latest-state input are sent by independent tasks
-(`clients/brood-client/src/remote.rs:451-493`) and merged later by another
-task (`crates/brood-remote/src/main.rs:1495-1523`). The merge assigns sequence
-only after the lanes have raced. Events such as button input include position
-and mitigate ordinary click ordering, but a delayed pointer sample can still
-cross a pointer-leave, focus, backend-authority, or connection transition and
-revive obsolete hover or targeting state. Priority selection is not a causal
-barrier.
+Remote input now stamps a monotonic `source_watermark` on
+`StampedClientMessage` before the critical/latest lane split
+(`clients/brood-client/src/remote.rs`). Both network tasks carry that stamp;
+`write_local_input` publishes any source-earlier pending latest sample before a
+critical event, then treats leave/focus as barriers that refuse later
+latest-state samples with an older watermark (`crates/brood-remote/src/main.rs`).
+IPC sequence therefore preserves source order for the queued motion-before-leave
+case, and obsolete motion cannot revive hover after leave. Covered by
+`input_watermark_tests` in brood-remote. Focus fan-out across local input vs
+presentation paths remains open (see the next item / issue #41).
 
 ### Focus transition pieces use independently pressured paths
 

@@ -16,7 +16,7 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use brood_protocol::{
     ActorMessage, ArtifactMessage, ArtifactRealm, BackendId, BackendOperation, BackendRequest,
     BackendResponseValue, ClientLifecycle, ClientMessage, EndpointCapabilities, FramePixelFormat,
-    FrameScene, InputEvent, Lane, ServerMessage,
+    FrameScene, InputEvent, Lane, ServerMessage, StampedClientMessage,
 };
 use brood_transport::{
     ArtifactExchange, ArtifactExchangeEvent, ArtifactOffer, NetworkFramePacket, NetworkReceiveLane,
@@ -65,7 +65,8 @@ pub struct RemoteConnection {
     input: Option<RemoteInputLane>,
     actor_messages: Option<RemoteActorMessageLane>,
     backend_commands: Option<RemoteBackendCommandLane>,
-    shutdown_sender: tokio_mpsc::Sender<ClientMessage>,
+    shutdown_sender: tokio_mpsc::Sender<StampedClientMessage>,
+    source_watermark: Arc<AtomicU64>,
     cancel_sender: tokio::sync::watch::Sender<bool>,
     event_gate_sender: mpsc::SyncSender<bool>,
     worker: Option<thread::JoinHandle<Result<()>>>,
@@ -85,6 +86,7 @@ impl std::fmt::Debug for RemoteConnection {
 impl RemoteConnection {
     pub fn start(config: RemoteConfig, proxy: &EventLoopProxy<ClientEvent>) -> Result<Self> {
         let configured_backend = config.backend;
+        let source_watermark = Arc::new(AtomicU64::new(0));
         let (critical_input_sender, critical_input_receiver) = tokio_mpsc::channel(INPUT_CAPACITY);
         let (latest_input_sender, latest_input_receiver) = tokio::sync::watch::channel(None);
         let (actor_sender, actor_receiver) = tokio_mpsc::channel(RELIABLE_CAPACITY);
@@ -152,10 +154,12 @@ impl RemoteConnection {
             input: Some(RemoteInputLane::new(
                 critical_input_sender.clone(),
                 latest_input_sender,
+                Arc::clone(&source_watermark),
             )),
             actor_messages: Some(RemoteActorMessageLane::new(actor_sender)),
             backend_commands: Some(RemoteBackendCommandLane::new(reliable_sender)),
             shutdown_sender: critical_input_sender,
+            source_watermark,
             cancel_sender,
             event_gate_sender,
             worker: Some(worker),
@@ -184,10 +188,11 @@ impl RemoteConnection {
 
     pub fn shutdown(&mut self) -> Result<()> {
         let _gate_result = self.event_gate_sender.try_send(false);
-        match self
-            .shutdown_sender
-            .try_send(ClientMessage::Lifecycle(ClientLifecycle::Disconnect))
-        {
+        let watermark = next_source_watermark(&self.source_watermark);
+        match self.shutdown_sender.try_send(StampedClientMessage::new(
+            watermark,
+            ClientMessage::Lifecycle(ClientLifecycle::Disconnect),
+        )) {
             Ok(()) | Err(tokio_mpsc::error::TrySendError::Closed(_)) => {}
             Err(tokio_mpsc::error::TrySendError::Full(_)) => {
                 let _send_result = self.cancel_sender.send(true);
@@ -245,8 +250,8 @@ struct RemoteReady {
 async fn run_connection(
     config: RemoteConfig,
     proxy: EventLoopProxy<ClientEvent>,
-    critical_input_receiver: tokio_mpsc::Receiver<ClientMessage>,
-    latest_input_receiver: tokio::sync::watch::Receiver<Option<ClientMessage>>,
+    critical_input_receiver: tokio_mpsc::Receiver<StampedClientMessage>,
+    latest_input_receiver: tokio::sync::watch::Receiver<Option<StampedClientMessage>>,
     actor_receiver: tokio_mpsc::Receiver<ActorCommand>,
     reliable_receiver: tokio_mpsc::Receiver<ReliableCommand>,
     mut cancel_receiver: tokio::sync::watch::Receiver<bool>,
@@ -451,16 +456,17 @@ fn join_transport_task(
 
 async fn send_critical_input_messages(
     mut critical: NetworkSendLane,
-    mut receiver: tokio_mpsc::Receiver<ClientMessage>,
+    mut receiver: tokio_mpsc::Receiver<StampedClientMessage>,
     disconnect_acknowledged: Arc<tokio::sync::Notify>,
 ) -> Result<()> {
-    while let Some(message) = receiver.recv().await {
-        let disconnect = message == ClientMessage::Lifecycle(ClientLifecycle::Disconnect);
-        match &message {
+    while let Some(stamped) = receiver.recv().await {
+        let disconnect =
+            stamped.message == ClientMessage::Lifecycle(ClientLifecycle::Disconnect);
+        match &stamped.message {
             ClientMessage::Input(input) if input.lane() == Lane::Critical => {
-                critical.send_client_message(&message).await?;
+                critical.send_stamped_client_message(&stamped).await?;
             }
-            ClientMessage::Lifecycle(_) => critical.send_client_message(&message).await?,
+            ClientMessage::Lifecycle(_) => critical.send_stamped_client_message(&stamped).await?,
             ClientMessage::Input(_) => bail!("latest-state input reached the critical sender"),
             ClientMessage::Actor(_)
             | ClientMessage::BackendRequest(_)
@@ -480,18 +486,18 @@ async fn send_critical_input_messages(
 
 async fn send_latest_input_messages(
     mut latest: NetworkSendLane,
-    mut receiver: tokio::sync::watch::Receiver<Option<ClientMessage>>,
+    mut receiver: tokio::sync::watch::Receiver<Option<StampedClientMessage>>,
 ) -> Result<()> {
     while receiver.changed().await.is_ok() {
-        let message = receiver.borrow_and_update().clone();
-        let Some(message) = message else {
+        let stamped = receiver.borrow_and_update().clone();
+        let Some(stamped) = stamped else {
             continue;
         };
         ensure!(
-            matches!(&message, ClientMessage::Input(input) if input.lane() == Lane::LatestState),
+            matches!(&stamped.message, ClientMessage::Input(input) if input.lane() == Lane::LatestState),
             "non-latest input reached the latest-state sender"
         );
-        latest.send_client_message(&message).await?;
+        latest.send_stamped_client_message(&stamped).await?;
     }
     Ok(())
 }
@@ -1197,21 +1203,24 @@ pub struct NetworkFrame {
 }
 
 pub struct RemoteInputLane {
-    critical: tokio_mpsc::Sender<ClientMessage>,
-    latest: tokio::sync::watch::Sender<Option<ClientMessage>>,
-    deferred: VecDeque<ClientMessage>,
+    critical: tokio_mpsc::Sender<StampedClientMessage>,
+    latest: tokio::sync::watch::Sender<Option<StampedClientMessage>>,
+    source_watermark: Arc<AtomicU64>,
+    deferred: VecDeque<StampedClientMessage>,
     deferred_high_water: usize,
     pane_routes: BTreeMap<u64, u64>,
 }
 
 impl RemoteInputLane {
-    const fn new(
-        critical: tokio_mpsc::Sender<ClientMessage>,
-        latest: tokio::sync::watch::Sender<Option<ClientMessage>>,
+    fn new(
+        critical: tokio_mpsc::Sender<StampedClientMessage>,
+        latest: tokio::sync::watch::Sender<Option<StampedClientMessage>>,
+        source_watermark: Arc<AtomicU64>,
     ) -> Self {
         Self {
             critical,
             latest,
+            source_watermark,
             deferred: VecDeque::new(),
             deferred_high_water: 0,
             pane_routes: BTreeMap::new(),
@@ -1227,16 +1236,17 @@ impl RemoteInputLane {
     }
 
     pub fn send(&mut self, message: ClientMessage) -> bool {
-        if is_pointer_motion(&message) {
-            return self.latest.send(Some(message)).is_ok();
+        let stamped = StampedClientMessage::new(next_source_watermark(&self.source_watermark), message);
+        if is_pointer_motion(&stamped.message) {
+            return self.latest.send(Some(stamped)).is_ok();
         }
         self.flush_deferred();
         if self.has_deferred() {
-            return self.defer(message);
+            return self.defer(stamped);
         }
-        match self.critical.try_send(message) {
+        match self.critical.try_send(stamped) {
             Ok(()) => true,
-            Err(tokio_mpsc::error::TrySendError::Full(message)) => self.defer(message),
+            Err(tokio_mpsc::error::TrySendError::Full(stamped)) => self.defer(stamped),
             Err(tokio_mpsc::error::TrySendError::Closed(_)) => false,
         }
     }
@@ -1269,7 +1279,7 @@ impl RemoteInputLane {
         !self.deferred.is_empty()
     }
 
-    fn defer(&mut self, message: ClientMessage) -> bool {
+    fn defer(&mut self, message: StampedClientMessage) -> bool {
         if self.deferred.is_empty() {
             eprintln!("critical network input lane backpressured; deferring input messages");
         }
@@ -1280,6 +1290,10 @@ impl RemoteInputLane {
         self.deferred_high_water = self.deferred_high_water.max(self.deferred.len());
         true
     }
+}
+
+fn next_source_watermark(counter: &AtomicU64) -> u64 {
+    counter.fetch_add(1, Ordering::Relaxed).wrapping_add(1)
 }
 
 const fn is_pointer_motion(message: &ClientMessage) -> bool {
@@ -1481,7 +1495,7 @@ impl RemoteBackendCommandLane {
 mod tests {
     use brood_protocol::{
         BackendActorRealm, BackendId, ClientMessage, FrameColorSpace, FramePixelFormat, InputEvent,
-        PanePosition,
+        PanePosition, StampedClientMessage,
     };
 
     use super::{
@@ -1492,6 +1506,7 @@ mod tests {
     use crate::actor_runtime::BackendActorMessageRequest;
     use std::{
         collections::{BTreeMap, HashMap},
+        sync::{Arc, atomic::AtomicU64},
         time::Duration,
     };
 
@@ -1501,28 +1516,55 @@ mod tests {
         })
     }
 
+    fn test_lane() -> (
+        RemoteInputLane,
+        tokio::sync::mpsc::Receiver<StampedClientMessage>,
+        tokio::sync::watch::Receiver<Option<StampedClientMessage>>,
+    ) {
+        let (critical_sender, critical_receiver) = tokio::sync::mpsc::channel(1);
+        let (latest_sender, latest_receiver) = tokio::sync::watch::channel(None);
+        let lane = RemoteInputLane::new(
+            critical_sender,
+            latest_sender,
+            Arc::new(AtomicU64::new(0)),
+        );
+        (lane, critical_receiver, latest_receiver)
+    }
+
     #[test]
     fn pointer_motion_supersedes_without_blocking_critical_input() {
-        let (critical_sender, mut critical_receiver) = tokio::sync::mpsc::channel(1);
-        let (latest_sender, latest_receiver) = tokio::sync::watch::channel(None);
-        let mut lane = RemoteInputLane::new(critical_sender, latest_sender);
+        let (mut lane, mut critical_receiver, latest_receiver) = test_lane();
 
         assert!(lane.send(pointer(1.0)));
         assert!(lane.send(pointer(3.0)));
         assert!(lane.send(ClientMessage::Input(InputEvent::KeyboardReset)));
 
-        assert_eq!(latest_receiver.borrow().as_ref(), Some(&pointer(3.0)));
+        let latest = latest_receiver.borrow().clone().expect("latest motion");
+        assert_eq!(latest.message, pointer(3.0));
+        assert!(latest.source_watermark >= 2);
+        let critical = critical_receiver.try_recv().expect("critical reset");
         assert_eq!(
-            critical_receiver.try_recv().ok(),
-            Some(ClientMessage::Input(InputEvent::KeyboardReset))
+            critical.message,
+            ClientMessage::Input(InputEvent::KeyboardReset)
         );
+        assert!(critical.source_watermark > latest.source_watermark);
+    }
+
+    #[test]
+    fn pointer_leave_and_prior_motion_share_source_watermark_family() {
+        let (mut lane, mut critical_receiver, latest_receiver) = test_lane();
+        assert!(lane.send(pointer(1.0)));
+        assert!(lane.send(ClientMessage::Input(InputEvent::PointerLeave)));
+        let motion = latest_receiver.borrow().clone().expect("motion");
+        let leave = critical_receiver.try_recv().expect("leave");
+        assert!(matches!(motion.message, ClientMessage::Input(InputEvent::PointerMotion { .. })));
+        assert_eq!(leave.message, ClientMessage::Input(InputEvent::PointerLeave));
+        assert!(motion.source_watermark < leave.source_watermark);
     }
 
     #[test]
     fn critical_input_is_retained_fifo_beyond_channel_capacity() {
-        let (critical_sender, mut critical_receiver) = tokio::sync::mpsc::channel(1);
-        let (latest_sender, _latest_receiver) = tokio::sync::watch::channel(None);
-        let mut lane = RemoteInputLane::new(critical_sender, latest_sender);
+        let (mut lane, mut critical_receiver, _latest_receiver) = test_lane();
 
         for _ in 0..=crate::actor_runtime::ACTOR_OUTPUT_BACKLOG {
             assert!(lane.send(ClientMessage::Input(InputEvent::KeyboardReset)));
@@ -1538,9 +1580,10 @@ mod tests {
             crate::actor_runtime::ACTOR_OUTPUT_BACKLOG
         );
         for _ in 0..=crate::actor_runtime::ACTOR_OUTPUT_BACKLOG {
+            let stamped = critical_receiver.try_recv().expect("retained critical");
             assert_eq!(
-                critical_receiver.try_recv().ok(),
-                Some(ClientMessage::Input(InputEvent::KeyboardReset))
+                stamped.message,
+                ClientMessage::Input(InputEvent::KeyboardReset)
             );
             lane.flush_deferred();
         }
