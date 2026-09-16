@@ -163,7 +163,7 @@ mutate newer UI state (`clients/brood-client/src/remote.rs`,
 `clients/brood-client/src/main.rs`). Covered by `wait_child_with_timeout`
 unit tests.
 
-### File drop reads### File drop reads and decodes synchronously
+### File drop reads and decodes synchronously
 
 The dropped-image path performs metadata lookup, whole-file read, format
 detection, and preview decode on the presentation event path
