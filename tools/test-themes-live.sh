@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Sourced by the isolated session-switcher harness via `brood test themes`.
 # The caller owns the offscreen compositor, process cleanup and capture tools.
 BASE_CONFIG="$OUT/theme-base.toml"
