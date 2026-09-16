@@ -20,6 +20,7 @@ mod debug_dump;
 mod frame_export;
 mod geometry;
 mod input;
+pub use input::should_forward_managed_pointer_button;
 pub mod launch_context;
 mod nested_test;
 mod plugin_runtime;
