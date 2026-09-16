@@ -61,14 +61,15 @@ The keybinding picker demonstrates this hole directly: close clears only the
 boolean when no picker identity exists, while any later `picker-created` reply
 is installed unconditionally (`plugins/keybindings/src/lib.rs:244-258,455-469`).
 
-### Agent-picker intent changes realm while it waits
+### Agent-picker intent changes realm while it waits — remitted
 
-The pending agent picker is an unscoped boolean. A realm change clears agents
-and subscribes to the new registry without clearing or rebinding that boolean
-(`plugins/session-switcher/src/lib.rs:1092-1126,1940-1953`). The first registry
-reply for the new session can fulfill a shortcut intent issued in the old
-session and open an unexpected agent (`plugins/session-switcher/src/lib.rs:
-2114-2137`).
+`agent_picker_pending` is now scoped to `(backend_id, session_id)`. Realm
+changes (Snapshot, layout-state focus, activate/create completion, and
+worktree completion) clear agents and the pending intent via
+`clear_agent_registry_for_realm_change`. Registry fulfillment only opens UI
+when the pending realm matches the current realm
+(`plugins/session-switcher/src/lib.rs`). Covered by
+`agent_picker_pending_must_not_fulfill_after_realm_change`.
 
 ### Layout completions can move durable state backward — remitted
 

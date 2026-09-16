@@ -285,7 +285,10 @@ struct SwitcherState {
     coding_agent_uis: Vec<String>,
     coding_agent_targets: BTreeMap<String, String>,
     agents: Vec<WireAgent>,
-    agent_picker_pending: bool,
+    /// When set, coding-agent shortcut is waiting for a registry reply
+    /// scoped to this `(backend_id, session_id)`. Cleared on realm change
+    /// or fulfillment; mismatched registry replies are ignored.
+    agent_picker_pending: Option<(u64, u64)>,
     diff_viewers: BTreeSet<String>,
     terminal_uis: BTreeMap<String, (u64, u64)>,
     neovim_uis_starting: BTreeMap<(u64, u64), String>,
@@ -772,7 +775,7 @@ impl SwitcherState {
             coding_agent_uis: Vec::new(),
             coding_agent_targets: BTreeMap::new(),
             agents: Vec::new(),
-            agent_picker_pending: false,
+            agent_picker_pending: None,
             diff_viewers: BTreeSet::new(),
             terminal_uis: BTreeMap::new(),
             neovim_uis_starting: BTreeMap::new(),
@@ -1386,7 +1389,7 @@ fn handle_session_event(event: SessionEvent) -> Vec<ActorCommand> {
                 commands.push(query_editor_status(backend, active));
             }
             if previous_realm != (state.backend_id, state.session_id) {
-                state.agents.clear();
+                clear_agent_registry_for_realm_change(&mut state);
                 if state.backend_id != 0 && state.session_id != 0 {
                     commands.push(subscribe_agent_registry(state.backend_id, state.session_id));
                 }
@@ -1520,6 +1523,10 @@ fn apply_completion(state: &mut SwitcherState, completion: SessionCommandComplet
             SessionOperation::Activate | SessionOperation::Create
         ) && let Some(session) = completion.session
         {
+            let next_realm = (completion.backend_id, session);
+            if next_realm != (state.backend_id, state.session_id) {
+                clear_agent_registry_for_realm_change(state);
+            }
             state.backend_id = completion.backend_id;
             state.session_id = session;
         }
@@ -1624,6 +1631,10 @@ fn apply_worktree_completion(
             // the authoritative identity even when completion wins the race;
             // the following catalogue update will retain this selection once
             // it adds the row.
+            let next_realm = (backend, session);
+            if next_realm != (state.backend_id, state.session_id) {
+                clear_agent_registry_for_realm_change(state);
+            }
             state.backend_id = backend;
             state.session_id = session;
             state.selected = Some((backend, session));
@@ -1822,7 +1833,7 @@ fn handle_layout_message(bytes: &[u8]) -> Vec<ActorCommand> {
         state.backend_id = backend;
         state.session_id = session;
         if realm_changed {
-            state.agents.clear();
+            clear_agent_registry_for_realm_change(&mut state);
         }
     }
     let requested_focus = shell_requested_focus(&state, message.focused_pane);
@@ -2284,7 +2295,7 @@ fn handle_key_policy_action(bytes: &[u8]) -> Vec<ActorCommand> {
             return Vec::new();
         };
         if state.agents.is_empty() {
-            state.agent_picker_pending = true;
+            state.agent_picker_pending = Some((state.backend_id, state.session_id));
             return vec![subscribe_agent_registry(state.backend_id, state.session_id)];
         }
         return open_agent_picker(&mut state);
@@ -2515,18 +2526,7 @@ fn handle_session_message(sender: &str, bytes: &[u8]) -> Vec<ActorCommand> {
             return Vec::new();
         }
         state.agents = message.agents;
-        if state.agent_picker_pending && !state.agents.is_empty() {
-            // When the shortcut had to wait for the session's first agent,
-            // there is no choice to present. Open that agent directly rather
-            // than flashing an empty/stale picker after its creation.
-            if state.agents.len() == 1 {
-                state.agent_picker_pending = false;
-                let agent = state.agents[0].id.clone();
-                return open_coding_agent_ui(&mut state, agent);
-            }
-            return open_agent_picker(&mut state);
-        }
-        return Vec::new();
+        return fulfill_pending_agent_picker(&mut state);
     }
     handle_terminal_inventory(sender, bytes)
 }
@@ -3574,8 +3574,38 @@ fn show_directory_picker(
     })]
 }
 
+
+fn clear_agent_registry_for_realm_change(state: &mut SwitcherState) {
+    state.agents.clear();
+    state.agent_picker_pending = None;
+}
+
+fn fulfill_pending_agent_picker(state: &mut SwitcherState) -> Vec<ActorCommand> {
+    let Some(pending_realm) = state.agent_picker_pending else {
+        return Vec::new();
+    };
+    let current_realm = (state.backend_id, state.session_id);
+    if pending_realm != current_realm {
+        // Shortcut was issued in another realm; do not open UI for this registry.
+        state.agent_picker_pending = None;
+        return Vec::new();
+    }
+    if state.agents.is_empty() {
+        return Vec::new();
+    }
+    // When the shortcut had to wait for the session's first agent, there is no
+    // choice to present. Open that agent directly rather than flashing an
+    // empty/stale picker after its creation.
+    if state.agents.len() == 1 {
+        state.agent_picker_pending = None;
+        let agent = state.agents[0].id.clone();
+        return open_coding_agent_ui(state, agent);
+    }
+    open_agent_picker(state)
+}
+
 fn open_agent_picker(state: &mut SwitcherState) -> Vec<ActorCommand> {
-    state.agent_picker_pending = false;
+    state.agent_picker_pending = None;
     let items = state
         .agents
         .iter()
@@ -5670,10 +5700,11 @@ mod tests {
     use super::{
         ActorCommand, EditMode, LayoutContext, LayoutLeaseToken, LayoutRegionResizeMessage,
         LayoutStateSize, ResizePaintPlan, SessionCommandCompleted, SessionOperation,
-        ShellLayoutState, SwitcherState, ViewSession, actor_realm, apply_backend_sessions,
-        apply_completion, apply_layout_pointer_message, apply_layout_transaction_notification,
-        apply_picker_selection, apply_worktree_completion,
+        ShellLayoutState, SwitcherState, ViewSession, WireAgent, actor_realm,
+        apply_backend_sessions, apply_completion, apply_layout_pointer_message,
+        apply_layout_transaction_notification, apply_picker_selection, apply_worktree_completion,
         authenticated_neovim_client, backend_picker_reply_is_current, begin_worktree_for_source,
+        clear_agent_registry_for_realm_change, fulfill_pending_agent_picker,
         creation_backend_items, header_geometry, neovim_client_realm, neovim_ui_id,
         open_creation_backend_picker, publish_layout, publish_layout_region_response,
         publish_synchronized_layout, publish_synchronized_layout_attempt,
@@ -8011,6 +8042,63 @@ mod tests {
         assert_eq!(revision, 2);
         let view: super::RenderView = serde_json::from_slice(&bytes).expect("render view");
         assert_eq!(view.status, "second");
+    }
+
+
+    #[test]
+    fn agent_picker_pending_must_not_fulfill_after_realm_change() {
+        let mut state = SwitcherState::new();
+        state.backend_id = 1;
+        state.session_id = 10;
+        state.agent_picker_pending = Some((1, 10));
+        state.agents = vec![WireAgent {
+            id: "agent-a".to_string(),
+            status: "idle".to_string(),
+            model: "m".to_string(),
+            reasoning: "r".to_string(),
+        }];
+
+        // Snapshot / layout-state / activate-create all route through this clear.
+        clear_agent_registry_for_realm_change(&mut state);
+        state.backend_id = 2;
+        state.session_id = 20;
+        state.agents = vec![WireAgent {
+            id: "agent-b".to_string(),
+            status: "idle".to_string(),
+            model: "m".to_string(),
+            reasoning: "r".to_string(),
+        }];
+
+        let commands = fulfill_pending_agent_picker(&mut state);
+        assert!(
+            commands.is_empty(),
+            "new session registry must not fulfill old-session agent-picker shortcut"
+        );
+        assert!(state.agent_picker_pending.is_none());
+
+        // Scoped pending for the current realm still fulfills.
+        state.agent_picker_pending = Some((2, 20));
+        let commands = fulfill_pending_agent_picker(&mut state);
+        assert_eq!(commands.len(), 1, "matching realm with one agent opens it");
+        assert!(state.agent_picker_pending.is_none());
+    }
+
+    #[test]
+    fn agent_picker_pending_ignores_mismatched_realm_without_prior_clear() {
+        let mut state = SwitcherState::new();
+        state.backend_id = 2;
+        state.session_id = 20;
+        // Stale pending left set (defense in depth if a realm path forgets to clear).
+        state.agent_picker_pending = Some((1, 10));
+        state.agents = vec![WireAgent {
+            id: "agent-b".to_string(),
+            status: "idle".to_string(),
+            model: "m".to_string(),
+            reasoning: "r".to_string(),
+        }];
+        let commands = fulfill_pending_agent_picker(&mut state);
+        assert!(commands.is_empty());
+        assert!(state.agent_picker_pending.is_none());
     }
 
     #[cfg(feature = "pure-renderer")]
