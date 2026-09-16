@@ -98,17 +98,15 @@ route / renderer state from a delayed `BackendSnapshot` event is still applied
 before the session-map gate; only the session catalogue / actor broadcast path
 is revision-gated today.
 
-### Command completion and catalogue publication are independent
+### Command completion and catalogue publication are independent — remitted
 
-The local command worker posts completion as soon as the DBus call returns
-(`clients/brood-client/src/main.rs:2400-2435`). The server publishes the
-catalogue after it has handled and replied to the DBus request
-(`crates/broodd/src/control.rs:2938-2965`). The native client responds to a
-successful activate or create by selecting the session immediately, before a
-catalogue containing that identity is guaranteed to be installed
-(`clients/brood-client/src/main.rs:9549-9577`). The worktree flow already has a
-special-case workaround, showing that this ordering cannot be assumed. A
-commit revision would remove the need for per-operation workarounds.
+Remitted in the session switcher by aligning ordinary Create/Activate/Rename
+selection with the worktree retain-until-catalogue contract, and by keeping
+`ensure_selection` from snapping list selection away from an unpublished
+`(backend_id, session_id)` realm when a delayed catalogue still lacks that row.
+Residual risk: the native client can still focus via `select_active_session`
+before catalogue install; a shared commit receipt across completion and
+catalogue publication remains future work.
 
 ### Backend deployment results do not identify the initiating intent — remitted
 

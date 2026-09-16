@@ -936,6 +936,21 @@ impl SwitcherState {
         }) {
             return;
         }
+        // Retain optimistic Create/Activate/worktree identity across the
+        // completion→catalogue gap. A stale catalogue must not snap list
+        // selection back to an older row while realm still points at the
+        // pending session.
+        if self.session_id != 0 {
+            let pending_identity = (self.backend_id, self.session_id);
+            let pending_published = self
+                .sessions
+                .iter()
+                .any(|session| (session.backend, session.id) == pending_identity);
+            if !pending_published {
+                self.selected = Some(pending_identity);
+                return;
+            }
+        }
         self.selected = self
             .sessions
             .iter()
@@ -1594,13 +1609,10 @@ fn apply_completion(state: &mut SwitcherState, completion: SessionCommandComplet
             SessionOperation::Activate | SessionOperation::Create | SessionOperation::Rename
         ) && let Some(session) = completion.session
         {
-            state.selected = state
-                .sessions
-                .iter()
-                .find(|candidate| {
-                    candidate.backend == completion.backend_id && candidate.id == session
-                })
-                .map(|candidate| (candidate.backend, candidate.id));
+            // Match the worktree contract: completion and catalogue travel on
+            // independent lanes, so keep the authoritative identity even when
+            // the session row has not been published yet.
+            state.selected = Some((completion.backend_id, session));
         }
         state.status = match completion.operation {
             SessionOperation::Refresh => "Sessions refreshed".to_string(),
@@ -7756,6 +7768,90 @@ mod tests {
         assert_eq!(state.pending, None);
         assert_eq!(state.status, "Switched session");
         assert_eq!(state.backend_id, 1);
+        assert_eq!(state.session_id, 9);
+        assert_eq!(state.selected, Some((1, 9)));
+    }
+
+    #[test]
+    fn create_completion_keeps_identity_before_catalogue() {
+        let mut state = SwitcherState::new();
+        state.backend_id = 1;
+        state.session_id = 3;
+        state.pending = Some(11);
+        state.sessions.push(ViewSession {
+            backend: 1,
+            id: 3,
+            name: "existing".to_string(),
+            active: true,
+            windows: 1,
+            working_directory: Some("/work/existing".to_string()),
+            project_id: "/work/existing/.git".to_string(),
+            project_name: "existing".to_string(),
+            branch: Some("main".to_string()),
+            worktree: false,
+            git: true,
+        });
+        // Realm advances on Activate/Create before apply_completion runs.
+        state.backend_id = 1;
+        state.session_id = 9;
+        apply_completion(
+            &mut state,
+            SessionCommandCompleted {
+                backend_id: 1,
+                request: 11,
+                operation: SessionOperation::Create,
+                success: true,
+                session: Some(9),
+                message: String::new(),
+            },
+        );
+        assert_eq!(state.selected, Some((1, 9)));
+        assert_eq!(state.pending, None);
+        assert_eq!(state.session_id, 9);
+    }
+
+    #[test]
+    fn stale_catalogue_after_create_must_not_diverge_realm_and_selection() {
+        let mut state = SwitcherState::new();
+        state.backend_id = 1;
+        state.session_id = 9;
+        state.selected = Some((1, 9));
+        state.sessions.push(ViewSession {
+            backend: 1,
+            id: 3,
+            name: "existing".to_string(),
+            active: true,
+            windows: 1,
+            working_directory: Some("/work/existing".to_string()),
+            project_id: "/work/existing/.git".to_string(),
+            project_name: "existing".to_string(),
+            branch: Some("main".to_string()),
+            worktree: false,
+            git: true,
+        });
+        apply_backend_sessions(
+            &mut state,
+            true,
+            false,
+            false,
+            vec![BackendCatalogueEntry {
+                backend: brood_protocol::BackendId(1),
+                label: "Local".to_string(),
+                sessions: vec![BackendSessionEntry {
+                    id: 3,
+                    name: "existing".to_string(),
+                    active: true,
+                    windows: 1,
+                    working_directory: Some("/work/existing".to_string()),
+                    project_id: "/work/existing/.git".to_string(),
+                    project_name: "existing".to_string(),
+                    branch: Some("main".to_string()),
+                    worktree: false,
+                    git: true,
+                    isolation: brood_protocol::SessionIsolationStatus::default(),
+                }],
+            }],
+        );
         assert_eq!(state.session_id, 9);
         assert_eq!(state.selected, Some((1, 9)));
     }
