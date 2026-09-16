@@ -3236,17 +3236,22 @@ impl Brood {
     }
 
     pub fn reset_transient_input_state(&mut self) {
-        for key_code in std::mem::take(&mut self.forwarded_pressed_keys)
-            .into_iter()
-            .rev()
-        {
-            self.seat.get_keyboard().expect("keyboard").input::<(), _>(
-                self,
-                key_code,
-                smithay::backend::input::KeyState::Released,
-                SERIAL_COUNTER.next_serial(),
-                0,
-                |_, _, _| smithay::input::keyboard::FilterResult::Forward,
+        let pending_keys = std::mem::take(&mut self.forwarded_pressed_keys);
+        if let Some(keyboard) = self.seat.get_keyboard() {
+            for key_code in pending_keys.into_iter().rev() {
+                keyboard.input::<(), _>(
+                    self,
+                    key_code,
+                    smithay::backend::input::KeyState::Released,
+                    SERIAL_COUNTER.next_serial(),
+                    0,
+                    |_, _, _| smithay::input::keyboard::FilterResult::Forward,
+                );
+            }
+        } else if !pending_keys.is_empty() {
+            warn!(
+                pending_keys = pending_keys.len(),
+                "dropping pressed-key reset: seat has no keyboard"
             );
         }
 
@@ -3669,10 +3674,11 @@ impl Brood {
         let serial = SERIAL_COUNTER.next_serial();
         let keyboard_focus =
             active_surface.filter(|surface| self.surface_can_receive_focus(surface));
-        self.seat
-            .get_keyboard()
-            .expect("keyboard")
-            .set_focus(self, keyboard_focus, serial);
+        let Some(keyboard) = self.seat.get_keyboard() else {
+            warn!("skipping keyboard focus update: seat has no keyboard");
+            return;
+        };
+        keyboard.set_focus(self, keyboard_focus, serial);
     }
 
     pub fn focus_pane(&mut self, pane: u64) -> bool {
@@ -3693,10 +3699,11 @@ impl Brood {
         self.focus.set_active_toplevel(Some(surface.clone()));
         self.activate_windows_without_geometry(Some(&surface));
         let serial = SERIAL_COUNTER.next_serial();
-        self.seat
-            .get_keyboard()
-            .expect("keyboard")
-            .set_focus(self, Some(surface), serial);
+        let Some(keyboard) = self.seat.get_keyboard() else {
+            warn!("skipping pane keyboard focus update: seat has no keyboard");
+            return true;
+        };
+        keyboard.set_focus(self, Some(surface), serial);
         true
     }
 
@@ -7765,10 +7772,11 @@ impl Brood {
         self.focus.set_active_toplevel(active_surface.clone());
         self.activate_windows_without_geometry(active_surface.as_ref());
         let serial = SERIAL_COUNTER.next_serial();
-        self.seat
-            .get_keyboard()
-            .expect("keyboard")
-            .set_focus(self, active_surface, serial);
+        let Some(keyboard) = self.seat.get_keyboard() else {
+            warn!("skipping focus stack keyboard update: seat has no keyboard");
+            return;
+        };
+        keyboard.set_focus(self, active_surface, serial);
     }
 
     pub fn close_active_window(&mut self) -> bool {
@@ -7923,7 +7931,13 @@ impl Brood {
             }
         }
 
-        let current_focus = self.seat.get_keyboard().expect("keyboard").current_focus();
+        let Some(keyboard) = self.seat.get_keyboard() else {
+            warn!("skipping seat keyboard focus repair: seat has no keyboard");
+            self.reconfigure_focus_stack();
+            self.last_window_count = window_count;
+            return outcome;
+        };
+        let current_focus = keyboard.current_focus();
         if let Some(current_focus) = current_focus {
             let focus_is_live = live_toplevel_surfaces.iter().any(|surface| {
                 surface == &current_focus

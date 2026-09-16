@@ -1,8 +1,3 @@
-#![allow(
-    clippy::expect_used,
-    reason = "the compositor creates its keyboard and pointer seats before input dispatch"
-)]
-
 use crate::{geometry::finite_axis_value, state::Brood};
 use smithay::{
     backend::input::{Axis, AxisSource, ButtonState, KeyState, Keycode},
@@ -40,7 +35,14 @@ pub fn managed_wheel_axis_frame(time: u32, horizontal_v120: i32, vertical_v120: 
     frame
 }
 
-const fn should_forward_managed_pointer_button(target_exists: bool, state: ButtonState) -> bool {
+/// Whether a managed presentation pointer button event should reach Smithay.
+///
+/// Presses without a target are dropped; releases still forward so implicit
+/// click / DnD grabs cannot stick to a destroyed surface.
+pub const fn should_forward_managed_pointer_button(
+    target_exists: bool,
+    state: ButtonState,
+) -> bool {
     target_exists || matches!(state, ButtonState::Released)
 }
 
@@ -70,15 +72,14 @@ impl Brood {
             self.dmabuf.fast_path.is_some() && self.active_window().is_some();
         self.stats.record_input(can_sample_visible_latency);
         self.stats.keyboard_events += 1;
+        let Some(keyboard) = self.seat.get_keyboard() else {
+            tracing::warn!("dropping keyboard key: seat has no keyboard");
+            return;
+        };
         let serial = SERIAL_COUNTER.next_serial();
-        self.seat.get_keyboard().expect("keyboard").input::<(), _>(
-            self,
-            key_code,
-            state,
-            serial,
-            time,
-            |_, _, _| FilterResult::Forward,
-        );
+        keyboard.input::<(), _>(self, key_code, state, serial, time, |_, _, _| {
+            FilterResult::Forward
+        });
     }
 
     pub fn forward_pointer_motion_to_pane(
@@ -102,7 +103,10 @@ impl Brood {
         } else {
             self.stats.pointer_target_misses += 1;
         }
-        let pointer = self.seat.get_pointer().expect("pointer");
+        let Some(pointer) = self.seat.get_pointer() else {
+            tracing::warn!(pane, "dropping pointer motion: seat has no pointer");
+            return;
+        };
         pointer.motion(
             self,
             under,
@@ -118,7 +122,10 @@ impl Brood {
     pub fn forward_pointer_leave_managed_pane(&mut self, time: u32) {
         self.set_pointer_hover_toplevel_surface(None);
         let serial = SERIAL_COUNTER.next_serial();
-        let pointer = self.seat.get_pointer().expect("pointer");
+        let Some(pointer) = self.seat.get_pointer() else {
+            tracing::warn!("dropping pointer leave: seat has no pointer");
+            return;
+        };
         let location = pointer.current_location();
         pointer.motion(
             self,
@@ -139,8 +146,14 @@ impl Brood {
         state: ButtonState,
         time: u32,
     ) {
-        let pointer = self.seat.get_pointer().expect("pointer");
-        let keyboard = self.seat.get_keyboard().expect("keyboard");
+        let Some(pointer) = self.seat.get_pointer() else {
+            tracing::warn!(pane, "dropping pointer button: seat has no pointer");
+            return;
+        };
+        let Some(keyboard) = self.seat.get_keyboard() else {
+            tracing::warn!(pane, "dropping pointer button: seat has no keyboard");
+            return;
+        };
         let serial = SERIAL_COUNTER.next_serial();
         let target_window = self.presentation_window_for_pane(pane);
         let target_surface = target_window
@@ -206,7 +219,10 @@ impl Brood {
     }
 
     pub fn forward_pointer_axis_to_pane(&mut self, pane: u64, frame: AxisFrame) {
-        let pointer = self.seat.get_pointer().expect("pointer");
+        let Some(pointer) = self.seat.get_pointer() else {
+            tracing::warn!(pane, "dropping pointer axis: seat has no pointer");
+            return;
+        };
         let has_target = self.presentation_window_for_pane(pane).is_some();
         self.stats
             .record_input(self.dmabuf.fast_path.is_some() && has_target);
