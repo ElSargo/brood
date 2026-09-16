@@ -7850,6 +7850,7 @@ mod tests {
                     git: true,
                     isolation: brood_protocol::SessionIsolationStatus::default(),
                 }],
+                snapshot_revision: 0,
             }],
         );
         assert_eq!(state.session_id, 9);
